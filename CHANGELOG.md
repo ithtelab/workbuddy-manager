@@ -7,6 +7,34 @@
 
 ---
 
+## [未发布]
+
+### 新增
+- **兼容 Anthropic Messages API（`/v1/messages`）**：Claude Code / Cursor / Cline /
+  Zed 等**只认 Anthropic 协议**的客户端现在可以直接接入本网关。
+
+  此前它们用不了——不是配置问题，而是协议不同：`system` 是顶层字段（不在 messages
+  里）、`max_tokens` **必填**、`content` 是 block 数组、流式是带 `event:` 行的事件流。
+  光靠改 `ANTHROPIC_BASE_URL` 指过来是不通的。
+
+  - 令牌两种传法都认：`x-api-key`（Anthropic SDK）与 `Authorization: Bearer`（Claude Code）
+  - **鉴权、IP 管控、配额、限流、日志与用量记账全部复用网关既有实现**，不另起一套
+  - 流式按规范逐事件转换：`message_start` → `content_block_start` →若干
+    `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`
+  - 工具调用双向映射：OpenAI 的**分片** `arguments` 字符串 ↔ Anthropic 的
+    `input_json_delta` 事件；非流式的 `input` 由字符串还原为对象
+  - 工具结果的消息形态差异也一并处理：Anthropic 把它放在 user 消息的 block 里，
+    OpenAI 要求是独立的 `role: tool` 消息（转换时会拆开并前置）
+  - `/v1/models` 按 `anthropic-version` 请求头分流为 Anthropic 形状
+    （两边路径同名但结构不同，只能按头分流；各注册一个路由会有一个永远收不到请求）
+  - 另提供 `/v1/messages/count_tokens`（按字符数粗估——拿不到上游分词器，
+    宁可高估留余量，也不低估导致真实请求超限）
+
+  > 与「转发热路径原样透传」不冲突：本层只改变**回给客户端的表达形式**，
+  > 不改动转发给上游的内容。`test_gateway_passthrough` 已相应标注这一例外。
+
+---
+
 ## [1.0.35] - 2026-09-15
 
 ### 新增

@@ -14,7 +14,7 @@ import logging
 from . import config, db, security
 from .iputil import client_ip
 from .routers import (
-    accounts, auth, gateway, keys, logs, models, playground,
+    accounts, anthropic, auth, gateway, keys, logs, models, playground,
     security as security_router, settings, stats, system,
 )
 from .services import tasklog
@@ -87,6 +87,8 @@ app.include_router(system.router)
 app.include_router(models.router)
 app.include_router(playground.router)
 app.include_router(gateway.router)
+# Anthropic Messages API 兼容层（/v1/messages）——给只认该协议的客户端用
+app.include_router(anthropic.router)
 
 
 @app.middleware('http')

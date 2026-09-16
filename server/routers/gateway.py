@@ -304,11 +304,48 @@ async def list_models(request: Request):
             resp = await client.get(f'{config.WB2API_BASE}/v1/models', headers=_upstream_headers())
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', resp.status_code, 0, 0, latency, request.headers.get('user-agent'), None, False)
-        return JSONResponse(_scope_models(resp.json(), key), status_code=resp.status_code)
+        payload = _scope_models(resp.json(), key)
+        # Anthropic 客户端（Claude Code 等）也会调这个路径，但期望的结构不同
+        if request.headers.get('anthropic-version'):
+            payload = _as_anthropic_models(payload)
+        return JSONResponse(payload, status_code=resp.status_code)
     except Exception as exc:  # noqa: BLE001
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', 502, 0, 0, latency, request.headers.get('user-agent'), str(exc), False)
         return _oai_error(f'上游不可用: {exc}', 502, 'api_error', 'upstream_unavailable')
+
+
+def _as_anthropic_models(payload: object) -> object:
+    """把 OpenAI 形状的模型列表翻成 Anthropic 的形状。
+
+    两边都叫 `/v1/models`，结构却完全不同：Anthropic 是
+    `{data:[{type:"model", id, display_name, created_at}], has_more, first_id, last_id}`。
+    Claude Code 按这个结构解析，形状不对会直接报错——所以只能在**同一个路径上
+    按请求头分流**（用 `anthropic-version` 区分），而不能各注册一个路由
+    （FastAPI 里先注册的会赢，另一个永远收不到请求）。
+
+    认不出的结构**原样返回**：不在我们看不懂的响应上动手脚。
+    """
+    items = payload.get('data') if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return payload
+    data = [
+        {
+            'type': 'model',
+            'id': str(m.get('id') or ''),
+            'display_name': str(m.get('name') or m.get('id') or ''),
+            # 协议要求 ISO8601；上游给的是 created(epoch)，缺省时用纪元起点占位
+            'created_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(m.get('created') or 0)),
+        }
+        for m in items
+        if isinstance(m, dict) and m.get('id')
+    ]
+    return {
+        'data': data,
+        'has_more': False,
+        'first_id': data[0]['id'] if data else None,
+        'last_id': data[-1]['id'] if data else None,
+    }
 
 
 def _scope_models(payload: object, key: dict | None) -> object:
