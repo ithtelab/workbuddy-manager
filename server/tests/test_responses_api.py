@@ -404,6 +404,42 @@ class RequestConversionTest(unittest.TestCase):
         self.assertEqual(out['tool_choice'],
                          {'type': 'function', 'function': {'name': 'get'}})
 
+    def test_custom_tool_is_wrapped_and_history_roundtrips(self) -> None:
+        patch = '*** Begin Patch\n*** Add File: probe.txt\n+ok\n*** End Patch'
+        body = {
+            'model': 'm',
+            'reasoning': {'effort': 'max', 'summary': 'ignored'},
+            'tools': [{
+                'type': 'custom',
+                'name': 'apply_patch',
+                'description': 'Apply a patch',
+                'format': {'type': 'grammar', 'definition': 'start: /[\\\\s\\\\S]+/'},
+            }],
+            'input': [
+                {'type': 'custom_tool_call', 'call_id': 'c1',
+                 'name': 'apply_patch', 'input': patch},
+                {'type': 'custom_tool_call_output', 'call_id': 'c1', 'output': 'ok'},
+            ],
+            'tool_choice': {'type': 'custom', 'name': 'apply_patch'},
+        }
+        out = R.to_chat_request(body)
+        self.assertEqual(out['reasoning_effort'], 'max')
+        self.assertEqual(out['tools'][0]['function']['parameters']['required'], ['input'])
+        self.assertIn('Requested grammar', out['tools'][0]['function']['description'])
+        self.assertEqual(out['messages'][0]['tool_calls'][0]['function']['arguments'],
+                         json.dumps({'input': patch}, ensure_ascii=False))
+        self.assertEqual(out['messages'][1]['role'], 'tool')
+        self.assertEqual(out['tool_choice'],
+                         {'type': 'function', 'function': {'name': 'apply_patch'}})
+
+    def test_custom_tool_history_requires_string_input(self) -> None:
+        with self.assertRaises(R.CustomToolArgumentsError):
+            R.to_chat_request({
+                'model': 'm',
+                'input': [{'type': 'custom_tool_call', 'name': 'apply_patch',
+                           'input': {'not': 'raw text'}}],
+            })
+
 
 class NonStreamingResponseTest(unittest.TestCase):
     def test_text_and_usage(self) -> None:
@@ -450,6 +486,29 @@ class NonStreamingResponseTest(unittest.TestCase):
         self.assertEqual(item['name'], 'get')
         self.assertEqual(item['arguments'], '{"a":1}')
         self.assertTrue(item['id'].startswith('fc_'))
+
+    def test_custom_tool_call_is_restored(self) -> None:
+        patch = '*** Begin Patch\n*** Add File: probe.txt\n+ok\n*** End Patch'
+        obj = R.to_responses_object({
+            'choices': [{
+                'message': {
+                    'content': None,
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'type': 'function',
+                        'function': {
+                            'name': 'apply_patch',
+                            'arguments': json.dumps({'input': patch}),
+                        },
+                    }],
+                },
+                'finish_reason': 'tool_calls',
+            }],
+        }, 'm', 'resp_1', {'apply_patch'})
+        item = obj['output'][0]
+        self.assertEqual(item['type'], 'custom_tool_call')
+        self.assertEqual(item['input'], patch)
+        self.assertNotIn('arguments', item)
 
 
 class StreamContractTest(unittest.TestCase):
@@ -501,6 +560,61 @@ class StreamContractTest(unittest.TestCase):
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0]['name'], 'get')
         self.assertEqual(tools[0]['arguments'], '{"a":1}', '参数分片没被拼回')
+
+    def test_custom_tool_stream_uses_raw_input_events(self) -> None:
+        t = R._StreamTranslator('m', 'resp_1', {'apply_patch'})
+        chunks: list[bytes] = []
+        chunks += t.feed(delta(tool={
+            'index': 0,
+            'id': 'call_1',
+            'function': {
+                'name': 'apply_',
+                'arguments': '{"input":"patch"}',
+            },
+        }))
+        chunks += t.feed(delta(tool={
+            'index': 0,
+            'function': {'name': 'patch'},
+        }))
+        chunks += t.feed(delta(finish='tool_calls'))
+        events = [
+            json.loads(line[5:].strip())
+            for chunk in chunks
+            for line in chunk.decode().splitlines()
+            if line.startswith('data:')
+        ]
+        custom = [event for event in events
+                  if event['type'] == 'response.custom_tool_call_input.delta']
+        done = [event for event in events
+                if event['type'] == 'response.custom_tool_call_input.done']
+        output = [event for event in events
+                  if event['type'] == 'response.output_item.done'][-1]['item']
+        self.assertEqual([event['delta'] for event in custom], ['patch'])
+        self.assertEqual(done[0]['input'], 'patch')
+        self.assertEqual(output['type'], 'custom_tool_call')
+        self.assertEqual(output['input'], 'patch')
+
+    def test_malformed_custom_stream_fails_without_executable_call(self) -> None:
+        t = R._StreamTranslator('m', 'resp_1', {'apply_patch'})
+        chunks = t.feed(delta(tool={
+            'index': 0,
+            'id': 'call_1',
+            'function': {
+                'name': 'apply_patch',
+                'arguments': '{"input": 1}',
+            },
+        }))
+        chunks += t.feed(delta(finish='tool_calls'))
+        events = [
+            json.loads(line[5:].strip())
+            for chunk in chunks
+            for line in chunk.decode().splitlines()
+            if line.startswith('data:')
+        ]
+        self.assertEqual(events[-1]['type'], 'response.failed')
+        self.assertFalse(any(event['type'] == 'response.output_item.done'
+                             and event.get('item', {}).get('type') == 'custom_tool_call'
+                             for event in events))
 
     def test_parallel_tool_calls_keep_separate_slots(self) -> None:
         """并发工具各自编号：混进一个槽位会让两个调用互相污染参数。"""

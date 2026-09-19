@@ -55,6 +55,48 @@ router = APIRouter(tags=['responses'])
 MAX_OUTPUT_ITEMS = 256
 
 
+class CustomToolArgumentsError(ValueError):
+    """Custom/freeform tool output cannot be executed through a function wrapper."""
+
+
+def _custom_tool_names(body: dict) -> set[str]:
+    tools = body.get('tools')
+    if not isinstance(tools, list):
+        return set()
+    return {
+        tool['name'] for tool in tools
+        if isinstance(tool, dict)
+        and tool.get('type') == 'custom'
+        and isinstance(tool.get('name'), str)
+        and tool['name']
+    }
+
+
+def _custom_input(raw: object) -> str:
+    """Decode the temporary Chat wrapper used for a Responses custom tool.
+
+    The wrapper is deliberately strict: a malformed or ambiguous custom call
+    must fail instead of being emitted as an executable ordinary function call.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate key')
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw, object_pairs_hook=unique_object) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        raise CustomToolArgumentsError(
+            'Custom tool arguments must be a JSON object containing only string input.') from None
+    if not isinstance(value, dict) or set(value) != {'input'} or not isinstance(value['input'], str):
+        raise CustomToolArgumentsError(
+            'Custom tool arguments must be a JSON object containing only string input.')
+    return value['input']
+
+
 def _as_int(value: object) -> int:
     try:
         return int(value)  # type: ignore[arg-type]
@@ -271,6 +313,35 @@ def _convert_tools(tools: object) -> list[dict] | None:
                 or {'type': 'object', 'properties': {}},
             },
         }
+        if tool.get('type') == 'custom':
+            # Chat Completions has no freeform/custom tool shape. Keep the
+            # upstream call executable by using one strict string wrapper; the
+            # response side restores the original custom_tool_call contract.
+            spec['function']['description'] += (
+                '\nPass the complete raw text for this custom tool in the input string. '
+                'Do not encode it as function arguments inside that string. '
+                'Any custom grammar is not enforced by this Chat Completions bridge.'
+            )
+            spec['function']['parameters'] = {
+                'type': 'object',
+                'properties': {
+                    'input': {
+                        'type': 'string',
+                        'description': 'Complete raw custom tool input.',
+                    },
+                },
+                'required': ['input'],
+                'additionalProperties': False,
+            }
+            fmt = tool.get('format')
+            if (
+                isinstance(fmt, dict)
+                and fmt.get('type') == 'grammar'
+                and isinstance(fmt.get('definition'), str)
+            ):
+                spec['function']['description'] += (
+                    '\nRequested grammar (guidance only):\n' + fmt['definition']
+                )
         out.append(spec)
     return out or None
 
@@ -287,8 +358,9 @@ def _convert_tool_choice(choice: object) -> object:
     return None
 
 
-def to_chat_request(body: dict) -> dict:
+def to_chat_request(body: dict, custom_tool_names: set[str] | None = None) -> dict:
     """Responses 请求体 → Chat Completions 请求体。"""
+    custom_tool_names = custom_tool_names or _custom_tool_names(body)
     # `stream` 必须**转告上游**：上游靠这个字段决定是回 SSE 还是回一次性 JSON。
     # 漏掉它会得到一个"看起来很成功"的结果——网关按流式解析，上游却回了 JSON，
     # 于是一个 data 帧都解析不出来，客户端只收到 response.created + completed 的
@@ -350,23 +422,32 @@ def to_chat_request(body: dict) -> dict:
             if not isinstance(item, dict):
                 continue
             kind = str(item.get('type') or '')
-            if kind == 'function_call':
+            if kind in ('function_call', 'custom_tool_call'):
+                if kind == 'custom_tool_call' and not isinstance(item.get('input'), str):
+                    raise CustomToolArgumentsError(
+                        'Custom tool history input must be a string.')
+                name = str(item.get('name') or '')
+                raw_arguments = (
+                    json.dumps({'input': item.get('input')}, ensure_ascii=False)
+                    if kind == 'custom_tool_call'
+                    else item.get('arguments')
+                )
                 pending_calls.append({
                     'id': str(item.get('call_id') or item.get('id') or ''),
                     'type': 'function',
                     'function': {
-                        'name': str(item.get('name') or ''),
+                        'name': name,
                         # Responses 的 arguments 已经是字符串；对象则序列化
-                        'arguments': item.get('arguments')
-                        if isinstance(item.get('arguments'), str)
-                        else json.dumps(item.get('arguments') or {}, ensure_ascii=False),
+                        'arguments': raw_arguments
+                        if isinstance(raw_arguments, str)
+                        else json.dumps(raw_arguments or {}, ensure_ascii=False),
                     },
                 })
                 continue
 
             flush_calls()
 
-            if kind == 'function_call_output':
+            if kind in ('function_call_output', 'custom_tool_call_output'):
                 # 与 Anthropic 层同一个坑（那个 PR #25 报了）：tool 消息的 content
                 # 在 OpenAI 协议里只能是字符串，**放不下结构化图片**。
                 # 只取文字会让工具输出的图片**静默丢失**（模型看不到图）；
@@ -486,6 +567,10 @@ def to_chat_request(body: dict) -> dict:
     if choice is not None:
         out['tool_choice'] = choice
 
+    reasoning = body.get('reasoning')
+    if isinstance(reasoning, dict) and isinstance(reasoning.get('effort'), str):
+        out['reasoning_effort'] = reasoning['effort']
+
     # 只透传**上游认识**的字段。`store` / `include` / `prompt_cache_key` /
     # `reasoning` 这些是 OpenAI 专有的，透过去只会换来一个 400。
     # （`stream` 不在其列——它必须转告上游，见函数开头。）
@@ -572,6 +657,16 @@ def _function_call_item(call_id: str, item_id: str, name: str, arguments: str) -
     }
 
 
+def _custom_call_item(call_id: str, item_id: str, name: str, raw_input: str) -> dict:
+    return {
+        'type': 'custom_tool_call',
+        'id': item_id,
+        'call_id': call_id,
+        'name': name,
+        'input': raw_input,
+    }
+
+
 def _reasoning_item(text: str, item_id: str) -> dict:
     """推理输出项：`summary` 给人看，`encrypted_content` 供客户端回传。
 
@@ -600,8 +695,14 @@ def _normalize_tool_arguments(raw: object) -> str:
     return json.dumps(raw, ensure_ascii=False)
 
 
-def to_responses_object(data: dict, model: str, resp_id: str) -> dict:
+def to_responses_object(
+    data: dict,
+    model: str,
+    resp_id: str,
+    custom_tool_names: set[str] | None = None,
+) -> dict:
     """Chat Completions 非流式响应 → Responses 响应体。"""
+    custom_tool_names = custom_tool_names or set()
     choice = (data.get('choices') or [{}])[0] if isinstance(data.get('choices'), list) else {}
     message = choice.get('message') or {}
     finish = str(choice.get('finish_reason') or 'stop')
@@ -613,14 +714,34 @@ def to_responses_object(data: dict, model: str, resp_id: str) -> dict:
     reasoning = message.get('reasoning_content')
     if isinstance(reasoning, str) and reasoning:
         output.append(_reasoning_item(reasoning, 'rs_' + uuid.uuid4().hex[:20]))
-    for call in message.get('tool_calls') or []:
+    calls = [call for call in message.get('tool_calls') or [] if isinstance(call, dict)]
+    custom_calls = [
+        call for call in calls
+        if isinstance(call.get('function'), dict)
+        and call['function'].get('name') in custom_tool_names
+    ]
+    if custom_calls and finish not in ('stop', 'tool_calls', 'length'):
+        raise CustomToolArgumentsError(
+            'Custom tool response ended without a complete tool turn.')
+    # A length-truncated custom call must never be exposed as executable output.
+    suppress_tools = bool(custom_calls) and finish == 'length'
+    for call in custom_calls:
+        _custom_input((call.get('function') or {}).get('arguments'))
+    for call in ([] if suppress_tools else calls):
         if not isinstance(call, dict):
             continue
         fn = call.get('function') or {}
-        output.append(_function_call_item(
+        name = str(fn.get('name') or '')
+        is_custom = name in custom_tool_names
+        output.append(_custom_call_item(
+            str(call.get('id') or f'call_{uuid.uuid4().hex[:12]}'),
+            'ctc_' + uuid.uuid4().hex[:20],
+            name,
+            _custom_input(fn.get('arguments')),
+        ) if is_custom else _function_call_item(
             str(call.get('id') or f'call_{uuid.uuid4().hex[:12]}'),
             'fc_' + uuid.uuid4().hex[:20],
-            str(fn.get('name') or ''),
+            name,
             _normalize_tool_arguments(fn.get('arguments')),
         ))
     text = message.get('content')
@@ -658,7 +779,12 @@ class _StreamTranslator:
     两个 item，混在一起会让客户端的思考区与正文区错位。
     """
 
-    def __init__(self, model: str, resp_id: str) -> None:
+    def __init__(
+        self,
+        model: str,
+        resp_id: str,
+        custom_tool_names: set[str] | None = None,
+    ) -> None:
         self.model = model
         self.resp_id = resp_id
         self.created_at = int(time.time())
@@ -682,6 +808,8 @@ class _StreamTranslator:
         self.saw_content = False
         self.finish_reason: str | None = None
         self.usage: dict = {}
+        self.custom_tool_names = custom_tool_names or set()
+        self.failed = False
 
     # ── 事件构造 ──
     def _created(self) -> list[bytes]:
@@ -795,6 +923,10 @@ class _StreamTranslator:
         }
         self.tools[seq] = state
         self.tool_order.append(seq)
+        # A custom tool's name may arrive in several upstream fragments.
+        # Buffer tool events until the final name/arguments can be validated.
+        if self.custom_tool_names:
+            return []
         return [_event('response.output_item.added', {
             'type': 'response.output_item.added',
             'output_index': index,
@@ -811,20 +943,41 @@ class _StreamTranslator:
 
     def _close_tools(self) -> list[bytes]:
         out: list[bytes] = []
+        custom_inputs = {
+            seq: _custom_input(state['args'])
+            for seq, state in self.tools.items()
+            if state['name'] in self.custom_tool_names
+        }
         for seq in self.tool_order:
             state = self.tools.get(seq)
             if not state or state.get('closed'):
                 continue
             state['closed'] = True
-            item = _function_call_item(
-                state['call_id'], state['id'], state['name'], state['args'])
+            custom = seq in custom_inputs
+            value = custom_inputs[seq] if custom else state['args']
+            field = 'input' if custom else 'arguments'
+            family = 'custom_tool_call_input' if custom else 'function_call_arguments'
+            item = (_custom_call_item if custom else _function_call_item)(
+                state['call_id'], state['id'], state['name'], value)
             self.items.append(item)
-            out += [
-                _event('response.function_call_arguments.done', {
-                    'type': 'response.function_call_arguments.done',
+            if self.custom_tool_names:
+                out.append(_event('response.output_item.added', {
+                    'type': 'response.output_item.added',
+                    'output_index': state['index'],
+                    'item': {**item, field: '', 'status': 'in_progress'},
+                }))
+                out.append(_event(f'response.{family}.delta', {
+                    'type': f'response.{family}.delta',
                     'output_index': state['index'],
                     'item_id': state['id'],
-                    'arguments': state['args'],
+                    'delta': value,
+                }))
+            out += [
+                _event(f'response.{family}.done', {
+                    'type': f'response.{family}.done',
+                    'output_index': state['index'],
+                    'item_id': state['id'],
+                    field: value,
                 }),
                 _event('response.output_item.done', {
                     'type': 'response.output_item.done',
@@ -906,16 +1059,27 @@ class _StreamTranslator:
                     str(name or ''),
                 )
             state = self.tools[seq]
+            if self.custom_tool_names:
+                # The first fragment is already stored by _open_tool. Later
+                # fragments may continue a split name; repeated full names
+                # are ignored so they do not become "BashBash".
+                if state.get('seen_fragment'):
+                    if isinstance(name, str) and name != state['name']:
+                        state['name'] += name
+                    if isinstance(call.get('id'), str):
+                        state['call_id'] = call['id']
+                state['seen_fragment'] = True
             # 分片参数原样透传，拼接交给客户端
             args = fn.get('arguments')
             if isinstance(args, str) and args:
                 state['args'] += args
-                out.append(_event('response.function_call_arguments.delta', {
-                    'type': 'response.function_call_arguments.delta',
-                    'output_index': state['index'],
-                    'item_id': state['id'],
-                    'delta': args,
-                }))
+                if not self.custom_tool_names:
+                    out.append(_event('response.function_call_arguments.delta', {
+                        'type': 'response.function_call_arguments.delta',
+                        'output_index': state['index'],
+                        'item_id': state['id'],
+                        'delta': args,
+                    }))
 
         finish = choice.get('finish_reason')
         if finish:
@@ -939,7 +1103,46 @@ class _StreamTranslator:
         # 漏掉 arguments.done 会让客户端的参数累积停在半截。
         if force and finish_reason is None and self.tools:
             finish_reason = 'tool_calls'
-        out += self._close_tools()
+        try:
+            has_custom = any(
+                state['name'] in self.custom_tool_names
+                for state in self.tools.values()
+            )
+            if has_custom and finish_reason not in ('stop', 'tool_calls', 'length'):
+                raise CustomToolArgumentsError(
+                    'Custom tool response ended without a complete tool turn.')
+            if self.custom_tool_names and any(
+                not state['name'] for state in self.tools.values()
+            ):
+                raise CustomToolArgumentsError(
+                    'Upstream tool call has no complete tool name.')
+            if finish_reason == 'length' and has_custom:
+                # A complete wrapper at a length stop is still incomplete and
+                # must not be exposed as an executable custom call.
+                for state in self.tools.values():
+                    if state['name'] in self.custom_tool_names:
+                        _custom_input(state['args'])
+            else:
+                out += self._close_tools()
+        except CustomToolArgumentsError as exc:
+            self.failed = True
+            out.append(_event('response.failed', {
+                'type': 'response.failed',
+                'response': {
+                    'id': self.resp_id,
+                    'object': 'response',
+                    'created_at': self.created_at,
+                    'status': 'failed',
+                    'model': self.model,
+                    'output': self.items,
+                    'error': {
+                        'code': 'invalid_custom_tool_arguments',
+                        'message': str(exc),
+                    },
+                    'usage': _usage_object(self.usage),
+                },
+            }))
+            return out
 
         if finish_reason == 'length':
             status, event_name = 'incomplete', 'response.incomplete'
@@ -987,9 +1190,10 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
 
     ua = request.headers.get('user-agent')
     stream = bool(body.get('stream'))
+    custom_tool_names = _custom_tool_names(body)
 
     try:
-        payload = to_chat_request(body)
+        payload = to_chat_request(body, custom_tool_names)
     except Exception as exc:  # noqa: BLE001
         gateway._record(key, ip, model, '', 400, 0, 0, 0, ua, str(exc), False)
         return _failed(f'请求转换失败：{exc}', 400)
@@ -1036,7 +1240,12 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 # 内容作为错误暴露出来，让问题可见。
                 return _failed('上游返回了无法解析的响应：' + resp.text[:300],
                                502, 'api_error', 'upstream_invalid_body')
-            return JSONResponse(to_responses_object(data, model, resp_id))
+            return JSONResponse(
+                to_responses_object(data, model, resp_id, custom_tool_names)
+            )
+        except CustomToolArgumentsError as exc:
+            return _failed(
+                str(exc), 502, 'api_error', 'invalid_custom_tool_arguments')
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
             gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
@@ -1079,7 +1288,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
 
     async def gen():
         pending = ''
-        translator = _StreamTranslator(model, resp_id)
+        translator = _StreamTranslator(
+            model, resp_id, custom_tool_names=custom_tool_names)
         error_text: str | None = None
         first_token_ms: int | None = None
 
