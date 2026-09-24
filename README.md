@@ -856,6 +856,17 @@ CI 会构建前端、打包产物、从 CHANGELOG 提取对应版本段落作为
 - [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) —— 底层账号池与 OpenAI 兼容代理（MIT；源码随本项目的发布包分发，版权归原作者）
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) —— 管理端功能形态参考
 
+## Hello World
+
+按照惯例，来一段带注释的 Hello World。本项目服务端是 Python（FastAPI），那就用它打招呼：
+
+```python
+# -*- coding: utf-8 -*-
+# 经典的 Hello World：先定义问候语，再打印出来
+greeting = "Hello, World!"   # 定义字符串变量 greeting，存放问候语
+print(greeting)              # 在控制台输出：Hello, World!
+```
+
 ## License
 
 [MIT](LICENSE)

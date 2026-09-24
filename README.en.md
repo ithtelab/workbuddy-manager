@@ -961,6 +961,18 @@ release notes, and creates a Release with the archives attached.
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) — feature
   reference for the console
 
+## Hello World
+
+As tradition dictates, here is an annotated Hello World. This project's server side is
+Python (FastAPI), so let it do the greeting:
+
+```python
+# -*- coding: utf-8 -*-
+# The classic Hello World: define the greeting first, then print it
+greeting = "Hello, World!"   # define a string variable holding the greeting
+print(greeting)              # print it to the console: Hello, World!
+```
+
 ## License
 
 [MIT](LICENSE)
