@@ -183,6 +183,9 @@
     "description": "{realm} pool health, gateway status and today's usage (auto-refresh every 30s)",
     "totalAccounts": "Total accounts",
     "totalAccountsHint": "{realm} managed",
+    "scopeAllGroups": "Scope: all groups ({n} total) · per-group detail on the Accounts page",
+    "groupsPartial": "Could not load accounts from {n} group(s); the figures below exclude them",
+    "accountsLoadFailed": "Account data failed to load",
     "valid": "Valid tokens",
     "allOk": "All healthy",
     "abnormal": {

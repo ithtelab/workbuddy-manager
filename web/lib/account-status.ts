@@ -17,8 +17,20 @@
  *   disabled → expired → unknown → cooling → neverSucceeded → notLoaded → online
  * 例如「上游状态取不到」必须早于「不在池里」——否则会把「看不到上游」
  * 误报成「账号文件坏了」（这个误报曾经真实发生过，见下）。
+ *
+ * 文件下半部分是**跨分组聚合**用的纯逻辑（`accountGroups` / `tagGroup` /
+ * `accountKey` / `interleave` / `poolTotals`）：仪表盘要把每个分组各取一份的
+ * 账号合成一份「全部」的视图（上游 issue #94 问题 2），而合成的每一步都要走
+ * `mergePoolStatus`，所以放在同一个模块里。
+ *
+ * ⚠️ 本模块**不得引入任何运行时 import**（只有 `import type`，编译后被抹掉）。
+ * 这是仓库给「可在 Node 里直接测的前端逻辑」定的规矩：`web/lib/*.test.mjs`
+ * 用 `node --experimental-strip-types` 直接 import `.ts` 源码，Node 的 ESM
+ * 解析要求带扩展名，而仓库的 app 代码一律不写扩展名——一旦这里 import 了别的
+ * 模块的**值**，测试就会以「找不到模块」失败，或者逼着全仓库改成 `.ts` 后缀。
+ * 要复用别的模块的函数，就把那个模块也做成零运行时依赖的。
  */
-import type {Account, UpstreamStatus} from './types';
+import type {Account, UpstreamEndpoint, UpstreamStatus} from './types';
 
 /** 账号当前的可用性分档 */
 export type AvailabilityTier =
@@ -237,3 +249,168 @@ export function availabilityClass(tier: AvailabilityTier): string {
       return 'text-emerald-600 dark:text-emerald-400';
   }
 }
+
+/* ──────────────────────────────────────────────────────────────
+ * 跨分组聚合（仪表盘「全部」视图）
+ *
+ * 仪表盘原先只取默认分组（`accountApi.list()` 不传 upstreamId，后端
+ * `routers/accounts.py::_group(None)` 就是默认分组），于是有多个分组时首页
+ * 只报 1/N 个池子。而那个数**看起来完全正常**——数字合理、图表正常，用户
+ * 不会怀疑，也永远不会自己变对（上游 issue #94 问题 2）。这比「加载中显示 0」
+ * 严重：前者是延迟，后者是错误。
+ *
+ * 修法是逐组各取一份再合并。合并本身有几处容易写错，所以和 `mergePoolStatus`
+ * 放在一起、由 `account-status.test.mjs` 直接测真实实现：
+ *
+ *  1. **`file` 只在分组内唯一**。两个分组可以有同名账号文件（`sub2api.json`
+ *     这类是扫码登录的默认文件名）。合并后若还拿 `a.file` 当 React key，两条
+ *     会撞成一个——列表少一条，或者状态串到别的号上，而两种都不会报错。
+ *  2. **池状态必须逐组合并**（`tagGroup` 就是干这个的）。`mergePoolStatus` 是把
+ *     「**这一份** /status 快照」并到「**这一份**账号列表」上的；若先跨组拼账号、
+ *     再拿某一组的 /status 去并，其余组的账号会因为「不在这份池里」被整批判成
+ *     `notLoaded`——那正是本模块开头记着的那个 P0 级误报。
+ *  3. **没有账号目录的分组不该被取数**。后端对这类分组的账号接口直接 409
+ *     （`routers/accounts.py::_require_dir`），列表接口给空数组。它们本来就没有
+ *     账号，纳进来只会多出几个必然失败的请求，还会让「共 N 个分组」这个数虚高。
+ * ────────────────────────────────────────────────────────────── */
+
+/** 账号 + 它属于哪个分组 */
+export interface GroupedAccount extends Account {
+  group: {id: number | null; name: string};
+}
+
+/** 一个分组的取数结果（成功与失败都在这里；失败时 accounts 为空、error 有值） */
+export interface GroupSlice {
+  /** 分组 id；null = 默认分组（与后端 `upstreamsvc.DEFAULT_ID` 一致） */
+  gid: number | null;
+  /** 分组名。多于一个分组时，界面靠它标注「这条账号属于哪个池」 */
+  name: string;
+  /** 该组的账号：已合并**该组**的池状态、已打上分组标记 */
+  accounts: GroupedAccount[];
+  /** 该组的池状态；没取到为 null */
+  upstream: UpstreamStatus | null;
+  /** 该组取数失败的原因；成功为 null */
+  error: unknown;
+}
+
+/**
+ * 该在哪些分组上取账号数：只取**配了本地账号目录**的。
+ *
+ * 默认分组永远有目录（部署时的 `WB_AUTH_DIR`，见 `upstreamsvc.default_upstream`）；
+ * 其余分组没配目录 = 只做密钥转发，一个账号都没有，而且它的账号接口会 409。
+ */
+export function accountGroups(groups: readonly UpstreamEndpoint[]): UpstreamEndpoint[] {
+  return groups.filter((g) => String(g.auth_dir ?? '').trim() !== '');
+}
+
+/**
+ * 把**一组**的账号与**它自己的**池状态合并，并打上分组标记。
+ *
+ * 参数刻意是「一组的账号 + 一组的 /status」：跨组混用会把别的组的账号判成
+ * 「不在池里」（见上方第 2 条）。
+ */
+export function tagGroup(
+  accounts: readonly Account[],
+  upstream: UpstreamStatus | null,
+  gid: number | null,
+  name: string,
+): GroupedAccount[] {
+  return mergePoolStatus(accounts as Account[], upstream)
+    .map((a) => ({...a, group: {id: gid, name}}));
+}
+
+/**
+ * React key。**必须带分组**。
+ *
+ * `file` 只在分组内唯一：两个分组里的 `sub2api.json` 是两个不同的账号。
+ * 只用文件名当 key，React 会把它们当成同一条——表现是列表少一条、或者某条的
+ * 状态串到另一条上，而两种都不会报错。
+ */
+export function accountKey(a: GroupedAccount): string {
+  return `${a.group.id ?? 'default'}:${a.file}`;
+}
+
+/**
+ * 交错取各组的下一个账号（第 1 组第 1 条 → 第 2 组第 1 条 → … → 第 1 组第 2 条）。
+ *
+ * 首页快照只画前 9 条（P1-7 记录了这个硬截断）。若按「一组接一组」平铺，默认
+ * 分组的 9 个账号会把格子占满，其余分组的问题一条都看不到——而「覆盖所有分组」
+ * 正是这次要修的东西。交错之后每个分组都有代表，截断也不会把某一组整个吞掉。
+ */
+export function interleave(slices: readonly GroupSlice[]): GroupedAccount[] {
+  const out: GroupedAccount[] = [];
+  const longest = slices.reduce((m, s) => Math.max(m, s.accounts.length), 0);
+  for (let i = 0; i < longest; i += 1) {
+    for (const s of slices) {
+      const a = s.accounts[i];
+      if (a) out.push(a);
+    }
+  }
+  return out;
+}
+
+/**
+ * 该组里「连败降权」的账号数（只数当前版本，与卡片、快照同口径）。
+ *
+ * 为什么要单独数（上游 issue #114）：**上游把降权并进 `cooling`**，所以
+ * `realm_totals` 里的「冷却中」是个混数——既有等一会儿就好的限流退避，也有
+ * 「这个号在持续失败」的降权。面板只显示混数时用户看不出降权的存在（反馈原话：
+ * 「降权统计这里根本不统计」）。从账号明细单独数一份，与上游口径不冲突：
+ * 它只是把 `cooling` 里降权的那一部分显式化。
+ *
+ * 参数是**一个分组的切片**而不是全量账号：面板改成「每个分组一块」之后，这一格
+ * 必须只数本组，否则每块都会显示全池的降权数（看起来像「四个分组各自都降权了
+ * 同样多个号」）。
+ */
+export function degradedCount(slice: GroupSlice, realm: string): number {
+  return slice.accounts.filter((a) => (a.realm ?? 'cn') === realm && isDegraded(a)).length;
+}
+
+/** 「反代上游」面板里一个分组那一块的池计数 */
+export interface PoolTotals {
+  total: number;
+  healthy: number;
+  cooling: number;
+  disabled: number;
+  /** 拿到了可用的计数（无论来自 realm_totals 还是顶层汇总） */
+  known: boolean;
+  /** 只能拿到顶层汇总（含两个版本），界面需标注 */
+  globalOnly: boolean;
+}
+
+/**
+ * 一个分组的池计数。
+ *
+ * 优先用上游按版本分好的 `realm_totals[realm]`——口径与上游状态机完全一致，
+ * 也不用我们去猜 `healthy` 该怎么算（曾经从账号明细里自己数，而明细里根本
+ * 没有这个字段，布尔转换恒为 false，面板因此全显示 0）。
+ *
+ * 老版本上游没给 realm_totals 时退回顶层汇总，并标 `globalOnly`：那时它是
+ * 两个版本的**合计**，界面必须说明，否则切到国际版会看到两个版本加起来的数。
+ *
+ * ⚠️ 这里是**一个分组**的口径，刻意不做跨组求和：两个分组可以指向同一套上游
+ * 实例（新建分组时地址默认沿用默认分组的），求和会把同一套实例数两遍。
+ */
+export function poolTotals(upstream: UpstreamStatus | null, realm: string): PoolTotals {
+  const perRealm = upstream?.realm_totals?.[realm];
+  if (perRealm) {
+    return {
+      total: perRealm.total,
+      healthy: perRealm.healthy,
+      cooling: perRealm.cooling,
+      disabled: perRealm.disabled,
+      known: true,
+      globalOnly: false,
+    };
+  }
+  const hasTop = typeof upstream?.total === 'number';
+  return {
+    total: upstream?.total ?? 0,
+    healthy: upstream?.healthy ?? 0,
+    cooling: upstream?.cooling ?? 0,
+    disabled: upstream?.disabled ?? 0,
+    known: hasTop,
+    globalOnly: hasTop,
+  };
+}
+
