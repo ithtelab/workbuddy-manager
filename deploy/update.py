@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import http.client
 import os
 import re
 import shutil
@@ -33,6 +34,23 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+
+def _force_utf8_stdio() -> None:
+    """中文 Windows 上重定向 stdout/stderr 默认 cp936（GBK）：print('✓'/'⚠️')
+    会 UnicodeEncodeError 直接杀死更新进程（时间戳前缀 11 字符 + ✓ 正是
+    'position 11' 报错的来源）。无论由谁启动、stdout 重定向到哪，这里
+    自我防御：stdio 强制 UTF-8，个别无法编码的字符以 replace 兜底，
+    日志绝不因此中断。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+_force_utf8_stdio()
+
 
 # ── 运行环境（与 server/config.py 保持一致的默认值）──────────
 INSTALL_DIR = Path(os.environ.get('WB_INSTALL_DIR') or Path(__file__).resolve().parent.parent)
@@ -189,10 +207,36 @@ def http_json(url: str, timeout: int = 20) -> dict:
 
 
 def download(url: str, dest: Path, rep: Reporter) -> None:
+    """下载 Release 资产到 dest。
+
+    timeout=120 是**单次 socket 操作**的超时（只在无数据流动时计时），不是
+    总时长——代理/TUN 链路慢时全量下载远超 120 秒属正常，不会被它中断。
+    对偶发网络失败（连接重置、响应中断、5xx）自动重试一次：更新是低频操作，
+    多花一次下载的代价远小于整次更新失败；4xx 是请求本身的问题（版本不存在、
+    地址错），重试不会变好，直接抛出。
+    """
     rep.log(f'下载 {url}')
-    req = urllib.request.Request(url, headers={'User-Agent': 'workbuddy-manager-updater'})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, 'wb') as fh:
-        shutil.copyfileobj(resp, fh)
+    last: BaseException | None = None
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'workbuddy-manager-updater'})
+            with urllib.request.urlopen(req, timeout=120) as resp, open(dest, 'wb') as fh:
+                shutil.copyfileobj(resp, fh)
+            last = None
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise
+            last = exc
+        except (OSError, http.client.HTTPException) as exc:
+            # URLError/socket.timeout/ConnectionReset 等都是 OSError 子类；
+            # IncompleteRead 走 HTTPException。两类都值得再试一次。
+            last = exc
+        if attempt == 1:
+            rep.log(f'下载失败（{last}），自动重试一次…', 'warn')
+    if last is not None:
+        raise last
+
     size = dest.stat().st_size
     rep.log(f'  完成（{size / 1024 / 1024:.2f} MB）')
     if size < 100_000:
@@ -1291,9 +1335,22 @@ def main() -> int:
             update_upstream(rep)
         if args.target in ('manager', 'both'):
             update_manager(rep)
-    except Exception as exc:  # noqa: BLE001
-        rep.log(f'更新失败：{exc}', 'error')
+    except BaseException as exc:  # noqa: BLE001
+        # KeyboardInterrupt（控制台 Ctrl+C/关窗）、SystemExit 等 BaseException
+        # 也要捕获并留下终态：只捕 Exception 的话中断会直接穿出去，
+        # 状态文件永远停在 running=true，前端就永远等不到「更新未完成」的
+        # 结束信号，一直显示「正在更新：执行中」。
+        if isinstance(exc, KeyboardInterrupt):
+            rep.log('更新被中断（收到 Ctrl+C / 控制台关闭信号）', 'error')
+        else:
+            rep.log(f'更新失败：{exc}', 'error')
         ok = False
+    finally:
+        # 收尾兜底：任何退出路径都必须把终态落盘。正常成功路径已在
+        # update_manager 内 rep.finish(True) 写过（running=false），这里
+        # 幂等跳过；其余情形（含中断）在此补写 ok=false，绝不留悬空状态。
+        if rep.state.get('running'):
+            rep.finish(ok)
 
     rep.log('更新完成' if ok else '更新未完成，请检查上方日志')
     rep.finish(ok)

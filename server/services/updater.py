@@ -210,6 +210,8 @@ def _pid_alive(pid: object) -> bool:
         return False
     if pid_int <= 0:
         return False
+    if os.name == 'nt':
+        return _pid_alive_windows(pid_int)
     try:
         os.kill(pid_int, 0)
         return True
@@ -219,6 +221,54 @@ def _pid_alive(pid: object) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _pid_alive_windows(pid_int: int) -> bool:
+    """Windows 探活：OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetExitCodeProcess。
+
+    为什么不用 os.kill(pid, 0)：在 Windows 上 sig=0 等价 CTRL_C_EVENT，走
+    GenerateConsoleCtrlEvent 分支——对**已退出但内核对象尚可打开**的 pid
+    静默成功（误判存活）。后果是更新进程死后 update.lock 仍被当作活跃，
+    read_status 把状态强制拉回 running=true，前端一直显示「正在更新：执行中」。
+    而「对象还在但已终止」用 GetExitCodeProcess 就能区分（退出码 != STILL_ACTIVE）。
+
+    OpenProcess 失败按 GetLastError 区分：
+      * 87 (ERROR_INVALID_PARAMETER) / 6 (ERROR_INVALID_HANDLE) → pid 不存在；
+      * 5  (ERROR_ACCESS_DENIED) → 打不开但进程多半存在（受保护进程），视为
+        存活。QUERY_LIMITED 本就是为低权限探测设计的，实际极少被拒——
+        宁可保守判活，也不误清锁放进第二个并发更新。
+    """
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_INVALID_PARAMETER = 87
+    ERROR_INVALID_HANDLE = 6
+    if pid_int > 0xFFFFFFFF:  # DWORD 上限之外必不存在（也防 ctypes 溢出报错）
+        return False
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid_int)
+    if not handle:
+        err = ctypes.get_last_error()
+        if err in (ERROR_INVALID_PARAMETER, ERROR_INVALID_HANDLE):
+            return False
+        # 其余打不开的情形（含 5）：保守视为存活，避免误判造成并发更新
+        return True
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True  # 查询失败：保守视为存活
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _lock_active() -> bool:
@@ -292,6 +342,38 @@ def set_upstream_ref(ref: str) -> str:
     return val
 
 
+def _write_initial_status(target: str, pid: int) -> None:
+    """写入更新刚启动时的占位状态（running=true / ok=null）。
+
+    字段口径与 deploy/update.py 的 Reporter 对齐：read_status 会把它合并进
+    返回值；子进程若瞬间死亡，「running 且 pid 已死」分支会用 _update_landed
+    收敛出终止态——初始状态没有 target_version、logs 为空，正好落到
+    ok=false「更新进程异常中断」，前端就能停下转圈并显示失败。
+    """
+    now = int(time.time())
+    data = {
+        'running': True,
+        'ok': None,
+        'target': target,
+        'step': '已启动更新进程',
+        'logs': [],
+        'started_at': now,
+        'finished_at': None,
+        'duration': 0,
+        'pid': pid,
+    }
+    try:
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # 与 Reporter.flush 相同的「临时文件 + 原子替换」写法，
+        # 避免轮询读到写了一半的 JSON
+        tmp = STATUS_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(STATUS_FILE)
+    except Exception:  # noqa: BLE001
+        # 状态写不出去也不必拦启动：子进程自己的 Reporter 还会再写
+        pass
+
+
 def start_update(target: str) -> tuple[bool, str]:
     """启动更新（后台脱离运行）。返回 (是否已启动, 说明)。"""
     if target not in ('manager', 'upstream', 'both'):
@@ -336,6 +418,11 @@ def start_update(target: str) -> tuple[bool, str]:
         # 上游版本固定（空 = 跟随分支）；worker 据此决定检出哪个版本
         'WB_UPSTREAM_REF': upstream_ref(),
         'WB_UPSTREAM_REF_FILE': str(UPSTREAM_REF_FILE),
+        # 子进程 stdio 与默认编码强制 UTF-8：中文 Windows 上重定向 stdout 的
+        # 默认编码是 cp936（GBK），print('✓'/'⚠️') 会 UnicodeEncodeError 直接
+        # 杀死更新进程（2026-09-26 实测：验签通过后即在 ✓ 日志行中断）。
+        'PYTHONIOENCODING': 'utf-8',
+        'PYTHONUTF8': '1',
     })
 
     try:
@@ -351,8 +438,8 @@ def start_update(target: str) -> tuple[bool, str]:
             stdout=logfh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            # 脱离父进程：管理端重启不影响更新流程
-            start_new_session=True,
+            **({'creationflags': subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+   if os.name == 'nt' else {'start_new_session': True}),
         )
     except Exception as exc:  # noqa: BLE001
         return False, f'启动更新失败：{exc}'
@@ -362,6 +449,8 @@ def start_update(target: str) -> tuple[bool, str]:
                 logfh.close()  # type: ignore[union-attr]
         except Exception:  # noqa: BLE001
             pass
+
+    _write_initial_status(target, proc.pid)
 
     try:
         LOCK_FILE.write_text(str(proc.pid), encoding='utf-8')
