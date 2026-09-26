@@ -1,8 +1,9 @@
 'use client';
 
-import {useCallback, useEffect, useState} from 'react';
+import {useState} from 'react';
 import {ShieldCheck, Plus, Trash2, Ban, CircleCheck, Network} from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
+import {useAsyncAll} from '@/lib/use-async-data';
 import {notify} from '@/lib/toast';
 import {useT} from '@/lib/i18n/provider';
 import {securityApi, errText} from '@/lib/api';
@@ -12,6 +13,9 @@ import {FileClock} from 'lucide-react';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {settingsApi} from '@/lib/api';
 import {EmptyState} from '@/components/common/layout/EmptyState';
+import {LoadError} from '@/components/common/states/LoadError';
+import {Skeleton} from '@/components/ui/skeleton';
+import {cn} from '@/lib/utils';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {useAuth} from '@/lib/auth-context';
 import {Button} from '@/components/ui/button';
@@ -112,53 +116,95 @@ function reasonText(t: (key: string, params?: Record<string, string>) => string,
   return key ? t(key) : code;
 }
 
+/**
+ * 取数完成前的空值。必须是模块级同一份：写成 `values.rules ?? []` 的话每次渲染
+ * 都会新建数组，进下游 useMemo 的依赖后每帧都变（同 dashboard 的处理）。
+ */
+const EMPTY_RULES: IpRule[] = [];
+const EMPTY_LOGS: IpAccessLog[] = [];
+const EMPTY_AUDIT: AuditLog[] = [];
+
 export default function SecurityPage() {
   const {isAdmin} = useAuth();
   const t = useT();
-  const [config, setConfig] = useState<SecurityConfig>({enabled: false, mode: 'blacklist'});
-  const [rules, setRules] = useState<IpRule[]>([]);
-  const [logs, setLogs] = useState<IpAccessLog[]>([]);
-  const [loading, setLoading] = useState(true);
+
+  /**
+   * 本页要的 4 份数据一次并发取回，成败逐项独立；加载态 / 失败态 / 是否正在刷新
+   * 也由它给出，本页不再自己维护 `loading`。
+   *
+   * 为什么必须换掉原先手写的那套 `Promise.allSettled` + 4 个 useState：那套写法
+   * **把失败静默丢掉了**（`if (x.status === 'fulfilled')` 后面没有 else，连 toast
+   * 都没有），于是取数失败时界面照常渲染初始值——`config` 的初值是
+   * `{enabled: false, mode: 'blacklist'}`，也就是**把「IP 访问控制：关闭」当成事实
+   * 显示出来**。这一页讲的是访问控制，把「开着」说成「关着」比空白更糟：管理员会
+   * 据此判断「拦截没生效」「没人被拦过」，而这两句话都没有任何依据。
+   *
+   * 现在：一次都没取到 → 整页错误态 + 重试；取到一部分 → 保留已取到的，
+   * 顶部一条常驻提示说明有几项没刷上；`config` 单独没取到时，那张卡片如实说
+   * 「未取到」而不是显示一个关闭状态的开关。
+   */
+  const {values, errors, isInitialLoading, isInitialFailed, isRefreshing, reload} = useAsyncAll({
+    config: () => securityApi.config(),
+    rules: () => securityApi.rules(),
+    logs: () => securityApi.logs(200),
+    audit: () => settingsApi.auditLogs(200),
+  }, []);
+
+  /** null = 这份数据还没取到（首屏加载中，或它自己失败了）。**不要**用假默认值兜底 */
+  const config: SecurityConfig | null = values.config ?? null;
+  const rules: IpRule[] = values.rules ?? EMPTY_RULES;
+  const logs: IpAccessLog[] = values.logs ?? EMPTY_LOGS;
   /** 管理端审计日志：登录、改密码、增删用户等敏感操作留痕 */
-  const [audit, setAudit] = useState<AuditLog[]>([]);
+  const audit: AuditLog[] = values.audit?.items ?? EMPTY_AUDIT;
 
   const [newKind, setNewKind] = useState<'allow' | 'deny'>('deny');
   const [newCidr, setNewCidr] = useState('');
   const [newNote, setNewNote] = useState('');
   const [busy, setBusy] = useState(false);
+  /** 保存配置时的乐观值，见 saveConfig 的说明。null = 没有在途改动 */
+  const [optimistic, setOptimistic] = useState<SecurityConfig | null>(null);
+  /** 实际显示的那份配置：在途改动优先，否则用取回来的 */
+  const shownConfig = optimistic ?? config;
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    const [c, r, l, a] = await Promise.allSettled([
-      securityApi.config(),
-      securityApi.rules(),
-      securityApi.logs(200),
-      settingsApi.auditLogs(200),
-    ]);
-    if (c.status === 'fulfilled') setConfig(c.value);
-    if (r.status === 'fulfilled') setRules(r.value);
-    if (l.status === 'fulfilled') setLogs(l.value);
-    if (a.status === 'fulfilled') setAudit(a.value.items);
-    setLoading(false);
-  }, []);
+  // IP 规则与访问日志会随流量变化，心跳刷新保持同步。
+  // 走 reload（刷新模式）：只把新数据换上去，**不**重走首屏流程——否则骨架会每
+  // 60 秒闪一次。
+  useHeartbeat(reload, 60000);
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  /** 有字段没刷新成功。此时至少还有一份数据在，用常驻提示如实说明，不清空内容 */
+  const partialFailed = Object.keys(errors).length > 0;
 
-  // IP 规则与访问日志会随流量变化，心跳刷新保持同步
-  useHeartbeat(load, 60000);
+  /**
+   * 某一项**从未**取到（首屏那次就失败了，所以 values 里始终没有它）。
+   *
+   * 用来把「没有数据」与「不知道有没有数据」分开：两者都会渲染成空表，但含义
+   * 完全相反。「暂无 IP 规则」是**一条规则都没有**的断言——在这一页等于告诉管理员
+   * 「没有任何网段被放行或拦截」，而实际可能只是这次没取到。宁可说「未取到」。
+   */
+  const rulesFailed = 'rules' in errors;
+  const logsFailed = 'logs' in errors;
+  const auditFailed = 'audit' in errors;
 
+  /**
+   * 保存配置。乐观更新：先切到目标态让开关立刻响应，失败再回滚——否则界面会停在
+   * 一个后端并未生效的状态上（要等刷新才暴露）。
+   *
+   * 两处与原先不同，都是因为 `config` 现在归 useAsyncAll 管、没有 setConfig 了：
+   *  · 乐观值放在 `optimistic` 里并**优先于**取回的值显示；
+   *  · 成功后**不能立刻撤掉**它——那一刻 values.config 还是上一次取回的旧值，
+   *    撤早了开关会跳回旧态。要先 `await reload()` 把新值拉回来再撤
+   *    （reload 会在这轮请求落地后才 resolve，见 lib/use-async-data.ts）。
+   * 失败时撤掉乐观值即可：显示回落到**服务端最后确认过**的那份值。
+   */
   async function saveConfig(next: SecurityConfig) {
-    // 乐观更新：先切到目标态让开关立刻响应；失败则回滚到改动前的值，
-    // 否则界面会停在一个后端并未生效的状态上（刷新才暴露）。
-    const prev = config;
-    setConfig(next);
+    setOptimistic(next);
     try {
       await securityApi.saveConfig(next);
       notify.ok(t('security.configSaved'));
+      await reload();
+      setOptimistic(null);
     } catch (e) {
-      setConfig(prev);
+      setOptimistic(null);
       notify.err(errText(e));
     }
   }
@@ -174,7 +220,11 @@ export default function SecurityPage() {
       notify.ok(t('security.ruleAdded'));
       setNewCidr('');
       setNewNote('');
-      load();
+      // 等这轮刷新落地再解除 busy：用户看到的「成功」包含列表里真的多出这一条。
+      // 若刷新失败，reload() 返回 false 而**不会**抛错——写操作是成功的，绝不能
+      // 报成失败（用户会以为没加上、再点一次，于是多出一条重复规则）。
+      // 「列表没刷上」由上面的常驻提示承担。
+      await reload();
     } catch (e) {
       notify.err(errText(e));
     } finally {
@@ -182,12 +232,37 @@ export default function SecurityPage() {
     }
   }
 
+  const header = (
+    <PageHeader
+      title={t('security.title')}
+      description={t('security.description')}
+    />
+  );
+
+  // 首屏：一份都没取到。此时**不能**渲染下面的卡片——`config` 的初值是
+  // `{enabled: false, mode: 'blacklist'}`，那等于把「IP 访问控制：关闭」当成事实
+  // 显示出来。这一页讲的正是访问控制，把「开着」说成「关着」比空白更糟：管理员
+  // 会据此判断「拦截没生效」「没人被拦过」，而这两句话都没有任何依据。
+  // 一次都没取到（失败）同理：给错误态与「重试」，而不是一直转圈。
+  if (isInitialFailed || isInitialLoading) {
+    return (
+      <div className="flex flex-col gap-4 md:gap-6">
+        {header}
+        {isInitialFailed ? <LoadError variant="page" onRetry={reload} /> : <SecuritySkeleton />}
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col gap-4 md:gap-6">
-      <PageHeader
-        title={t('security.title')}
-        description={t('security.description')}
-      />
+    <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
+      {header}
+
+      {/* 刷新时有请求失败：常驻提示，**不**顶掉已经显示出来的内容——那些数据
+          仍然是对的，只是可能不是最新的。原先这套取数把失败静默丢掉了，连
+          提示都没有，界面照常显示初始值。 */}
+      {partialFailed && (
+        <LoadError message={t('security.partialLoadFailed')} onRetry={reload} />
+      )}
 
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <div className="rounded-[20px] bg-muted p-4 lg:col-span-1">
@@ -196,31 +271,40 @@ export default function SecurityPage() {
             {t('security.policy')}
           </div>
           <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-xs font-medium">{t('security.enableControl')}</div>
-                <div className="text-[11px] text-muted-foreground">{t('security.enableControlHint')}</div>
-              </div>
-              <Switch
-                checked={config.enabled}
-                disabled={!isAdmin}
-                onCheckedChange={(v) => saveConfig({...config, enabled: v})}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-[11px] text-muted-foreground">{t('security.mode')}</Label>
-              <Select
-                value={config.mode}
-                disabled={!isAdmin}
-                onValueChange={(v) => saveConfig({...config, mode: v as SecurityConfig['mode']})}
-              >
-                <SelectTrigger className="bg-background"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="blacklist">{t('security.modeBlacklist')}</SelectItem>
-                  <SelectItem value="whitelist">{t('security.modeWhitelist')}</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
+            {shownConfig === null ? (
+              /* config 单独没取到：如实说「未取到」。**不能**渲染一个处于「关闭」
+                 状态的开关——那会把「不知道」说成「关着」，而这一页的开关正是
+                 用户判断拦截是否生效的依据。 */
+              <div className="text-[11px] text-muted-foreground">{t('security.notLoaded')}</div>
+            ) : (
+              <>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-xs font-medium">{t('security.enableControl')}</div>
+                    <div className="text-[11px] text-muted-foreground">{t('security.enableControlHint')}</div>
+                  </div>
+                  <Switch
+                    checked={shownConfig.enabled}
+                    disabled={!isAdmin}
+                    onCheckedChange={(v) => saveConfig({...shownConfig, enabled: v})}
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">{t('security.mode')}</Label>
+                  <Select
+                    value={shownConfig.mode}
+                    disabled={!isAdmin}
+                    onValueChange={(v) => saveConfig({...shownConfig, mode: v as SecurityConfig['mode']})}
+                  >
+                    <SelectTrigger className="bg-background"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="blacklist">{t('security.modeBlacklist')}</SelectItem>
+                      <SelectItem value="whitelist">{t('security.modeWhitelist')}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -298,7 +382,7 @@ export default function SecurityPage() {
                             try {
                               await securityApi.removeRule(r.id);
                               notify.ok(t('keys.deleted'));
-                              load();
+                              await reload();
                             } catch (e) {
                               notify.err(errText(e));
                             }
@@ -320,7 +404,12 @@ export default function SecurityPage() {
               </TableBody>
             </Table>
             {!rules.length && (
-              <div className="py-8 text-center text-xs text-muted-foreground">{t('security.noRules')}</div>
+              /* 空表有两种截然不同的含义，不能共用一句话：`noRules` 断言的是
+                 「一条规则都没有」（在这一页等于说没有任何网段被放行或拦截），
+                 而取数失败时我们**并不知道**有没有规则。 */
+              <div className="py-8 text-center text-xs text-muted-foreground">
+                {rulesFailed ? t('security.notLoaded') : t('security.noRules')}
+              </div>
             )}
           </div>
         </div>
@@ -346,7 +435,7 @@ export default function SecurityPage() {
               onConfirm={async () => {
                 await securityApi.logsClear();
                 notify.ok(t('logs.cleared'));
-                load();
+                await reload();
               }}
               trigger={
                 <Button variant="outline" size="sm" className="rounded-full text-red-500">
@@ -396,14 +485,17 @@ export default function SecurityPage() {
             ))}
           </TableBody>
         </Table>
-        {!logs.length && !loading && (
-          <EmptyState
-            icon={ShieldCheck}
-            title={t('security.noAccessLogs')}
-            description={t('security.noAccessLogsDesc')}
-            className="flex flex-col items-center justify-center py-14 text-center"
-          />
-        )}
+        {!logs.length &&
+          (logsFailed ? (
+            <div className="py-14 text-center text-xs text-muted-foreground">{t('security.notLoaded')}</div>
+          ) : (
+            <EmptyState
+              icon={ShieldCheck}
+              title={t('security.noAccessLogs')}
+              description={t('security.noAccessLogsDesc')}
+              className="flex flex-col items-center justify-center py-14 text-center"
+            />
+          ))}
       </section>
 
       {/* 管理端审计日志：本次安全事件暴露的问题之一就是「改密码不留痕」，
@@ -466,17 +558,70 @@ export default function SecurityPage() {
               ))}
             </TableBody>
           </Table>
+        ) : auditFailed ? (
+          <div className="py-14 text-center text-xs text-muted-foreground">{t('security.notLoaded')}</div>
         ) : (
-          !loading && (
-            <EmptyState
-              icon={FileClock}
-              title={t('security.noAudit')}
-              description={t('security.noAuditDesc')}
-              className="flex flex-col items-center justify-center py-14 text-center"
-            />
-          )
+          <EmptyState
+            icon={FileClock}
+            title={t('security.noAudit')}
+            description={t('security.noAuditDesc')}
+            className="flex flex-col items-center justify-center py-14 text-center"
+          />
         )}
       </section>
     </div>
+  );
+}
+
+/**
+ * 骨架里的一根「条」。
+ *
+ * 与 `dashboard` 同因：`Skeleton` 自带 `bg-accent`，而本页卡片用的是 `bg-muted`
+ * ——这两个颜色在 globals.css 里**明暗两套主题下都是同一个字面量**，直接放上去
+ * 等于画了看不见的条。改用前景色的低透明度：浅色下压暗、深色下提亮。
+ */
+function Bar({className}: {className?: string}) {
+  return <Skeleton className={cn('bg-foreground/10', className)} />;
+}
+
+/**
+ * 首屏骨架。结构与真实内容**逐块对应**（配置卡 + 加规则卡 / 访问日志表 / 审计表），
+ * 而不是一坨居中的转圈：数据到位时版面不会整体跳一下。
+ *
+ * 页面每 60 秒心跳刷新一次，但只有「一份都没取到」才会走到这里
+ * （见 use-async-data 的 isInitialLoading），所以不会一闪一闪。
+ */
+function SecuritySkeleton() {
+  return (
+    <>
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <div className="rounded-[20px] bg-muted p-4 lg:col-span-1">
+          <Bar className="mb-3 h-3.5 w-24" />
+          <div className="space-y-4">
+            <Bar className="h-9 w-full rounded-xl" />
+            <Bar className="h-9 w-full rounded-xl" />
+          </div>
+        </div>
+        <div className="rounded-[20px] bg-muted p-4 lg:col-span-2">
+          <Bar className="mb-3 h-3.5 w-20" />
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
+            {Array.from({length: 4}, (_, i) => (
+              <Bar key={i} className="h-9 w-full rounded-xl" />
+            ))}
+          </div>
+          <Bar className="mt-4 h-32 w-full rounded-2xl" />
+        </div>
+      </section>
+
+      <section className="rounded-[20px] bg-muted p-4">
+        <Bar className="mb-4 h-3.5 w-28" />
+        <Bar className="h-40 w-full rounded-2xl" />
+      </section>
+
+      <section className="rounded-[20px] bg-muted p-4">
+        <Bar className="mb-4 h-3.5 w-24" />
+        <Bar className="h-40 w-full rounded-2xl" />
+      </section>
+    </>
   );
 }

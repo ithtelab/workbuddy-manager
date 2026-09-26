@@ -672,7 +672,9 @@
     "reasonModelNotAllowed": "model not in the key's allowlist",
     "accessLogScope": "Only blocked requests are recorded; allowed calls appear in Request logs",
     "deleteRuleTitle": "Delete this IP rule?",
-    "deleteRuleDesc": "Takes effect immediately — the network stops matching this rule, whether it allowed or blocked."
+    "deleteRuleDesc": "Takes effect immediately — the network stops matching this rule, whether it allowed or blocked.",
+    "partialLoadFailed": "Some data failed to load",
+    "notLoaded": "Not loaded"
   },
   "models": {
     "title": "Models",

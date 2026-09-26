@@ -648,7 +648,9 @@
     "reasonModelNotAllowed": "모델이 키 허용 목록에 없습니다",
     "accessLogScope": "차단된 요청만 기록합니다. 허용된 호출은 요청 로그 페이지에서 볼 수 있습니다",
     "deleteRuleTitle": "이 IP 규칙을 삭제할까요?",
-    "deleteRuleDesc": "삭제하면 즉시 적용됩니다: 해당 대역은 더 이상 이 규칙의 적용을 받지 않습니다(허용과 차단 모두 해제됩니다)."
+    "deleteRuleDesc": "삭제하면 즉시 적용됩니다: 해당 대역은 더 이상 이 규칙의 적용을 받지 않습니다(허용과 차단 모두 해제됩니다).",
+    "partialLoadFailed": "일부 데이터를 불러오지 못했습니다",
+    "notLoaded": "불러오지 못했습니다"
   },
   "models": {
     "title": "모델",

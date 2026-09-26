@@ -648,7 +648,9 @@
     "reasonModelNotAllowed": "模型不在密钥白名单内",
     "accessLogScope": "仅记录被拦截的请求；放行的调用见「请求日志」页",
     "deleteRuleTitle": "删除这条 IP 规则？",
-    "deleteRuleDesc": "删除后立即生效：该网段不再受这条规则约束（放行或拦截都随之取消）。"
+    "deleteRuleDesc": "删除后立即生效：该网段不再受这条规则约束（放行或拦截都随之取消）。",
+    "partialLoadFailed": "部分数据加载失败",
+    "notLoaded": "未取到"
   },
   "models": {
     "title": "模型中心",

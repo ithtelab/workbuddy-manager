@@ -37,6 +37,7 @@ _HOOK = _ROOT / 'web' / 'lib' / 'use-async-data.ts'
 _MAIN = _ROOT / 'web' / 'app' / '(main)'
 _LOGS = _MAIN / 'logs' / 'page.tsx'
 _STATS = _MAIN / 'stats' / 'page.tsx'
+_SECURITY = _MAIN / 'security' / 'page.tsx'
 _NODE = shutil.which('node')
 
 # 接入状态系统的页面 → 它们在「数据还没到」时会说的那些谎话。
@@ -59,6 +60,11 @@ _PAGES_WITH_LIES = {
     ],
     'playground/page.tsx': [
         "t('playground.noModels')",       # 「暂无可用模型」
+    ],
+    'security/page.tsx': [
+        "t('security.noRules')",          # 「暂无规则」——在这一页等于说没有任何网段被放行或拦截
+        "t('security.noAccessLogs')",     # 「暂无访问记录」——等于说没人被拦过
+        "t('security.noAudit')",          # 「暂无审计记录」
     ],
 }
 
@@ -278,6 +284,105 @@ class AsyncStateInvariantTest(unittest.TestCase):
             offender.exists(),
             '静态导出下 loading.tsx 不生效（官方 Platform Support: Static export → No），'
             '首屏加载态请用 useAsyncAll 的 isInitialLoading',
+        )
+
+
+class SecurityPageHonestyTest(unittest.TestCase):
+    """安全管控页「宁可说不知道，也不说没有」的三条不变式。
+
+    这一页的特殊之处：它讲的是**访问控制**，而它原来犯的错是把失败静默丢掉，
+    于是界面上那些断言性的话（「IP 访问控制：关闭」「暂无规则」「暂无访问记录」）
+    全都在**没有任何依据**的情况下说了出来。管理员据此会得出「拦截没生效」
+    「没人被拦过」这类结论——比显示空白危险得多，因为它看起来是有信息的。
+
+    三条都不容易在行为测试里表达（要真浏览器），但都能用源码形状钉住；
+    每条都对应一次真实浏览器验收里能观察到的现象，写在各自的 docstring 里。
+    """
+
+    def test_not_loaded_is_not_the_same_as_empty(self) -> None:
+        """空表与「没取到」必须**分别**渲染，不能共用一句话。
+
+        两者渲染出来是同一片空白，含义却正好相反：前者是「确实一条都没有」，
+        后者是「不知道有没有」。共用一句话时，取数失败会被显示成前者——
+        而安全页的「暂无规则」等于告诉管理员「没有任何网段被放行或拦截」。
+
+        真实浏览器验收（把 `/api/security/logs` 打成 500）里，这一条的表现是：
+        页面必须出现「未取到」，且**不**出现「暂无访问记录」。
+        """
+        code = _code(_SECURITY)
+        for key in ('rules', 'logs', 'audit'):
+            self.assertRegex(
+                code, rf"{key}Failed\s*=\s*'{key}'\s*in\s*errors",
+                f'安全页没有从 errors 里算出 {key}Failed——「没取到」与「确实为空」'
+                '就分不开了',
+            )
+            self.assertIn(
+                f'{key}Failed ?', code,
+                f'安全页的 {key} 空状态没有按 {key}Failed 分支——取数失败时会显示成'
+                '「确实一条都没有」',
+            )
+        self.assertIn("t('security.notLoaded')", code,
+                      '安全页没有「未取到」这句话，失败时只能复用空表文案')
+
+    def test_missing_config_does_not_render_a_switch(self) -> None:
+        """配置没取到时，**不能**渲染出一个「关闭」的开关。
+
+        这条是本批最要紧的一条：开关正是管理员判断拦截是否生效的依据。用假默认值
+        兜底（原来的写法初值就是 `{enabled: false}`）等于把「不知道」说成「关着」——
+        管理员会以为拦截被关了，进而去排查一个根本不存在的问题。
+
+        真实浏览器验收（把 `/api/security/config` 打成 500）里的表现是：
+        开关**一个都不渲染**，策略卡如实写「未取到」。
+
+        这里钉两件事：不许用对象字面量兜底；必须有 `shownConfig === null` 的分支。
+        """
+        code = _code(_SECURITY)
+        self.assertRegex(code, r'values\.config\s*\?\?\s*null',
+                         '安全页的 config 不再以 null 表示「没取到」')
+        self.assertNotRegex(
+            code, r'values\.config\s*\?\?\s*\{',
+            '安全页用假默认值兜底了 config——取数失败时会渲染出一个「关闭」的开关，'
+            '等于把「不知道」说成「关着」。这一页的开关是判断拦截是否生效的依据。',
+        )
+        self.assertIn('shownConfig === null', code,
+                      '策略卡没有区分「配置没取到」——要么渲染假开关，要么整块消失')
+
+    def test_reload_resolves_after_the_request_lands(self) -> None:
+        """`reload()` 必须返回**这一轮请求自己的 promise**，不能另包一个。
+
+        安全页保存配置是乐观更新：先切到目标态让开关立刻响应，再 `await reload()`
+        把服务端确认过的新值拉回来，最后才撤掉乐观值。若 reload 返回的不是那个
+        promise（比如另写 `Promise.resolve(...)`、或者干脆不返回），撤乐观值会发生在
+        `values.config` 还是**旧值**的时候，开关当场跳回原态——用户看到的是
+        「点了没反应」，而服务端其实已经改成功了。
+
+        真实浏览器验收里这条的表现是：`data-state` 的变化序列必须恰好是
+        `checked → unchecked`，中途不许出现 `checked`。
+        （只看最终状态是不够的——回弹之后那一轮刷新落地会把开关再变回 unchecked，
+        只看终态会误判为通过。）
+        """
+        hook = _code(_HOOK)
+        self.assertRegex(hook, r'reload:\s*\(\)\s*=>\s*Promise<boolean>',
+                         'hook 的 reload 不再声明返回 Promise<boolean>')
+        self.assertRegex(
+            hook, r"reload\s*=\s*useCallback\(\s*\(\)\s*=>\s*run\(",
+            'reload 没有直接把 run(...) 的 promise 返回出去——它必须是「这一轮请求'
+            '落地后才 resolve」的那一个，否则乐观更新会在新值到达前就撤掉，'
+            '开关跳回旧态',
+        )
+        self.assertIn('Object.keys(fresh.errors).length === 0', hook,
+                      'reload 没有按「是否还有字段没取到」给出成败')
+
+        code = _code(_SECURITY)
+        save = code.find('async function saveConfig')
+        self.assertGreaterEqual(save, 0, '安全页找不到 saveConfig')
+        body = code[save:save + 900]
+        self.assertIn('await reload()', body,
+                      'saveConfig 没有等这一轮刷新落地')
+        self.assertLess(
+            body.find('await reload()'), body.find('setOptimistic(null)'),
+            'saveConfig 在等刷新落地**之前**就撤掉了乐观值——那一刻 values.config '
+            '还是旧值，开关会跳回去，用户以为没点到',
         )
 
 
