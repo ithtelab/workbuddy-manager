@@ -848,6 +848,8 @@
     "sourceAdd": "Add account",
     "sourceAuto": "Upstream auto",
     "checkinEmpty": "No check-in records yet. Using Check in all on the Accounts page, or the 🎁 button of a single account, leaves a record here.",
+    "checkinLoadFailed": "Check-in records failed to load",
+    "taskLogLoadFailed": "Automatic task records failed to load",
     "rawLogTitle": "Upstream raw logs",
     "rawLogSubtitle": "(check-in / keep-alive / travel / activity)",
     "rawLogFrom": "From container logs",

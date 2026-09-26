@@ -824,6 +824,8 @@
     "sourceAdd": "계정 추가",
     "sourceAuto": "업스트림 자동",
     "checkinEmpty": "출석 기록이 없습니다. 계정 페이지의 '전체 출석' 또는 개별 계정의 🎁 버튼을 사용하면 여기에 기록됩니다.",
+    "checkinLoadFailed": "출석 기록을 불러오지 못했습니다",
+    "taskLogLoadFailed": "자동 작업 기록을 불러오지 못했습니다",
     "rawLogTitle": "업스트림 원본 로그",
     "rawLogSubtitle": "(출석 / 연결 유지 / 여행 / 활동)",
     "rawLogFrom": "컨테이너 로그에서",

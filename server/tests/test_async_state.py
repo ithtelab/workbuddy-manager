@@ -37,6 +37,7 @@ _HOOK = _ROOT / 'web' / 'lib' / 'use-async-data.ts'
 _MAIN = _ROOT / 'web' / 'app' / '(main)'
 _LOGS = _MAIN / 'logs' / 'page.tsx'
 _STATS = _MAIN / 'stats' / 'page.tsx'
+_TASKS = _MAIN / 'tasks' / 'page.tsx'
 _NODE = shutil.which('node')
 
 # 接入状态系统的页面 → 它们在「数据还没到」时会说的那些谎话。
@@ -59,6 +60,11 @@ _PAGES_WITH_LIES = {
     ],
     'playground/page.tsx': [
         "t('playground.noModels')",       # 「暂无可用模型」
+    ],
+    'tasks/page.tsx': [
+        "t('tasks.checkinEmpty')",        # 「暂无签到记录」——等于说「你没签过到」
+        "t('tasks.noTaskRecords')",       # 「暂无自动任务记录」——等于说采集器没跑过
+        "t('tasks.rawLogNote')",          # 上游原始日志的「这里没有记录不代表没执行」
     ],
 }
 
@@ -279,6 +285,115 @@ class AsyncStateInvariantTest(unittest.TestCase):
             '静态导出下 loading.tsx 不生效（官方 Platform Support: Static export → No），'
             '首屏加载态请用 useAsyncAll 的 isInitialLoading',
         )
+
+
+class TasksPageHonestyTest(unittest.TestCase):
+    """任务记录页「配件面板不该拖垮正片」的三条不变式。
+
+    这一页的形状和前几页都不同，难点不在「有没有守卫」，而在**上游原始日志面板**：
+    它有意容忍失败——上游只在失败与旅行/活跃时打日志、容器重建即丢，「取不到」是
+    常态，用户不需要为此做任何事。所以它不能和两份正片数据共用一组判据：
+
+      · 它失败了不该让「部分数据加载失败」挂出来；
+      · 更要紧的是它**成功了**而两份正片全挂时——它会让 `hasData` 有值，整页错误态
+        就不再出现，用户看到的仍是「暂无签到记录」。这正是本批要修的那句谎话，
+        只是换了个触发路径。
+
+    三条都能用源码形状钉住，每条对应一次真实浏览器验收里能观察到的现象。
+    """
+
+    def test_upstream_panel_is_a_separate_hook(self) -> None:
+        """「上游原始日志」必须**单独一个 hook**，不能和两份正片混在一组。
+
+        与 `stats` 页的上游统计同因（见 `test_stats_keeps_upstream_out_of_the_main_group`）：
+        一份「取不到是常态」的配件数据，混进主组会顶掉「一份都没取到」的判据。
+
+        真实浏览器验收里的表现：只把 `/api/upstream/logs` 打成 500，页面**不该**出现
+        「部分数据加载失败」；只把两份正片打成 500，页面**必须**出现整页错误态
+        （若配件混在主组里，这条会失败——它自己有值，于是「一份都没取到」不成立）。
+        """
+        code = _code(_TASKS)
+        args = _hook_args(code, 0)
+        self.assertGreaterEqual(len(args), 2, '找不到 tasks 页第一个 useAsyncAll 调用')
+        self.assertIn('checkinLogs(', args[0], '正片那组里没有签到记录')
+        self.assertIn('taskLogs(', args[0], '正片那组里没有自动任务记录')
+        self.assertNotIn(
+            'upstreamLogs(', args[0],
+            '上游原始日志被放回了正片那一组：它「取不到是常态」，混在一起时它若成功、'
+            '两份正片全挂，整页错误态就不会出现——用户看到的仍是「暂无签到记录」',
+        )
+        second = _hook_args(code, 1)
+        self.assertTrue(
+            second and 'upstreamLogs(' in second[0],
+            'tasks 页没有第二个 useAsyncAll 把上游原始日志单独接起来',
+        )
+
+    def test_upstream_panel_keeps_refreshing_after_the_split(self) -> None:
+        """拆成独立 hook 后，这块面板必须**自己有心跳**。
+
+        原先它跟着主 load 一起每 30 秒重拉；拆开时若忘了给它一个心跳，这块面板会
+        停在进页面那一刻的内容上，之后再也不会更新——而且**界面不会报任何错**，
+        看起来只是「上游最近没打日志」。这种静默的功能退化最难发现。
+        """
+        code = _code(_TASKS)
+        self.assertRegex(
+            code, r'useHeartbeat\(\s*upstream\.reload\s*,',
+            '上游原始日志面板没有自己的心跳：拆开之后它不再随主数据刷新，会停在'
+            '进页面那一刻的内容上，而界面上看不出任何异常',
+        )
+        self.assertRegex(
+            code, r'useHeartbeat\(\s*reload\s*,',
+            '正片数据没有走 reload 心跳（应传 reload 而不是首屏那次取数）',
+        )
+
+    def test_failed_panel_does_not_render_the_empty_copy(self) -> None:
+        """哪一块没取到，就在**那一块**挂常驻提示，不能落进「暂无记录」的文案。
+
+        两者渲染出来是同一片空白，含义却正好相反：前者是「确实一条都没有」，后者是
+        「不知道有没有」。任务记录页尤其要紧——它是用户核对积分收益的依据，把它说成
+        「暂无」会让人以为后台采集器坏了，于是去排查一个根本不存在的问题。
+
+        这里钉三件事：两块各自从 errors 里算出自己的失败标记；两处空态分支都被它挡
+        住；两条提示文案都真的用上了（有文案没人用 = 失败时还是那句「暂无」）。
+
+        真实浏览器验收（把 `/api/task-logs` 打成 500）里的表现是：出现「自动任务记录
+        加载失败」，且**不**出现「暂无自动任务记录」。
+        """
+        code = _code(_TASKS)
+        for key in ('checkin', 'tasks'):
+            self.assertRegex(
+                code, rf"{key}Failed\s*=\s*'{key}'\s*in\s*errors",
+                f'任务记录页没有从 errors 里算出 {key}Failed——「没取到」与「确实为空」'
+                '就分不开了',
+            )
+            self.assertIn(
+                f'{key}Failed ?', code,
+                f'任务记录页的 {key} 空态没有按 {key}Failed 分支——取数失败时会显示成'
+                '「确实一条都没有」',
+            )
+        self.assertIn("t('tasks.checkinLoadFailed')", code,
+                      '签到记录面板没有自己的失败文案，只能复用「暂无签到记录」')
+        self.assertIn("t('tasks.taskLogLoadFailed')", code,
+                      '自动任务面板没有自己的失败文案，只能复用「暂无自动任务记录」')
+
+    def test_failed_panel_does_not_render_the_total(self) -> None:
+        """取不到时，页脚的「共 N 条」也必须一起收起来。
+
+        这是同一个谎话的**最后一处**，而且是最容易漏的一处：正文已经被行内提示挡住了，
+        页脚却还挂着「共 0 条」——总数取不到时它就是 0，于是「加载失败」和「共 0 条」
+        并排显示，互相打脸。用户读到的仍然是「一条都没有」。
+
+        真实浏览器验收里靠这条抓：只把 `/api/checkin-logs` 打成 500 时，页面上**不得**
+        出现「共 0 条」（另一块成功了，显示的是「共 2 条」，所以这个判据不含糊）。
+        本批就是先在截图里看见这行字、才回头补的守卫——**断言全绿不等于界面上没有谎话**。
+        """
+        code = _code(_TASKS)
+        for key, var in (('checkin', 'checkinLogs'), ('tasks', 'taskLogs')):
+            self.assertRegex(
+                code, rf'totalUnknown=\{{{key}Failed\s*&&\s*!{var}\.length\}}',
+                f'任务记录页的 {key} 面板页脚没有在取数失败时收起来——会显示「共 0 条」，'
+                '等于告诉用户「确实一条都没有」',
+            )
 
 
 if __name__ == '__main__':

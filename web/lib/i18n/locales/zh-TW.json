@@ -824,6 +824,8 @@
     "sourceAdd": "新增帳號",
     "sourceAuto": "上游自動",
     "checkinEmpty": "暫無簽到紀錄。在「帳號管理」點「全部簽到」或單一帳號的 🎁 會在此留痕。",
+    "checkinLoadFailed": "簽到紀錄載入失敗",
+    "taskLogLoadFailed": "自動任務紀錄載入失敗",
     "rawLogTitle": "上游原始日誌",
     "rawLogSubtitle": "（簽到 / 保活 / 旅行 / 活躍）",
     "rawLogFrom": "來自容器日誌",

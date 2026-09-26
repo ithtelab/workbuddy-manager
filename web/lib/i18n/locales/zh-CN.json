@@ -822,6 +822,8 @@
     "sourceAdd": "添加账号",
     "sourceAuto": "上游自动",
     "checkinEmpty": "暂无签到记录。在「账号管理」点「全部签到」或单个账号的 🎁 会在此留痕。",
+    "checkinLoadFailed": "签到记录加载失败",
+    "taskLogLoadFailed": "自动任务记录加载失败",
     "rawLogTitle": "上游原始日志",
     "rawLogSubtitle": "（签到 / 保活 / 旅行 / 活跃）",
     "rawLogFrom": "来自容器日志",

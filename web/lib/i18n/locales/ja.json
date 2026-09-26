@@ -824,6 +824,8 @@
     "sourceAdd": "アカウント追加",
     "sourceAuto": "上流の自動",
     "checkinEmpty": "チェックイン記録がありません。「アカウント」ページの「一括チェックイン」または個別アカウントの 🎁 で記録されます。",
+    "checkinLoadFailed": "チェックイン記録の読み込みに失敗しました",
+    "taskLogLoadFailed": "自動タスク記録の読み込みに失敗しました",
     "rawLogTitle": "上流の生ログ",
     "rawLogSubtitle": "（チェックイン / キープアライブ / 旅行 / アクティビティ）",
     "rawLogFrom": "コンテナログより",
