@@ -449,7 +449,7 @@ def read_status() -> dict:
     except Exception:  # noqa: BLE001 —— 状态文件坏了不该让接口 500
         data = {}
     if not isinstance(data, dict) or not data:
-        return {
+        data = {
             'running': False, 'kind': '', 'ok': None, 'step': '', 'percent': 0,
             'tables_total': 0, 'tables_done': 0, 'rows': 0,
             'logs': [], 'started_at': 0, 'finished_at': 0,
@@ -464,6 +464,11 @@ def read_status() -> dict:
         if data.get('ok') is None:
             data['ok'] = False
             data['step'] = '任务被中断（面板重启过）'
+    # 最近两次完成时刻**随状态一起给出**（issue #122）：面板的空闲轮询只拉
+    # 这个轻量接口，靠这两个字段让「上次迁移 / 上次恢复」在定时备份跑完后
+    # 自动刷新——否则面板要么显示过期时刻，要么就得整份拉配置并覆盖表单。
+    data['last_export_at'] = _as_int(db.get_setting(LAST_EXPORT_KEY, 0), 0)
+    data['last_import_at'] = _as_int(db.get_setting(LAST_IMPORT_KEY, 0), 0)
     return data
 
 

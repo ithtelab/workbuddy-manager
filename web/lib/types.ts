@@ -1190,6 +1190,15 @@ export interface PgSyncStatus {
   logs: PgSyncLogLine[];
   started_at: number;
   finished_at: number;
+  /**
+   * 上次迁移 / 上次恢复的完成时刻（0 = 从未）。
+   *
+   * 随 `/status` 一起给出（issue #122）：面板的空闲轮询只拉这个轻量接口，
+   * 靠这两个字段让「上次迁移 / 上次恢复」在定时备份跑完后自动刷新，
+   * 不必再整份拉配置——那会覆盖用户正在填的表单。
+   */
+  last_export_at: number;
+  last_import_at: number;
 }
 
 export interface PgSyncConfigResponse {

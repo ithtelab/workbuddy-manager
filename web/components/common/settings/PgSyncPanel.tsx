@@ -17,6 +17,7 @@ import type {PgSyncConfig, PgSyncStatus} from '@/lib/types';
 import {notify} from '@/lib/toast';
 import {fmtAgo, fmtDateTime} from '@/lib/format';
 import {useAuth} from '@/lib/auth-context';
+import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useT} from '@/lib/i18n/provider';
 import {RichText} from '@/lib/i18n/rich-text';
 import {Button} from '@/components/ui/button';
@@ -53,6 +54,14 @@ export function PgSyncPanel() {
   const [busy, setBusy] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
+  /**
+   * 整份拉配置（表单初值 + 状态）。
+   *
+   * **只在显式路径上调用**：首次挂载、加载失败后的「重试」。（保存后的刷新
+   * 用的是 `save()` 自己的返回，不走这里。）它做的是 `setForm(r.config)`
+   * 全量覆盖，所以**绝不能进轮询**——那正是 issue #122：空闲轮询每 15 秒
+   * 覆盖一次表单，用户填到一半的字段被打回去。轮询走 `pollStatus()`。
+   */
   const load = useCallback(async () => {
     try {
       const r = await pgSyncApi.config();
@@ -68,10 +77,28 @@ export function PgSyncPanel() {
     }
   }, []);
 
-  /** 只刷进度，不覆盖表单 —— 轮询期间用户可能正在改输入框 */
+  /**
+   * 轮询**只更新状态**，不整份拉配置、不碰用户正在填的字段（issue #122）。
+   *
+   * 这条路径的关键约束：**绝不能覆盖用户正在编辑的内容**。之前的写法是空闲时
+   * 每 15 秒调一次 `load()`（整份配置回来**全量覆盖**表单），填写到一半的
+   * 地址 / 端口会被服务器旧值打回去——输入框每隔 15 秒跳一次，基本没法填。
+   *
+   * 现在拉轻量的 `/status`，并只并入两个**服务器持有**的时刻字段
+   * （last_export_at / last_import_at，供「上次迁移 / 上次恢复」在定时备份跑完后
+   * 自动刷新）；其余字段一律保持用户手里的值。
+   */
   const pollStatus = useCallback(async () => {
     try {
-      setStatus(await pgSyncApi.status());
+      const s = await pgSyncApi.status();
+      setStatus(s);
+      setForm((f) => ({
+        ...f,
+        last_export_at: typeof s.last_export_at === 'number'
+          ? s.last_export_at : f.last_export_at,
+        last_import_at: typeof s.last_import_at === 'number'
+          ? s.last_import_at : f.last_import_at,
+      }));
     } catch {
       /* 任务进行中接口短暂不可用属正常，忽略 */
     }
@@ -82,24 +109,13 @@ export function PgSyncPanel() {
   }, [load]);
 
   const running = !!status?.running;
-  useEffect(() => {
-    const interval = running ? 1500 : 15000;
-    const timer = window.setInterval(() => {
-      if (running) {
-        void pollStatus();
-      } else {
-        void load();
-      }
-    }, interval);
-    return () => window.clearInterval(timer);
-  }, [running, pollStatus, load]);
-
-  // 任务跑完的那一刻把配置也刷一遍（last_export_at 变了）
-  const wasRunning = useRef(false);
-  useEffect(() => {
-    if (wasRunning.current && !running) void load();
-    wasRunning.current = running;
-  }, [running, load]);
+  // 轮询一律只拉 /status：运行中 1.5 秒（进度条 / 日志），空闲 15 秒
+  // （等定时备份的结果与完成时刻）。空闲时**不**再整份拉配置——见 pollStatus。
+  //
+  // 走 useHeartbeat 而不是裸 setInterval：标签页不可见时跳过（浏览器本来就会
+  // 把定时器节流到约 1 次/分钟），**切回来立即补一次**——否则切走再回来要等
+  // 一个完整间隔才更新（换机器的场景里用户正盯着进度条）。
+  useHeartbeat(() => void pollStatus(), running ? 1500 : 15000);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;

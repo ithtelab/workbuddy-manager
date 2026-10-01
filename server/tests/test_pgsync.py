@@ -355,6 +355,74 @@ class StatusTest(_Case):
         self.assertFalse(st['running'])
 
 
+class StatusTimestampsTest(_Case):
+    """状态里带上「上次迁移 / 上次恢复」两个时刻（issue #122）。
+
+    为什么必须随 /status 给出：面板的空闲轮询只拉它（轻量）。这两个时刻如果
+    只藏在整份配置接口里，面板要么显示过期值、要么就得整份拉配置——而把整份
+    配置写回表单正是被报告的问题（填写被打断）。
+    """
+
+    def test_defaults_to_zero(self) -> None:
+        st = pgsync.read_status()
+        self.assertEqual(st['last_export_at'], 0)
+        self.assertEqual(st['last_import_at'], 0)
+
+    def test_reads_from_settings(self) -> None:
+        self.db.set_setting(pgsync.LAST_EXPORT_KEY, 111)
+        self.db.set_setting(pgsync.LAST_IMPORT_KEY, 222)
+        st = pgsync.read_status()
+        self.assertEqual(st['last_export_at'], 111)
+        self.assertEqual(st['last_import_at'], 222)
+
+
+class PgSyncPanelPollingShapeTest(unittest.TestCase):
+    """面板轮询的**源码形状**守卫（issue #122）。
+
+    被报告的问题有一个行为测试抓不住的形态：空闲轮询整份拉配置并把服务器
+    旧值写回表单，用户填到一半的字段被打回去。这里把三条不变式钉在源码上：
+
+      1. 轮询走 `useHeartbeat`（隐藏时跳过、切回立即补一次），回调只允许调
+         `pollStatus`，不许出现 `load(`；
+      2. `pollStatus` 对表单只允许**合并**两个时刻字段（`setForm((f)`），
+         不许出现整份覆盖；
+      3. 整份配置拉取（`pgSyncApi.config()`）全文件只允许出现一次
+         （挂载 / 重试用的 `load`）。
+
+    照仓库里同类守卫的惯例：断言的是**结构**，文案与排版随便改；这几条一旦
+    被改回去，这里会红。
+    """
+
+    SRC = (Path(__file__).resolve().parents[2]
+           / 'web' / 'components' / 'common' / 'settings' / 'PgSyncPanel.tsx')
+
+    def setUp(self) -> None:
+        self.src = self.SRC.read_text(encoding='utf-8')
+
+    def test_poll_uses_heartbeat_and_not_load(self) -> None:
+        lines = [l.strip() for l in self.src.splitlines()
+                 if 'useHeartbeat(' in l
+                 and not l.lstrip().startswith(('import', '//', '*'))]
+        self.assertEqual(len(lines), 1, f'没找到唯一的 useHeartbeat 调用：{lines}')
+        call = lines[0]
+        self.assertIn('pollStatus', call)
+        self.assertNotIn('load(', call,
+                         '轮询又整份拉配置了 —— 会覆盖用户正在填的表单（issue #122）')
+        self.assertNotIn('window.setInterval(', self.src,
+                         '轮询改回了裸 setInterval —— 切回标签页不会立即更新'
+                         '（仓库的轮询可见性守卫也会拒绝）')
+
+    def test_poll_merges_instead_of_overwriting(self) -> None:
+        seg = self.src.split('const pollStatus')[1].split('}, []);')[0]
+        self.assertIn('pgSyncApi.status()', seg)
+        self.assertIn('setForm((f)', seg, '轮询对表单必须是合并写法')
+        self.assertNotIn('setForm(r.config)', seg, '轮询不许整份覆盖表单')
+
+    def test_full_config_has_a_single_call_site(self) -> None:
+        self.assertEqual(self.src.count('pgSyncApi.config()'), 1,
+                         '整份配置只允许在 load()（挂载 / 重试）里拉一次')
+
+
 class StartJobTest(_Case):
     """任务启动的前置校验，以及**锁不能泄漏**。"""
 
