@@ -156,6 +156,15 @@ export const accountApi = {
   list: (upstreamId?: number | null) =>
     get<AccountsResponse>('/api/accounts',
                           upstreamId == null ? undefined : {upstream_id: upstreamId}),
+  upload: (files: File[], upstreamId?: number | null) => {
+    const body = new FormData();
+    files.forEach((file) => body.append('files', file, file.name));
+    return http.post<{
+      ok: boolean;
+      uploaded: Array<{file: string; uid: string; updated: boolean}>;
+      failed: Array<{file: string; message: string}>;
+    }>('/api/accounts/upload' + groupQs(upstreamId), body).then((r) => r.data);
+  },
   /**
    * 发起扫码登录；realm 决定国内版 / 国际版端点。
    *
