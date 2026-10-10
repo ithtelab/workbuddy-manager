@@ -1,6 +1,9 @@
 ﻿# WorkBuddy Manager —— 跨机器通用自动化更新程序（Windows）
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 脚本住在 windows\ 子目录里：项目根（server/、web/out、.env、upstream/ 所在处）
+# 是它的上一级。拼项目内的路径一律用 $root；只有找**同一目录里的兄弟脚本**才用 $scriptDir。
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $scriptDir
 Set-Location $root
 
 # 启用现代 TLS 协议支持
@@ -400,15 +403,15 @@ if ($confirmProceed -eq 'n' -or $confirmProceed -eq 'N') {
 
 # ── 7. 停止运行中服务 ───────────────────────────────────
 Write-Host "[INFO] 正在安全停止当前服务进程..." -ForegroundColor Yellow
-$stopScript = Join-Path $root 'stop.ps1'
+$stopScript = Join-Path $scriptDir 'stop.ps1'
 if (Test-Path $stopScript) { & $stopScript }
 
-# ── 8. 备份本地 Windows 适配脚本 ─────────────────────────
+# ── 8. 备份本地 Windows 适配脚本（它们在 windows\ 下，按 $scriptDir 找）──
 $backupDir = Join-Path $root '.tools\scripts_backup'
 New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 $scriptsToProtect = @('start.ps1', 'stop.ps1', 'service-tools.ps1', 'start.cmd', 'stop.cmd', 'update.cmd', 'update.ps1')
 foreach ($s in $scriptsToProtect) {
-    $src = Join-Path $root $s
+    $src = Join-Path $scriptDir $s
     if (Test-Path $src) { Copy-Item $src (Join-Path $backupDir $s) -Force }
 }
 
@@ -483,7 +486,7 @@ Write-Host "[INFO] 临时签名安装包已自动彻底清理删除。" -Foregro
 # 还原 Windows 脚本与带空格路径引号修复
 foreach ($s in $scriptsToProtect) {
     $bak = Join-Path $backupDir $s
-    if (Test-Path $bak) { Copy-Item $bak (Join-Path $root $s) -Force }
+    if (Test-Path $bak) { Copy-Item $bak (Join-Path $scriptDir $s) -Force }
 }
 Remove-Item $backupDir -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -516,6 +519,6 @@ Write-Host "[INFO] 个人配置（.env、账号授权、数据库历史）完好
 $startNow = Read-Host "是否立即启动服务？(Y/n)"
 if ($startNow -ne 'n' -and $startNow -ne 'N') {
     Write-Host "[INFO] 正在启动服务..." -ForegroundColor Cyan
-    $startCmd = Join-Path $root 'start.cmd'
+    $startCmd = Join-Path $scriptDir 'start.cmd'
     Start-Process -FilePath "cmd.exe" -ArgumentList "/c", "`"$startCmd`""
 }

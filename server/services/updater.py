@@ -382,7 +382,7 @@ def start_update(target: str) -> tuple[bool, str]:
     if os.name == 'nt' and config.WB2API_MODE == 'native':
         return False, (
             'Windows 原生部署暂不支持网页一键更新；'
-            '请手动替换代码、重新构建前端，然后运行 service-tools.ps1 restart。'
+            '请手动替换代码、重新构建前端，然后运行 windows\\service-tools.ps1 restart。'
         )
     if target in ('upstream', 'both') and not can_control_docker():
         # 重建上游容器需要操作宿主 docker。判定按**实际能力**（能否跑通

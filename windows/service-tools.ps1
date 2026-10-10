@@ -1,11 +1,11 @@
 ﻿# WorkBuddy Manager —— 后台服务管理（Windows / PowerShell）
 #
-#   powershell -ExecutionPolicy Bypass -File service-tools.ps1 start    后台启动（日志写 data\）
-#   powershell -ExecutionPolicy Bypass -File service-tools.ps1 stop     停止
-#   powershell -ExecutionPolicy Bypass -File service-tools.ps1 status   查看状态
-#   powershell -ExecutionPolicy Bypass -File service-tools.ps1 restart  重启
+#   powershell -ExecutionPolicy Bypass -File windows\service-tools.ps1 start    后台启动（日志写 data\）
+#   powershell -ExecutionPolicy Bypass -File windows\service-tools.ps1 stop     停止
+#   powershell -ExecutionPolicy Bypass -File windows\service-tools.ps1 status   查看状态
+#   powershell -ExecutionPolicy Bypass -File windows\service-tools.ps1 restart  重启
 #
-# 与 start.ps1 的区别：start.ps1 是前台运行（关窗口即停），本脚本用 Start-Process
+# 与同目录 start.ps1 的区别：start.ps1 是前台运行（关窗口即停），本脚本用 Start-Process
 # 拉起独立进程，关掉终端也不影响；日志落在 data\manager.out.log 与 data\manager.err.log。
 param(
     [Parameter(Position = 0)]
@@ -13,7 +13,9 @@ param(
     [string]$Action = 'status'
 )
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 项目根在上一级（server/、web/out、.env 所在处）；兄弟脚本用 $scriptDir 找
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $scriptDir
 $python = Join-Path $root '.venv\Scripts\python.exe'
 $outLog = Join-Path $root 'data\manager.out.log'
 $errLog = Join-Path $root 'data\manager.err.log'
@@ -61,7 +63,12 @@ function Start-Manager {
     }
 
     if (Get-ManagerProcess) { Write-Host "端口 $port 已被占用，服务似乎已在运行（用 status 确认）"; return }
-    if (-not (Test-Path $python)) { Write-Error "未找到 $python，请先创建虚拟环境并安装依赖" }
+    if (-not (Test-Path $python)) {
+        # 只报一次就返回：原来 Write-Error 之后会继续往下跑，紧接着再抛一条
+        # 「Start-Process: 系统找不到指定的文件」，用户看到的是两条错、猜不出哪条是真因。
+        Write-Error "未找到 $python，请先创建虚拟环境并安装依赖（在项目根双击 windows\start.cmd 会自动准备）"
+        return
+    }
     New-Item -ItemType Directory -Force (Join-Path $root 'data') | Out-Null
     # 中文 Windows 默认 GBK：不切 UTF-8 模式时，读 docker logs（UTF-8）的线程会抛
     # UnicodeDecodeError，任务记录页拿不到上游日志。子进程继承这里的变量。

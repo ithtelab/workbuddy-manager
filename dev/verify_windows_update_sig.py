@@ -1,4 +1,4 @@
-"""验一遍 Windows 一键更新脚本（`update.ps1`）的验签门禁 —— 拿**真实发布产物**跑。
+"""验一遍 Windows 一键更新脚本（`windows/update.ps1`）的验签门禁 —— 拿**真实发布产物**跑。
 
 为什么值得单独跑：这个门禁是 Windows 原生部署唯一的信任锚点，而它的失效方式全都
 **不报错**、只悄悄失守。开发时真踩过两条：
@@ -9,7 +9,7 @@
   ② `allowed_signers` 用 PS 5.1 的 `[Text.Encoding]::UTF8` 写会带 BOM，ssh-keygen
      解析失败 —— **真包也被判验签不过**（exit=255）。
 
-这个脚本从**工作区**的 `update.ps1` 里截出那个函数，在真 PowerShell 里跑三种输入：
+这个脚本从**工作区**的 `windows/update.ps1` 里截出那个函数，在真 PowerShell 里跑三种输入：
 
     真包（tar.gz + .sig）           → 期望放行
     改一个字节的包 + 原 .sig        → 期望中止
@@ -69,10 +69,10 @@ def main() -> int:
     data[len(data) // 2] ^= 0xFF
     tampered.write_bytes(bytes(data))
 
-    src = (REPO / 'update.ps1').read_text(encoding='utf-8-sig')
+    src = (REPO / 'windows' / 'update.ps1').read_text(encoding='utf-8-sig')
     m = re.search(r'^function Test-PackageSignature.*?(?=^})', src, re.S | re.M)
     if not m:
-        print('update.ps1 里找不到 Test-PackageSignature', file=sys.stderr)
+        print('windows/update.ps1 里找不到 Test-PackageSignature', file=sys.stderr)
         return 2
 
     ps = REPO / 'dev' / '.windows-sig-probe.ps1'

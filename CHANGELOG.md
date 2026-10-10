@@ -20,6 +20,21 @@
 
 ---
 
+## [未发布]
+
+### 变更
+
+- **Windows 的启动脚本挪到了 `windows\` 目录**：仓库根目录原先散着 7 个脚本，现在统一
+  收进 `windows\`，根目录干净一些。用法跟着变：双击 `windows\start.cmd` 启动、
+  `windows\stop.cmd` 停止、`windows\update.cmd` 更新；后台常驻从 `service-tools.ps1 start`
+  变成 `windows\service-tools.ps1 start`。**已经在用的快捷方式、批处理或记事本里的命令，
+  路径要改一下**，脚本本身的行为没变。
+
+  另外两点：这个目录**不要挪动**，也别把脚本单独复制出去 —— 它们按自己所在目录的上一级
+  当项目根（找 `server/`、`web/out`、`.env`、`upstream/`）；`windows\service-tools.ps1 start`
+  在找不到 Python 虚拟环境时现在只报一次错就停下，不会再顺带抛一条看不懂的
+  「Start-Process: 系统找不到指定的文件」。
+
 ## [1.0.81] - 2026-10-10
 
 ### 新增

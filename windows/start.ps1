@@ -1,6 +1,9 @@
-# WorkBuddy Manager —— 本机启动脚本（Windows / PowerShell）
+﻿# WorkBuddy Manager —— 本机启动脚本（Windows / PowerShell）
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+# 脚本住在 windows\ 子目录里：项目根（server/、web/out、.env、upstream/ 所在处）
+# 是它的上一级。拼项目内的路径一律用 $root；只有找**同一目录里的兄弟脚本**才用 $scriptDir。
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $scriptDir
 Set-Location $root
 
 # 启用现代 TLS 协议支持
@@ -66,7 +69,7 @@ if (-not (Test-Path $python)) {
         & $uvExe pip install -r (Join-Path $root 'server\requirements.txt') --python $python
     } else {
         Write-Host "[INIT] 正在调用自动更新程序同步依赖与前端产物..." -ForegroundColor Yellow
-        & (Join-Path $root 'update.ps1')
+        & (Join-Path $scriptDir 'update.ps1')
     }
 }
 
@@ -74,7 +77,7 @@ if (-not (Test-Path $python)) {
 $webIndex = Join-Path $root 'web\out\index.html'
 if (-not (Test-Path $webIndex)) {
     Write-Host "[WARN] 检测到尚未下载前端页面包，正在调用更新程序自动拉取..." -ForegroundColor Yellow
-    & (Join-Path $root 'update.ps1')
+    & (Join-Path $scriptDir 'update.ps1')
 }
 
 # 5. 编码设置与参数解析

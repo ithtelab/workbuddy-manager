@@ -233,7 +233,7 @@ WB_BASE_PATH=/workbuddy-manager
 > 这个坑的麻烦之处在于**症状很隐蔽**：配置看起来加了，但前缀没被剥掉，
 > 表现为「页面能打开、接口全 404」，容易误判成反代写错了。
 >
-> （唯一的例外是 Windows 原生部署：`start.ps1` 用 `uvicorn --env-file .env` 显式读取 `.env`。）
+> （唯一的例外是 Windows 原生部署：`windows\start.ps1` 用 `uvicorn --env-file .env` 显式读取 `.env`。）
 
 **③ 反向代理：两种 `proxy_pass` 写法都可以**
 
@@ -545,10 +545,15 @@ Set-Location web
 npm ci
 npm run build:export
 Set-Location ..
-powershell -ExecutionPolicy Bypass -File .\service-tools.ps1 start
+powershell -ExecutionPolicy Bypass -File .\windows\service-tools.ps1 start
 ```
 
-用 `service-tools.ps1 status|restart|stop` 管理后台进程。Windows 原生模式支持
+用 `windows\service-tools.ps1 status|restart|stop` 管理后台进程。
+
+> Windows 的启动脚本都在 `windows\` 目录里，**不要把它们挪出去**：脚本按自己所在
+> 目录的上一级当项目根（找 `server/`、`web/out`、`.env`、`upstream/`）。双击
+> `windows\start.cmd` 前台启动（关窗口即停）、`stop.cmd` 停止、`update.cmd` 一键更新；
+> 后台常驻用 `windows\service-tools.ps1 start`。Windows 原生模式支持
 保存配置后重启上游及读取上游日志；网页一键更新依赖 Linux/Docker，当前会明确拒绝，
 请手动更新代码后重启服务。
 

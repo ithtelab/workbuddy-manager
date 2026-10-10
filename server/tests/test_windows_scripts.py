@@ -140,9 +140,6 @@ class GitAttributesTest(unittest.TestCase):
         self.assertIn('eol: crlf', r.stdout, f'git 没把该文件判成 crlf：{r.stdout!r}')
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class WindowsUpdaterTrustChainTest(unittest.TestCase):
     """Windows 一键更新脚本（`update.ps1`）的信任链守卫。
@@ -160,7 +157,7 @@ class WindowsUpdaterTrustChainTest(unittest.TestCase):
         而错误看起来像「包坏了」。
     """
 
-    UPDATER = _ROOT / 'update.ps1'
+    UPDATER = _ROOT / 'windows' / 'update.ps1'
 
     def test_script_exists(self) -> None:
         self.assertTrue(self.UPDATER.is_file(), f'找不到 {self.UPDATER}')
@@ -227,3 +224,70 @@ class WindowsUpdaterTrustChainTest(unittest.TestCase):
         # 且确认必须在「停服务」之前
         self.assertLess(src.index('Read-Host'), src.index('stop.ps1'),
                         '确认排在了停服务之后 —— 用户点「不要」时服务已经被停了')
+
+
+class WindowsScriptLayoutTest(unittest.TestCase):
+    """脚本住在 `windows/`：项目根 = 脚本目录的**上一级**。
+
+    这条布局不是审美问题，而是脚本能跑的前提：
+
+      · `start.ps1` / `service-tools.ps1` / `update.ps1` 按「项目根」找 `server/`、
+        `web/out`、`.env`、`upstream/`、`.venv/`；
+      · `stop.ps1` 调同目录的 `service-tools.ps1`，`start.ps1` 调同目录的 `update.ps1`；
+      · `update.ps1` 更新前把这一套脚本备份到 `.tools/scripts_backup`，更新后按名字
+        **还原回脚本目录** —— 基准用错的话，更新完脚本会散落到仓库根，下次就找不到了。
+
+    写错的形态都是「脚本语法没错、也能跑，只是在错的地方找文件」：启动时报
+    「未找到 .venv」、更新后根目录多出一套脚本。所以这里按文本机械地钉住三条。
+    """
+
+    PS1 = ('start.ps1', 'stop.ps1', 'service-tools.ps1', 'update.ps1')
+    ENTRY_CMD = (('start.cmd', 'start.ps1'), ('stop.cmd', 'stop.ps1'), ('update.cmd', 'update.ps1'))
+
+    def _scripts(self) -> dict:
+        out = {}
+        names = list(self.PS1) + [c for c, _ in self.ENTRY_CMD]
+        for name in names:
+            p = _ROOT / 'windows' / name
+            self.assertTrue(p.is_file(), f'windows/{name} 不见了（被挪回根目录了？）')
+            out[name] = p.read_text(encoding='utf-8-sig')
+        return out
+
+    def test_root_is_the_parent_directory(self) -> None:
+        """项目根必须由**脚本目录的上一级**算出，而不是脚本自己所在目录。"""
+        for name, src in self._scripts().items():
+            if not name.endswith('.ps1'):
+                continue
+            with self.subTest(script=name):
+                self.assertIn('$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path', src)
+                self.assertIn('$root = Split-Path -Parent $scriptDir', src,
+                              f'{name} 没把项目根当成上一级 —— 它会在脚本目录里找 server/')
+
+    def test_sibling_scripts_use_script_dir(self) -> None:
+        """找兄弟脚本（同一目录里的那几个）必须走 `$scriptDir`，不许走 `$root`。"""
+        siblings = list(self.PS1) + [c for c, _ in self.ENTRY_CMD]
+        for name, src in self._scripts().items():
+            if not name.endswith('.ps1'):
+                continue
+            for line in src.splitlines():
+                if line.strip().startswith('#'):
+                    continue
+                with self.subTest(script=name, line=line.strip()[:60]):
+                    self.assertNotIn('Join-Path $root $s', line,
+                                     f'{name} 的批量备份/还原又用回 $root 了：{line.strip()[:80]}')
+                    for sib in siblings:
+                        for quoted in (f"Join-Path $root '{sib}'", f'Join-Path $root "{sib}"'):
+                            self.assertNotIn(quoted, line,
+                                             f'{name} 用 $root 找兄弟脚本了：{line.strip()[:80]}')
+
+    def test_entry_cmd_stays_sibling(self) -> None:
+        """三个双击入口要按 `%~dp0`（自己所在目录）调同目录的 .ps1 —— 它们总是一起挪动。"""
+        scripts = self._scripts()
+        for cmd, ps1 in self.ENTRY_CMD:
+            with self.subTest(script=cmd):
+                self.assertIn(f'%~dp0{ps1}', scripts[cmd],
+                              f'{cmd} 没有按 %~dp0 调同目录的 {ps1}')
+
+
+if __name__ == '__main__':
+    unittest.main()
