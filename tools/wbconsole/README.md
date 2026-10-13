@@ -1,50 +1,49 @@
-# WorkBuddy Manager 一键部署
+# WorkBuddy Manager 本机控制台
 
-一个 Go 写的小程序，编译成单个 exe。**双击就把整套项目部署好并启动**：建虚拟环境、装依赖、
-编译上游网关、拉起上游与管理端 —— 全程不弹窗口，也不用敲任何命令。
+一个 Go 写的小程序，编译成单个 exe，放在项目根目录。**双击打开控制台菜单**，四件事：
+部署并启动 / 关闭 / 重启 / 查看状态。选「1」即完成整套项目的部署：建虚拟环境、装依赖、
+编译上游网关、拉起上游与管理端 —— 全程不用敲命令。
 
-- 双击 → 等一会儿 → 浏览器打开 `http://127.0.0.1:7864`
-- 装好之后再次双击，会直接拉起服务，不会重复装依赖
-- 不弹窗口，所以可以直接放进「启动」目录做开机自启
+- 双击 → 选「1」→ 浏览器打开 `http://127.0.0.1:7864`
+- 已经部署过的机器上再选「1」，会直接拉起服务，不会重复装依赖
+- 装依赖、编上游的进度直接打在这一个窗口里，看得见
 
 它和 `windows/start.cmd`、`windows/service-tools.ps1` 覆盖的是同一件事，区别在于：
 
-- **部署时不弹任何窗口**：用 `-H windowsgui` 编译，双击不会有控制台蹦出来。
-- **顺手补齐部署**：缺 `.venv` 就建、缺依赖就装、缺 `wb2api.exe` 就 `go build`。
-- **管理端脱离终端后台运行**：关掉任何窗口都不会把它带走。
+- **多一个菜单**：四项操作都在一个窗口里，不用记命令。
+- **不会冒出第二个控制台**：管理端、上游、依赖探测都用 `CREATE_NO_WINDOW` 起，
+  全程只有双击出来的这一个窗口。
+- **管理端脱离本窗口**：关掉菜单窗口不会把它带走，服务继续跑。
 
 ## 构建
 
 前置：Go 1.27 或更高（见 `go.mod`），没有任何第三方依赖。
 
-```powershell
-cd tools\wbconsole
-
-# 唯一的构建形态：双击即完成部署并启动
-go build -trimpath -ldflags "-s -w -H=windowsgui -X main.defaultAction=deploy" `
-  -o "..\..\bin\WorkBuddy Manager.exe" .
+```bat
+tools\wbconsole\build.cmd
 ```
 
-两个编译参数都不能省：
-
-- `-H windowsgui` 让 exe 不自带控制台。省了它，双击会先弹一个黑窗，部署时的
-  `python.exe` 还会再弹一个。
-- `-X main.defaultAction=deploy` 让它被双击（没有参数）时直接走部署。
-
-exe 放哪都行，但**建议放进项目目录内**（例如 `bin\`）。程序按「自己所在目录向上找含
-`server/main.py` 的目录」定位项目根，**不依赖当前工作目录**，所以双击、快捷方式、
-命令行启动表现一致。也可以用 `WB_MANAGER_ROOT` 环境变量直接指定项目根。
-
-停止 / 重启 / 看状态传第一个参数即可：
+脚本**只产出一个 exe**，直接放在**项目根目录**：`WorkBuddy Manager.exe`。它等价于：
 
 ```powershell
-"WorkBuddy Manager.exe" stop      # 关闭管理端和上游
+cd tools\wbconsole
+go build -trimpath -ldflags "-s -w" -o "..\..\WorkBuddy Manager.exe" .
+```
+
+**不要加 `-H windowsgui`** —— 那会让 exe 不带控制台，菜单就没法显示了。
+
+exe 就放在项目根目录。程序按「自己所在目录向上找含 `server/main.py` 的目录」定位项目根，
+**不依赖当前工作目录**，所以双击、快捷方式、命令行启动表现一致。也可以用
+`WB_MANAGER_ROOT` 环境变量直接指定项目根。
+
+除了菜单，也可以传第一个参数：
+
+```powershell
+"WorkBuddy Manager.exe" deploy    # 同菜单里的「1」；不带参数则进菜单
+"WorkBuddy Manager.exe" stop
 "WorkBuddy Manager.exe" restart
 "WorkBuddy Manager.exe" status
 ```
-
-exe 不带控制台，所以这些动作会照常执行但**没有回显**；要看结果就用
-`windows\stop.cmd`，或把它重定向到文件（`> status.txt`）。
 
 ## 图标
 
@@ -56,19 +55,21 @@ go install github.com/akavel/rsrc@latest
 rsrc -arch amd64 -ico ..\..\web\public\favicon\favicon.ico -o rsrc.syso
 ```
 
-## 启动管理端时的硬要求
+## 子进程的创建标志
 
 管理端是 `python -m uvicorn server.main:app`，stdout / stderr 重定向到
 `data\manager.out.log` / `data\manager.err.log`，PID 写进 `data\manager.pid`。
-子进程的创建标志踩过一次坑，改这段之前先读：
+创建标志踩过一次坑，改这段之前先读：
 
-- **必须带 `CREATE_NO_WINDOW`（`0x08000000`）**。本程序用 `-H windowsgui` 编译，自己不带
-  控制台；不加这个标志，`python.exe` 这类控制台程序会凭空弹出一个黑窗（`cmd.exe` 同理）。
+- **管理端、上游、依赖探测都必须带 `CREATE_NO_WINDOW`（`0x08000000`）**。它让子进程既不
+  分配自己的控制台，也不继承本窗口 —— 所以全程不会多出第二个窗口，而且**关掉菜单窗口时
+  管理端不会跟着一起死**。
 - **不能改用 `DETACHED_PROCESS`（`0x08`）**。Windows 规定这两个标志同用时
-  `CREATE_NO_WINDOW` 会被**忽略**，结果是 `python.exe` 反而新开一个**可见**控制台 ——
-  「部署完弹出一个 python.exe 黑窗」就是这么来的。实测：`0x208` 出可见窗口，
+  `CREATE_NO_WINDOW` 会被**忽略**，`python.exe` 反而会新开一个**可见**控制台 ——
+  「部署完莫名多出一个 python.exe 黑窗」就是这么来的。实测：`0x208` 出可见窗口，
   `0x08000200` 无窗口。
-- 它同时让子进程**不继承**调用者的控制台，所以管理端不会跟着任何窗口一起被关掉。
+- **建 venv、`pip install`、`go build` 上游这三步故意不加上面的标志**：让它们继承本窗口，
+  进度看得见；继承不会另开窗口。
 
 ## 目录约定
 
