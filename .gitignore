@@ -134,10 +134,3 @@ local-ops/
 LOCAL_DEPLOY_NOTES.md
 start-all.cmd
 stop-all.cmd
-
-# ── 构建副产物：本地编译出的 exe（不提交）───────────────────────
-# 唯一例外是根目录的交付物「WorkBuddy Manager.exe」（tools/wbconsole/build.cmd
-# 产出，随仓库分发）；其余位置构建/部署落下的 exe（tools/wbconsole/wbconsole.exe、
-# deploy/windows-native/wb2api.exe 等）都是本地产物，一律不提交。
-*.exe
-!/WorkBuddy Manager.exe
