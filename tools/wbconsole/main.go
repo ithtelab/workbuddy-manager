@@ -26,7 +26,7 @@ const (
 
 	// Windows 进程创建标志
 	createNewProcessGroup = 0x00000200
-	// 子进程不分配控制台窗口。宿主本身没有控制台时（-H windowsgui 编译出的普通版），
+	// 子进程不分配控制台窗口。用 -H windowsgui 编译时，exe 自己不带控制台，
 	// cmd.exe / python.exe 这类控制台程序会凭空弹出一个黑窗，必须显式压掉；
 	// 它同时让子进程不再继承本终端，关掉本窗口不会把它一起带走。
 	// 不可与 DETACHED_PROCESS(0x08) 并用：那样本标志会被忽略，
@@ -34,7 +34,7 @@ const (
 	createNoWindow = 0x08000000
 )
 
-// 由构建参数注入：控制台版走菜单，普通版直接部署并启动
+// 由构建参数注入：未注入时走交互菜单，注入 deploy 后直接部署并启动
 var defaultAction = "menu"
 
 var (

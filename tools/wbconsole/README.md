@@ -20,7 +20,7 @@
 ```powershell
 cd tools\wbconsole
 
-# 普通版：本项目唯一的构建形态，双击即完成部署并启动
+# 唯一的构建形态：双击即完成部署并启动
 go build -trimpath -ldflags "-s -w -H=windowsgui -X main.defaultAction=deploy" `
   -o "..\..\bin\WorkBuddy Manager.exe" .
 ```
