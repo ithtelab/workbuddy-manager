@@ -191,6 +191,43 @@ server {
 > 首段可被客户端伪造）。若前面还叠了 CDN，请把服务端
 > `WB_TRUSTED_PROXY_HOPS` 设为 CDN + 反代的层数。
 
+#### 前面是 Cloudflare（或任何 CDN）时**必须**再配一步
+
+只把 `X-Real-IP` 设成 `$remote_addr` 在 CF 后面是不够的：请求经过 CDN 时
+`$remote_addr` 是**边缘节点**的地址（`162.159.x` / `172.68.x` …），于是应用侧的
+全局 IP 白/黑名单、登录失败锁定、密钥 IP 白名单、审计日志全部按「CDN 的 IP」
+记账 —— 所有用户看起来都是同一个来源，IP 类管控既拦不准也锁不准（实测线上：
+`request_logs` 访问量前几名全是 CF 网段，单条 1.8 万次）。要用 nginx 自带的
+`realip` 模块从 `CF-Connecting-IP` 还原真实来源：
+
+```bash
+{
+  curl -fsS https://www.cloudflare.com/ips-v4
+  curl -fsS https://www.cloudflare.com/ips-v6
+  echo
+  echo 'real_ip_header CF-Connecting-IP;'
+  echo 'real_ip_recursive on;'
+} | sed -E '/^[0-9a-fA-F:.]+\/[0-9]+$/ { s/^/set_real_ip_from /; s/$/;/ }' \
+  | sudo tee /etc/nginx/conf.d/cloudflare-realip.conf
+
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+这个文件由 `nginx.conf` 里 `http {}` 中的 `include conf.d/*.conf` 加载，对所有
+站点生效。要点：
+
+- **`set_real_ip_from` 必须限定为 CDN 网段**。绕过 CDN 直连源站的请求，TCP
+  对端不匹配这些网段，伪造的 `CF-Connecting-IP` 就不会被采信。
+- CF 网段会变（官方列表会增减），建议把上面那段放进 cron（例如每月一次）后
+  跟 `nginx -t && systemctl reload nginx`，别只跑一次就忘了。
+- 应用侧**不用改**：`X-Real-IP` 仍由 nginx 覆盖成 `$remote_addr`，此时它已是
+  真实客户端 IP；`WB_TRUSTED_PROXY_HOPS` 也不必上调 —— 那是给「直接采信
+  `X-Forwarded-For`」的场景算层数用的。
+
+验证：`sudo tail -1 /var/log/nginx/access.log` 的第一列应是真实客户端 IP；
+或者不带密钥请求一次 `/v1/usage`（会返回 401），管理端「安全 → IP 访问日志」
+里新增那条的来源 IP 应是你的公网 IP，而不是 CF 网段。
+
 ### 4. 子路径部署（可选）
 
 如果域名根路径已被别的站点占用（例如 `https://example.com/` 是另一个系统），
