@@ -208,6 +208,9 @@ class SourceIntrospectionTest(_Case):
         self.assertIn('request_logs', tables)
         # sqlite 自己的内部表不能出现在镜像清单里
         self.assertFalse([t for t in tables if t.startswith('sqlite_')])
+        # 控制面（令牌、配置）不随备份走：恢复时它们必须留在本地
+        self.assertNotIn('api_tokens', tables)
+        self.assertNotIn('settings', tables)
 
     def test_columns_match_schema(self) -> None:
         src = pgsync._SqliteSource(config.DB_PATH)
@@ -561,20 +564,35 @@ class RealPgTest(_Case):  # pragma: no cover - 只在有 PG 的环境跑
                 'enabled': False, 'interval_minutes': 0}
 
     def test_export_then_import(self) -> None:
+        """数据表往返生效；**控制面表（settings / api_tokens）留在本地**。
+
+        后者是安全边界，不是便利性取舍：镜像可能在别人的数据库里，能写回
+        settings 就等于能改更新链路（github_mirror / update_proxy），能写回
+        api_tokens 就等于能塞一把 admin 范围的管理令牌。见 pgsync._CONTROL_TABLES。
+        """
         cfg = self._cfg()
+        self.db.execute('INSERT INTO account_notes(uid, note, updated_at) '
+                        'VALUES(?, ?, ?)', ('pg-roundtrip', 'before', 1))
         self.db.execute('INSERT INTO settings(key, value) VALUES(?, ?)',
                         ('pg_roundtrip', '"before"'))
         reporter = pgsync._Reporter('export')
         exported = pgsync.export_to_pg(cfg, reporter)
         self.assertGreater(exported['rows'], 0)
+        self.assertNotIn('settings', exported['tables'])
+        self.assertNotIn('api_tokens', exported['tables'])
 
+        self.db.execute('DELETE FROM account_notes WHERE uid = ?', ('pg-roundtrip',))
         self.db.execute('DELETE FROM settings WHERE key = ?', ('pg_roundtrip',))
         reporter = pgsync._Reporter('import')
         pgsync.import_from_pg(cfg, reporter)
-        row = self.db.query_one('SELECT value FROM settings WHERE key = ?',
-                                ('pg_roundtrip',))
-        self.assertIsNotNone(row)
-        self.assertEqual(json.loads(row['value']), 'before')
+        row = self.db.query_one('SELECT note FROM account_notes WHERE uid = ?',
+                                ('pg-roundtrip',))
+        self.assertIsNotNone(row, '数据表应随恢复回来')
+        self.assertEqual(row['note'], 'before')
+        self.assertIsNone(
+            self.db.query_one('SELECT value FROM settings WHERE key = ?',
+                              ('pg_roundtrip',)),
+            'settings 不属于备份，恢复不该把它灌回来')
 
 
 if __name__ == '__main__':

@@ -278,6 +278,24 @@ def _is_mirror_table(name: str) -> bool:
     return str(name).startswith(_MIRROR_PREFIX)
 
 
+# 控制面表：**不随备份搬迁**（导出不带、恢复也不从镜像写回）。
+#
+# 备份的语义是「异地存一份数据」；但恢复是「把镜像整表灌回本地」，而镜像可能
+# 躺在别人的数据库里（云 PG、共享实例、或一份被改过的备份）。这两张表一旦能被
+# 镜像写回，就等于：
+#   · `api_tokens` —— 往镜像里塞一行攻击者自己算好的 sha256，恢复后直接以
+#     admin 范围调用管理面；
+#   · `settings`   —— 改掉 github_mirror / update_proxy 等更新链路配置，让下一次
+#     「一键更新」从攻击者指定的地址拉包。
+# 它们描述的是「这台机器怎么运转」而不是业务数据，应当留在本地、由本机的用户
+# 与会话管理。排除后恢复日志里也不会再把它们报成「镜像里没有、保持现状」。
+_CONTROL_TABLES = frozenset({'api_tokens', 'settings'})
+
+
+def _is_control_table(name: str) -> bool:
+    return str(name) in _CONTROL_TABLES
+
+
 # ── 数据源 / 目标（搬运的两端）──────────────────────────
 #
 # 抽出这一层是为了**可测**：导出与恢复的差别只是「谁当源、谁当目标」，
@@ -302,7 +320,8 @@ class _SqliteSource:
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name NOT LIKE 'sqlite_%' ORDER BY name"
         ).fetchall()
-        return [str(r[0]) for r in rows]
+        return [str(r[0]) for r in rows
+                if not _is_control_table(r[0])]
 
     def columns(self, table: str) -> list[dict]:
         rows = self._conn.execute(f'PRAGMA table_info("{table}")').fetchall()
@@ -336,7 +355,8 @@ class _PgSource:
                 "WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' "
                 "ORDER BY table_name"
             )
-            return [str(r[0]) for r in cur.fetchall() if not _is_mirror_table(r[0])]
+            return [str(r[0]) for r in cur.fetchall()
+                    if not _is_mirror_table(r[0]) and not _is_control_table(r[0])]
 
     def columns(self, table: str) -> list[dict]:
         with self._conn.cursor() as cur:
@@ -746,7 +766,8 @@ def _local_tables(conn: sqlite3.Connection) -> set[str]:
     rows = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' "
         "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
-    return {str(r[0]) for r in rows if not _is_mirror_table(r[0])}
+    return {str(r[0]) for r in rows
+            if not _is_mirror_table(r[0]) and not _is_control_table(r[0])}
 
 
 def _local_backup() -> Path | None:
