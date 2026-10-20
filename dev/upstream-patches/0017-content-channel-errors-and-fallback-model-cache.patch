@@ -1,0 +1,193 @@
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -1153,6 +1153,12 @@
+ 	if !codeMarker(lower, "11128") && !codeMarker(lower, "11-128") {
+ 		return false
+ 	}
++	// Generic displayTips also accompany request-content rejections. Preserve
++	// the existing request-level classification instead of cooling every account
++	// or consulting a console backend with a different model catalog.
++	if contentBlockedRule.hit(body, lower) {
++		return false
++	}
+ 	return strings.Contains(body, "渠道校验") ||
+ 		strings.Contains(lower, "channel verification") ||
+ 		strings.Contains(lower, "official client")
+@@ -1205,6 +1211,8 @@
+ 		return nil, 0, nil, cerr
+ 	}
+ 	paths := c.chatPaths(a)
++	var primaryRejection *Error
++	var primaryBody []byte
+ 	for i, path := range paths {
+ 		url := c.chatBase(a) + path
+ 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
+@@ -1248,9 +1256,20 @@
+ 			// 失败仍按下面原有逻辑返回，由 handler 决定怎么罚号 —— 那时也**不该禁用**
+ 			// （见 handler 的 ErrAccountFault 分支）。
+ 			if i < len(paths)-1 && IsChannelCheck(string(raw)) {
++				primaryRejection = &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
++				if d, ok := ParseRetryAfter(resp.Header); ok {
++					primaryRejection.RetryAfter = d
++				}
++				primaryBody = raw
+ 				log.Printf("WARN: [upstream] chat_stream acct=%s: %s 被拒（%d），换路径 %s 重试",
+ 					logfmt.Label(a.UID, a.Nickname), path, resp.StatusCode, paths[i+1])
+ 				continue
++			}
++			// The console backend can lack a model that /v2 does serve. Its 11102
++			// must not poison the account/model cache for the primary backend.
++			// Preserve the primary rejection (including Retry-After) for policy and diagnostics.
++			if kind == ErrModelBlocked && primaryRejection != nil {
++				return nil, primaryRejection.Status, primaryBody, primaryRejection
+ 			}
+ 			// ≥400 直接返回（除上面的渠道校验换路径外，chat 层无 fallback 链；billing
+ 			// 层的 404 fallback 独立存在，语义不受影响）。
+--- a/internal/upstream/channel_check_test.go
++++ b/internal/upstream/channel_check_test.go
+@@ -59,6 +59,18 @@
+ 	}
+ }
+ 
++func TestContentRejectionWithGenericChannelTipsStaysRequestLevel(t *testing.T) {
++	for _, message := range []string{"Illegal API invocation from an unapproved channel", "blocked by security policy"} {
++		body := `{"code":11128,"msg":"` + message + `","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`
++		if IsChannelCheck(body) {
++			t.Fatalf("generic displayTips overrode content rejection: %s", body)
++		}
++		if got := Classify(400, body); got != ErrContentBlocked {
++			t.Fatalf("content rejection must not cool accounts: got %v", got)
++		}
++	}
++}
++
+ func TestClassifyRoutesChannelCheckToAccountFault(t *testing.T) {
+ 	// 归账号级是为了让 handler 的 ErrAccountFault 分支接管（那里最先判它、只软冷却）。
+ 	// 落通用 4xx 的后果是「只换号不罚」：坏号留在池里、每次被选中都失败。
+--- /dev/null
++++ b/internal/upstream/fallback_model_cache_test.go
+@@ -0,0 +1,59 @@
++package upstream
++
++import (
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++func TestConsoleMissingModelPreservesPrimaryRejection(t *testing.T) {
++	paths := []string{}
++	c := testClient(func(r *http.Request) (*http.Response, error) {
++		paths = append(paths, r.URL.Path)
++		if r.URL.Path == chatCompletionsPath {
++			r := jsonResp(400, channelBody)
++			r.Header.Set("Retry-After", "30")
++			return r, nil
++		}
++		return jsonResp(400, `{"code":11102,"msg":"model [deepseek-v4.1-flash] service info not found"}`), nil
++	})
++	_, status, body, err := c.ChatStream(&auth.Auth{UID: "u1"}, []byte(`{"model":"deepseek-v4.1-flash","messages":[]}`), "", ChatMeta{})
++	if len(paths) != 2 || status != 400 || string(body) != channelBody {
++		t.Fatalf("lost primary response: paths=%v status=%d body=%s", paths, status, body)
++	}
++	ue, ok := err.(*Error)
++	if !ok || ue.Kind != ErrAccountFault || ue.RetryAfter != 30*time.Second {
++		t.Fatalf("fallback must not produce model-blocked policy: %v", err)
++	}
++}
++
++func TestPrimaryMissingModelStillReturnsModelBlocked(t *testing.T) {
++	calls := 0
++	c := testClient(func(r *http.Request) (*http.Response, error) {
++		calls++
++		return jsonResp(400, `{"code":11102,"msg":"model service info not found"}`), nil
++	})
++	_, _, _, err := c.ChatStream(&auth.Auth{UID: "u1"}, []byte(`{"model":"missing","messages":[]}`), "", ChatMeta{})
++	ue, ok := err.(*Error)
++	if !ok || ue.Kind != ErrModelBlocked || calls != 1 {
++		t.Fatalf("real primary missing-model behavior changed: calls=%d err=%v", calls, err)
++	}
++}
++
++func TestConsoleFallbackCanStillSucceed(t *testing.T) {
++	c := testClient(func(r *http.Request) (*http.Response, error) {
++		if r.URL.Path == chatCompletionsPath {
++			return jsonResp(400, channelBody), nil
++		}
++		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("data: [DONE]\n\n"))}, nil
++	})
++	rc, status, _, err := c.ChatStream(&auth.Auth{UID: "u1"}, []byte(`{"model":"supported","messages":[]}`), "", ChatMeta{})
++	if err != nil || status != 200 || rc == nil {
++		t.Fatalf("successful fallback changed: status=%d err=%v", status, err)
++	}
++	rc.Close()
++}
+--- /dev/null
++++ b/internal/server/content_channel_tips_test.go
+@@ -0,0 +1,62 @@
++package server
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"workbuddy2api/internal/auth"
++)
++
++func TestContentRejectionWithChannelTipsDoesNotExhaustPool(t *testing.T) {
++	const body = `{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`
++	calls := 0
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		calls++
++		return 400, body, false
++	})
++	p := testPoolWith(
++		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
++	)
++	defer p.Close()
++	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: "SYS"})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hello"}]}`)))
++	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"content_blocked"`) {
++		t.Fatalf("want request-level error, got %d %s", rec.Code, rec.Body)
++	}
++	if calls != 1 {
++		t.Fatalf("content rejection must not fall back or rotate accounts: %d calls", calls)
++	}
++	for _, uid := range []string{"u1", "u2"} {
++		st, _ := p.Status(uid)
++		if st.Cooling || st.Disabled || len(st.RateLimitedModels) != 0 {
++			t.Fatalf("request rejection poisoned account %s: %+v", uid, st)
++		}
++	}
++}
++
++func TestContentChannelTipsStillAllowExistingDegradedRetry(t *testing.T) {
++	calls := 0
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		calls++
++		if calls == 1 {
++			return 400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel","displayTips":{"en":"Please use an official client; channel verification failed"}}`, false
++		}
++		return 200, sseOK, true
++	})
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	defer p.Close()
++	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough"})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[{"role":"system","content":"client system prompt"},{"role":"user","content":"hello"}]}`)))
++	if rec.Code != http.StatusOK || calls != 2 {
++		t.Fatalf("expected one request-level retry: status=%d calls=%d body=%s", rec.Code, calls, rec.Body)
++	}
++	st, _ := p.Status("u1")
++	if st.Cooling || st.Disabled || len(st.RateLimitedModels) != 0 {
++		t.Fatalf("degraded retry must keep the account healthy: %+v", st)
++	}
++}

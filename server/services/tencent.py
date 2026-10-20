@@ -1172,7 +1172,8 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     必须用流式：上游强制要求 stream=true，非流式会返回
     code=11101「Non-stream chat request is currently not supported」
     （见 workbuddy2api payload.go 中强制 obj["stream"]=true 的处理）。
-    因此这里发起流式请求，读到首个数据块即判定可用，随即断开。
+    因此这里发起流式请求，读到模型输出或完成帧才判定可用，随即断开。
+    SSE 心跳和空角色帧不能证明模型可用，HTTP 200 里的错误帧也必须检查。
 
     请求头复刻上游 ChatHeaders：缺失字段用 X-No-* 约定。
     国内版带 X-Enterprise-Id / X-Domain（有值则带、否则 X-No-*）；
@@ -1243,7 +1244,7 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
         'stream': True,
     }
 
-    started = _time.time()
+    started = _time.monotonic()
     # 路径候选：/v2 优先、/console 兜底（见 realm.chat_paths 的注释）。这里逐个尝试，
     # 触发回落的条件是**渠道校验**或 404/405：2026-10-17 上游给 /v2 加了渠道强校验，
     # 被校验到的请求回「没通过渠道校验」，而官方客户端走的 /console 正常放行 ——
@@ -1258,27 +1259,94 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
                     'POST', f'{base}{path}', json=payload, headers=headers,
                 ) as resp:
                     if resp.status_code >= 400:
-                        raw = (await resp.aread()).decode('utf-8', errors='replace')
-                        code, msg = _parse_error_body(raw, resp.status_code)
-                        channel_check = _is_channel_check(code, raw)
-                        if channel_check and idx < len(paths) - 1:
-                            continue  # 换下一条路径再试，别当成账号问题
-                        if channel_check:
-                            # 两条都被拦：说清「不是账号问题」，否则用户会以为号坏了去重扫。
-                            return False, ('这次调用被上游的渠道校验拦下了（已试过 ' +
-                                           '/'.join(paths) + '）—— 账号本身没问题；'
-                                           '请先升级到最新版本，仍不行就把这句反馈给维护者')
-                        return False, _explain_code(code, msg)
-                    # 读到首个非空数据块即可确认账号可用，无需等流结束
-                    async for chunk in resp.aiter_bytes():
-                        if chunk:
-                            elapsed = int((_time.time() - started) * 1000)
+                        detail = (await resp.aread()).decode('utf-8', errors='replace')
+                    else:
+                        ok, detail = await asyncio.wait_for(
+                            _probe_stream_result(resp), timeout=config.TENCENT_TIMEOUT,
+                        )
+                        if ok:
+                            elapsed = int((_time.monotonic() - started) * 1000)
                             return True, f'连通正常（{model}，{elapsed}ms）'
-                    return False, '上游未返回任何数据'
+                        if not detail.lstrip().startswith('{'):
+                            return False, detail
+                    # HTTP errors and SSE error frames must use the same policy.
+                    code, msg = _parse_error_body(detail, resp.status_code)
+                    if _is_channel_check(code, detail):
+                        if idx < len(paths) - 1:
+                            continue
+                        return False, ('这次调用被上游的渠道校验拦下了（已试过 ' +
+                                       '/'.join(paths) + '）—— 账号本身没问题；'
+                                       '请先升级到最新版本，仍不行就把这句反馈给维护者')
+                    return False, _explain_code(code, msg)
         return False, '所有候选路径均不可用'
+    except asyncio.TimeoutError:
+        return False, f'探测超时（{config.TENCENT_TIMEOUT} 秒内未收到模型输出）'
     except Exception as exc:  # noqa: BLE001
         return False, f'请求异常: {err_text(exc)}'
 
+
+
+_PROBE_EVENT_LIMIT = 64 * 1024
+
+
+def _probe_frame_result(raw: str) -> tuple[bool, str] | None:
+    """None means valid transport/role data that does not prove model availability."""
+    if raw.strip() == '[DONE]':
+        return False, '上游流已结束，但未返回模型输出'
+    try:
+        frame = json.loads(raw)
+    except (ValueError, TypeError):
+        return False, '上游返回了无效的流式数据'
+    if not isinstance(frame, dict):
+        return False, '上游返回了无效的流式数据'
+    if frame.get('error') or frame.get('code') not in (None, 0, '0'):
+        return False, raw  # Preserve the complete error, including displayTips.
+    for choice in frame.get('choices') or []:
+        if not isinstance(choice, dict):
+            continue
+        if choice.get('finish_reason'):
+            return True, ''
+        delta = choice.get('delta') or {}
+        if not isinstance(delta, dict):
+            continue
+        if any(delta.get(k) for k in ('content', 'reasoning_content', 'refusal')):
+            return True, ''
+        functions = [delta.get('function_call')]
+        functions.extend(t.get('function') for t in delta.get('tool_calls') or [] if isinstance(t, dict))
+        if any(isinstance(f, dict) and (f.get('name') or f.get('arguments')) for f in functions):
+            return True, ''
+    return None
+
+
+async def _probe_stream_result(resp) -> tuple[bool, str]:
+    """Read bounded SSE events; comments and empty roles are not model output."""
+    pending = b''
+
+    def inspect(event: bytes) -> tuple[bool, str] | None:
+        if event.lstrip().startswith(b'{'):
+            return _probe_frame_result(event.decode('utf-8', errors='replace'))
+        data = [line[5:].lstrip(b' ') for line in event.splitlines() if line.startswith(b'data:')]
+        if data:
+            return _probe_frame_result(b'\n'.join(data).decode('utf-8', errors='replace'))
+        return None
+
+    async for chunk in resp.aiter_bytes():
+        pending = (pending + chunk).replace(b'\r\n', b'\n')
+        if len(pending) > _PROBE_EVENT_LIMIT:
+            return False, '上游流式数据过大，无法确认模型可用'
+        # A pretty-printed JSON error under HTTP 200 is not an SSE event.
+        if pending.lstrip().startswith(b'{'):
+            continue
+        while b'\n\n' in pending:
+            event, pending = pending.split(b'\n\n', 1)
+            result = inspect(event)
+            if result is not None:
+                return result
+    if pending.strip():
+        result = inspect(pending)
+        if result is not None:
+            return result
+    return False, '上游未返回模型输出（仅心跳、空角色帧或连接提前结束）'
 
 
 def _is_channel_check(code: object, raw: str) -> bool:
@@ -1289,18 +1357,25 @@ def _is_channel_check(code: object, raw: str) -> bool:
     「内容审核拦截」，那种要按内容问题处理（不换路径）。
     码的字面量用拼接构造：它极易手抄成 1138/1128，而判据写错不会有人发现。
     """
-    text = str(code or '')
-    if '11-128' not in text and '11128' not in text:
+    text = str(code or '').strip()
+    if text not in ('11-128', '11128'):
         return False
     low = raw.lower()
+    if any(marker in low for marker in (
+        'blocked by security policy', 'unapproved channel', 'illegal api invocation',
+    )):
+        return False
     return ('渠道校验' in raw or 'channel verification' in low or 'official client' in low)
 
 def _parse_error_body(raw: str, status: int) -> tuple[int | str, str]:
-    """错误响应可能是 {code,msg} 信封，也可能是纯文本。"""
+    """Accept business envelopes, OpenAI error objects, and plain-text errors."""
     try:
         env = json.loads(raw)
         if isinstance(env, dict):
-            return env.get('code', status), str(env.get('msg') or env.get('message') or '')
+            error = env.get('error')
+            if isinstance(error, dict):
+                return error.get('code', status), str(error.get('message') or error.get('msg') or error)
+            return env.get('code', status), str(env.get('msg') or env.get('message') or error or '')
     except Exception:  # noqa: BLE001
         pass
     return status, raw.strip()[:200]

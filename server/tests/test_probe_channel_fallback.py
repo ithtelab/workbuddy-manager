@@ -143,6 +143,22 @@ class ProbeConsoleFallbackTest(unittest.TestCase):
         # 没有渠道校验文案 → 不命中（内容审核那类要保持原行为）
         self.assertFalse(tencent._is_channel_check(DASHED, "blocked by security policy"))
         self.assertFalse(tencent._is_channel_check(400, "没通过渠道校验"))
+        for unrelated in ('111280', 'prefix-11128', '11-128-extra'):
+            self.assertFalse(tencent._is_channel_check(unrelated, 'channel verification failed'))
+
+    def test_content_rejection_with_generic_channel_tips_does_not_switch(self) -> None:
+        for msg in ('Illegal API invocation from an unapproved channel', 'blocked by security policy'):
+            with self.subTest(msg=msg):
+                _PathAwareClient.seen = []
+                _PathAwareClient.body = (
+                    '{"code":11128,"msg":"' + msg + '",'
+                    '"displayTips":{"en":"This call failed channel verification, '
+                    'possibly because it was not sent from an official client."}}'
+                ).encode()
+                with mock.patch.object(config, 'http_client', _PathAwareClient):
+                    ok, _ = asyncio.run(tencent.probe_account(dict(AUTH), 'deepseek-v4.1-flash'))
+                self.assertFalse(ok)
+                self.assertEqual(len(_PathAwareClient.seen), 1)
 
 
 if __name__ == "__main__":
