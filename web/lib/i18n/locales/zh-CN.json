@@ -787,6 +787,7 @@
     "reasonInvalidKey": "API Key 无法识别",
     "reasonIpBlocked": "来源 IP 被 IP 规则拦截",
     "reasonRateLimited": "超出网关限速",
+    "reasonKeyAuthFlood": "同一 IP 反复使用无效 API Key，同类记录已折叠",
     "reasonKeyDisabled": "密钥已停用",
     "reasonKeyExpired": "密钥已过期",
     "reasonQuotaExhausted": "密钥 Token 额度已用尽",

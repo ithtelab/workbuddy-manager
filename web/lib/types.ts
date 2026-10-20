@@ -805,7 +805,11 @@ export interface IpAccessLog {
    * 拦截原因短码（issue #33）：missing_key / invalid_key / ip_blocked /
    * key_disabled / key_expired / quota_exhausted / credit_quota_exhausted /
    * ip_not_allowed / too_many_ips / realm_mismatch / model_not_allowed /
-   * rate_limited 等。
+   * rate_limited / key_auth_flood 等。
+   *
+   * `key_auth_flood` 不是「这一条被什么拦了」，而是一条**汇总标记**：同一个 IP
+   * 在一分钟窗口内用无效/缺失密钥刷了太多次，后面的同类记录被折叠，这一行代表
+   * 那批被折叠的请求（后端 `_auth_log_verdict`）。
    *
    * 稳定短码而非散文：展示侧按语言翻译，改文案不必迁移历史数据。
    * 存量记录为 null（那时没记原因），界面显示「未记录」。

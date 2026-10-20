@@ -5,6 +5,7 @@ import json
 import os
 from urllib.parse import urlsplit
 import logging
+import threading
 import time
 
 import httpx
@@ -247,6 +248,57 @@ def _rate_limited(key: dict) -> tuple[bool, int]:
     return limited, len(hits)
 
 
+# ── 未鉴权入口的入站日志采样 ─────────────────────────────
+# 「没有密钥」「密钥不认识」这两条路径**在校验密钥之前**就写库，任何匿名者都能
+# 触发（`/v1/chat/completions` 与 `/v1/usage` 都是这样）。攻击者只要写个循环
+# 用随机 token 打过来，就能以每请求一行的速度把 `ip_access_logs` 的两万行窗口
+# 顶掉——真正该看的扫描记录反而被自己人（同一个人）挤了出去，外加持续的写盘与
+# 行数清理开销。这是**匿名写放大**，与 `_log_ip` 里清洗/截断防的是同一类问题。
+#
+# 做法：按 (来源 IP, 原因) 做**窗口内计数**，前 N 次照常逐条记录（保留细节：
+# 路径、UA 都不一样，排查时有用），超出的折叠掉，并在本窗口第一次折叠时写一条
+# `key_auth_flood` 汇总行——运维能看到「这个 IP 在这一分钟里刷了更多」，但库里
+# 每分钟最多 N+1 行/IP。折叠不是丢弃信号，而是把「很多条一样的东西」压成一条
+# 仍能看出发生了什么的记录。
+#
+# 只对这两个**未鉴权可达**的原因采样：`ip_blocked` / `rate_limited` / 密钥层
+# 拒绝都要求先拿出一把已知密钥，写放大的成本已经由密钥本身承担，采样反而会
+# 藏掉「某把密钥被反复拒绝」的线索。
+#
+# 计数在进程内存里（与上面的每密钥限流同一口径）：单实例足够；`workers > 1`
+# 时每个进程各自计数，上限按进程数放大——仍然有界，可接受。
+_AUTH_FAIL_REASONS = frozenset({'missing_key', 'invalid_key'})
+_AUTH_LOG_WINDOW = 60
+_AUTH_LOG_PER_WINDOW = max(1, _env_int('WB_AUTH_LOG_PER_MIN', 5))
+# (ip, reason) -> [窗口起点, 本窗次数, 是否已写过汇总行]
+_auth_log_state: dict[tuple[str, str], list] = {}
+_auth_log_lock = threading.Lock()
+
+
+def _auth_log_verdict(ip: str, reason: str) -> str:
+    """返回 'log'（逐条记录）/ 'flood'（写一条汇总行）/ 'drop'（折叠掉）。"""
+    now = time.time()
+    key = (ip, reason)
+    with _auth_log_lock:
+        state = _auth_log_state.get(key)
+        if not state or now - state[0] >= _AUTH_LOG_WINDOW:
+            state = [now, 0, False]
+            _auth_log_state[key] = state
+        state[1] += 1
+        # 顺手清理过期项，避免被大量来源 IP 撑爆字典（键里含外部输入的 IP）。
+        # 只在真的很大、且不是每次请求都做时才扫（扫描本身是 O(n)）。
+        if len(_auth_log_state) > 4096 and state[1] % 64 == 0:
+            for k in [k for k, v in _auth_log_state.items()
+                      if now - v[0] >= _AUTH_LOG_WINDOW]:
+                _auth_log_state.pop(k, None)
+        if state[1] <= _AUTH_LOG_PER_WINDOW:
+            return 'log'
+        if not state[2]:
+            state[2] = True
+            return 'flood'
+        return 'drop'
+
+
 def _log_ip(ip: str, path: str, blocked: bool, ua: str | None,
             reason: str | None = None) -> None:
     """记录一次入站访问。**默认只记拦截**，放行不记（见下）。
@@ -278,9 +330,19 @@ def _log_ip(ip: str, path: str, blocked: bool, ua: str | None,
         污染事后排查（实测确认）。
       * 写入走 `db.add_ip_access_log`，由它负责行数上限（超出就丢最旧的），
         避免表无限增长直到磁盘写满。
+      * 「没有密钥」「密钥不认识」这两种**匿名可达**的原因再做一层窗口采样
+        （见 `_auth_log_verdict`）：每 IP 每分钟前几条照常记，其余折叠成一条
+        `key_auth_flood`。所以「一次都没记」不会发生，被折叠的那部分仍留了
+        一条能看出「这个 IP 在刷」的记录。
     """
     if not blocked and not config.AUDIT_ALL_ACCESS:
         return
+    if reason and reason in _AUTH_FAIL_REASONS:
+        verdict = _auth_log_verdict(ip, reason)
+        if verdict == 'drop':
+            return
+        if verdict == 'flood':
+            reason = 'key_auth_flood'
     db.add_ip_access_log(ip, path, blocked, ua, reason)
 
 

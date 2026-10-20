@@ -814,6 +814,7 @@
     "reasonInvalidKey": "API key not recognised",
     "reasonIpBlocked": "source IP blocked by an IP rule",
     "reasonRateLimited": "gateway rate limit exceeded",
+    "reasonKeyAuthFlood": "repeated invalid or missing API keys from one IP (duplicates collapsed)",
     "reasonKeyDisabled": "key is disabled",
     "reasonKeyExpired": "key has expired",
     "reasonQuotaExhausted": "key token quota exhausted",

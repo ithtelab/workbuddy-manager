@@ -787,6 +787,7 @@
     "reasonInvalidKey": "API 키를 인식할 수 없습니다",
     "reasonIpBlocked": "소스 IP가 IP 규칙에 의해 차단됨",
     "reasonRateLimited": "게이트웨이 속도 제한 초과",
+    "reasonKeyAuthFlood": "동일 IP에서 반복된 잘못된 API 키 (동일 기록 접음)",
     "reasonKeyDisabled": "키가 비활성화되었습니다",
     "reasonKeyExpired": "키가 만료되었습니다",
     "reasonQuotaExhausted": "키 토큰 할당량이 소진되었습니다",
