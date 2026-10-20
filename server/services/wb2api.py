@@ -789,6 +789,10 @@ def clear_account_cooling_state(uid: str) -> dict:
     account['consecutive_fails'] = 0
     if not bool(account.get('disabled')):
         account.pop('reason', None)
+    # 若此前因手动冷却/冻结而置位了 manual_disabled，一并解除
+    if account.get('manual_disabled') and any(k in str(account.get('manual_reason') or '') for k in ('冷却', 'cooling', '冻结', 'freeze')):
+        account['manual_disabled'] = False
+        account.pop('manual_reason', None)
 
     backup = path.with_name(path.name + '.force-clear.bak')
     shutil.copy2(path, backup)
@@ -849,6 +853,11 @@ def set_account_cooling_state(
     account['cool_kind'] = 0  # 0 = CoolHard (hard_credit)，保证全冷却兜底时也不会被选中
     account['reason'] = str(reason or '手动设置冷却').strip()
     account['soft_streak'] = 0
+    # 防护：上游 stock workbuddy2api 的定期签到（ReenableIfCredits）在查得余额大于 0 时
+    # 会调用 reviveCoolingLocked() 重置 until。为防止账号在签到后被自动解冻并消耗积分，
+    # 同步置位 manual_disabled（上游对其承诺：签到解冻绝不解除手动停用，选号完全排除，任务照常）。
+    account['manual_disabled'] = True
+    account['manual_reason'] = account['reason']
 
     _atomic_write_json(path, state)
     return {
@@ -932,7 +941,12 @@ async def force_clear_account_cooling(uid: str) -> tuple[bool, str, dict]:
         )
         if account is None:
             return False, '该账号不在上游账号池里', {}
-        if not account.get('cooling') and not account.get('rate_limited_models'):
+        has_freeze = bool(
+            account.get('manual_disabled') and any(
+                k in str(account.get('manual_reason') or '') for k in ('冷却', 'cooling', '冻结', 'freeze')
+            )
+        )
+        if not account.get('cooling') and not account.get('rate_limited_models') and not has_freeze:
             return True, '该账号当前没有冷却或模型级限流状态，无需清除', {}
 
     stopped, stop_message = await _set_upstream_running(False)
@@ -959,7 +973,12 @@ async def force_clear_account_cooling(uid: str) -> tuple[bool, str, dict]:
     )
     if account is None:
         return False, '状态已清除且上游已启动，但账号尚未进入账号池', changed
-    if account.get('cooling') or account.get('rate_limited_models'):
+    has_freeze_after = bool(
+        account.get('manual_disabled') and any(
+            k in str(account.get('manual_reason') or '') for k in ('冷却', 'cooling', '冻结', 'freeze')
+        )
+    )
+    if account.get('cooling') or account.get('rate_limited_models') or has_freeze_after:
         return False, '上游已重启，但冷却或模型限流状态仍然存在', changed
 
     return True, '已强制清除冷却与模型限流状态，上游已重启生效', changed
@@ -999,7 +1018,7 @@ async def force_set_account_cooling(
     )
     if account is None:
         return False, '状态已设定且上游已启动，但账号尚未进入账号池', changed
-    if not account.get('cooling'):
+    if not account.get('cooling') and not account.get('manual_disabled'):
         return False, '上游已重启，但冷却状态未生效（可能已过截止时间）', changed
 
     return True, '已强制设定冷却状态，上游已重启生效', changed

@@ -55,6 +55,8 @@ class ForceSetCoolingTest(unittest.TestCase):
         self.assertEqual(target['reason'], '防刷保护')
         self.assertEqual(target['cool_kind'], 0)
         self.assertEqual(target['soft_streak'], 0)
+        self.assertTrue(target.get('manual_disabled'))
+        self.assertEqual(target.get('manual_reason'), '防刷保护')
         self.assertEqual(target['credits'], 123)
         self.assertEqual(data['accounts']['other']['credits'], 9)
         self.assertTrue(pathlib.Path(result['backup']).is_file())

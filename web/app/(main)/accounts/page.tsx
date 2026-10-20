@@ -944,7 +944,17 @@ export default function AccountsPage() {
     // 于是被禁用的号按钮显示成「停用」，点一下反而给**已被禁用**的号再加一层
     // manual_disabled（越弄越糟），而真正需要的「启用」根本没有入口。
     const stopped = paused || viaBit || autoDisabled;
-    const hasClearableState = a.cooling === true || rateLimitedModels(a).length > 0;
+    const hasClearableState =
+      a.cooling === true ||
+      rateLimitedModels(a).length > 0 ||
+      (a.manual_disabled === true &&
+        Boolean(
+          a.manual_reason &&
+            (a.manual_reason.includes('冷却') ||
+              a.manual_reason.includes('cooling') ||
+              a.manual_reason.includes('冻结') ||
+              a.manual_reason.includes('freeze')),
+        ));
     // 手机卡片宽度只有 260–300px，必须换行（否则最右侧的停用/删除被裁掉）；
     // 桌面表格空间足够，固定一行 —— 否则窄的「操作」列会把图标挤成两行
     // （issue #151 的后续反馈）。表格容器自身可横向滚动，md 以上不再换行。
