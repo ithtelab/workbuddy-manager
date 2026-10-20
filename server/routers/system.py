@@ -85,12 +85,24 @@ async def upload_update_package(
     """上传离线升级包（发布页下载的那个 .tar.gz）。
 
     先写 `.part`、校验通过后再原子替换到最终位置：中途失败不会留下一个「看起来
-    能用」的半截包。校验三件事——大小上限、能不能当 tar.gz 解开、包内有没有
-    `.version`（不是本项目的包当场拒掉）。用户填了发布页 sha256 的话一并核对。
+    能用」的半截包。校验四件事——大小上限、能不能当 tar.gz 解开、包内有没有
+    `.version`（不是本项目的包当场拒掉）、发布页 sha256。
+
+    **摘要默认必填**：安装离线包会让包内的代码与依赖在本机执行（见
+    updater.allow_unverified_package 的说明），不核对摘要等于把「面板会话」
+    直接升级成「主机代码执行」。确实拿不到摘要的离线环境请显式设
+    `WB_ALLOW_UNVERIFIED_PACKAGE=1`。
     """
     want = (expected_sha256 or '').strip().lower()
     if want and not _SHA256_RE.match(want):
         raise HTTPException(status_code=400, detail='sha256 要填发布页上那串 64 位十六进制')
+    if not want and not updater.allow_unverified_package():
+        raise HTTPException(
+            status_code=400,
+            detail='请填写发布页上的 sha256：安装升级包会在本机执行包内代码，'
+                   '没有摘要就无法确认包没被替换。确实拿不到摘要的离线环境，'
+                   '可在服务端设 WB_ALLOW_UNVERIFIED_PACKAGE=1 后重试。',
+        )
 
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp_path = updater.PACKAGE_FILE.with_suffix('.part')

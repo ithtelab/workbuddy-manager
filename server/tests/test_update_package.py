@@ -106,7 +106,15 @@ class _Base(unittest.TestCase):
             db._conn.close()
         db._conn = None
 
-    def _upload(self, path: Path, expected: str = ''):
+    def _upload(self, path: Path, expected: str | None = None):
+        """上传一个包。`expected=None` = 自动填**正确**的摘要。
+
+        摘要现在是必填项（见 updater.allow_unverified_package）：绝大多数用例
+        关心的是"包本身能不能收"，不该被摘要门槛挡住，所以默认替它们算好；
+        专门测"不填摘要"的用例显式传 `expected=''`。
+        """
+        if expected is None:
+            expected = hashlib.sha256(path.read_bytes()).hexdigest()
         with open(path, 'rb') as fh:
             return self.client.post(
                 '/api/system/update-package',
@@ -142,6 +150,24 @@ class UploadEndpointTest(_Base):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()['expected_sha256'], digest, '摘要要归一化成小写存下来')
 
+    def test_upload_without_digest_is_refused(self) -> None:
+        """不填摘要 = 无法确认包没被替换，必须当场拒收（漏洞修复的守卫）。"""
+        pkg = _make_package(self.root / 'nodigest.tar.gz')
+        r = self._upload(pkg, expected='')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('sha256', r.text)
+        self.assertFalse(updater.PACKAGE_FILE.exists(), '拒收时不该留下包')
+        self.assertFalse(updater.package_meta().get('present'))
+
+    def test_upload_without_digest_allowed_by_explicit_env(self) -> None:
+        """显式声明「我知道自己在装什么」的离线环境仍可放行。"""
+        pkg = _make_package(self.root / 'nodigest-ok.tar.gz')
+        with mock.patch.dict(os.environ, {'WB_ALLOW_UNVERIFIED_PACKAGE': '1'}):
+            r = self._upload(pkg, expected='')
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(r.json()['expected_sha256'], '没填就是没填，不能编一个')
+        self.assertTrue(updater.PACKAGE_FILE.is_file())
+
     def test_non_package_is_refused(self) -> None:
         junk = self.root / 'junk.tar.gz'
         junk.write_bytes(os.urandom(200_000))
@@ -149,7 +175,6 @@ class UploadEndpointTest(_Base):
         self.assertEqual(r.status_code, 400)
         self.assertIn('读不了', r.text)
         self.assertFalse(updater.PACKAGE_FILE.exists())
-
     def test_package_without_version_marker_is_refused(self) -> None:
         pkg = _make_package(self.root / 'c.tar.gz', with_version=False)
         r = self._upload(pkg)
@@ -208,6 +233,21 @@ class StartUpdateFromPackageTest(_Base):
         env = got['env']
         self.assertEqual(env['WB_UPDATE_PACKAGE'], str(updater.PACKAGE_FILE))
         self.assertEqual(env['WB_UPDATE_PACKAGE_SHA256'], digest)
+
+    def test_stored_package_without_digest_is_refused_at_install(self) -> None:
+        """旧版面板存下的"无摘要包"也不能直接装：上传端点不是唯一入口。"""
+        pkg = _make_package(self.root / 'legacy.tar.gz')
+        with mock.patch.dict(os.environ, {'WB_ALLOW_UNVERIFIED_PACKAGE': '1'}):
+            self.assertEqual(self._upload(pkg, expected='').status_code, 200)
+        got = self._spawn_env(target='manager', source='uploaded')
+        self.assertFalse(got['ok'], '没有摘要的包必须拒绝安装')
+        self.assertIn('sha256', got['message'])
+        # 显式声明风险后才放行（同样是那份包）
+        with mock.patch.dict(os.environ, {'WB_ALLOW_UNVERIFIED_PACKAGE': '1'}):
+            allowed = self._spawn_env(target='manager', source='uploaded')
+        self.assertTrue(allowed['ok'], allowed['message'])
+        self.assertNotIn('WB_UPDATE_PACKAGE_SHA256', allowed['env'],
+                         '没填摘要就不该传一个假摘要给更新器')
 
     def test_release_source_does_not_pass_package_env(self) -> None:
         pkg = _make_package(self.root / 'g.tar.gz')

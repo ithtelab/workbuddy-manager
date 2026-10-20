@@ -70,6 +70,20 @@ def _read_package_version(path: Path) -> str:
     return ''
 
 
+def allow_unverified_package() -> bool:
+    """是否允许安装**没有发布页摘要**的离线升级包（默认：不允许）。
+
+    为什么默认拒绝：离线包没有签名链，而安装链路本身就能执行任意代码 ——
+    包内 `server/requirements.txt` 会在替换代码**之前**被 `pip install -r` 执行
+    （可指向任意索引/URL），随后 `server/` 整目录替换并重启进程。也就是说，
+    「面板管理员」到「主机代码执行」之间原本只隔着一次摘要核对。
+    Windows 更新器对未验证包要求显式 `-AllowUnverified`；这里给同名语义的
+    `WB_ALLOW_UNVERIFIED_PACKAGE=1`，只在确实拿不到发布页摘要的离线环境里用。
+    """
+    value = (os.environ.get('WB_ALLOW_UNVERIFIED_PACKAGE') or '').strip().lower()
+    return value in ('1', 'true', 'yes', 'on')
+
+
 def package_meta() -> dict:
     """已上传升级包的元信息 + 文件是否还在（界面据此决定按钮可不可点）。"""
     raw = db.get_setting(PACKAGE_META_KEY, {}) or {}
@@ -536,6 +550,15 @@ def start_update(target: str, *, source: str = 'release') -> tuple[bool, str]:
             return False, '还没有上传升级包（在「离线升级包」里选一个发布包上传后再试）'
         package_path = PACKAGE_FILE
         package_expected = str(meta.get('expected_sha256') or '')
+        # 早于「摘要必填」的那版面板可能已经存下了一个无摘要的包：这里再拦一次，
+        # 不能只靠上传端点（那层只挡新上传）。判定与上传端点同源，见
+        # allow_unverified_package 的说明。
+        if not package_expected and not allow_unverified_package():
+            return False, (
+                '这个离线升级包没有发布页 sha256 可供核对，已拒绝安装。'
+                '请重新上传并填写发布页上那串 64 位 sha256；'
+                '确实无法核对的离线环境，设 WB_ALLOW_UNVERIFIED_PACKAGE=1 后重试。'
+            )
     if os.name == 'nt' and config.WB2API_MODE == 'native':
         return False, (
             'Windows 原生部署暂不支持网页一键更新；'
