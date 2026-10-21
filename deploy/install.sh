@@ -245,6 +245,22 @@ step "2/4 管理端 WorkBuddy Manager"
 
 mkdir -p "${APP_DIR}/data"
 
+# 服务账号：uid 10001 与容器形态对齐（上游容器内的进程就是这个 uid，双方才能
+# 共享 auths/ 与 config.json 的写权限）。uid 被占时退回 root 运行并明说，不硬凑
+# 别的 uid（那会让管理端写不了上游目录，问题更隐蔽）。
+RUN_USER=""
+if id workbuddy >/dev/null 2>&1; then
+  RUN_USER=workbuddy
+  ok "服务账号已存在：workbuddy"
+elif getent passwd 10001 >/dev/null 2>&1; then
+  warn "uid 10001 已被用户 $(id -un 10001) 占用，管理端将继续以 root 运行（沙箱降级）"
+else
+  useradd --system --uid 10001 --user-group \
+          --home-dir "${APP_DIR}" --shell /usr/sbin/nologin workbuddy
+  RUN_USER=workbuddy
+  ok "已创建服务账号 workbuddy（uid 10001）"
+fi
+
 if [ "${SRC_DIR}" != "${APP_DIR}" ]; then
   info "同步代码到 ${APP_DIR}"
   cp -r "${SRC_DIR}/server" "${APP_DIR}/"
@@ -306,10 +322,58 @@ sed -e "s#/opt/workbuddy-manager#${APP_DIR}#g" \
     -e "s#WB_UPSTREAM_CONFIG=/opt/workbuddy2api/config.json#WB_UPSTREAM_CONFIG=${UPSTREAM_DIR}/config.json#g" \
     "${APP_DIR}/deploy/workbuddy-web.service" > /etc/systemd/system/workbuddy-web.service
 
-# 若 venv 可用，改写 ExecStart 指向 venv
+# 若 venv 可用，改写 ExecStart 指向 venv（监听地址维持模板里的 127.0.0.1：
+# 公网访问一律经反向代理，直接暴露管理面是被打穿的常见入口）
 if [ "$RT_PY" != "$PY" ]; then
-  sed -i "s#^ExecStart=.*#ExecStart=${APP_DIR}/venv/bin/python -m uvicorn server.main:app --host 0.0.0.0 --port ${MANAGER_PORT}#" \
+  sed -i "s#^ExecStart=.*#ExecStart=${APP_DIR}/venv/bin/python -m uvicorn server.main:app --host 127.0.0.1 --port ${MANAGER_PORT}#" \
     /etc/systemd/system/workbuddy-web.service
+fi
+
+# 降权与 docker 组：
+#   · root 回退（uid 冲突）时，去掉 unit 里的 User/Group 行，服务才能启动；
+#   · 上游为容器形态时管理端要访问 docker.sock（docker 组等同宿主 root，
+#     native 形态的用户可用 WBM_NO_DOCKER_GROUP=1 跳过，install 会顺手删掉
+#     unit 里的 SupplementaryGroups 行）。
+if [ -z "$RUN_USER" ]; then
+  sed -i '/^User=/d;/^Group=/d;/^SupplementaryGroups=/d' /etc/systemd/system/workbuddy-web.service
+  warn "服务以 root 运行：建议释放 uid 10001 后重跑本脚本"
+elif [ "${WBM_NO_DOCKER_GROUP:-0}" = "1" ]; then
+  sed -i '/^SupplementaryGroups=/d' /etc/systemd/system/workbuddy-web.service
+  info "按要求未加入 docker 组：容器形态上游的「重载 / 更新」界面功能将不可用"
+elif getent group docker >/dev/null 2>&1; then
+  usermod -aG docker "$RUN_USER"
+  warn "已将 ${RUN_USER} 加入 docker 组（等同宿主 root，仅用于操作上游容器）"
+else
+  sed -i '/^SupplementaryGroups=/d' /etc/systemd/system/workbuddy-web.service
+  warn "宿主无 docker 组（native 部署？），已去掉 SupplementaryGroups"
+fi
+
+# 目录属主交给服务账号：代码只读即可，data/ 要可写。
+# 上游侧只对齐 config.json（auths/data 已在步骤 1 chown 为 10001，同一 uid）。
+if [ -n "$RUN_USER" ]; then
+  chown -R "$RUN_USER:$RUN_USER" "${APP_DIR}"
+  [ -f "${UPSTREAM_DIR}/config.json" ] && \
+    chown "$RUN_USER:$RUN_USER" "${UPSTREAM_DIR}/config.json" 2>/dev/null || true
+fi
+
+# polkit 授权：面板「一键更新」在宿主形态下由服务进程执行
+# `systemctl restart workbuddy-web`，非 root 需要显式授权。只放行这一个
+# unit 的管理动作，不给任何其他权限。没有 polkit 的精简系统不写
+# （那种环境一键更新会在重启一步提示手动执行，新代码本身已就位）。
+if [ -n "$RUN_USER" ] && [ -d /etc/polkit-1/rules.d ]; then
+  cat > /etc/polkit-1/rules.d/49-workbuddy-web.rules <<'POLKIT'
+// WorkBuddy Manager：允许服务账号重启自己的 unit（见 deploy/install.sh）。
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "workbuddy") {
+        var unit = action.lookup("unit");
+        if (unit == "workbuddy-web.service") {
+            return polkit.Result.YES;
+        }
+    }
+});
+POLKIT
+  ok "已写入 polkit 规则：${RUN_USER} 可重启 workbuddy-web.service（一键更新需要）"
 fi
 
 systemctl daemon-reload
@@ -378,7 +442,7 @@ cat <<EOF
   │  部署完成                                            │
   └──────────────────────────────────────────────────────┘
 
-  管理端      http://127.0.0.1:${MANAGER_PORT}   （监听 0.0.0.0:${MANAGER_PORT}；建议用防火墙/反代收紧）
+  管理端      http://127.0.0.1:${MANAGER_PORT}   （仅监听 127.0.0.1；公网访问请走反向代理）
   上游        http://127.0.0.1:${UPSTREAM_PORT}   （workbuddy2api，仅监听 127.0.0.1）
   配置目录    ${APP_DIR}
   账号目录    ${UPSTREAM_DIR}/auths

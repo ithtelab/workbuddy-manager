@@ -1703,7 +1703,11 @@ def restart_service(rep: Reporter) -> None:
         return
     rc, _ = run(['systemctl', 'restart', SERVICE_NAME], rep=rep, check=False)
     if rc != 0:
-        raise RuntimeError(f'重启服务失败（systemctl 返回 {rc}），请手动执行 systemctl status {SERVICE_NAME}')
+        # 服务降权为专用账号后，没有 polkit 授权的机器上会走到这里：
+        # 新代码已落盘，只差重启这一步，所以提示必须给出可直接照做的命令。
+        raise RuntimeError(
+            f'重启服务失败（systemctl 返回 {rc}）。新代码已就位，'
+            f'请在服务器上手动执行：systemctl restart {SERVICE_NAME}')
     rep.log('服务已重启')
 
 

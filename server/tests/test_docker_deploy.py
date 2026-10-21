@@ -172,15 +172,11 @@ class RestartBehaviorTest(unittest.TestCase):
 class UpstreamUpdateGuardTest(unittest.TestCase):
     """「能否更新上游」按**实际能力**判定，不按是否容器。
 
-    这是本项目的一处**判断修正**，值得写下来：
-      初版按「在容器里就不允许更新上游」实现，理由写成"挂 docker.sock 等于把
-      宿主 root 交给容器，比少一个功能危险得多"。这个理由**不成立**——宿主
-      部署时本服务本来就是 root 运行（systemd 单元无 User=、安装脚本要求 root），
-      而 root 进程本来就能 `docker run -v /:/host` 拿到宿主文件系统。也就是说
-      宿主部署的权限**已经等价于**挂 docker.sock。
-
-    结论：按能力判定才正确 —— 容器挂了 socket 就能（与宿主部署对齐），宿主没装
-    docker 反而不能。按「是否容器」判会把可用场景误判为不可用。
+    历史注记：初版按「在容器里就不允许」实现；后来修正为按能力判定（容器挂了
+    socket 就能，宿主没装 docker 反而不能），这个判定至今正确。当年支撑它的
+    另一个论据（"宿主本来就是 root，与挂 socket 权限等价"）已随 2026-10-21
+    安全检查失效：宿主形态降权为专用账号，docker.sock 也改为显式开启，两种
+    形态都不再默认持有宿主 root。
     """
 
     def _start(self, target: str, docker_ok: bool):
@@ -223,8 +219,8 @@ class UpstreamUpdateGuardTest(unittest.TestCase):
     def test_capability_not_derived_from_container(self) -> None:
         """关键断言：能力**不看**是否容器。
 
-        容器挂了 socket 就能更新上游；按容器判定会把这种（我们推荐的默认
-        配置）误判为不可用。
+        容器挂了 socket 就能更新上游；按容器判定会把这种（显式开启 docker.sock
+        后的）部署误判为不可用。
         """
         from server.services import updater
         with mock.patch.object(updater, 'in_container', return_value=True),                 mock.patch.object(updater, 'can_control_docker', return_value=True):
@@ -674,19 +670,29 @@ class DockerAssetsTest(unittest.TestCase):
         self.assertTrue(any('/opt/workbuddy2api' in v for v in vols),
                         '未挂载上游目录 —— 容器版将无法更新上游')
 
-    def test_docker_socket_mounted_for_full_capability(self) -> None:
-        """默认挂载 docker.sock，使容器版与宿主部署能力对齐。
+    def test_docker_socket_is_opt_in(self) -> None:
+        """docker.sock **默认不挂**，以注释形式保留显式开启的路径（2026-10-21
+        安全检查 H2）。
 
-        这是**判断修正**：初版刻意不挂，理由写成"挂了等于把宿主 root 交给容器"。
-        但宿主部署本来就是 root（systemd 无 User=），而 root 进程本来就能
-        `docker run -v /:/host` —— 两者权限等价，不挂只是让功能残缺。
-        若不想要，注释掉即可（功能会自动降级并如实提示）。
+        曾经的默认是挂载，理由是"宿主部署本来就是 root，两者权限等价"。该论据
+        随宿主形态降权（unit 专用账号 + 沙箱指令）不再成立：容器隔离的意义正是
+        阻断 Web 应用漏洞直达宿主，把宿主 root 交给一个持有全部账号凭据的
+        Web 进程不该是默认状态。挂载后功能不会静默失效（界面如实降级提示），
+        想要完整能力的用户按注释两步开启。
         """
+        compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
         import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        dc = yaml.safe_load(compose)
         vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
-        self.assertTrue(any('docker.sock' in v for v in vols),
-                        '未挂 docker.sock —— 容器版将无法重载/更新上游')
+        self.assertFalse(any('docker.sock' in v for v in vols),
+                         'docker.sock 不应默认挂载 —— 想要完整能力请按注释显式开启')
+        groups = [str(g) for g in (dc['services']['workbuddy-manager'].get('group_add') or [])]
+        self.assertFalse(groups, 'group_add 应与挂载一同默认关闭')
+        # 开启路径必须完整可照做：挂载行与 group_add 都以注释保留
+        self.assertIn('# - /var/run/docker.sock:/var/run/docker.sock', compose,
+                      '挂载行的注释模板丢了 —— 用户想开也不知道怎么写')
+        self.assertIn('# group_add:', compose,
+                      'group_add 的注释模板丢了 —— 只挂 socket 不进组照样 EACCES')
 
     def test_env_file_actually_reaches_both_deployments(self) -> None:
         """`.env` 里的可选项（出口代理等）必须真能到达进程。
@@ -739,15 +745,17 @@ class DockerSocketPreflightTest(unittest.TestCase):
     """
 
     def test_compose_group_add_uses_env_gid(self) -> None:
-        """compose 要能用宿主**真实的** docker 组 GID 给容器补组。"""
-        import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
-        svc = dc['services']['workbuddy-manager']
-        groups = [str(g) for g in (svc.get('group_add') or [])]
-        self.assertTrue(groups,
-                        '没配 group_add —— 容器内 uid 10001 用不了挂进来的 docker.sock')
-        self.assertTrue(any('DOCKER_GID' in g for g in groups),
-                        f'group_add 没用 DOCKER_GID 变量：{groups}（宿主 GID 因机器而异，写死必错）')
+        """开启 docker.sock 后，compose 要能用宿主**真实的** docker 组 GID 补组。
+
+        挂载与 group_add 默认都是注释状态（opt-in，见 DockerAssetsTest 的
+        docker.sock 用例）；这里钉住的是**注释模板本身**要能直接照抄：宿主 GID
+        因机器而异，必须用 DOCKER_GID 变量而不是写死。
+        """
+        compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
+        self.assertIn('#   - "${DOCKER_GID:-999}"', compose,
+                      '注释模板里的 group_add 没用 DOCKER_GID 变量 —— 照抄也会因 GID 不对而 EACCES')
+        self.assertIn('stat -c', compose,
+                      '注释里要给出取 GID 的命令：stat -c %g /var/run/docker.sock')
         env = (_ROOT / '.env.example').read_text(encoding='utf-8')
         self.assertIn('DOCKER_GID', env, '.env.example 没说明 DOCKER_GID 怎么取')
         self.assertIn('stat -c', env,

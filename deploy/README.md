@@ -357,24 +357,28 @@ docker compose up -d --build workbuddy-manager
 
 #### 容器内操作 docker（更新上游 / 重载配置）
 
-容器以 uid 10001 运行，而宿主的 `/var/run/docker.sock` 通常归 `root:docker`
-（GID 998/999）—— 不在那个组里就是 `permission denied`。compose 已用 `group_add`
-引用 `DOCKER_GID`，把本机的真实值填进 `.env` 即可：
+**默认不挂 docker.sock**：挂上它等于把宿主 root 权限交给管理端容器（`docker run -v /:/host`
+即可拿到宿主文件系统），这不该是默认状态。需要「保存设置后自动重载上游容器 / 一键更新上游」
+这些界面功能时，再按下面两步显式开启：
+
+1. 把 `docker-compose.yml` 里 `docker.sock` 挂载与 `group_add` 两段的注释解开；
+2. 把宿主 socket 的真实 GID 填进 `.env`（容器以 uid 10001 运行，宿主的
+   `/var/run/docker.sock` 通常归 `root:docker`，不在那个组里就是 `permission denied`）：
 
 ```bash
 echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
 docker compose up -d workbuddy-manager
 ```
 
-不配也不会静默失败：更新上游时会提示你去取真实 GID。完全不想要容器操作 docker
-的话，把 compose 里挂 `docker.sock` 那一行注释掉即可，相关功能会如实降级。
+不配也不会静默失败：更新上游时会提示你去取真实 GID。不挂 socket 时，相关功能
+会如实降级为「请到宿主机执行 docker compose ...」。
 
 ---
 
 ## 五、目录与端口
 
 ```
-管理端   /opt/workbuddy-manager         :7864   监听 0.0.0.0（经反代对外；建议防火墙收紧）
+管理端   /opt/workbuddy-manager         :7864   仅监听 127.0.0.1（公网访问走反向代理）
   ├─ server/        后端代码
   ├─ web/out/       前端静态产物
   ├─ data/          SQLite、users.json（含会话密钥）

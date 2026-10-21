@@ -141,7 +141,8 @@
 **② Docker（自己起容器）**
 
 ```bash
-docker run -d --name workbuddy-manager -p 7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/ithtelab/workbuddy-manager:latest
+# 端口只绑本机：公网访问请走反向代理（HTTPS + 访问控制），直接暴露管理面风险高
+docker run -d --name workbuddy-manager -p 127.0.0.1:7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/ithtelab/workbuddy-manager:latest
 ```
 
 **③ 服务器一键脚本（装依赖、拉包、配 systemd）**
