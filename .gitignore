@@ -27,6 +27,11 @@ config.json
 .idea/
 .vscode/
 .zcode/
+# 本机运行助手（工作笔记可能含部署细节与凭据痕迹，严禁提交；.workbuddy/ 的
+# memory/2026-10-15.md 就曾明文记录过管理端口令——离线比对确认已失效，但
+# 一次 git add . 就能把它写进历史）
+.workbuddy/
+dev/start_local.py
 *.log
 next-env.d.ts
 *.tsbuildinfo

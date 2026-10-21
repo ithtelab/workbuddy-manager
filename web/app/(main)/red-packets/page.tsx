@@ -10,6 +10,7 @@ import type {
   CreatedRedPacket, RedPacket, RedPacketDetail, RedPacketKind, RedPacketMode,
 } from '@/lib/types';
 import {fmtDateTime, fmtNumber} from '@/lib/format';
+import {withBasePath} from '@/lib/base-path';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
@@ -149,9 +150,11 @@ export default function RedPacketsPage() {
   /**
    * 抽奖链接。用 query 参数而不是路径段：静态导出下动态路径要预生成所有可能的
    * code（不可能），而 query 不需要任何路由支持 —— `/claim/` 是普通静态页。
+   * 必须经 withBasePath：子路径部署（NEXT_PUBLIC_BASE_PATH 非空）下，裸拼
+   * `/claim/` 会落到域名根上，复制出去的链接 404。
    */
   function claimUrl(code: string): string {
-    return `${window.location.origin}/claim/?code=${encodeURIComponent(code)}`;
+    return `${window.location.origin}${withBasePath('/claim/')}?code=${encodeURIComponent(code)}`;
   }
 
   async function copyLink(code: string) {
