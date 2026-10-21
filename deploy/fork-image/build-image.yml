@@ -96,7 +96,7 @@ jobs:
     if: github.ref_name == github.event.repository.default_branch
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # 先把前端构建好，再交给 Dockerfile 复用（Dockerfile 的逻辑是「有 web/out
       # 就直接用，没有才在容器里现场构建」）。好处有两个：
@@ -105,7 +105,7 @@ jobs:
       #   · 前端构建失败会在**构建镜像之前**就报出来，不必等几分钟才发现。
       # Node 版本与 Dockerfile 里的 node:20-slim 对齐。
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
           cache: npm
@@ -176,13 +176,13 @@ jobs:
 
       - name: 设置 QEMU
         # amd64 的机器上构建 arm64 层需要它（模拟出 arm64 执行环境）
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: 设置 Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: 登录 GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -190,14 +190,14 @@ jobs:
 
       - name: 登录 Docker Hub
         if: steps.hub.outputs.enabled == '1'
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: 构建并推送（amd64 + arm64）
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           # 两个架构合并成一个 manifest list，本地镜像库放不下它，

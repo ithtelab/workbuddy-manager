@@ -52,13 +52,13 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=${TAG#v}" >> $GITHUB_OUTPUT
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ steps.vars.outputs.tag }}
           fetch-depth: 0
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           # 22 起才有 ESM 的 TypeScript type stripping：几处「借 Node 直接跑真实 .ts
           # 实现」的用例（async-state / display-prefs 等）在 20 上会自我 skip —— 也就是
@@ -173,7 +173,7 @@ jobs:
 
       - name: 安装 Go（校验随包上游）
         if: steps.pack.outputs.has_upstream == '1'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: ${{ steps.pack.outputs.stage }}/upstream/go.mod
           cache: false
@@ -366,17 +366,17 @@ jobs:
         # 跨架构构建 arm64 层需要它：runner 是 amd64，模拟出 arm64 执行环境
         continue-on-error: true
         if: github.event_name == 'push' || inputs.tag != ''
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: 设置 Buildx
         continue-on-error: true
         if: github.event_name == 'push' || inputs.tag != ''
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: 登录 GHCR
         continue-on-error: true
         if: github.event_name == 'push' || inputs.tag != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -390,7 +390,7 @@ jobs:
         continue-on-error: true
         if: github.event_name == 'push' || inputs.tag != ''
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           # 多平台必须走 buildx 并直接 push：本地镜像库放不下多架构的 manifest list
@@ -468,13 +468,13 @@ jobs:
     needs: release
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.release.outputs.tag }}
           # build.ps1 用 git describe 取版本号写进 exe 的文件属性
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
           cache: npm
