@@ -14,6 +14,7 @@ from fastapi import Depends, HTTPException, Request
 
 from . import config, tokensvc
 from .iputil import client_ip
+from .iputil import _is_trusted_proxy  # noqa: SLF001 —— 与 client_ip 同一份可信代理判据
 
 _fail: dict[str, list] = {}
 MAX_FAILS = 5
@@ -36,6 +37,22 @@ def verify_pwd(pwd: str, stored: str) -> bool:
         return hmac.compare_digest(digest.hex(), expect)
     except Exception:
         return False
+
+
+_DUMMY_HASH: str | None = None
+
+
+def dummy_verify(pwd: str) -> None:
+    """对一份固定的哑哈希完整跑一遍 PBKDF2，丢弃结果。
+
+    登录时用户不存在会短路跳过 PBKDF2（260000 轮，毫秒级时间差），响应快慢
+    因此暴露"用户名是否存在"——管理端默认必有 admin，价值有限，但公网服务
+    不该留这个侧信道。用户不存在的分支先跑一次本函数，把耗时对齐。
+    """
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = make_hash(secrets.token_urlsafe(24))
+    verify_pwd(pwd, _DUMMY_HASH)
 
 
 # ── 用户存储 ─────────────────────────────────────────────
@@ -288,6 +305,10 @@ def cookie_secure(request: Request) -> bool:
     """会话 cookie 是否带 `Secure` 标志。`WB_SECURE_COOKIE` = auto | true | false。
 
     `auto` 的判据是 `X-Forwarded-Proto`（反代终止 TLS 时由它告知原始协议）。
+    该头与 X-Real-IP 一样是普通请求头，只在 **TCP 对端是可信代理**时才采信
+    （与 `iputil.client_ip` 同一份判据）：直连的攻击者发
+    `X-Forwarded-Proto: http` 不能让 HTTPS 部署漏发 `Secure`。
+
     **这里有个隐蔽的失效形态**：反代没传该头时（1Panel / nginx 默认配置就未必传），
     后端只看到明文 HTTP，于是 `auto` 静默地不加 `Secure` —— 而用户访问的确实是
     HTTPS，他以为自己受保护。这类「以为安全其实没有」比明确的报错更危险，
@@ -298,7 +319,10 @@ def cookie_secure(request: Request) -> bool:
         return True
     if setting in ('false', '0'):
         return False
-    proto = request.headers.get('x-forwarded-proto', request.url.scheme)
+    proto = request.scope.get('scheme') or request.url.scheme
+    peer = request.client.host if request.client else ''
+    if config.TRUST_PROXY and _is_trusted_proxy(peer):
+        proto = request.headers.get('x-forwarded-proto', proto)
     return proto == 'https'
 
 
@@ -377,7 +401,14 @@ def login_blocked(ip: str, username: str | None = None) -> bool:
         key = username.lower()
         ucnt, ufirst = _user_fail.get(key, [0, 0.0])
         if ucnt >= MAX_FAILS and (now - ufirst) < LOCK_SECONDS:
-            return True
+            # 按用户名的锁定是为了防「换 IP 爆破同一账号」，但它同时给了匿名者
+            # 一件武器：对 admin 提交 5 次错误密码就能把**从未输错**的管理员
+            # 也锁在门外（远程锁定 DoS）。所以这里只拦**自己也失败过**的来源
+            # IP：爆破者每个 IP 都有失败记录，照样被拦；干净的管理员 IP 不受
+            # 牵连（它自己的输错次数仍由上面的按 IP 计数管着）。
+            icnt, ifirst = _fail.get(ip, [0, 0.0])
+            if icnt > 0 and (now - ifirst) < LOCK_SECONDS:
+                return True
     return False
 
 

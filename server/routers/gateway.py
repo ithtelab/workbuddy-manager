@@ -431,6 +431,23 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             logger.warning('累计用量失败（不影响请求）: %s', exc)
 
 
+def _global_ip_blocked(ip: str) -> bool:
+    """全局入站 IP 规则是否拦截该来源（未启用安全策略时恒为放行）。
+
+    从 `_authorize` 抽出：`/v1/usage` 与调用路径必须同口径——它虽是只读端点，
+    但同样暴露密钥元数据与余量，被全局黑名单拦住的来源不该换条路就能查
+    （2026-10-21 安全检查 L4）。
+    """
+    sec = get_security_config()
+    if not sec.get('enabled'):
+        return False
+    rules = [
+        {'kind': r['kind'], 'cidr': r['cidr']}
+        for r in db.query('SELECT kind, cidr FROM ip_rules')
+    ]
+    return not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist'))
+
+
 def _authorize(request: Request, model: str | None,
                *, is_model_list: bool = False,
                mapped: str | None = None) -> tuple[dict | None, str, JSONResponse | None]:
@@ -465,16 +482,10 @@ def _authorize(request: Request, model: str | None,
     mapped = _map_model(model) if mapped is None else mapped
 
     # 全局入站 IP 规则
-    sec = get_security_config()
-    if sec.get('enabled'):
-        rules = [
-            {'kind': r['kind'], 'cidr': r['cidr']}
-            for r in db.query('SELECT kind, cidr FROM ip_rules')
-        ]
-        if not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist')):
-            _log_ip(ip, path, True, ua, 'ip_blocked')
-            _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
-            return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
+    if _global_ip_blocked(ip):
+        _log_ip(ip, path, True, ua, 'ip_blocked')
+        _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+        return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
     # 注意这一行**在密钥校验之前**：密钥层面的拒绝（停用 / 过期 / 配额用尽 /
     # 模型与版本不符 / IP 白名单）发生在这之后，若就这样返回，日志里会显示
@@ -663,6 +674,12 @@ def key_usage(request: Request):
     if not key:
         _log_ip(ip, path, True, ua, 'invalid_key')
         return _oai_error('API Key 无效', 401, 'authentication_error', 'invalid_api_key')
+
+    # 全局入站 IP 规则：与其他 /v1 入口同口径（见 _global_ip_blocked 的说明）。
+    if _global_ip_blocked(ip):
+        _log_ip(ip, path, True, ua, 'ip_blocked')
+        _record(key, ip, '', '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+        return _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
     def allowance(limit: int | None, used: int | None) -> dict:
         used_n = int(used or 0)

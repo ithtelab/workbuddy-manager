@@ -253,8 +253,14 @@ class LoginLockoutTest(unittest.TestCase):
             security.record_fail(f'172.{i // 250}.{i % 250}.9', f'flood{i}')
         self.assertTrue(security.login_blocked('4.4.4.4', 'admin'),
                         '窗口内的 admin 锁定条目被灌入操作挤掉了')
+        # 按用户名维度的锁定只拦「自己也失败过」的来源 IP（2026-10-21 安全
+        # 检查 L2）：干净的管理员 IP 不该被匿名者的失败计数锁在门外。
+        self.assertFalse(security.login_blocked('5.5.5.5', 'admin'),
+                         '从未输错的来源不该被按用户名的锁定拦截（远程锁定 DoS）')
+        # 但「失败过的」来源仍要被拦——这就是防换 IP 爆破的那一半。
+        security.record_fail('5.5.5.5', 'someone-else')
         self.assertTrue(security.login_blocked('5.5.5.5', 'admin'),
-                        '按用户维度的 admin 锁定同样不该被挤掉')
+                        '自己失败过的来源在用户名锁定期内必须被拦')
 
     def test_successful_login_clears_counter(self) -> None:
         for _ in range(3):
