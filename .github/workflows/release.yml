@@ -458,7 +458,7 @@ jobs:
         continue-on-error: true
         if: steps.pack.outputs.has_upstream == '1' && (github.event_name == 'push' || inputs.tag != '')
         id: build_upstream
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ steps.pack.outputs.stage }}/upstream
           platforms: linux/amd64,linux/arm64
