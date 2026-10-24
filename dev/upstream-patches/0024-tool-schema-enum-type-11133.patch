@@ -1,0 +1,374 @@
+--- a/internal/upstream/payload.go
++++ b/internal/upstream/payload.go
+@@ -7,6 +7,7 @@ package upstream
+ import (
+ 	"encoding/json"
+ 	"log"
++	"math"
+ 	"strings"
+ )
+ 
+@@ -61,6 +62,9 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
+ 	}
+ 	normalizeToolChoice(obj)
+ 	normalizeToolPatterns(obj)
++	// Kimi 系模型对「只有 enum、没有 type」的工具属性做严格校验（上游 11133）：
++	// 在出站前补 type，属于「让请求通过」的安全网，与 normalizeToolPatterns 同口径。
++	normalizeToolEnumTypes(obj)
+ 	normalizeRoles(obj)
+ 	normalizeImageURL(obj)
+ 	// tool 配对两步（见 tool_pairing.go）：先重排再清理。所有模型一律执行（独立于
+@@ -409,3 +413,115 @@ func unescapePatternLiteralEscapes(node any) {
+ 		}
+ 	}
+ }
++
++// normalizeToolEnumTypes 给「只有 enum、没有 type」的工具属性补上推断出的 type。
++//
++// 背景（现场实测 2026-10-24）：Kimi 系模型（k3.1-pro / k3-1 / k2.5）对
++// tools[].function.parameters 做严格 schema 校验 —— 属性只写 {"enum":[...]} 而不写
++// "type" 时整单 400：
++//
++//	{"code":11133,"msg":"Invalid request parameters",
++//	 "extError":{"code":"400001","message":"the request parameters were rejected by the model provider"}}
++//
++// 同一份 schema 在 DeepSeek / GLM / MiniMax 上照常 200，所以这是「按模型严格程度
++// 而异」的请求侧问题：不补 type，Kimi 用户等于该模型全废（每条请求都撞同一个 400）。
++//
++// 推断规则（只增补、不改 enum 取值，语义不变）：
++//   - 全部字符串 → string
++//   - 全部整数 → integer；整数与小数混合 → number
++//   - 全部布尔 → boolean
++//   - 混合标量/含 null → 不改写（无法无损推断），交由上游原样报错
++//
++// 作用域仅 tools/functions 的 parameters（与 normalizeToolPatterns 同口径），
++// 不动 response_format 等其它位置的 schema。
++func normalizeToolEnumTypes(obj map[string]any) {
++	for _, key := range []string{"tools", "functions"} {
++		list, ok := obj[key].([]any)
++		if !ok {
++			continue
++		}
++		for _, item := range list {
++			m, ok := item.(map[string]any)
++			if !ok {
++				continue
++			}
++			// 现行形态把 parameters 包在 function 里；旧式形态直接挂在条目上。
++			if fn, ok := m["function"].(map[string]any); ok {
++				inferEnumTypes(fn["parameters"])
++			}
++			inferEnumTypes(m["parameters"])
++		}
++	}
++}
++
++// inferEnumTypes 递归处理 schema 树：补 type 并按常见关键字下钻。
++func inferEnumTypes(node any) {
++	switch n := node.(type) {
++	case map[string]any:
++		if enum, ok := n["enum"].([]any); ok {
++			if _, hasType := n["type"]; !hasType {
++				if t := enumScalarType(enum); t != "" {
++					n["type"] = t
++				}
++			}
++		}
++		for k, v := range n {
++			switch k {
++			case "properties", "patternProperties", "definitions", "$defs":
++				if props, ok := v.(map[string]any); ok {
++					for _, pv := range props {
++						inferEnumTypes(pv)
++					}
++				}
++			case "items", "additionalProperties", "not", "contains":
++				inferEnumTypes(v)
++			case "anyOf", "oneOf", "allOf", "prefixItems":
++				if list, ok := v.([]any); ok {
++					for _, x := range list {
++						inferEnumTypes(x)
++					}
++				}
++			}
++		}
++	case []any:
++		for _, v := range n {
++			inferEnumTypes(v)
++		}
++	}
++}
++
++// enumScalarType 由 enum 取值推断 JSON Schema type；无法无损推断时返回空串。
++func enumScalarType(vals []any) string {
++	if len(vals) == 0 {
++		return ""
++	}
++	typ := ""
++	for _, v := range vals {
++		var cur string
++		switch x := v.(type) {
++		case string:
++			cur = "string"
++		case bool:
++			cur = "boolean"
++		case float64:
++			if math.Trunc(x) == x {
++				cur = "integer"
++			} else {
++				cur = "number"
++			}
++		default:
++			return ""
++		}
++		switch {
++		case typ == "":
++			typ = cur
++		case typ == cur:
++			// 同型，继续
++		case (typ == "integer" && cur == "number") || (typ == "number" && cur == "integer"):
++			typ = "number"
++		default:
++			return ""
++		}
++	}
++	return typ
++}
+--- /dev/null
++++ b/internal/upstream/tool_enum_type_test.go
+@@ -0,0 +1,208 @@
++package upstream
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++// toolEnumBody 构造一个只带 tools 的请求体，便于断言改写结果。
++func toolEnumBody(t *testing.T, params map[string]any) []byte {
++	t.Helper()
++	body := map[string]any{
++		"model": "kimi-k3.1-pro",
++		"messages": []any{
++			map[string]any{"role": "user", "content": "hi"},
++		},
++		"tools": []any{
++			map[string]any{
++				"type": "function",
++				"function": map[string]any{
++					"name":       "probe",
++					"parameters": params,
++				},
++			},
++		},
++	}
++	raw, err := json.Marshal(body)
++	if err != nil {
++		t.Fatalf("marshal: %v", err)
++	}
++	return raw
++}
++
++// prepareAndProperty 跑一遍出站改写，取回 tools[0].function.parameters.properties[key]。
++func prepareAndProperty(t *testing.T, params map[string]any, key string) map[string]any {
++	t.Helper()
++	out := PrepareBodyOpt(toolEnumBody(t, params), false)
++	var got map[string]any
++	if err := json.Unmarshal(out, &got); err != nil {
++		t.Fatalf("unmarshal out: %v", err)
++	}
++	tools, _ := got["tools"].([]any)
++	if len(tools) == 0 {
++		t.Fatalf("tools 丢失: %s", out)
++	}
++	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
++	props, _ := fn["parameters"].(map[string]any)["properties"].(map[string]any)
++	prop, _ := props[key].(map[string]any)
++	if prop == nil {
++		t.Fatalf("属性 %q 丢失", key)
++	}
++	return prop
++}
++
++// enum 缺 type：按取值类型补 type，且不能改动 enum 本身。
++func TestToolEnumWithoutTypeGetsInferredType(t *testing.T) {
++	cases := []struct {
++		name string
++		enum []any
++		want string
++	}{
++		{"strings", []any{"quick", "deep"}, "string"},
++		{"integers", []any{float64(1), float64(2)}, "integer"},
++		{"integers and float", []any{float64(1), float64(2.5)}, "number"},
++		{"floats", []any{float64(0.5)}, "number"},
++		{"booleans", []any{true, false}, "boolean"},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			prop := prepareAndProperty(t, map[string]any{
++				"type":       "object",
++				"properties": map[string]any{"x": map[string]any{"enum": c.enum}},
++			}, "x")
++			if got := prop["type"]; got != c.want {
++				t.Errorf("type=%v want %s", got, c.want)
++			}
++			enum, ok := prop["enum"].([]any)
++			if !ok || len(enum) != len(c.enum) {
++				t.Errorf("enum 被改动: %v", prop["enum"])
++			}
++		})
++	}
++}
++
++// 已显式声明 type 的属性不得被覆盖。
++func TestToolEnumExistingTypePreserved(t *testing.T) {
++	prop := prepareAndProperty(t, map[string]any{
++		"type":       "object",
++		"properties": map[string]any{"x": map[string]any{"type": "string", "enum": []any{"a"}}},
++	}, "x")
++	if got := prop["type"]; got != "string" {
++		t.Errorf("显式 type 被覆盖: %v", got)
++	}
++}
++
++// 混合标量无法无损推断：不补 type（交给上游按原样报错，不臆造）。
++func TestToolEnumMixedScalarsUntouched(t *testing.T) {
++	prop := prepareAndProperty(t, map[string]any{
++		"type":       "object",
++		"properties": map[string]any{"x": map[string]any{"enum": []any{"a", float64(1)}}},
++	}, "x")
++	if _, has := prop["type"]; has {
++		t.Errorf("混合标量不应补 type: %v", prop)
++	}
++}
++
++// 嵌套位置（array.items / anyOf / $defs）同样要处理。
++func TestToolEnumNestedPositions(t *testing.T) {
++	params := map[string]any{
++		"type": "object",
++		"properties": map[string]any{
++			"arr": map[string]any{
++				"type":  "array",
++				"items": map[string]any{"enum": []any{"a", "b"}},
++			},
++			"choice": map[string]any{
++				"anyOf": []any{
++					map[string]any{"enum": []any{float64(1)}},
++					map[string]any{"type": "string"},
++				},
++			},
++		},
++		"$defs": map[string]any{
++			"mode": map[string]any{"enum": []any{"on", "off"}},
++		},
++	}
++	out := PrepareBodyOpt(toolEnumBody(t, params), false)
++	var got map[string]any
++	if err := json.Unmarshal(out, &got); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	tools, _ := got["tools"].([]any)
++	fn, _ := tools[0].(map[string]any)["function"].(map[string]any)
++	root, _ := fn["parameters"].(map[string]any)
++	props, _ := root["properties"].(map[string]any)
++
++	arr, _ := props["arr"].(map[string]any)
++	items, _ := arr["items"].(map[string]any)
++	if items["type"] != "string" {
++		t.Errorf("array.items 未补 type: %v", items)
++	}
++
++	choice, _ := props["choice"].(map[string]any)
++	alts, _ := choice["anyOf"].([]any)
++	branch, _ := alts[0].(map[string]any)
++	if branch["type"] != "integer" {
++		t.Errorf("anyOf 分支未补 type: %v", branch)
++	}
++
++	defs, _ := root["$defs"].(map[string]any)
++	mode, _ := defs["mode"].(map[string]any)
++	if mode["type"] != "string" {
++		t.Errorf("$defs 未补 type: %v", mode)
++	}
++}
++
++// 非 tools 位置的 schema（如 response_format）不得被改写。
++func TestNormalizeToolEnumTypesOnlyTouchesTools(t *testing.T) {
++	body := map[string]any{
++		"model":    "kimi-k3.1-pro",
++		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
++		"response_format": map[string]any{
++			"type":        "json_schema",
++			"json_schema": map[string]any{"schema": map[string]any{"properties": map[string]any{"x": map[string]any{"enum": []any{"a"}}}}},
++		},
++	}
++	raw, _ := json.Marshal(body)
++	out := PrepareBodyOpt(raw, false)
++	var got map[string]any
++	if err := json.Unmarshal(out, &got); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	rf, _ := got["response_format"].(map[string]any)
++	schema, _ := rf["json_schema"].(map[string]any)
++	sch, _ := schema["schema"].(map[string]any)
++	props, _ := sch["properties"].(map[string]any)
++	x, _ := props["x"].(map[string]any)
++	if _, has := x["type"]; has {
++		t.Errorf("response_format 不应该被改写: %v", x)
++	}
++}
++
++// 旧式 functions[] 形态同样覆盖。
++func TestNormalizeToolEnumTypesLegacyFunctions(t *testing.T) {
++	body := map[string]any{
++		"model":    "kimi-k3.1-pro",
++		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
++		"functions": []any{
++			map[string]any{
++				"name":       "legacy",
++				"parameters": map[string]any{"type": "object", "properties": map[string]any{"x": map[string]any{"enum": []any{"a"}}}},
++			},
++		},
++	}
++	raw, _ := json.Marshal(body)
++	out := PrepareBodyOpt(raw, false)
++	var got map[string]any
++	if err := json.Unmarshal(out, &got); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	fns, _ := got["functions"].([]any)
++	fn, _ := fns[0].(map[string]any)
++	params, _ := fn["parameters"].(map[string]any)
++	props, _ := params["properties"].(map[string]any)
++	x, _ := props["x"].(map[string]any)
++	if x["type"] != "string" {
++		t.Errorf("functions[] 未补 type: %v", x)
++	}
++}
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -866,6 +866,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				st.status = http.StatusBadRequest
+ 				return
+ 			}
++			// 11133「Invalid request parameters」：上游对**请求本身**的拒绝（如 Kimi 系
++			// 模型要求工具 schema 里 enum 必须带 type，缺了整单 400）。同一 body 换任何
++			// 账号都会得到同一个 400 —— 轮转只会把无效请求放大 MaxRotate 倍，而
++			// ErrClient 默认策略里的 NoteFailures 还会把健康账号的连败计数喂高、临时
++			// 踢出池（现场实测：一次连续探测把 healthy 从 19 打到 7）。
++			// 因此这里 fail-fast：400 + 上游原文，不轮转、不罚号（本分支不进
++			// applyErrorPolicy，ErrClient 的 NoteFailures 不会执行）。
++			if kind == upstream.ErrClient && strings.Contains(string(respBody), "11133") {
++				fail(acct.UID)
++				msg := string(respBody)
++				if strings.TrimSpace(msg) == "" {
++					msg = "request parameters were rejected by the model provider"
++				}
++				writeOpenAIErrorHint(w, http.StatusBadRequest, "invalid_request", msg,
++					h.hintOf(kind, string(respBody), bareModel, reqHasImage, uerr))
++				st.status = http.StatusBadRequest
++				return
++			}
+ 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
+ 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
+ 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
