@@ -1,0 +1,162 @@
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -609,6 +609,19 @@ func Classify(status int, body string) ErrKind {
+ 	if sessionDeadRule.hit(body, lower) {
+ 		return ErrSessionDead
+ 	}
++	// HTTP 401 且**不是 JSON 业务信封**（APISIX/openresty 直接回 HTML 页或空体，
++	// 没有 code 字段）：凭证在上游不被接受。
++	//
++	// 现场（2026-10-24）：三个共享账号被其他设备登录后，access token 对 chat 与
++	// 计费接口一律 401（HTML），而 refresh 仍可换出新 token。旧逻辑把它们落进通用
++	// ErrClient「只换号不罚号」—— 账号留在池里被反复选中、每次白换一次号，
++	// `/status` 仍显示健康，面板「刷新积分」静默回退到上游快照。
++	//
++	// 只收「非信封」形态：带 JSON code 的 401 是业务层答复（其语义由既有各层判定，
++	// 例如 12153 已被上面的 sessionDeadRule 命中），不应在这里一刀切改判。
++	if status == http.StatusUnauthorized && !strings.HasPrefix(strings.TrimSpace(body), "{") {
++		return ErrSessionDead
++	}
+ 	// 渠道校验（/v2 上的新强校验，2026-10-17）：归**账号级**分类，但 applyErrorPolicy
+ 	// 里最先判它、只做软冷却（绝不禁用，理由见那里的注释）。不在这里归类的话：没带
+ 	// `request illegal` 字样的渠道校验会落通用 4xx「只换号不罚号」，坏号留在池里
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -866,6 +866,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				st.status = http.StatusBadRequest
+ 				return
+ 			}
++			// 11133「Invalid request parameters」：上游对**请求本身**的拒绝（如 Kimi 系
++			// 模型要求工具 schema 里 enum 必须带 type，缺了整单 400）。同一 body 换任何
++			// 账号都会得到同一个 400 —— 轮转只会把无效请求放大 MaxRotate 倍，而
++			// ErrClient 默认策略里的 NoteFailures 还会把健康账号的连败计数喂高、临时
++			// 踢出池（现场实测：一次连续探测把 healthy 从 19 打到 7）。
++			// 因此这里 fail-fast：400 + 上游原文，不轮转、不罚号（本分支不进
++			// applyErrorPolicy，ErrClient 的 NoteFailures 不会执行）。
++			if kind == upstream.ErrClient && strings.Contains(string(respBody), "11133") {
++				fail(acct.UID)
++				msg := string(respBody)
++				if strings.TrimSpace(msg) == "" {
++					msg = "request parameters were rejected by the model provider"
++				}
++				writeOpenAIErrorHint(w, http.StatusBadRequest, "invalid_request", msg,
++					h.hintOf(kind, string(respBody), bareModel, reqHasImage, uerr))
++				st.status = http.StatusBadRequest
++				return
++			}
+ 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
+ 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
+ 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+@@ -1149,6 +1167,30 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		}
+ 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
+ 	case upstream.ErrSessionDead:
++		// 12153（offline session，业务信封）是确定的重登终态；HTTP 401 不同：
++		// 实测存在「access token 已失效、但 refreshToken 仍可用」的情形——共享账号
++		// 被其他设备登录后 AT 被上游作废，refresh 一次就能换出新 AT（现场：三个号
++		// 中两个这样救回）。直接禁用会误杀本可自愈的号，所以先做一次同步刷新：
++		//   · 刷新成功 → 短冷却（本次请求已失败，让后续请求用新 token），不罚号；
++		//   · 刷新失败 → 才按「需重新登录」禁用（refreshToken 也废了）。
++		// 12153 不走这条路：它是上游明确答复会话不存在，刷新没有意义。
++		if !strings.Contains(body, "12153") {
++			if a := h.cfg.Pool.AuthByUID(uid); a != nil {
++				if err := h.cfg.Upstream.RefreshToken(a); err == nil {
++					a.BackfillRealm()
++					if serr := a.SaveAtomic(); serr != nil {
++						log.Printf("WARN: [server] 401 refresh acct=%s: save auth failed: %v",
++							logfmt.Label(a.UID, a.Nickname), serr)
++					}
++					// 30s 足够覆盖同批并发请求，又不至于让账号长期出池。
++					h.cfg.Pool.Cooldown(uid, pool.CoolSoft, 30*time.Second,
++						"401 access token refreshed")
++					return
++				}
++			}
++			h.cfg.Pool.Disable(uid, "401 unauthorized (refresh also failed), re-login required")
++			return
++		}
+ 		h.cfg.Pool.Disable(uid, "12153 session dead")
+ 	case upstream.ErrNotFound:
+ 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
+--- /dev/null
++++ b/internal/upstream/session_dead_401_test.go
+@@ -0,0 +1,79 @@
++package upstream
++
++import (
++	"net/http"
++	"testing"
++)
++
++// 401 一律归「登录态失效」（需要重新登录的终态）。
++//
++// 背景：APISIX/openresty 对吊销凭证直接回 HTML 401（body 里没有 code 字段），
++// 旧逻辑落通用 ErrClient「只换号不罚号」——账号留在池里被反复选中、每次白换
++// 一次号，/status 仍显示健康，面板刷新积分只会静默回退到上游快照。
++func TestClassify401AsSessionDead(t *testing.T) {
++	cases := []struct {
++		name   string
++		status int
++		body   string
++		want   ErrKind
++	}{
++		{
++			name:   "APISIX HTML 401（无业务信封）",
++			status: http.StatusUnauthorized,
++			body:   "<html>\n<head><title>401 Authorization Required</title></head>\n<body><center><h1>401 Authorization Required</h1></center><hr><center>openresty</center></body>\n</html>",
++			want:   ErrSessionDead,
++		},
++		{
++			name:   "空 body 401",
++			status: http.StatusUnauthorized,
++			body:   "",
++			want:   ErrSessionDead,
++		},
++		{
++			name:   "12153 业务信封（原有路径不变）",
++			status: http.StatusUnauthorized,
++			body:   `{"code":12153,"msg":"12153:refresh token is invalid","requestId":"x"}`,
++			want:   ErrSessionDead,
++		},
++		{
++			// 带 JSON 业务信封的 401 保持既有语义（业务层答复，交由各层判定），
++			// 不能因为状态码是 401 就一刀切改判——既有的 TestClassify 也锁着这条。
++			name:   "JSON 401 无 12153（保持 ErrClient）",
++			status: http.StatusUnauthorized,
++			body:   `{"code":401,"msg":"unauthorized"}`,
++			want:   ErrClient,
++		},
++		{
++			name:   "403 HTML 仍是 WAF（语义不能被 401 规则带偏）",
++			status: http.StatusForbidden,
++			body:   "<html><head><title>403 Forbidden</title></head></html>",
++			want:   ErrWafBlock,
++		},
++		{
++			name:   "400 HTML 仍是客户端错误",
++			status: http.StatusBadRequest,
++			body:   "<html><body>bad request</body></html>",
++			want:   ErrClient,
++		},
++		{
++			name:   "200 业务信封不受影响",
++			status: http.StatusOK,
++			body:   `{"code":0,"msg":"OK"}`,
++			want:   ErrNone,
++		},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			if got := Classify(c.status, c.body); got != c.want {
++				t.Fatalf("Classify(%d, %q) = %v, want %v", c.status, shortBody(c.body), got, c.want)
++			}
++		})
++	}
++}
++
++func shortBody(s string) string {
++	if len(s) <= 40 {
++		return s
++	}
++	return s[:40] + "..."
++}
