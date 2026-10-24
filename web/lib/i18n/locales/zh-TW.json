@@ -705,6 +705,7 @@
     "reset": "重設",
     "colTime": "時間",
     "colFirstToken": "首字",
+    "colEffort": "思考強度",
     "colAccount": "帳號",
     "rowAccount": "帳號",
     "accountPending": "未擷取（稍後自動回填）",

@@ -705,6 +705,7 @@
     "reset": "リセット",
     "colTime": "時刻",
     "colFirstToken": "初回トークン",
+    "colEffort": "思考の強さ",
     "colAccount": "アカウント",
     "rowAccount": "アカウント",
     "accountPending": "未取得（後で自動補完）",

@@ -673,6 +673,10 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ('red_packet_shares', 'token', "TEXT NOT NULL DEFAULT ''"),
     ('red_packet_shares', 'claimed_by_ip', 'TEXT'),
     ('red_packet_shares', 'claimed_at', 'INTEGER'),
+    # 思考强度（reasoning_effort）：客户端显式传的档位（low / medium / high / max…）。
+    # NULL = 客户端没传（走模型默认档）或该字段上线前的历史记录——两者界面都显示
+    # 「—」，不做推断，避免把「默认」写成某个具体档位误导排查。
+    ('request_logs', 'effort', 'TEXT'),
 )
 
 
@@ -1171,15 +1175,16 @@ def add_request_log(**fields: object) -> None:
         'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '
         'prompt_tokens, completion_tokens, latency_ms, first_token_ms, ua, error, '
         'stream, credit, realm, account, cache_hit_tokens, cache_miss_tokens, '
-        'cache_write_tokens) '
-        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'cache_write_tokens, effort) '
+        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (fields.get('ts'), fields.get('key_id'), fields.get('ip'),
          fields.get('model'), fields.get('mapped_model'), fields.get('status'),
          fields.get('prompt_tokens'), fields.get('completion_tokens'),
          fields.get('latency_ms'), fields.get('first_token_ms'), fields.get('ua'),
          fields.get('error'), fields.get('stream'), fields.get('credit'),
          fields.get('realm'), fields.get('account'), fields.get('cache_hit_tokens'),
-         fields.get('cache_miss_tokens'), fields.get('cache_write_tokens')),
+         fields.get('cache_miss_tokens'), fields.get('cache_write_tokens'),
+         fields.get('effort')),
     )
     _request_log_writes += 1
     if _request_log_writes >= _REQUEST_LOG_CHECK_EVERY:

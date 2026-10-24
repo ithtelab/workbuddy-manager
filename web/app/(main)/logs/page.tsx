@@ -383,6 +383,7 @@ export default function LogsPage() {
               <TableHead className="text-[11px] text-muted-foreground">IP</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colAccount')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('nav.models')}</TableHead>
+              <TableHead className="text-[11px] text-muted-foreground">{t('logs.colEffort')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colFirstToken')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colLatency')}</TableHead>
@@ -410,6 +411,20 @@ export default function LogsPage() {
                   {l.model || '—'}
                   {l.mapped_model && l.mapped_model !== l.model && (
                     <span className="ml-1 text-[11px] text-muted-foreground">→{l.mapped_model}</span>
+                  )}
+                </TableCell>
+                {/*
+                  思考强度：客户端显式传的 reasoning_effort（low/medium/high/max…）。
+                  没传就显示「—」而不是猜默认档——同一模型不同版本的默认档可能不同，
+                  写死会把「客户端没传」误读成「客户端要了某个档位」。
+                */}
+                <TableCell className="text-xs">
+                  {l.effort ? (
+                    <Badge variant="secondary" className="rounded-full font-mono text-[10px]">
+                      {l.effort}
+                    </Badge>
+                  ) : (
+                    <span className="text-muted-foreground/50">—</span>
                   )}
                 </TableCell>
                 <TableCell>

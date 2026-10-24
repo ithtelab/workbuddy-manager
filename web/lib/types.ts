@@ -622,6 +622,15 @@ export interface RequestLog {
   ip: string;
   model: string | null;
   mapped_model: string | null;
+  /**
+   * 思考强度（reasoning_effort）：客户端在请求体里**显式传的**档位
+   * （low / medium / high / max…，不同模型档位不同）。
+   *
+   * null = 客户端没传（走模型默认档）或该字段上线前的历史记录——界面显示「—」。
+   * 刻意不做推断：把「默认」写成某个具体档位，排查时会误判客户端行为
+   * （例如以为客户端一直在要 max）。
+   */
+  effort: string | null;
   status: number;
   prompt_tokens: number;
   completion_tokens: number;

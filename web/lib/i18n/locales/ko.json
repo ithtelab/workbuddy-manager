@@ -705,6 +705,7 @@
     "reset": "초기화",
     "colTime": "시간",
     "colFirstToken": "첫 토큰",
+    "colEffort": "사고 강도",
     "colAccount": "계정",
     "rowAccount": "계정",
     "accountPending": "아직 수집되지 않음(자동으로 채워짐)",

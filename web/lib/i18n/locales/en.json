@@ -732,6 +732,7 @@
     "reset": "Reset",
     "colTime": "Time",
     "colFirstToken": "First token",
+    "colEffort": "Effort",
     "colAccount": "Account",
     "rowAccount": "Account",
     "accountPending": "not captured yet (backfills automatically)",
