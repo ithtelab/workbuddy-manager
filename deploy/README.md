@@ -96,6 +96,9 @@ services:
   `docker compose up -d --build`）：升级上游 = 改 `image:` 的版本号 +
   `docker compose up -d`。面板「全部更新」里针对上游源码的那一步对镜像部署无效，
   这是预期行为。
+- 镜像自带 `dev.workbuddy.upstream-id` label，面板读运行中容器的这个 label 判断
+  「镜像部署且与本次发布同源」，同源时不会提示「随包上游与本机不一致」。读不到
+  label 的旧镜像（≤ 2.8.2）仍按部署目录的 `.upstream-id` 判定，行为不变。
 
 ### 许可
 

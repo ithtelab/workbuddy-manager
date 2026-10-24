@@ -31,6 +31,11 @@ STATUS_FILE = config.DATA_DIR / 'update-status.json'
 # docker 可用性缓存（(时间, 布尔)）。每次探测要跑 docker info（~50ms），
 # 而状态接口会被前端轮询，加 30 秒缓存避免频繁探测。
 _docker_ok_cache: tuple[float, bool] | None = None
+# 上游镜像自报标识的缓存（(时间, 值)）。docker inspect 也是子进程，节奏与
+# docker 可用性探测保持一致（30 秒）。
+_image_id_cache: tuple[float, str] | None = None
+# 发布流水线给上游镜像打的 label，与 Release 正文隐藏标记、包内 .upstream-id 同值。
+UPSTREAM_IMAGE_LABEL = 'dev.workbuddy.upstream-id'
 LOCK_FILE = config.DATA_DIR / 'update.lock'
 LOG_FILE = config.DATA_DIR / 'update.log'
 
@@ -215,8 +220,8 @@ def read_status() -> dict:
         'version': current_version(),
         'updater_found': _updater_script().is_file(),
         'upstream_dir': str(_upstream_dir()),
-        # 随包上游的稳定标识（打包时写入 upstream/.upstream-id，空 = 旧部署）
-        'upstream_id': _local_upstream_id(),
+        # 运行中上游的稳定标识：镜像 label 优先，回退包内 .upstream-id（空 = 未知）
+        'upstream_id': _running_upstream_id(),
         # 运行形态与能力边界
         'in_container': container,
         # 「能否更新上游」按**实际能力**判定（能否操作 docker），不按是否容器：
@@ -951,6 +956,56 @@ def _local_upstream_id() -> str:
         return ''
 
 
+def _image_upstream_id() -> str:
+    """运行中上游容器镜像自报的 upstream-id（镜像部署形态的权威标识）。
+
+    发布流水线给上游镜像打同一个 `dev.workbuddy.upstream-id` label，值与
+    Release 正文隐藏标记、包内 `.upstream-id` 同源。镜像部署的机器磁盘上
+    **没有源码目录**（只挂 config.json / auths / data），只有这个 label 能
+    回答「跑的是哪一版」；没有该 label 的镜像或源码部署返回空串，由调用方
+    回退到 `.upstream-id`，判定语义与之前一致。
+    """
+    global _image_id_cache
+    if config.WB2API_MODE != 'docker':
+        return ''
+    now = time.time()
+    if _image_id_cache is not None and now - _image_id_cache[0] < 30:
+        return _image_id_cache[1]
+    value = ''
+    if can_control_docker():
+        try:
+            proc = subprocess.run(
+                ['docker', 'inspect', '--format',
+                 f'{{{{index .Config.Labels "{UPSTREAM_IMAGE_LABEL}"}}}}',
+                 config.WB2API_CONTAINER],
+                capture_output=True, text=True, timeout=8)
+            raw = (proc.stdout or '').strip()
+            # 镜像没有这个 label 时，模板渲染成 "<no value>"
+            if proc.returncode == 0 and raw and raw != '<no value>':
+                value = raw
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning('读取上游镜像 %s 失败：%s', UPSTREAM_IMAGE_LABEL, err_text(exc))
+    _image_id_cache = (now, value)
+    return value
+
+
+def _running_upstream_id() -> str:
+    """运行中上游的稳定标识：镜像 label 优先，回退部署目录标记。"""
+    return _image_upstream_id() or _local_upstream_id()
+
+
+def upstream_changed(release_upstream_id: str, running_upstream_id: str,
+                     manager_stale: bool = False) -> bool:
+    """Release 包内上游与**运行中**上游是否不同源。
+
+    运行侧标识为空按「未知 = 需要同步」处理（老部署两者都没有）；本次检测
+    失败（stale）时不下结论，避免拿上一个 Release 的缓存误报（issue #240）。
+    """
+    if not release_upstream_id or manager_stale:
+        return False
+    return not running_upstream_id or release_upstream_id != running_upstream_id
+
+
 def _fetch_remote_versions() -> dict:
     """向 GitHub 查询管理端最新 Release（不做缓存判断）。
 
@@ -1023,7 +1078,7 @@ def check_updates(force: bool = False) -> dict:
     # 缓存可能还是上一个 Release 的 upstream-id，会把已经同步好的机器一直
     # 显示成「需要同步」。下次检查成功后再判断。
     manager_stale = bool(cache.get('manager', {}).get('stale'))
-    local_upstream_id = _local_upstream_id()
+    running_upstream_id = _running_upstream_id()
     release_upstream_id = str(cache.get('manager', {}).get('upstream_id') or '')
 
     return {
@@ -1037,11 +1092,10 @@ def check_updates(force: bool = False) -> dict:
             'assets_ready': cache.get('manager', {}).get('assets_ready'),
             'release_notes': str(cache.get('manager', {}).get('release_notes') or ''),
             'published_at': str(cache.get('manager', {}).get('published_at') or ''),
-            # 远端包内上游 id 与本机不一致（含老部署没有 .upstream-id）：
+            # 远端包内上游 id 与运行中上游不一致（镜像 label / 包内标记）：
             # 界面把主按钮改成「全部更新」，避免面板升了、上游还是旧代码。
-            'upstream_changed': bool(
-                release_upstream_id and not manager_stale
-                and (not local_upstream_id or release_upstream_id != local_upstream_id)),
+            'upstream_changed': upstream_changed(
+                release_upstream_id, running_upstream_id, manager_stale),
             'error': str(cache.get('manager', {}).get('error') or ''),
             # stale=True：这一节的值来自**上一次**成功检测（本次失败了），
             # 界面不能据此下「已是最新」的结论（issue #204）。
@@ -1052,7 +1106,7 @@ def check_updates(force: bool = False) -> dict:
         # 上游不再有独立远端版本：current 是随包上游的稳定标识，has_update
         # 恒为 false；是否需要同步由 manager.upstream_changed 表达。
         'upstream': {
-            'current': local_upstream_id[:8],
+            'current': running_upstream_id[:8],
             'latest': '',
             'has_update': False,
             'date': '',
