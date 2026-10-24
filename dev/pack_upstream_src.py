@@ -93,6 +93,22 @@ def _iter_files(root: Path) -> list[Path]:
     return out
 
 
+def tree_id(root: Path) -> str:
+    """源码树的稳定标识：路径 + 内容哈希（排除了会随时间变化的说明文件）。
+
+    写进包内 `.upstream-id`，面板用它判断「这次 Release 带的上游与本机是否
+    同一份」——没有它就只能比较版本号，而版本号在纯上游修复时不会变。
+    """
+    h = hashlib.sha256()
+    for f in _iter_files(root):
+        rel = f.relative_to(root).as_posix()
+        if rel in ('UPSTREAM-SRC.txt', '.upstream-id'):
+            continue
+        h.update(rel.encode('utf-8')); h.update(b'\0')
+        h.update(f.read_bytes()); h.update(b'\0')
+    return h.hexdigest()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description='打上游源码包（随 Release 分发）')
     ap.add_argument('src', type=Path, help='上游源码目录')
@@ -143,6 +159,8 @@ LICENSE 与版权声明。
 打包说明：{args.stamp or '（未填写）'}
 打包时间：{time.strftime('%Y-%m-%d %H:%M:%S')}
 """, encoding='utf-8')
+
+        (work / '.upstream-id').write_text(tree_id(work) + '\n', encoding='utf-8')
 
         files = _iter_files(work)
         out_path: Path = args.out / 'workbuddy2api-src.tar.gz'

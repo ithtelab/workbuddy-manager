@@ -1,0 +1,171 @@
+--- a/internal/upstream/effort_catalog.go
++++ b/internal/upstream/effort_catalog.go
+@@ -8,7 +8,7 @@
+ // 档位值照抄参考仓库 dsh-codearts：CN/CodeBuddy 面取 src/product.ts CODEBUDDY_FALLBACK_MODELS
+ // ∪ src/buddy-adapter.ts:126-137 REASONING_EFFORTS；global/WorkBuddy 面取 src/product.ts
+ // WORKBUDDY_FALLBACK_MODELS。两个 realm 对同一模型给出不同档位（如 deepseek-v4.1-flash：
+-// CN 三档 ['low','high','max']、global 仅 ['high']），故**按 realm 分表**，绝不混用。
++// CN 三档 ['low','high','max']、global ['high','max']），故**按 realm 分表**，绝不混用。
+ //
+ // 只列**可枚举**档位的模型；仅有固定默认档（glm-5.1/kimi-* 的 medium）同样入表，
+ // 但其档位是「可枚举单档」而非「无选择器」，照抄参考仓库如实暴露。
+@@ -42,15 +42,15 @@
+ }
+ 
+ // globalEffortFallback global / WorkBuddy 国际版面静态兜底表。
+-// 注意 deepseek-v4.1-flash 在国际版**只有 ['high']**（product.ts:190 实测 IDE 缓存），
+-// 与 CN 面的三档刻意不同——往 WorkBuddy 上游发 low/max 是非法参数 400。
++// deepseek-v4.1-flash 在国际版为 ['high','max']（2026-10 issue #238：官方客户端已可选
++// Max），与 CN 面的三档仍不同——low 不是国际版的合法档位。
+ var globalEffortFallback = map[string]effortCap{
+ 	"fast-model":          {efforts: []string{"medium"}},
+ 	"balanced-model":      {efforts: []string{"medium"}},
+ 	"primary-model":       {efforts: []string{"high"}},
+ 	"hy4-preview-f":       {efforts: []string{"high"}, defaultEffort: "high"},
+ 	"hy3":                 {efforts: []string{"low", "high"}, defaultEffort: "high"},
+-	"deepseek-v4.1-flash": {efforts: []string{"high"}},
++	"deepseek-v4.1-flash": {efforts: []string{"high", "max"}, defaultEffort: "high"},
+ 	"gpt-6-astra":         {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+ 	"gpt-5.6-sol":         {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+ 	"gpt-5.6-terra":       {efforts: []string{"low", "medium", "high", "xhigh", "max"}, defaultEffort: "high"},
+@@ -63,6 +63,29 @@
+ 	"glm-5.2":             {efforts: []string{"high", "xhigh"}, defaultEffort: "high"},
+ 	"kimi-k3":             {efforts: []string{"medium"}},
+ 	"kimi-k2.6":           {efforts: []string{"medium"}},
++}
++
++// globalEffortExtras 产品能力已更新、模型接口 supportedEfforts 还没跟上的补档。
++// 2026-10 issue #238：国际版官方客户端已可选 Max，接口仍只回 ['high']；
++// 只在已有档位上追加，不给未知模型凭空造档位。
++var globalEffortExtras = map[string][]string{
++	"deepseek-v4.1-flash": {"max"},
++}
++
++// extendGlobalEfforts 把 globalEffortExtras 合并进已有档位（去重、保持原顺序）。
++// 无补档或原档位为空时原样返回（不为未知模型造档位）。
++func extendGlobalEfforts(model string, efforts []string) []string {
++	extras := globalEffortExtras[model]
++	if len(extras) == 0 || len(efforts) == 0 {
++		return efforts
++	}
++	out := append([]string(nil), efforts...)
++	for _, extra := range extras {
++		if !containsEffort(out, extra) {
++			out = append(out, extra)
++		}
++	}
++	return out
+ }
+ 
+ // staticEffortCap 按 realm 取静态兜底条目；未命中返回 zero effortCap（efforts=nil）。
+@@ -92,6 +115,9 @@
+ 		src = effortCap{efforts: remoteEfforts, defaultEffort: remoteDefault}
+ 	default:
+ 		src = staticEffortCap(realm, model)
++	}
++	if realmKey(realm) == "global" {
++		src.efforts = extendGlobalEfforts(model, src.efforts)
+ 	}
+ 	if len(src.efforts) == 0 {
+ 		return nil, ""
+@@ -141,5 +167,9 @@
+ 			defs[id] = v
+ 		}
+ 	}
++	// 远端元数据滞后时按产品能力补档（issue #238）。
++	for id, v := range efforts {
++		efforts[id] = extendGlobalEfforts(id, v)
++	}
+ 	return efforts, defs
+ }
+--- a/internal/upstream/effort_catalog_test.go
++++ b/internal/upstream/effort_catalog_test.go
+@@ -43,18 +43,31 @@
+ }
+ 
+ // TestEffortListingRealmSplit issue #84 核心：同模型 deepseek-v4.1-flash 在两个 realm 档位刻意不同。
+-// global 只有 ['high']（WorkBuddy 国际版实测），不能沿用 CN 三档。
++// issue #238：global 已从 ['high'] 扩展为 ['high','max']，但仍不能沿用 CN 的 low。
+ func TestEffortListingRealmSplit(t *testing.T) {
+ 	cnEfforts, cnDef := EffortListing("cn", "deepseek-v4.1-flash", nil, "")
+ 	if !reflect.DeepEqual(cnEfforts, []string{"low", "high", "max"}) || cnDef != "high" {
+ 		t.Errorf("cn deepseek-v4.1-flash=%v/%q want [low high max]/high", cnEfforts, cnDef)
+ 	}
+ 	gEfforts, gDef := EffortListing("global", "deepseek-v4.1-flash", nil, "")
+-	if !reflect.DeepEqual(gEfforts, []string{"high"}) {
+-		t.Errorf("global deepseek-v4.1-flash=%v want [high]", gEfforts)
++	if !reflect.DeepEqual(gEfforts, []string{"high", "max"}) {
++		t.Errorf("global deepseek-v4.1-flash=%v want [high max]", gEfforts)
+ 	}
+-	if gDef != "" {
+-		t.Errorf("global deepseek-v4.1-flash defaultEffort=%q want empty (无 defaultReasoningEffort)", gDef)
++	if gDef != "high" {
++		t.Errorf("global deepseek-v4.1-flash defaultEffort=%q want high", gDef)
++	}
++}
++
++// TestEffortListingGlobalRemoteLagAddsMax issue #238：接口元数据仍只回 high 时，
++// 产品已支持的 Max 仍要出现在 /v1/models，不能被远端单档覆盖掉。
++func TestEffortListingGlobalRemoteLagAddsMax(t *testing.T) {
++	efforts, def := EffortListing("global", "deepseek-v4.1-flash",
++		[]string{"high"}, "high")
++	if !reflect.DeepEqual(efforts, []string{"high", "max"}) {
++		t.Errorf("efforts=%v want [high max]", efforts)
++	}
++	if def != "high" {
++		t.Errorf("defaultEffort=%q want high", def)
+ 	}
+ }
+ 
+--- a/internal/upstream/global_effort_test.go
++++ b/internal/upstream/global_effort_test.go
+@@ -105,7 +105,7 @@
+ }
+ 
+ // TestGlobalEffortDowngradeStatic 探测失败（负缓存）→ global 请求按静态兜底表降级：
+-// deepseek-v4.1-flash 只认 high，客户端传 low → 降级 high（issue #84 核心）。
++// deepseek-v4.1-flash 不认 low，客户端传 low → 降级 high（issue #84 核心）。
+ func TestGlobalEffortDowngradeStatic(t *testing.T) {
+ 	auth.SetGlobalEnabled(true)
+ 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+@@ -136,6 +136,40 @@
+ 	}
+ }
+ 
++// TestGlobalEffortRemoteLagKeepsMax issue #238：接口元数据仍只回 high，但官方客户端
++// 已支持 Max；请求传 max 不能被降级掉（否则网关永远用不上新档位）。
++func TestGlobalEffortRemoteLagKeepsMax(t *testing.T) {
++	auth.SetGlobalEnabled(true)
++	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
++
++	var outbound []byte
++	srv := globalEffortChatSrv(t, `{"code":0,"data":{"models":[
++		{"id":"deepseek-v4.1-flash","reasoning":{"supportedEfforts":["high"],"defaultEffort":"high"}}
++	]}}`, func(b []byte) { outbound = b })
++	defer srv.Close()
++
++	c := &Client{
++		HTTP:           &http.Client{},
++		ChatBaseGlobal: strings.TrimSuffix(srv.URL, "/"),
++		GlobalEnabled:  true,
++	}
++	c.FetchGlobalModels(globalAcct())
++
++	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"deepseek-v4.1-flash","reasoning_effort":"max","messages":[]}`), "", ChatMeta{})
++	if err != nil || status != 200 {
++		t.Fatalf("chat status=%d err=%v", status, err)
++	}
++	rc.Close()
++
++	var m map[string]any
++	if err := json.Unmarshal(outbound, &m); err != nil {
++		t.Fatalf("unmarshal outbound: %v (%s)", err, outbound)
++	}
++	if got, _ := m["reasoning_effort"].(string); got != "max" {
++		t.Errorf("reasoning_effort=%v want max (issue #238 产品已支持 Max)", m["reasoning_effort"])
++	}
++}
++
+ // TestGlobalEffortDowngradeRemote global 探测下发档位 → 降级以远端桶为权威
+ // （gpt-5.4 remote=[low high]，传 max → 降级 high）。
+ func TestGlobalEffortDowngradeRemote(t *testing.T) {

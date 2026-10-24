@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import json
 import os
 import re
@@ -739,10 +740,25 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
             '%Y-%m-%d %H:%M:%S', time.localtime(now + 365 * 101 * 24 * 3600)
         ),
     }
+    enterprise_id = str(auth.get('enterprise_id') or '').strip()
     try:
-        # 路径按版本分派；国际版以无 /v2 前缀为首选、404 时回落（与国内版相反）
-        # 头走 billing 域（带 X-User-Id 等身份头，对齐上游 BillingHeaders）
+        # 头走 billing 域（带 X-User-Id / X-Enterprise-Id / X-Tenant-Id 身份头，
+        # 对齐上游 BillingHeaders）。企业与个人两条路共用同一份头。
         hdr = _billing_hdr(realm, auth)
+
+        # ── 企业账号：额度不在个人「资源包」体系内 ──────────────
+        # 个人端点 get-user-resource 对企业账号恒返回空 Accounts（我校的
+        # _extract_resource_accounts 解析不出来 → "响应结构无法识别" → 显示 0）。
+        # 企业额度必须走专用端点 get-enterprise-user-usage。
+        #
+        # 口径差异（与个人接口**相反**，极易搞错）：
+        #   个人：CapacityRemain 就是「剩余」
+        #   企业：credit 是**本周期已用**，limitNum 是**分配给该账号的额度**
+        #        → remain = limitNum - credit
+        #   limitNum == -1 表示不限量
+        if enterprise_id:
+            return await _fetch_enterprise_credits(realm, auth, hdr)
+
         resp = None
         async with _account_http_client(auth) as client:
             for path in billing_paths(realm, 'user-resource'):
@@ -778,6 +794,64 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
         return True, _round_credits(total), '查询成功', expiries
     except Exception as exc:  # noqa: BLE001
         return False, None, f'查询异常: {err_text(exc)}', []
+
+
+
+def _enterprise_cycle_expiry(data: dict) -> int | None:
+    """解析企业额度的周期结束时间（cycleEndTime，UTC+8 墙钟字符串）。
+
+    上游格式 "2026-11-13 23:59:59"，与个人套餐 CycleEndTime 同口径。
+    解析失败返回 None —— 调用方据此跳过 expiries，不让倒计时显示错时间。
+    """
+    raw = str(data.get('cycleEndTime') or '').strip()
+    if not raw:
+        return None
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S'):
+        try:
+            st = time.strptime(raw, fmt)
+        except (ValueError, OverflowError):
+            continue
+        # 上游给的是 UTC+8 墙钟。calendar.timegm 按 UTC 解释 st，
+        # 减 8 小时即得到该墙钟对应的真实 epoch。
+        return int(calendar.timegm(st) - 8 * 3600)
+    return None
+
+
+async def _fetch_enterprise_credits(
+    realm: Realm, auth: dict, hdr: dict
+) -> tuple[bool, int | float | None, str, list[dict]]:
+    """企业账号额度查询（get-enterprise-user-usage）。
+
+    返回与 fetch_credits 同结构：(ok, credits, message, expiries)。
+    口径：上游 credit 是**已用**、limitNum 是**配额**，
+    故 remain = limitNum - credit（与个人接口语义相反）。
+    """
+    path = '/v2/billing/meter/get-enterprise-user-usage'
+    try:
+        async with _account_http_client(auth) as client:
+            resp = await client.post(
+                f'{billing_base(realm)}{path}', json={}, headers=hdr
+            )
+        code, data = _envelope(resp)
+        if code != 0 or not isinstance(data, dict):
+            return False, None, f'企业额度查询失败 code={code}', []
+
+        raw_limit = data.get('limitNum')
+        limit = float(raw_limit) if raw_limit is not None else 0.0
+        if limit < 0:
+            return True, None, '企业额度不限量', []
+
+        used = float(data.get('credit') or 0.0)
+        remain = max(0.0, limit - used)
+        credits = _round_credits(remain)
+
+        expiries: list[dict] = []
+        at = _enterprise_cycle_expiry(data)
+        if at is not None and remain > 0:
+            expiries.append({'at': at, 'amount': credits})
+        return True, credits, '查询成功（企业额度）', expiries
+    except Exception as exc:  # noqa: BLE001
+        return False, None, f'企业额度查询异常: {err_text(exc)}', []
 
 
 async def fetch_models(auth: dict) -> tuple[bool, list | str]:

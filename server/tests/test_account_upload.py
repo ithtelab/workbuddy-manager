@@ -256,7 +256,24 @@ class ImportExportAuditTest(AccountUploadTest):
             response = self.client.get('/api/accounts/export')
         self.assertEqual(response.status_code, 200)
         self.assertTrue(rows, '导出没有留下审计记录')
-        self.assertIn('accounts.export', str(rows[0][0]))
+        args, kwargs = rows[0]
+        self.assertEqual(args[1], 'accounts.export')
+        self.assertIn('1 个账号文件', args[3])
+        self.assertIn('来源', args[3])
+        self.assertIn('ip', kwargs, '导出审计应记录结构化来源 IP')
+
+    def test_bulk_export_emits_warning(self) -> None:
+        for i in range(5):
+            (self.auth_dir / f'workbuddy-bulk-{i}.json').write_text(json.dumps({
+                'account': {'uid': f'bulk-{i}', 'nickname': f'B{i}'},
+                'auth': {'accessToken': 'at', 'expiresAt': 4102444800},
+            }), encoding='utf-8')
+        with mock.patch.object(accounts.logger, 'warning') as warning:
+            response = self.client.get('/api/accounts/export')
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any('批量导出账号凭据' in str(c)
+                            for c in warning.call_args_list),
+                        '批量导出没有告警')
 
     def test_export_response_is_not_cacheable(self) -> None:
         response = self.client.get('/api/accounts/export')

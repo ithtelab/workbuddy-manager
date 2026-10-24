@@ -77,5 +77,22 @@ class OutcomeRedactionTest(unittest.TestCase):
         self.assertEqual(status['logs'], ['old http://***@host:1 failed'])
 
 
+    def test_dict_entries_keep_their_shape(self) -> None:
+        """issue #224：dict 日志不能被 str()，否则前端 l.text 全是 undefined。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / 'update-status.json'
+            f.write_text(
+                '{"logs":[{"ts":1,"level":"info",'
+                '"text":"proxy http://u:p@h:1 failed"}],"running":false}',
+                encoding='utf-8')
+            with mock.patch.object(updater, 'STATUS_FILE', f), mock.patch.object(
+                    updater, '_lock_active', return_value=False):
+                status = updater.read_status()
+        entry = status['logs'][0]
+        self.assertIsInstance(entry, dict)
+        self.assertEqual(entry['level'], 'info')
+        self.assertEqual(entry['text'], 'proxy http://***@h:1 failed')
+
+
 if __name__ == '__main__':
     unittest.main()

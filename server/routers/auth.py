@@ -54,7 +54,7 @@ async def login(request: Request) -> JSONResponse:
         security.record_fail(ip, username)
         # 登录失败也要留痕：本次事故中攻击者拿到了会话，但服务端没有任何记录
         security.audit({'username': username or '(空)'}, 'login_failed', username,
-                       f'来源 {ip}')
+                       f'来源 {ip}', ip=ip)
         raise HTTPException(status_code=401, detail='用户名或密码错误')
 
     security.clear_fail(ip, username)
@@ -67,7 +67,7 @@ async def login(request: Request) -> JSONResponse:
         logger.warning(warn)
     # orig 缺省 = 现在（首次登录）：这次是会话的**起点**，后续续期不会推后它。
     token = security.issue_token(username, user.get('role', 'viewer'))
-    security.audit(user, 'login', username, f'来源 {ip}')
+    security.audit(user, 'login', username, f'来源 {ip}', ip=ip)
     resp = JSONResponse({'ok': True, 'username': username, 'role': user.get('role', 'viewer')})
     resp.set_cookie(
         config.COOKIE_NAME,
@@ -113,7 +113,8 @@ def revoke_own_sessions(request: Request,
     if not username:
         raise HTTPException(status_code=401, detail='未登录')
     security.revoke_sessions(username)
-    security.audit(user, 'revoke_sessions', username, f'来源 {client_ip(request)}')
+    ip = client_ip(request)
+    security.audit(user, 'revoke_sessions', username, f'来源 {ip}', ip=ip)
     resp = JSONResponse({'ok': True, 'relogin_required': True})
     resp.delete_cookie(config.COOKIE_NAME, path='/')
     return resp

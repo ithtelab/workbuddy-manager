@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import unittest
 from pathlib import Path
@@ -221,6 +222,83 @@ class SharedCriterionTest(unittest.TestCase):
         # 畸形输入不放行
         self.assertFalse(keysvc.model_allowed(_key(models=['glm-5.2']), None))
         self.assertFalse(keysvc.model_allowed(_key(models=['glm-5.2']), '   '))
+
+
+class CatalogShrinkTest(unittest.TestCase):
+    """issue #239：上游清单里的已下架模型要按模型中心的实时目录裁掉。
+
+    上游 `/v1/models` 会列出一批腾讯早已收缩掉的旧模型（cn 域 52 个，
+    模型中心只有 20 个），下游拿它当选择器，选中后才 503。模型中心直连
+    腾讯的目录是当前可用的权威清单；取不到时原样透传，绝不能把列表清空。
+    """
+
+    def _scope(self, payload, key, mapping=None):
+        with mock.patch.object(db, 'get_setting',
+                               lambda k, d=None: (mapping or {}) if k == 'model_map' else d):
+            return G._scope_models(payload, key)
+
+    def test_drops_ids_missing_from_tencent_catalog(self) -> None:
+        payload = {'object': 'list', 'data': [
+            {'id': 'glm-5.2'}, {'id': 'deepseek-v4.1-flash'},
+            {'id': 'global:gpt-5.6-sol'},
+        ]}
+        key = _key(realm='cn')
+        scoped = self._scope(payload, key)
+        out = G._filter_catalog_models(scoped, key, 'cn', {'glm-5.2'})
+        self.assertEqual([m['id'] for m in out['data']], ['glm-5.2'],
+                         'cn 清单里仍留着模型中心没有的旧模型')
+
+    def test_global_prefix_is_compared_bare(self) -> None:
+        """模型中心给裸名，上游国际版给 `global:` 前缀，前缀不能导致误删。"""
+        payload = {'data': [{'id': 'global:gpt-5.6-sol'}]}
+        key = _key(realm='global')
+        out = G._filter_catalog_models(payload, key, 'global', {'gpt-5.6-sol'})
+        self.assertEqual([m['id'] for m in out['data']], ['global:gpt-5.6-sol'])
+
+    def test_alias_entry_survives(self) -> None:
+        """白名单里的别名指向仍在目录里的模型时，别名条目不能被裁掉。"""
+        mapping = {'gpt-4o-mini': 'glm-5.2'}
+        key = _key(models=['gpt-4o-mini'])
+        scoped = self._scope({'data': [{'id': 'glm-5.2'}]}, key, mapping)
+        self.assertEqual([m['id'] for m in scoped['data']], ['gpt-4o-mini'])
+        with mock.patch.object(db, 'get_setting',
+                               lambda k, d=None: mapping if k == 'model_map' else d):
+            out = G._filter_catalog_models(scoped, key, 'cn', {'glm-5.2'})
+        self.assertEqual([m['id'] for m in out['data']], ['gpt-4o-mini'],
+                         '别名指向的模型仍可用，别名不该被删')
+
+    def test_alias_to_dead_model_is_dropped(self) -> None:
+        """别名指向的模型已下架 → 别名同样不可用，应删。"""
+        mapping = {'dead-alias': 'old-model'}
+        key = _key(models=['dead-alias'])
+        scoped = self._scope({'data': [{'id': 'old-model'}, {'id': 'glm-5.2'}]},
+                             key, mapping)
+        with mock.patch.object(db, 'get_setting',
+                               lambda k, d=None: mapping if k == 'model_map' else d):
+            out = G._filter_catalog_models(scoped, key, 'cn', {'glm-5.2'})
+        self.assertEqual([m['id'] for m in out['data']], [])
+
+    def test_upstream_fallback_source_skips_filter(self) -> None:
+        """目录来源是上游回退（同一份旧表）时不做裁剪。"""
+        payload = {'data': [{'id': 'old-model'}]}
+        key = _key(realm='cn')
+        cat = {'source': 'upstream', 'models': [{'id': 'glm-5.2'}]}
+        with mock.patch.object(G.modelcatalog, 'catalog',
+                               mock.AsyncMock(return_value=cat)):
+            out = asyncio.run(G._drop_models_outside_catalog(payload, key))
+        self.assertEqual([m['id'] for m in out['data']], ['old-model'])
+
+    def test_catalog_failure_keeps_list(self) -> None:
+        """目录取不到/超时 → 原样返回，不能把列表清空。"""
+        payload = {'data': [{'id': 'old-model'}]}
+        key = _key(realm='cn')
+
+        async def _boom(realm):
+            raise TimeoutError('catalog timeout')
+
+        with mock.patch.object(G.modelcatalog, 'catalog', _boom):
+            out = asyncio.run(G._drop_models_outside_catalog(payload, key))
+        self.assertEqual([m['id'] for m in out['data']], ['old-model'])
 
 
 if __name__ == '__main__':

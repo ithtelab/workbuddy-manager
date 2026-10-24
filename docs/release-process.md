@@ -6,9 +6,9 @@
 
 ## 上游停更之后
 
-- **发版前不再需要查上游**：没有新提交可对。`deploy/check-upstream.sh` 仍可运行，
-  它会明确告诉你「上游仓库已不可访问，这一步不再需要」并以 0 退出
-  （把 `UPSTREAM_REPO` 指向你自己的副本时，它照旧按老规矩检查）。
+- **发版前不再查外部上游**：上游由本项目维护，没有独立的远端提交可对。
+  `deploy/check-upstream.sh` 只提示这一点并以 0 退出；需要验证的是补丁与
+  Go 测试，不是 git 提交。
 - **源码从哪来**：维护者手上留存了一份**最后版本的源码归档**（HEAD 快照，
   287 个文件，含 `LICENSE`）。它是完整的、可构建的；但原克隆是 blob-less
   部分克隆，**逐版本历史无法完整还原**，所以归档以「单次导入提交」的形式保存，
@@ -204,7 +204,17 @@ bash deploy/verify-release.sh /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz
 tar tzf /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz | head -5      # 抽查包结构
 #    再解开看 .version 与 server/main.py 的版本号
 
-# 5) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
+# 5) 给旧版更新器补过渡签名（v1.0.85 及更早仍强制验签；私钥只在维护者本机）
+cd /tmp/vX.Y.Z
+ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-vX.Y.Z.tar.gz
+gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
+  --repo ithtelab/workbuddy-manager
+#    验一下再继续（用仓库里记录的公钥，或 update.py 里内嵌的那把）：
+#    printf 'release %s\n' "$(cat ~/.ssh/workbuddy-release.pub)" > allowed_signers
+#    ssh-keygen -Y verify -f allowed_signers -I release -n file \
+#      -s workbuddy-manager-vX.Y.Z.tar.gz.sig < workbuddy-manager-vX.Y.Z.tar.gz
+
+# 6) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
 gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 ```
 
@@ -213,9 +223,10 @@ gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 直接把 Release 公开发布，产物还在上传时点「一键更新」就会拿到半成品或 404。现在
 用户侧看到的一直是上一个**已发布且产物齐全**的版本。
 
-2026-10-14 起**不再有「维护者离线签名」这一步**：更新器只核对发布页给的 sha256 与
-文件大小（发布说明里就印着那个哈希，工作流自动附上）。为什么取消、还剩下哪些保证、
-老版本怎么过渡，见 [release-signing.md](release-signing.md)。
+2026-10-14 起**新版本更新器不再要求签名**：只核对发布页给的 sha256 与文件大小
+（发布说明里就印着那个哈希，工作流自动附上）。但 `.sig` 仍要按第 5 步手工补 ——
+停在 v1.0.85 及更早的更新器强制验签，漏掉就会让这批老部署无法升级。为什么这样
+过渡、私钥如何保管，见 [release-signing.md](release-signing.md)。
 
 ## 发布包字节的可复现性
 

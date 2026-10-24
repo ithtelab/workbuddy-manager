@@ -772,6 +772,7 @@ export function ProxyPanel() {
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="__pool__">{t('settings.proxyFollowPool')}</SelectItem>
+                    <SelectItem value="__direct__">{t('settings.proxyDirectOnly')}</SelectItem>
                     {routes.map((r) => (
                       <SelectItem key={r.name} value={r.name}>{r.name}</SelectItem>
                     ))}

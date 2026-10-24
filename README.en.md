@@ -17,6 +17,10 @@ A web console for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)
 
 **English** · [简体中文](README.md) ｜ Documented and discussed in the [LINUX DO](https://linux.do) community
 
+<p align="center">
+  <strong>⚠️ Intended use:</strong> this project is only for managing accounts that <strong>you or your family members have voluntarily authorized</strong>. Bulk registration, account trading, registration-on-behalf, SMS-code farming, account theft, bypassing platform risk controls, resale, or any for-profit use are prohibited. By using this project you agree to the <a href="#intended-use--disclaimer">full disclaimer</a>.
+</p>
+
 <a href="https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme_en"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane (sponsor)" width="100%" /></a>
 
 **Sponsor**: [ProxyLane](https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme_en) residential proxies in 195 countries, 95%+ of IPs rated low risk by Scamalytics. Put the country, city and a session name in the `WB_HTTP_PROXY` username: each instance gets one residential IP for up to 72 hours, and a replacement IP stays in the same city.
@@ -120,6 +124,16 @@ Usage: daily / hourly, failures and latency
 Request logs: model, status, TTFB and billing per call
 
 More screenshots: [full gallery](docs/screenshots.md).
+
+---
+
+## Official download source
+
+**Download only from this repository's [Releases](https://github.com/ithtelab/workbuddy-manager/releases).** Official packages ship with a sha256 digest and `.sig` signature, and the updater verifies them.
+
+A third-party account has been directing users in issues to `github.com/AEmbers/workbuddy-manager` for so-called `v2.8.4` / `v2.8.5` builds, claiming to have "taken over" this project. That fork is not authorized by this project, and its builds do not carry this project's offline signature, so their origin and integrity cannot be verified through the official chain. **Do not set `WB_SKIP_SIGNATURE=1` or disable digest checks to install a third-party package.**
+
+If you have already signed in to the panel or entered upstream accounts on a third-party build, rotate the panel admin password and upstream account authorizations, then reinstall the official package.
 
 ---
 
@@ -276,6 +290,28 @@ release notes, and creates a Release with the archives attached.
   this project's releases)
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) — feature
   reference for the console
+
+---
+
+## Intended use & disclaimer
+
+**This project exists to help individuals manage accounts they or their family members have voluntarily authorized. It is not designed for bulk operations or commercial gain.**
+
+Permitted use:
+
+- Managing Tencent CodeBuddy accounts that you own or that your family members have explicitly authorized you to manage;
+- Learning, research and personal use on your own devices or private network.
+
+Prohibited use:
+
+- Bulk registration, registration-on-behalf, SMS-code farming, or buying, selling, renting or trading accounts;
+- Account theft, credential stuffing, or bypassing identity verification, risk controls, regional restrictions or other platform security mechanisms;
+- Charging for, reselling, lead-generating with, or otherwise monetizing this project or any derived service;
+- Any use that violates Tencent's terms of service, applicable laws, or the rights of others.
+
+You are responsible for confirming that your account authorization and use are lawful. Any account ban, data loss, service interruption or legal liability caused by abuse, misuse or violation of these boundaries is the user's responsibility; the authors and contributors are not responsible for your actions and provide no warranty of any kind.
+
+This project is not affiliated with or endorsed by Tencent or CodeBuddy. Related trademarks belong to their respective owners. The project is provided "as is" under the [MIT](LICENSE) license.
 
 ---
 

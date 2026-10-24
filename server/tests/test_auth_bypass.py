@@ -379,6 +379,22 @@ class UserAdminHttpTest(unittest.TestCase):
         r = self.c.patch('/api/users/admin', json={'password': 'abc'})
         self.assertEqual(r.status_code, 400)
 
+    def test_weak_password_rejected_on_create_and_change(self) -> None:
+        """生产事故根因：admin123 这类弱口令不能再被设置。"""
+        self.assertEqual(self._login('admin', 'http-admin-pw'), 200)
+
+        r = self.c.post('/api/users', json={
+            'username': 'weakling', 'password': 'admin123', 'role': 'viewer'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('12', r.json().get('detail', ''))
+
+        r = self.c.patch('/api/users/admin', json={'password': 'admin9876543210'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('用户名加数字', r.json().get('detail', ''))
+
+        # 被拒绝的两次都不能改掉原来的密码
+        self.assertEqual(self._login('admin', 'http-admin-pw'), 200)
+
     def test_viewer_cannot_manage_users(self) -> None:
         self.assertEqual(self._login('guest', 'guest-pw-123'), 200)
         self.assertEqual(
@@ -417,10 +433,14 @@ class UserAdminHttpTest(unittest.TestCase):
         self.assertEqual(self._login('admin', 'final-pw-123'), 200)
         r2 = self.c.get('/api/audit-logs')
         self.assertEqual(r2.status_code, 200, r2.text)
-        actions = {it['action'] for it in r2.json()['items']}
+        rows = r2.json()['items']
+        actions = {it['action'] for it in rows}
         self.assertIn('login', actions, '登录成功要留痕')
         self.assertIn('login_failed', actions, '登录失败要留痕（攻击者试密码就在这里）')
         self.assertIn('update_user', actions, '改密码要留痕')
+        for action in ('login', 'login_failed', 'update_user'):
+            row = next(it for it in rows if it['action'] == action)
+            self.assertTrue(row.get('ip'), f'{action} 应记录结构化来源 IP')
 
 
 if __name__ == '__main__':

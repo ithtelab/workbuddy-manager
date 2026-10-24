@@ -20,7 +20,7 @@ from .routers import (
     pgsync as pgsync_router, redpackets, responses, security as security_router,
     proxies, settings, stats, system, tokens, upstreams,
 )
-from .services import accountlog, dailyplan, pgsync, renew, tasklog, taskrun
+from .services import accountlog, cooling, dailyplan, pgsync, renew, tasklog, taskrun
 
 # 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
 # 一旦出现 emoji（账号昵称就可能带）就会抛 UnicodeEncodeError —— 与「成长任务」
@@ -35,6 +35,12 @@ async def lifespan(app: FastAPI):
     config.ensure_dirs()
     db.connect()
     security.load_users()  # 首次启动会自动生成管理员并打印一次密码
+    weak_admins = security.weak_admin_passwords()
+    if weak_admins:
+        # 不拒绝启动：用户需要先进面板改密码。日志必须足够醒目。
+        logger.error('管理员仍在使用常见弱口令：%s。请立即在「设置 → 管理用户」'
+                     '中修改；本次生产事故的入口就是 admin123。',
+                     '、'.join(weak_admins))
     _warn_if_exposed()
     _warn_weak_upstream_key()
     # 给「抽奖码」这一列上线之前建的红包补码（幂等）：没有码就拼不出抽奖链接，
@@ -51,6 +57,9 @@ async def lifespan(app: FastAPI):
     # token 自动续期（issue #40）：上游只在「保活时刻」与「有流量时」刷新，
     # 长期闲置的账号会一路走到过期。这里按剩余寿命巡检补齐那个空档。
     renew.start_scheduler()
+    # 强制冷却到期清理：manual_disabled 不会随 until 自动消失，不清理会让
+    # 定时冷却变成永久停用（见 services/cooling.py）。
+    cooling.start_scheduler()
     # 每日任务计划（签到 / 领奖 / 做任务）：管理端自己的调度器，把「一键」动作
     # 做成每天到点自动跑。默认全部关闭，由用户在账号页显式开启（full 有风控风险）。
     dailyplan.start_scheduler()
@@ -66,6 +75,7 @@ async def lifespan(app: FastAPI):
         tasklog.stop_collector()
         taskrun.stop_scheduler()
         renew.stop_scheduler()
+        cooling.stop_scheduler()
         dailyplan.stop_scheduler()
         accountlog.stop_collector()
         pgsync.stop_scheduler()
@@ -120,7 +130,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='2.4.0',
+    version='2.9.0',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，

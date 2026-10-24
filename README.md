@@ -17,6 +17,10 @@
 
 [English](README.en.md) · **简体中文** ｜ 本项目在 [LINUX DO](https://linux.do) 社区发布与交流
 
+<p align="center">
+  <strong>⚠️ 使用边界：</strong>本项目只用于管理<strong>本人及亲属自愿授权</strong>的账号；禁止批量注册、账号交易、代注册、接码、盗号、绕过平台风控，以及任何商业转售或盈利性用途。使用即表示你已阅读并同意<a href="#使用边界与免责声明">完整免责声明</a>。
+</p>
+
 <a href="https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助位）" width="100%" /></a>
 
 **赞助商**：[ProxyLane](https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme) 住宅代理，覆盖 195 个国家，95%+ IP 获 Scamalytics 低风险评级。在 `WB_HTTP_PROXY` 的用户名里写上国家、城市和会话名，每个实例走一个住宅 IP，最长 72 小时不变，换 IP 也留在同一城市。
@@ -112,6 +116,16 @@
 调用日志：每一笔的模型、状态、首字延迟与扣费
 
 其余界面截图见 [界面预览（全部）](docs/screenshots.md)。
+
+---
+
+## 官方下载源
+
+**只从本仓库的 [Releases](https://github.com/ithtelab/workbuddy-manager/releases) 下载。** 本项目的官方发布包提供 sha256 与 `.sig` 签名，更新器会核对它们。
+
+近期有第三方账号在 issue 里引导用户到 `github.com/AEmbers/workbuddy-manager` 下载所谓 `v2.8.4` / `v2.8.5`，并声称“已独立接手本项目”。该 fork 未获得本项目授权，构建也没有本项目的离线签名，无法按官方校验链确认来源和完整性。**不要为了安装第三方包设置 `WB_SKIP_SIGNATURE=1` 或跳过摘要校验。**
+
+如果已经在第三方包上登录过面板或填写过上游账号，建议轮换面板管理员密码和上游账号授权，然后重新安装官方发布包。
 
 ---
 
@@ -273,6 +287,28 @@ CI 会构建前端、打包产物、从 CHANGELOG 提取对应版本段落作为
 - [**linux-do/cdk**](https://github.com/linux-do/cdk)（MIT）—— 界面设计令牌与浮动底栏组件来源，本项目 UI 视觉与其保持一致
 - [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) —— 底层账号池与 OpenAI 兼容代理（MIT；源码随本项目的发布包分发，版权归原作者）
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) —— 管理端功能形态参考
+
+---
+
+## 使用边界与免责声明
+
+**本项目的初衷是方便个人管理本人及亲属自愿授权的账号，不是为批量运营或商业牟利设计的。**
+
+允许的用途：
+
+- 管理你本人或亲属明确授权给你的腾讯 CodeBuddy 账号；
+- 在自己的设备或内网中学习、研究和自用。
+
+禁止的用途：
+
+- 批量注册、代注册、接码，以及买卖、出租或交易账号；
+- 盗号、撞库、绕过实名认证、风控、区域限制或其他平台安全机制；
+- 将本项目或其派生服务用于对外收费、转售、引流或其他盈利性用途；
+- 任何违反腾讯服务条款、当地法律法规或侵犯他人权益的用途。
+
+使用者应自行确认账号授权与使用方式合法合规。因滥用、误用或违反上述边界导致的封号、数据丢失、服务中断或法律责任，由使用者自行承担；项目作者与贡献者不对使用者的行为负责，也不提供任何形式的担保。
+
+本项目与腾讯、CodeBuddy 官方无隶属或合作关系；相关商标归其权利人所有。项目按 [MIT](LICENSE) 许可「按现状」提供。
 
 ---
 

@@ -45,11 +45,17 @@ _RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     # 降级成功（buddy5 失败 → 单发成功）：不是失败，按「已做」记 pending
     (re.compile(r'buddy5 失败 -> 降级单发'), 'pending'),
     (re.compile(r'失败'), 'failed'),
-    (re.compile(r'已领|已完成|claimed'), 'claimed'),
+    # `claim 200 ok(credit=+300 energy=+5)` 是本轮真正入账的收尾行，但它既没有
+    # 「已领」也没有「claimed」字样，早先落到默认 pending —— 结果是**刚领完的
+    # 任务在摘要素里仍显示「待处理」**（实测一轮 +1700 分，列表全标待处理）。
+    # 必须排在 pending 之前：同一任务前面还有 query/accept/report 等 pending 行。
+    (re.compile(r'已领|已完成|claimed|claim \d+ ok'), 'claimed'),
     (re.compile(r'未达 target|未 completed|可点亮|可领|locked|dry-run|夜猫'
                 r'|in_progress|无需上报|前置解锁|部分点亮|（点亮）|未变化'), 'pending'),
+    # `query 任务不存在` 是「该账号没下发这条任务」，不是待办：标 skipped 才不会
+    # 让人以为还能做。mp 口径那句自带 skip，本来就走这里。
     (re.compile(r'跳过|skip|非映射|未映射|不可伪造|无可用对象 id|未登记生效'
-                r'|only_claim|未到上线时间'), 'skipped'),
+                r'|only_claim|未到上线时间|任务不存在'), 'skipped'),
 )
 
 # 状态选择优先级：一条任务打出多行时，取**结论最重**的那档。

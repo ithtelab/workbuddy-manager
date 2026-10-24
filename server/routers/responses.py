@@ -498,6 +498,52 @@ def _convert_tool_choice(choice: object, bridge: _ToolBridge | None = None) -> o
     return None
 
 
+def _structured_output_instruction(body: dict) -> str:
+    """把 Responses 的 `text.format` 转成模型可执行的 JSON 约束。
+
+    上游 Chat Completions 不消费 Responses 的 `text` 对象；只在网关侧丢掉它，
+    模型就会按自然语言回答（Codex guardian 的 JSON 校验因此恒失败，issue #258）。
+    这里把 json_schema / json_object 写成一条 system 指令，至少让模型知道必须返回
+    合法 JSON。`text.format.type == "text"`（默认）不产生任何改写。
+    """
+    text = body.get('text')
+    if not isinstance(text, dict):
+        return ''
+    fmt = text.get('format')
+    if not isinstance(fmt, dict):
+        return ''
+    kind = str(fmt.get('type') or '').strip().lower()
+    if kind == 'json_object':
+        return ('You must respond with a single valid JSON object. '
+                'Do not wrap it in markdown fences or add any text outside the JSON object.')
+    if kind != 'json_schema':
+        return ''
+    schema = fmt.get('schema')
+    if schema is None:
+        return ''
+    try:
+        schema_text = json.dumps(schema, ensure_ascii=False, separators=(',', ':'))
+    except (TypeError, ValueError):
+        return ''
+    name = str(fmt.get('name') or '').strip()
+    label = f' named {name!r}' if name else ''
+    return (f'You must respond with a single valid JSON object{label} that conforms '
+            f'exactly to this JSON Schema:\n{schema_text}\n'
+            'Do not wrap it in markdown fences or add any text outside the JSON object.')
+
+
+def _inject_structured_output(messages: list[dict], body: dict) -> None:
+    """把 JSON 约束接到第一条 system/developer 消息上；没有就新建一条。"""
+    instruction = _structured_output_instruction(body)
+    if not instruction:
+        return
+    if (messages and messages[0].get('role') in ('system', 'developer')
+            and isinstance(messages[0].get('content'), str)):
+        messages[0]['content'] = messages[0]['content'].rstrip() + '\n\n' + instruction
+    else:
+        messages.insert(0, {'role': 'system', 'content': instruction})
+
+
 def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                     bridge: _ToolBridge | None = None) -> dict:
     """Responses 请求体 → Chat Completions 请求体。"""
@@ -795,6 +841,7 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                     attach_reasoning(prev, take_reasoning())
                     break
 
+    _inject_structured_output(messages, body)
     out['messages'] = messages
 
     if body.get('max_output_tokens') is not None:

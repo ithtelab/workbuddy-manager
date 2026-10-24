@@ -101,6 +101,44 @@ function Find-LocalPackage {
 }
 
 # ── 2. 免 API 限制的版本检测（彻底杜绝 GitHub API 403 频率超限）──
+
+# GitHub 镜像（issue #216）：国内机器直连 github.com / api.github.com 常超时。
+# gh-proxy 一类服务的用法是「镜像基址 + 完整原始地址」。只在显式配置时启用；
+# 走镜像时**不发送任何 Token**（镜像会把请求转给第三方）。
+function Get-GitHubMirror {
+    $raw = $env:WB_GITHUB_MIRROR
+    if (-not $raw) {
+        # 面板里配的镜像存在数据库里，这个独立脚本读不到；.env 是它能拿到的口径。
+        $envPath = Join-Path $root '.env'
+        if (Test-Path $envPath) {
+            foreach ($line in Get-Content $envPath) {
+                if ($line -match '^\s*WB_GITHUB_MIRROR\s*=\s*(.+)$') {
+                    $raw = $Matches[1].Trim().Trim('"').Trim("'")
+                    break
+                }
+            }
+        }
+    }
+    if (-not $raw) { return '' }
+    $raw = $raw.Trim()
+    if ($raw -notmatch '^https?://') { $raw = 'https://' + $raw }
+    if ($raw -notmatch '^https?://[^/?#]+') { return '' }
+    # 拼地址的规则是「基址 + 完整原始地址」：带查询串/片段必然拼出错误页，直接不用
+    if ($raw -match '[?#]') { return '' }
+    return $raw.TrimEnd('/') + '/'
+}
+
+function New-MirrorUrl {
+    param([string]$Url, [string]$Mirror)
+    if (-not $Mirror) { return $Url }
+    if ($Url -notmatch '^https://(github\.com|api\.github\.com|codeload\.github\.com|raw\.githubusercontent\.com|objects\.githubusercontent\.com)/') {
+        return $Url
+    }
+    return "$Mirror$Url"
+}
+
+$mirrorBase = Get-GitHubMirror
+
 function Get-LatestGitHubTag {
     $proxyList = [System.Collections.Generic.List[string]]::new()
     if ($env:HTTPS_PROXY) { $proxyList.Add($env:HTTPS_PROXY) }
@@ -112,7 +150,29 @@ function Get-LatestGitHubTag {
 
     $curlExe = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 
+    # 方式 0: 经镜像取 Releases API（镜像可代理 api.github.com，且不受网页正文限制）
+    if ($mirrorBase) {
+        try {
+            $apiParams = @{
+                Uri = "$mirrorBase" + 'https://api.github.com/repos/ithtelab/workbuddy-manager/releases/latest'
+                Headers = @{"User-Agent"="workbuddy-updater"}
+                TimeoutSec = 15
+            }
+            $res = Invoke-RestMethod @apiParams
+            if ($res.tag_name) {
+                $digest = ''
+                foreach ($a in @($res.assets)) {
+                    if ($a.name -like '*.tar.gz') { $digest = "$($a.digest)" }
+                }
+                return @{ Tag = $res.tag_name; Proxy = ''; Digest = $digest }
+            }
+        } catch {
+            Write-Host "[WARN] 镜像版本检测失败，回退直连：$($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
     # 方式 1: 直接向 github.com 发起 HEAD 请求取重定向 Location（无 60次/小时 API 限制）
+    # 注意：gh-proxy 一类镜像只放行资源下载，对网页正文返回 403，所以这条**不走镜像**。
     if ($curlExe) {
         foreach ($p in $proxyList) {
             try {
@@ -300,11 +360,22 @@ $expectedDigest = if ($tagInfo -and $tagInfo.Digest) { "$($tagInfo.Digest)" } el
 # 投毒路径，不能默认放行。
 if (-not $expectedDigest -and $latestVer) {
     try {
+        # 配了镜像时先经镜像取摘要（api.github.com 可被镜像代理）
         $apiUrl = "https://api.github.com/repos/ithtelab/workbuddy-manager/releases/tags/$latestVer"
-        $release = Invoke-RestMethod -Uri $apiUrl -TimeoutSec 15 -Headers @{
-            'User-Agent' = 'workbuddy-updater'
-            'Accept' = 'application/vnd.github+json'
+        $apiTargets = @()
+        if ($mirrorBase) { $apiTargets += (New-MirrorUrl -Url $apiUrl -Mirror $mirrorBase) }
+        $apiTargets += $apiUrl
+        $release = $null
+        foreach ($target in $apiTargets) {
+            try {
+                $release = Invoke-RestMethod -Uri $target -TimeoutSec 15 -Headers @{
+                    'User-Agent' = 'workbuddy-updater'
+                    'Accept' = 'application/vnd.github+json'
+                }
+                break
+            } catch {}
         }
+        if (-not $release) { throw '所有地址都取不到 Releases API' }
         foreach ($asset in $release.assets) {
             if ($asset.name -like 'workbuddy-manager-*.tar.gz' -and $asset.digest) {
                 $expectedDigest = [string]$asset.digest
@@ -326,16 +397,31 @@ if ($targetPkg) {
     $downloadSuccess = $false
 
     # 尝试方式 1: 使用 curl.exe 命令行静默下载
+    # 配了镜像时先走镜像，失败再直连 —— 镜像自己也会抖，不能因为它挂了就没法更新。
     if ($curlExe) {
-        Write-Host "[INFO] 正在尝试后台下载官方发布包 ($latestVer)..." -ForegroundColor Cyan
-        $cArgsBase = @('-L', '--fail', '--connect-timeout', '10')
-        if ($detectedProxy) { $cArgsBase += @('-x', $detectedProxy) }
+        $downloadTargets = @()
+        if ($mirrorBase) { $downloadTargets += (New-MirrorUrl -Url $tarUrl -Mirror $mirrorBase) }
+        $downloadTargets += $tarUrl
+        foreach ($dlUrl in $downloadTargets) {
+            if ($mirrorBase -and $dlUrl -ne $tarUrl) {
+                Write-Host "[INFO] 正在尝试经镜像下载官方发布包 ($latestVer)..." -ForegroundColor Cyan
+            } else {
+                Write-Host "[INFO] 正在尝试后台下载官方发布包 ($latestVer)..." -ForegroundColor Cyan
+            }
+            $cArgsBase = @('-L', '--fail', '--connect-timeout', '10')
+            if ($detectedProxy) { $cArgsBase += @('-x', $detectedProxy) }
 
-        & $curlExe ($cArgsBase + @('-o', $tempTar, $tarUrl))
+            & $curlExe ($cArgsBase + @('-o', $tempTar, $dlUrl))
 
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $tempTar) -and ((Get-Item $tempTar).Length -gt 5000000)) {
-            $downloadSuccess = $true
-            Write-Host "[SUCCESS] 发布包下载完成。" -ForegroundColor Green
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $tempTar) -and ((Get-Item $tempTar).Length -gt 5000000)) {
+                $downloadSuccess = $true
+                Write-Host "[SUCCESS] 发布包下载完成。" -ForegroundColor Green
+                break
+            }
+            Remove-Item $tempTar -Force -ErrorAction SilentlyContinue
+            if ($dlUrl -ne $tarUrl) {
+                Write-Host "[WARN] 镜像下载失败，回退直连..." -ForegroundColor Yellow
+            }
         }
     }
 

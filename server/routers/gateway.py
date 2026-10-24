@@ -1,10 +1,12 @@
 """对外反代网关：密钥鉴权 → IP 管控 → 模型映射 → 转发 → 计量落库。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from urllib.parse import urlsplit
 import logging
+import threading
 import time
 
 import httpx
@@ -12,7 +14,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, db, iputil, keysvc, upstreamsvc
-from ..services import modelmap, proxyroutes
+from ..services import modelcatalog, modelmap, proxyroutes
 from ..config import _env_int
 from ..routers.security import get_config as get_security_config
 
@@ -247,6 +249,61 @@ def _rate_limited(key: dict) -> tuple[bool, int]:
     return limited, len(hits)
 
 
+# ── 未鉴权入口的入站日志采样 ─────────────────────────────
+# 「没有密钥」「密钥不认识」这两条路径**在校验密钥之前**就写库，任何匿名者都能
+# 触发（`/v1/chat/completions` 与 `/v1/usage` 都是这样）。攻击者只要写个循环
+# 用随机 token 打过来，就能以每请求一行的速度把 `ip_access_logs` 的两万行窗口
+# 顶掉——真正该看的扫描记录反而被自己人（同一个人）挤了出去，外加持续的写盘与
+# 行数清理开销。这是**匿名写放大**，与 `_log_ip` 里清洗/截断防的是同一类问题。
+#
+# 做法：按 (来源 IP, 原因) 做**窗口内计数**，前 N 次照常逐条记录（保留细节：
+# 路径、UA 都不一样，排查时有用），超出的折叠掉，并在本窗口第一次折叠时写一条
+# `key_auth_flood` 汇总行——运维能看到「这个 IP 在这一分钟里刷了更多」，但库里
+# 每分钟最多 N+1 行/IP。折叠不是丢弃信号，而是把「很多条一样的东西」压成一条
+# 仍能看出发生了什么的记录。
+#
+# 只对这两个**未鉴权可达**的原因采样：`ip_blocked` / `rate_limited` / 密钥层
+# 拒绝都要求先拿出一把已知密钥，写放大的成本已经由密钥本身承担，采样反而会
+# 藏掉「某把密钥被反复拒绝」的线索。
+#
+# 计数在进程内存里（与上面的每密钥限流同一口径）：单实例足够；`workers > 1`
+# 时每个进程各自计数，上限按进程数放大——仍然有界，可接受。
+_AUTH_FAIL_REASONS = frozenset({'missing_key', 'invalid_key'})
+_AUTH_LOG_WINDOW = 60
+_AUTH_LOG_PER_WINDOW = max(1, _env_int('WB_AUTH_LOG_PER_MIN', 5))
+# 计数表的硬上限。大量不同来源 IP 在同一个窗口内各打一次时，过期清理
+# 永远不会被触发（每个 state 的计数都停在 1）；必须有一个不依赖计数的上限。
+_AUTH_LOG_MAX_ENTRIES = 8192
+# (ip, reason) -> [窗口起点, 本窗次数, 是否已写过汇总行]
+_auth_log_state: dict[tuple[str, str], list] = {}
+_auth_log_lock = threading.Lock()
+
+
+def _auth_log_verdict(ip: str, reason: str) -> str:
+    """返回 'log'（逐条记录）/ 'flood'（写一条汇总行）/ 'drop'（折叠掉）。"""
+    now = time.time()
+    key = (ip, reason)
+    with _auth_log_lock:
+        state = _auth_log_state.get(key)
+        if not state or now - state[0] >= _AUTH_LOG_WINDOW:
+            state = [now, 0, False]
+            _auth_log_state[key] = state
+        state[1] += 1
+        # 硬上限：大量不同来源 IP 各打一次时，按 state 计数的过期清理永远
+        # 轮不到（每个计数都是 1），字典会无界增长。超过上限就清空重来——
+        # 宁可少采样一小段，也不让外部输入把进程内存撑爆。
+        if len(_auth_log_state) > _AUTH_LOG_MAX_ENTRIES:
+            _auth_log_state.clear()
+            state = [now, 1, False]
+            _auth_log_state[key] = state
+        if state[1] <= _AUTH_LOG_PER_WINDOW:
+            return 'log'
+        if not state[2]:
+            state[2] = True
+            return 'flood'
+        return 'drop'
+
+
 def _log_ip(ip: str, path: str, blocked: bool, ua: str | None,
             reason: str | None = None) -> None:
     """记录一次入站访问。**默认只记拦截**，放行不记（见下）。
@@ -278,9 +335,19 @@ def _log_ip(ip: str, path: str, blocked: bool, ua: str | None,
         污染事后排查（实测确认）。
       * 写入走 `db.add_ip_access_log`，由它负责行数上限（超出就丢最旧的），
         避免表无限增长直到磁盘写满。
+      * 「没有密钥」「密钥不认识」这两种**匿名可达**的原因再做一层窗口采样
+        （见 `_auth_log_verdict`）：每 IP 每分钟前几条照常记，其余折叠成一条
+        `key_auth_flood`。所以「一次都没记」不会发生，被折叠的那部分仍留了
+        一条能看出「这个 IP 在刷」的记录。
     """
     if not blocked and not config.AUDIT_ALL_ACCESS:
         return
+    if reason and reason in _AUTH_FAIL_REASONS:
+        verdict = _auth_log_verdict(ip, reason)
+        if verdict == 'drop':
+            return
+        if verdict == 'flood':
+            reason = 'key_auth_flood'
     db.add_ip_access_log(ip, path, blocked, ua, reason)
 
 
@@ -740,6 +807,10 @@ async def list_models(request: Request):
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', resp.status_code, 0, 0, latency, request.headers.get('user-agent'), None, False)
         payload = _scope_models(resp.json(), key)
+        # 目录收缩（issue #239）：上游模型表可能仍列着腾讯已经下架的 id，
+        # 客户端选中后才 503。模型中心直连腾讯的目录是当前可用的权威清单，
+        # 取得到且来源是腾讯时按它裁一次；取不到就原样透传。
+        payload = await _drop_models_outside_catalog(payload, key)
         # 能力字段兜底（issue #211）：随包上游的版本可能比面板旧 —— 补丁只在上游
         # 侧时，下游经面板拿到的清单仍缺字段，客户端会整条跳过模型。
         payload = _listing_compat_models(payload)
@@ -827,6 +898,76 @@ def _alias_entries(items: list, allow: list[str]) -> list[dict]:
         out.append({**src, 'id': name})
         seen.add(name)
     return out
+
+
+def _catalog_model_key(model: object) -> str:
+    """模型名的跨源比对键：去掉 `cn:` / `global:` 前缀。
+
+    两个来源的前缀口径不同：上游清单国际版带 `global:`，模型中心直连腾讯
+    给的是裸名。同一把密钥只看一个版本，所以去掉前缀比对不会把两版同名
+    模型混在一起（版本维度由 `_model_realm_of` 先筛过）。
+    """
+    raw = keysvc._bare_model(model)
+    return raw[7:] if raw.lower().startswith('global:') else raw
+
+
+def _filter_catalog_models(payload: object, key: dict | None,
+                           realm: str, catalog_ids: set[str]) -> object:
+    """按模型中心的实时目录裁掉已下架的 id（issue #239）。
+
+    上游 `/v1/models` 的表里仍留着腾讯已经收缩掉的旧模型；下游把它当选择器，
+    选中后才 503。模型中心直连腾讯的目录是当前可用的权威清单，取得到时以它
+    为准。白名单里的**别名**要继续保留（它指向的模型仍在目录里）。
+    """
+    if not isinstance(payload, dict) or not catalog_ids:
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    key = key or {}
+    mapping = db.get_setting('model_map', {}) or {}
+    aliases: set[str] = set()
+    for raw in key.get('models') or []:
+        name = keysvc._bare_model(raw)
+        target = modelmap.target_for(mapping, name)
+        if target and _catalog_model_key(target) in catalog_ids:
+            aliases.add(_catalog_model_key(name))
+    kept: list = []
+    for m in items:
+        if not isinstance(m, dict) or not m.get('id'):
+            kept.append(m)
+            continue
+        if _model_realm_of(m) != realm:
+            kept.append(m)
+            continue
+        mid = _catalog_model_key(m.get('id'))
+        if mid in catalog_ids or mid in aliases:
+            kept.append(m)
+    return {**payload, 'data': kept}
+
+
+async def _drop_models_outside_catalog(payload: object, key: dict | None) -> object:
+    """取该版本的模型中心目录并裁掉已下架模型；取不到就原样返回。
+
+    目录走 `modelcatalog.catalog()`（5 分钟缓存，来源可能是直连腾讯，也可能
+    是上游回退）。**只有来源是腾讯时才裁**：上游回退本身就是同一份旧表，
+    拿它裁等于没裁。超时/异常一律放弃裁剪，不能因为目录取不到就把列表清空。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    realm = keysvc._norm_realm((key or {}).get('realm'))
+    if realm not in ('cn', 'global'):
+        return payload
+    try:
+        cat = await asyncio.wait_for(modelcatalog.catalog(realm), timeout=5)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug('模型目录裁剪跳过：%s', exc)
+        return payload
+    if cat.get('source') != 'tencent':
+        return payload
+    ids = {_catalog_model_key(m.get('id')) for m in (cat.get('models') or [])
+           if isinstance(m, dict) and m.get('id')}
+    return _filter_catalog_models(payload, key, realm, ids)
 
 
 def _scope_models(payload: object, key: dict | None) -> object:

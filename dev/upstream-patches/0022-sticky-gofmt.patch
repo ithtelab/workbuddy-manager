@@ -1,0 +1,32 @@
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index 131fc52..d6a9e29 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -98,7 +98,7 @@ func main() {
+ 	} else {
+ 		log.Printf("未配置出口线路（config.json 的 proxies 段）：账号绑定的线路名会明确报错，不会静默直连")
+ 	}
+-	p.SetCreditExhausted(cfg.CreditExhaustedDur)       // 积分耗尽后的冷却时长（credit_exhausted，0 = 旧行为）               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
++	p.SetCreditExhausted(cfg.CreditExhaustedDur) // 积分耗尽后的冷却时长（credit_exhausted，0 = 旧行为）               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+ 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+ 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+ 
+diff --git a/internal/session/session.go b/internal/session/session.go
+index 1b16626..b92b54c 100644
+--- a/internal/session/session.go
++++ b/internal/session/session.go
+@@ -341,11 +341,11 @@ func hashIndex(key string, n int) int {
+ //  5. prompt_cache_key（第 5 项，见下）
+ //
+ // 前四项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+-//（P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
++// （P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
+ // user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
+ // 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
+-//（与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
+-//（7d 兜底）自然过期，键消失不产生脏绑定。
++// （与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
++// （7d 兜底）自然过期，键消失不产生脏绑定。
+ //
+ // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
+ // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，

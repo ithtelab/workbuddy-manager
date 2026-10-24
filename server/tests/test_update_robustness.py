@@ -5,10 +5,11 @@
 当时只把它当普通命令失败上报，用户看到的是难懂的 checksum 报错，
 既不知道原因、也没有退路。
 
-这里覆盖三件事：
+这里覆盖两件事：
   1. Dockerfile 预检能提前查出「引用了不存在的文件」，且不误报；
-  2. 固定上游版本（回退手段）的读写与格式校验；
-  3. 构建失败诊断能把 docker 报错归纳成人话。
+  2. 构建失败诊断能把 docker 报错归纳成人话。
+
+随包上游的同步语义在下面的 BundledUpstreamSyncTest 里覆盖。
 """
 from __future__ import annotations
 
@@ -18,9 +19,6 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
-
-from server import config  # noqa: E402
-from server.services import updater  # noqa: E402
 
 # 复用 worker 里的纯函数（deploy/update.py 是独立脚本，不在包内）
 DEPLOY_DIR = pathlib.Path(__file__).resolve().parents[2] / 'deploy'
@@ -95,105 +93,6 @@ class BuildFailureDiagnosis(unittest.TestCase):
 
     def test_unknown_returns_empty(self) -> None:
         self.assertEqual(worker._diagnose_build_failure('some novel error'), '')
-
-
-class UpstreamRefPinning(unittest.TestCase):
-    """固定上游版本（回退手段）。"""
-
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self._orig_file = updater.UPSTREAM_REF_FILE
-        self._orig_data = config.DATA_DIR
-        updater.UPSTREAM_REF_FILE = pathlib.Path(self._tmp.name) / 'ref.txt'
-        config.DATA_DIR = pathlib.Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        updater.UPSTREAM_REF_FILE = self._orig_file
-        config.DATA_DIR = self._orig_data
-        self._tmp.cleanup()
-
-    def test_default_is_follow_branch(self) -> None:
-        self.assertEqual(updater.upstream_ref(), '')
-
-    def test_set_and_read_commit(self) -> None:
-        self.assertEqual(updater.set_upstream_ref('98b5e160'), '98b5e160')
-        self.assertEqual(updater.upstream_ref(), '98b5e160')
-
-    def test_set_and_read_tag(self) -> None:
-        self.assertEqual(updater.set_upstream_ref('v1.2.3'), 'v1.2.3')
-
-    def test_full_sha_accepted(self) -> None:
-        sha = '4a80249f6ffb7eea087ee86a5e6ade57432bb895'
-        self.assertEqual(updater.set_upstream_ref(sha), sha)
-
-    def test_clear_restores_branch_tracking(self) -> None:
-        updater.set_upstream_ref('98b5e160')
-        self.assertEqual(updater.set_upstream_ref(''), '')
-        self.assertEqual(updater.upstream_ref(), '')
-        self.assertFalse(updater.UPSTREAM_REF_FILE.exists(), '取消固定应删除文件')
-
-    def test_rejects_injection(self) -> None:
-        """该值会进入 git 参数位，必须严格校验。"""
-        for bad in ('a;rm -rf /', '$(whoami)', 'a b', 'a\nb', '../x', '-flag', '`id`', 'a|b'):
-            with self.assertRaises(ValueError, msg=bad):
-                updater.set_upstream_ref(bad)
-        self.assertEqual(updater.upstream_ref(), '', '非法输入不应落盘')
-
-    def test_status_exposes_ref(self) -> None:
-        updater.set_upstream_ref('98b5e160')
-        self.assertEqual(updater.read_status().get('upstream_ref'), '98b5e160')
-
-
-class UpstreamRemoteGoneTest(unittest.TestCase):
-    """上游仓库没了的时候，更新日志要把原因说对。
-
-    背景：上游原仓库 Sliverkiss/workbuddy2api 自 2026-09-23 起已不可访问。
-    此前拉取失败一律写「git fetch 失败（网络问题？）」——用户会去查网络、
-    反复重试一个必然失败的地址。真正的原因与出路要写清楚：源码还在本地、
-    本次照常重建；以后要更新就指向自己的副本。
-
-    判据用**真实的 git 报文**：git 的原文是
-    `fatal: repository 'https://…' not found`（仓库地址夹在中间），
-    所以「repository…not found」不能写成连写匹配（头一版就栽在这，测试看得见）。
-    """
-
-    GONE = [
-        "remote: Repository not found.\nfatal: repository 'https://github.com/x/y.git/' not found",
-        "fatal: repository 'https://github.com/Sliverkiss/workbuddy2api.git/' not found",
-        'fatal: could not read from remote repository',
-        "fatal: 'https://example.com/x.git' does not appear to be a git repository",
-    ]
-    OTHER = [
-        'fatal: could not resolve host: github.com',
-        'fatal: unable to access ...: Connection timed out',
-        '',
-    ]
-
-    def test_repo_gone_is_named_as_such(self) -> None:
-        """远端拿不到代码时：说清「源码从发布包来」这条出路，且**不把人往网络上引**。
-
-        判据盯的是**实质**而不是某四个字：措辞会随文案调整（本轮就把「已不可访问」
-        改成了中性的「远端仓库取不到代码」），但「出路要说清、别甩锅网络」这两条不变。
-        """
-        for out in self.GONE:
-            with self.subTest(out=out.splitlines()[0] if out else ''):
-                hint = worker._fetch_failed_hint(out)
-                self.assertIn('WB_UPSTREAM_REPO', hint, '要给出可操作的出路')
-                self.assertTrue('发布包' in hint or '包内' in hint,
-                                '要说清源码随发布包分发这条正路')
-                self.assertNotIn('网络', hint, '这不是网络问题，别让人去查网络')
-
-    def test_network_failure_is_not_blamed_on_the_missing_repo(self) -> None:
-        """网络、超时这类失败不能误报成「远端没了」——那会把排查带偏。"""
-        for out in self.OTHER:
-            with self.subTest(out=out):
-                hint = worker._fetch_failed_hint(out)
-                self.assertNotIn('发布包', hint)
-                self.assertIn('网络', hint, '网络类失败要如实说是网络')
-
-    def test_pinned_target_is_mentioned(self) -> None:
-        hint = worker._fetch_failed_hint(self.GONE[1], 'v1.2.3')
-        self.assertIn('v1.2.3', hint, '固定了版本时要说明是哪一次拉取失败')
 
 
 class BundledUpstreamSyncTest(unittest.TestCase):
@@ -312,12 +211,13 @@ class BundledUpstreamSyncTest(unittest.TestCase):
         n = worker._sync_bundled_upstream(self.bundle, self._rep())
         self.assertEqual(n, 0, '内容一致时必须返回 0（调用方据此跳过容器重建）')
 
-    def test_git_upstream_is_left_alone(self) -> None:
+    def test_git_upstream_is_synced_too(self) -> None:
+        """外部上游停更后，git 目录也按发布包内源码同步。"""
         (self.target / '.git').mkdir()
         n = worker._sync_bundled_upstream(self.bundle, self._rep())
-        self.assertEqual(n, 0)
+        self.assertEqual(n, 3)
         self.assertEqual((self.target / 'scripts' / 'checkin.py').read_text(encoding='utf-8'),
-                         'OLD\n', 'git 部署有自己的更新通道，不该被包内源码覆盖')
+                         'NEW\n', 'git 目录不再是独立更新源，应按包内源码同步')
 
     def test_missing_bundle_is_noop(self) -> None:
         empty = self.bundle.parent / 'empty'

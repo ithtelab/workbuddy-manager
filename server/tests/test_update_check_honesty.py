@@ -74,7 +74,6 @@ class StaleCheckTest(unittest.TestCase):
             mock.patch.object(updater, '_write_cache',
                               side_effect=lambda v: self._cache.update(v)),
             mock.patch.object(updater, 'current_version', return_value='v1.0.0'),
-            mock.patch.object(updater, '_local_upstream_head', return_value=''),
         ]
         for p in self._patches:
             p.start()

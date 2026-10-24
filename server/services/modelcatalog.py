@@ -91,8 +91,12 @@ def _load_token(filename: str) -> str:
 # 模型中心显示「不支持推理」，与真实能力不符（用户报的 issue #8）。
 #
 # **两个版本的表绝不混用**：同一模型在两个版本下的档位可能不同
-# （deepseek-v4.1-flash：国内版 low/high/max，国际版仅 high）。
+# （deepseek-v4.1-flash：国内版 low/high/max，国际版 high/max）。
 # 这张表是「远端没给时的兜底」，远端给了就以远端为准（见 _decorate）。
+#
+# _EFFORT_EXTEND 是**产品能力已更新、模型接口元数据还没跟上**时的补档：
+# 2026-10 issue #238，国际版官方客户端已能选 Max，但模型接口仍只回 high。
+# 只在远端/兜底已有档位时追加，不会给未知模型凭空造档位。
 _EFFORT_FALLBACK: dict[str, dict[str, dict]] = {
     'cn': {
         'deepseek-v4-flash': {'efforts': ['low', 'high', 'max']},
@@ -118,7 +122,7 @@ _EFFORT_FALLBACK: dict[str, dict[str, dict]] = {
         'primary-model': {'efforts': ['high']},
         'hy4-preview-f': {'efforts': ['high'], 'default': 'high'},
         'hy3': {'efforts': ['low', 'high'], 'default': 'high'},
-        'deepseek-v4.1-flash': {'efforts': ['high']},
+        'deepseek-v4.1-flash': {'efforts': ['high', 'max'], 'default': 'high'},
         'gpt-6-astra': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
         'gpt-5.6-sol': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
         'gpt-5.6-terra': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
@@ -132,6 +136,11 @@ _EFFORT_FALLBACK: dict[str, dict[str, dict]] = {
         'kimi-k3': {'efforts': ['medium']},
         'kimi-k2.6': {'efforts': ['medium']},
     },
+}
+
+_EFFORT_EXTEND: dict[str, dict[str, list[str]]] = {
+    # issue #238：官方客户端已可选 Max，接口 supportedEfforts 仍为 ['high']。
+    'global': {'deepseek-v4.1-flash': ['max']},
 }
 
 
@@ -148,8 +157,11 @@ def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
     显示「不支持推理」，与真实能力不符（用户报的 issue #8 即此）。
 
     兜底表**按版本分表且不混用**：同一模型在两个版本下的档位可能不同
-    （deepseek-v4.1-flash：国内版三档、国际版仅 high），混用会把国际版
+    （deepseek-v4.1-flash：国内版三档、国际版 high/max），混用会把国际版
     显示成支持国内版的档位。
+
+    远端元数据滞后于产品客户端时，`_EFFORT_EXTEND` 在已有档位上补差
+    （issue #238）；只在 efforts 非空时追加，避免给未知模型造档位。
     """
     out = []
     for m in items:
@@ -164,6 +176,10 @@ def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
             cap = _EFFORT_FALLBACK.get(realm, {}).get(mid)
             efforts = list(cap['efforts']) if cap else []
             eff_default = str(cap.get('default') or '') if cap else ''
+        if efforts:
+            for extra in _EFFORT_EXTEND.get(realm, {}).get(mid, ()):
+                if extra not in efforts:
+                    efforts.append(extra)
         # 默认档必须在支持列表内才有效（镜像上游的 containsEffort 校验）
         if eff_default and eff_default not in efforts:
             eff_default = ''

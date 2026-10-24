@@ -57,6 +57,23 @@ class SwapDirTest(unittest.TestCase):
         # incoming 是源，不该被搬走或删掉
         self.assertTrue((self.incoming / 'main.py').is_file())
 
+    def test_exdev_falls_back_to_copy_and_delete(self) -> None:
+        """overlayfs lowerdir 上的目录 rename 会报 EXDEV（issue #225）。"""
+        real_replace = os.replace
+        calls = {'n': 0}
+
+        def exdev_first(src, dst):  # noqa: ANN001, ANN202
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise OSError(18, 'Invalid cross-device link')
+            return real_replace(src, dst)
+
+        with mock.patch('os.replace', side_effect=exdev_first):
+            self.mod.swap_dir(self.incoming, self.target)
+        self.assertEqual((self.target / 'main.py').read_text(encoding='utf-8'), 'new')
+        self.assertFalse((self.target / 'stale.py').exists())
+        self.assertFalse((self.root / 'server.old').exists())
+
     def test_rollback_when_swap_fails(self) -> None:
         real_replace = os.replace
         calls = {'n': 0}

@@ -472,6 +472,15 @@ const FEATURES_FIELDS: Field[] = [
     desc: '对发往上游的请求做轻量脱敏，降低被判定异常的概率。除非在排查问题，否则建议保持开启',
     def: true,
   },
+  {
+    key: 'reasoning_as_content',
+    kind: 'bool',
+    label: '思考内容兜底为正文',
+    desc: '模型在思考模式下正文为空时，把推理原文同时作为正文下发，避免只看正文的客户端'
+      + '显示空回复。代价：同时渲染推理与正文的客户端会把同一段话显示两遍'
+      + '（表现为「推理变成了正文」）。客户端能显示推理时建议关闭',
+    def: true,
+  },
 ];
 
 const SESSION_FIELDS: Field[] = [
@@ -870,6 +879,14 @@ const FIELD_BY_KEY: Record<string, Field> = {};
 for (const g of GROUPS) for (const f of g.fields) FIELD_BY_KEY[f.key] = f;
 
 /**
+ * 界面归在某组、但在上游 config.json 里是**顶层**键的字段。
+ *
+ * 目前只有 reasoning_as_content（思考兜底）：它在上游是根级布尔，塞进
+ * features 段就等于写到错误路径、改了不生效。提交时必须提到顶层。
+ */
+const TOP_LEVEL_KEYS = new Set(['reasoning_as_content']);
+
+/**
  * 设置页的外壳（批次 4 的 P1-2：7 个 Tab 变成可寻址子路由）。
  *
  * **为什么外壳是 `layout.tsx` 而不是 `page.tsx`**：`/settings/upstream` 与
@@ -1037,7 +1054,13 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
       prompt: pickValues(PROMPT_FIELDS, cfg.prompt),
       cooldown: pickValues(COOLDOWN_FIELDS, cfg.cooldown),
       pool: pickValues(POOL_FIELDS, cfg.pool),
-      features: pickValues(FEATURES_FIELDS, cfg.features),
+      // reasoning_as_content 在上游是**顶层**键（不在 features 段里），
+      // 但界面上跟其它功能开关放一组更自然。这里把顶层值并进视图，
+      // 保存时再由 saveGroup 提到顶层（见 TOP_LEVEL_KEYS）。
+      features: pickValues(FEATURES_FIELDS, {
+        ...cfg.features,
+        reasoning_as_content: cfg.reasoning_as_content,
+      }),
       session: pickValues(SESSION_FIELDS, cfg.session_sticky),
       server: pickValues(SERVER_FIELDS, cfg.server),
       upstream: pickValues(UPSTREAM_FIELDS, cfg.upstream),
@@ -1152,6 +1175,8 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
     }
     const org = original.current[group];
     const patch: Record<string, boolean | number | number[] | string> = {};
+    // 顶层键单独收：它们不属于任何段，必须放在请求体根上
+    const topPatch: Record<string, boolean | number | number[] | string> = {};
     for (const k of Object.keys(cur)) {
       if (cur[k] === org[k]) continue;
       const f = FIELD_BY_KEY[k];
@@ -1161,16 +1186,19 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
         notify.err(t('settings.fieldInvalid', {label: tp(f.label)}), w.error);
         return;
       }
-      patch[k] = w.value;
+      (TOP_LEVEL_KEYS.has(k) ? topPatch : patch)[k] = w.value;
     }
-    if (!Object.keys(patch).length) {
+    if (!Object.keys(patch).length && !Object.keys(topPatch).length) {
       notify.info(t('settings.noChanges'));
       return;
     }
     setBusy(true);
     try {
       const def = GROUPS.find((g) => g.id === group);
-      const saved = await settingsApi.saveUpstream({[def?.section ?? group]: patch});
+      const body: Record<string, unknown> = {...topPatch};
+      // 段内有改动时才带该段：只改顶层键时不要顺手回写整段
+      if (Object.keys(patch).length) body[def?.section ?? group] = patch;
+      const saved = await settingsApi.saveUpstream(body);
       // 容器部署下无法自动重载上游（需 docker 命令，而容器刻意不挂 docker 套接字），
       // 后端会带回 reload_hint —— 如实转达，不让人以为改完就生效了
       if (saved?.reload_hint) {

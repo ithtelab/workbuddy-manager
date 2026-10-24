@@ -11,10 +11,11 @@ import time
 import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from .. import config, db, security, upstreamsvc
+from ..iputil import client_ip
 from ..services import (
     credits as creditsvc, dailyplan, modelcatalog, reload, renew, tasklog, taskrun,
     tencent, wb2api,
@@ -26,6 +27,10 @@ logger = logging.getLogger('workbuddy.accounts')
 router = APIRouter(prefix='/api', tags=['accounts'])
 
 _ACCOUNT_UPLOAD_MAX_BYTES = 2 * 1024 * 1024
+
+# 一次导出多少个账号算「批量」。达到这个数量就额外打一条 warning：
+# 事故里攻击者正是分多次导出全部 8 个账号，单条审计不够醒目。
+_BULK_EXPORT_ALERT = 5
 
 
 def _export_account_name(path: Path) -> str:
@@ -106,6 +111,7 @@ def _uploaded_entries(raw: object) -> list[object]:
 
 @router.get('/accounts/export')
 def export_accounts(
+    request: Request,
     upstream_id: int | None = Query(None),
     user: dict = Depends(security.require_session_admin),
 ) -> StreamingResponse:
@@ -143,8 +149,13 @@ def export_accounts(
             written += 1
 
     payload.seek(0)
+    ip = client_ip(request)
     security.audit(user, 'accounts.export', group['name'],
-                   f'导出 {written} 个账号文件（含凭据）')
+                   f'导出 {written} 个账号文件（含凭据）；来源 {ip}', ip=ip)
+    if written >= _BULK_EXPORT_ALERT:
+        # 只写 journal，不改返回体：导出本身是合法功能，告警属于旁路。
+        logger.warning('批量导出账号凭据 user=%s count=%d ip=%s upstream=%s',
+                       (user or {}).get('username', ''), written, ip, group['name'])
     return StreamingResponse(
         payload,
         media_type='application/zip',
@@ -159,6 +170,7 @@ def export_accounts(
 
 @router.post('/accounts/upload')
 async def upload_accounts(
+    request: Request,
     files: list[UploadFile] = File(...),
     upstream_id: int | None = Query(None),
     overwrite: bool = Query(False),
@@ -241,9 +253,10 @@ async def upload_accounts(
             failed.append({'file': name, 'message': '文件导入失败'})
 
     if uploaded or rejected:
+        ip = client_ip(request)
         security.audit(user, 'accounts.import', group['name'],
                        f'新增 {len(added)} / 覆盖 {len(overwritten)} / '
-                       f'拒绝 {len(rejected)} / 失败 {len(failed)}')
+                       f'拒绝 {len(rejected)} / 失败 {len(failed)}；来源 {ip}', ip=ip)
     return {
         'ok': not failed and not rejected,
         'uploaded': uploaded,

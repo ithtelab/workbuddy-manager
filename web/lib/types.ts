@@ -805,7 +805,11 @@ export interface IpAccessLog {
    * 拦截原因短码（issue #33）：missing_key / invalid_key / ip_blocked /
    * key_disabled / key_expired / quota_exhausted / credit_quota_exhausted /
    * ip_not_allowed / too_many_ips / realm_mismatch / model_not_allowed /
-   * rate_limited 等。
+   * rate_limited / key_auth_flood 等。
+   *
+   * `key_auth_flood` 不是「这一条被什么拦了」，而是一条**汇总标记**：同一个 IP
+   * 在一分钟窗口内用无效/缺失密钥刷了太多次，后面的同类记录被折叠，这一行代表
+   * 那批被折叠的请求（后端 `_auth_log_verdict`）。
    *
    * 稳定短码而非散文：展示侧按语言翻译，改文案不必迁移历史数据。
    * 存量记录为 null（那时没记原因），界面显示「未记录」。
@@ -847,6 +851,11 @@ export interface UpstreamConfig {
   listen?: string;
   api_key_masked?: string;
   auth_dir?: string;
+  /**
+   * 思考内容兜底（上游 config.json 的**顶层**键，不在 features 段里）：
+   * 正文为空时把推理原文当正文下发。缺省按上游默认 true 回显。
+   */
+  reasoning_as_content?: boolean;
   /** 上游 config.json 中声明的 auth_dir，与管理端不一致时出现 */
   upstream_auth_dir?: string;
   schedule?: Record<string, unknown>;
@@ -1014,8 +1023,8 @@ export interface UpdateStatus {
   version: string;
   updater_found: boolean;
   upstream_dir: string;
-  /** 当前固定的上游版本（空 = 跟随分支） */
-  upstream_ref?: string;
+  /** 随包上游的稳定标识（空 = 旧部署没有 .upstream-id） */
+  upstream_id?: string;
   started_at?: number;
   finished_at?: number | null;
   duration?: number;
@@ -1060,6 +1069,12 @@ export interface ManagerVersion extends VersionSide {
    * 只会拿到 404，界面要**先说清楚**。`null` = 未知（旧缓存）。
    */
   assets_ready: boolean | null;
+  /** Release 正文（纯文本，截断）；更新前展示，避免装完才知道配套要求 */
+  release_notes?: string;
+  /** Release 发布时间（ISO 字符串） */
+  published_at?: string;
+  /** 本次发布包内的上游与本机不一致（由 Release 正文里的 upstream-id 判断） */
+  upstream_changed?: boolean;
   repo: string;
 }
 
@@ -1120,6 +1135,22 @@ export interface Versions {
   upstream_connected: boolean;
   upstream_accounts: number | null;
   upstream_dir: string;
+}
+
+/**
+ * GitHub 镜像（issue #216）：国内机器直连 GitHub 超时时，用加速服务取
+ * Release 元信息与发布包。走镜像时**不会**发送 GitHub Token。
+ */
+export interface GithubMirror {
+  /** 生效的镜像基址（规范化后带尾斜杠）；空串 = 直连 */
+  mirror: string;
+  /** 面板里存的值（空 = 没设过） */
+  stored: string;
+  /** 部署时注入的环境变量 WB_GITHUB_MIRROR */
+  env_mirror: string;
+  source: 'panel' | 'env' | '';
+  /** 界面上的快捷选项 */
+  presets: string[];
 }
 
 /** 更新日志中的一条（level 1 = 二级缩进，作为子项展示） */

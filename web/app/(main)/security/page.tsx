@@ -100,6 +100,8 @@ const REASON_KEYS: Record<string, string> = {
   invalid_key: 'security.reasonInvalidKey',
   ip_blocked: 'security.reasonIpBlocked',
   rate_limited: 'security.reasonRateLimited',
+  // 同一 IP 用无效/缺失密钥刷接口，后续同类记录被折叠（后端 `_auth_log_verdict`）
+  key_auth_flood: 'security.reasonKeyAuthFlood',
   // 密钥层（keysvc 的 code）
   key_disabled: 'security.reasonKeyDisabled',
   key_expired: 'security.reasonKeyExpired',

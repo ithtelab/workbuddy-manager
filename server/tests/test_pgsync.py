@@ -208,6 +208,9 @@ class SourceIntrospectionTest(_Case):
         self.assertIn('request_logs', tables)
         # sqlite 自己的内部表不能出现在镜像清单里
         self.assertFalse([t for t in tables if t.startswith('sqlite_')])
+        # 令牌整表不随备份走；settings 是混合表，按 key 白名单同步
+        self.assertNotIn('api_tokens', tables)
+        self.assertIn('settings', tables)
 
     def test_columns_match_schema(self) -> None:
         src = pgsync._SqliteSource(config.DB_PATH)
@@ -224,16 +227,34 @@ class SourceIntrospectionTest(_Case):
                          'DOUBLE PRECISION')
 
     def test_rows_batched_and_projected(self) -> None:
-        for i in range(5):
+        keys = ['model_map', 'daily_tasks_plan', 'task_claim_schedule',
+                'token_refresh_plan', 'proxy_pool']
+        for key in keys:
             self.db.execute('INSERT INTO settings(key, value) VALUES(?, ?)',
-                            (f'k{i}', str(i)))
+                            (key, '{}'))
         src = pgsync._SqliteSource(config.DB_PATH)
         try:
             chunks = list(src.rows('settings', ['key'], 2))
         finally:
             src.close()
         self.assertEqual([len(c) for c in chunks], [2, 2, 1])  # 按批切
-        self.assertEqual(chunks[0][0], ('k0',))                # 只取投影的那一列
+        self.assertIn(chunks[0][0][0], keys)                    # 只取投影的那一列
+
+    def test_settings_rows_are_allowlisted(self) -> None:
+        for key in ('model_map', 'github_token', 'update_proxy',
+                    'http_proxy', 'credits_snapshot'):
+            self.db.execute('INSERT INTO settings(key, value) VALUES(?, ?)',
+                            (key, 'x'))
+        src = pgsync._SqliteSource(config.DB_PATH)
+        try:
+            rows = [row for chunk in src.rows('settings', ['key', 'value'], 100)
+                    for row in chunk]
+        finally:
+            src.close()
+        self.assertIn('model_map', [row[0] for row in rows])
+        for secret in ('github_token', 'update_proxy', 'http_proxy',
+                       'credits_snapshot'):
+            self.assertNotIn(secret, [row[0] for row in rows])
 
 
 class CopyTest(_Case):
@@ -561,20 +582,43 @@ class RealPgTest(_Case):  # pragma: no cover - 只在有 PG 的环境跑
                 'enabled': False, 'interval_minutes': 0}
 
     def test_export_then_import(self) -> None:
+        """数据表往返生效；settings 只同步白名单 key，敏感 key 留在本地。
+
+        安全边界，不是便利性取舍：镜像可能在别人的数据库里，能写回
+        github_mirror / update_proxy 就等于能改更新链路，能写回 api_tokens
+        就等于能塞一把 admin 范围的管理令牌；但 model_map / 每日任务 / 代理池
+        这些业务配置应该继续能备份恢复。
+        """
         cfg = self._cfg()
+        self.db.execute('INSERT INTO account_notes(uid, note, updated_at) '
+                        'VALUES(?, ?, ?)', ('pg-roundtrip', 'before', 1))
         self.db.execute('INSERT INTO settings(key, value) VALUES(?, ?)',
-                        ('pg_roundtrip', '"before"'))
+                        ('model_map', '{"pg": "x"}'))
+        self.db.execute('INSERT INTO settings(key, value) VALUES(?, ?)',
+                        ('github_mirror', '"https://local"'))
         reporter = pgsync._Reporter('export')
         exported = pgsync.export_to_pg(cfg, reporter)
         self.assertGreater(exported['rows'], 0)
+        self.assertIn('settings', exported['tables'])
+        self.assertNotIn('api_tokens', exported['tables'])
 
-        self.db.execute('DELETE FROM settings WHERE key = ?', ('pg_roundtrip',))
+        self.db.execute('DELETE FROM account_notes WHERE uid = ?', ('pg-roundtrip',))
+        self.db.execute("DELETE FROM settings WHERE key = 'model_map'")
+        self.db.execute("UPDATE settings SET value = '\"https://local-kept\"' "
+                        "WHERE key = 'github_mirror'")
         reporter = pgsync._Reporter('import')
         pgsync.import_from_pg(cfg, reporter)
-        row = self.db.query_one('SELECT value FROM settings WHERE key = ?',
-                                ('pg_roundtrip',))
-        self.assertIsNotNone(row)
-        self.assertEqual(json.loads(row['value']), 'before')
+        row = self.db.query_one('SELECT note FROM account_notes WHERE uid = ?',
+                                ('pg-roundtrip',))
+        self.assertIsNotNone(row, '数据表应随恢复回来')
+        self.assertEqual(row['note'], 'before')
+        row = self.db.query_one("SELECT value FROM settings WHERE key = 'model_map'")
+        self.assertIsNotNone(row, '白名单里的业务配置应随恢复回来')
+        self.assertEqual(json.loads(row['value']), {'pg': 'x'})
+        row = self.db.query_one(
+            "SELECT value FROM settings WHERE key = 'github_mirror'")
+        self.assertEqual(json.loads(row['value']), 'https://local-kept',
+                         '敏感 key 不该被镜像覆盖')
 
 
 if __name__ == '__main__':

@@ -1,0 +1,457 @@
+diff --git a/README.md b/README.md
+index 1119726..e8e9e57 100644
+--- a/README.md
++++ b/README.md
+@@ -83,7 +83,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
+ 选号 = 会话粘性（命中即定）→ 成本分层（硬过滤）→ 加权随机（软均衡）三层串联，各层语义：
+ 
+ - **成本分层** — 账本把每个 `(账号, 模型)` 归入三档：**tier 0**（实测免费，单价 ≤ 0）、**tier 1**（无观测）、**tier 2**（实测收费）。同一次选号在**存活的最便宜档内**选：有 tier 0 就只在 tier 0 里挑，全池无免费观测才落到 tier 1，再不行才是 tier 2——即「贵号永远只作兜底」。tier 1 的号**不会被跳过**：新账号 / 新模型没跑过就没有观测，直接淘汰会把新号饿死。观测随 `usage.credit` 实时更新且 6 小时过期，所以限免窗口（如夜间免费）一结束，账号回到 tier 1 / tier 2，选号自动跟随——无需重启，日志会打 `free tier ended` 提示价格切换
+-- **会话粘性** — 同一对话固定走同一账号（多轮上下文不跳号、上游 prompt cache 不碎）。粘性键按此优先级取：**conversation 维度四键**（`metadata.conversation_id` / `metadata.conversationId` / `conversation_id` / `conversationId` 任一）→ **`prompt_cache_key`**（pi-ai 系客户端把会话 ID 放在这个 OpenAI 前缀缓存字段里）→ **首条 user 消息文本的 sha256 兜底**（OpenAI 兼容协议无会话 ID 字段，dsh / Codex 等客户端四键全缺，此前粘性恒不命中、逐请求换号；现由首条 user 消息派生会话级稳定键——会话内历史追加不影响该键，开新会话自然换键）。`user_id` **不是**粘性键——它会把一个用户的所有并行对话钉到同一个号上（粒度远粗于上游对话级缓存边界），发 `user_id` 的客户端回落加权轮换（**该回落同样适用于首条 user 消息兜底**：请求体带 `metadata.user_id` 或顶层 `user_id` 时不派生兜底键）。绑定 30 分钟滚动续期，空闲即过期释放
++- **会话粘性** — 同一对话固定走同一账号（多轮上下文不跳号、上游 prompt cache 不碎）。粘性键按此优先级取：**conversation 维度四键**（`metadata.conversation_id` / `metadata.conversationId` / `conversation_id` / `conversationId` 任一）→ **`prompt_cache_key`**（pi-ai 系客户端把会话 ID 放在这个 OpenAI 前缀缓存字段里）→ **首条 user 消息文本的 sha256 兜底**（OpenAI 兼容协议无会话 ID 字段，dsh / Codex 等客户端四键全缺，此前粘性恒不命中、逐请求换号；现由首条 user 消息派生会话级稳定键——会话内历史追加不影响该键，开新会话自然换键）。`user_id` **不是**粘性键——它会把一个用户的所有并行对话钉到同一个号上（粒度远粗于上游对话级缓存边界），发 `user_id` 的客户端回落加权轮换（**该回落同样适用于首条 user 消息兜底**：请求体带 `metadata.user_id` 或顶层 `user_id` 时不派生兜底键）。绑定 30 分钟滚动续期，空闲即过期释放。**首绑按三因子权重分配**（issue #265）：会话第一次绑号时，在「优先未绑定任何会话的空闲号」的候选集里按 `credits ×10 + 快过期积分 ×8 + 闲置补偿` 加权抽取，而不是按 uid 哈希取模——否则带会话标识的请求首轮绑定后一路滚动续期，永远走不到下面的「负载分布」那层，快过期积分在默认配置下就轮不到被优先消耗
+ - **负载分布** — 粘性与分层都未限定时，三因子加权随机（`credits ×10 + 快过期积分 ×8 + 闲置补偿`）把流量摊开：高余额号多扛、快过期积分的号先用、闲置号补位；防惊群跳过 100ms 内刚选中的号。权重是**概率倾斜**而非硬排序（Top-5 短名单 + 名单内抽签），不会让单一账号垄断流量
+ 
+ ### 定时积分任务
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index e2be0b8..396c2f2 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -103,6 +103,10 @@ func main() {
+ 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
+ 			// 见 wiring.go）；裸名走 cn（现状零回归）。
+ 			AvailableForModel: realmAwareAvailableForModel(p),
++			// 首绑按三因子权重分配（issue #265）：粘性命中即定，若首绑仍按哈希取模，
++			// 「快过期积分优先消耗」这条池权重在默认配置下就永远轮不到——带会话标识的
++			// 请求首轮绑定后滚动续期，压根走不到 Pool.pick。
++			PickForModel: realmAwareWeightedPick(p),
+ 		})
+ 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
+ 		sessRouter.StartGC()
+diff --git a/cmd/server/wiring.go b/cmd/server/wiring.go
+index a5efefb..51f762d 100644
+--- a/cmd/server/wiring.go
++++ b/cmd/server/wiring.go
+@@ -18,4 +18,20 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
+ 		realm, bare := server.ResolveModel(model)
+ 		return p.AvailableUIDsForModelRealm(bare, realm)
+ 	}
+-}
+\ No newline at end of file
++}
++
++// realmAwareWeightedPick 构造会话粘性**首绑**的加权选号闭包（issue #265）。
++//
++// 背景：粘性未命中时旧实现用 FNV-1a 取模在可用 UID 里选，与积分余额、快过期积分、
++// 闲置时长都无关；而默认开启的粘性让带会话标识的请求首轮就被绑定并滚动续期，永远
++// 走不到 Pool.pick 的三因子加权。于是「快过期积分优先消耗」（pool.expiring_soon）
++// 在默认配置下基本失效——一个没有快过期积分的号可以独占整段会话流量。
++//
++// 候选集已由 realmAwareAvailableForModel 按 realm + 模型可用性筛过，这里只需剥掉
++// realm 前缀拿裸模型名：成本台账与 6004 模型级冷却都以裸名记账。
++func realmAwareWeightedPick(p *pool.Pool) func(model string, candidates []string) string {
++	return func(model string, candidates []string) string {
++		_, bare := server.ResolveModel(model)
++		return p.WeightedPickAmong(candidates, bare)
++	}
++}
+diff --git a/internal/pool/weightedbind.go b/internal/pool/weightedbind.go
+new file mode 100644
+index 0000000..7b51ac9
+--- /dev/null
++++ b/internal/pool/weightedbind.go
+@@ -0,0 +1,63 @@
++package pool
++
++import (
++	"time"
++)
++
++// WeightedPickAmong 在给定候选 uid 集合内按三因子权重选一个账号（供会话粘性首绑）。
++//
++// 为什么需要它（issue #265）：会话粘性未命中时，分配此前是
++// `pool2[hashIndex(key, len(pool2))]` —— FNV-1a 取模落在「可用 UID 字典序」的某个
++// 位置上，与积分余额、快过期积分、闲置时长全部无关。而 pool 为「积分过期」专门设计的
++// 三因子权重（expiringWeight，见 weightOf）只在 Pick 这条路径生效。粘性默认开启，
++// 带会话标识的请求（conversation 四键 / prompt_cache_key / 首条 user 消息兜底）在第一
++// 轮就完成绑定并滚动续期，**永远走不到 Pick** —— 于是「快过期积分优先消耗」在默认配置
++// 下基本失效：一个 creditsExpiring=0 的号可以独占整段会话流量，而两个 expiring 占比
++// 24% 的号一次都轮不到。
++//
++// 与 pick 的差异（有意为之）：
++//   - 不做成本分层硬过滤。成本分层回答「本次请求走谁更便宜」，是即时决策；粘性首绑回答
++//     「这段会话长期挂谁」。按单价硬过滤会让全部会话收敛到最便宜的号，反而加剧单一账号
++//     垄断 —— 正是本 issue 要消解的现象。
++//   - 不做 Top-5 截断。首绑对每个会话只发生一次，没有惊群压力；截断必须先排序，而等
++//     权重时的排序会系统性偏向候选集里靠前的 uid（候选来自 sort.Strings），把「加权」
++//     悄悄退化成「字典序」。
++//   - 不写 lastUsed / usedSeq。绑定不等于消耗：真正的在途租约与使用序号由随后的
++//     PickByUIDForModel / Acquire 推进。若在这里写 lastUsed，一次绑定就把闲置补偿清零，
++//     而粘性会持续命中该号，等于整个 TTL 都背着这个惩罚。
++//
++// 返回空串表示候选集里此刻没有可用账号，调用方自行兜底（粘性路由回落哈希分配）。
++func (p *Pool) WeightedPickAmong(candidates []string, model string) string {
++	if len(candidates) == 0 {
++		return ""
++	}
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++
++	now := time.Now()
++	// 候选集已由调用方按 realm + 模型可用性筛过；这里按池内实时状态再过滤一次，缩掉
++	// 「筛完到此刻之间刚进冷却 / 刚被手动停用」的时间窗 —— 否则会把一个已经不可用的号
++	// 绑给会话，下一跳又得解绑重来。
++	live := make([]*entry, 0, len(candidates))
++	var maxCredits int64
++	for _, uid := range candidates {
++		e, found := p.byUID[uid]
++		if !found || !e.healthyForModel(now, model) {
++			continue
++		}
++		live = append(live, e)
++		if e.credits > maxCredits {
++			maxCredits = e.credits
++		}
++	}
++	if len(live) == 0 {
++		return ""
++	}
++	// 权重口径用**本候选集**最大 credits（而非全池）：粘性首绑只在给定候选集内做选择，
++	// 用全池最大值会让本集合内的 credits 项整体缩水，快过期与闲置两项被动放大。
++	ws := make([]weighted, len(live))
++	for i, e := range live {
++		ws[i] = weighted{e: e, w: p.weightOf(e, maxCredits, now)}
++	}
++	return p.pickWeighted(ws).a.UID
++}
+diff --git a/internal/pool/weightedbind_test.go b/internal/pool/weightedbind_test.go
+new file mode 100644
+index 0000000..6a52693
+--- /dev/null
++++ b/internal/pool/weightedbind_test.go
+@@ -0,0 +1,125 @@
++package pool
++
++import (
++	"math/rand/v2"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++// newDeterministicSource 固定种子的确定性随机源：加权分布断言在 CI 上必须可复现，
++// 否则偶发越界会让本组用例变成 flaky。
++func newDeterministicSource() func(n int64) int64 {
++	src := rand.New(rand.NewPCG(20251023, 265))
++	return func(n int64) int64 { return src.Int64N(n) }
++}
++
++// TestWeightedPickAmongPrefersExpiring 核心语义（issue #265）：候选集内快过期积分
++// 占比高的账号，被粘性首绑选中的概率必须显著更高——这正是 Pick 的三因子权重里
++// expiringWeight 的意图，也是本补丁要让粘性首绑继承的语义。
++func TestWeightedPickAmongPrefersExpiring(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "plain"})
++	p.Add(&auth.Auth{UID: "expiring"})
++	p.SetCreditsDetailed("plain", 5000, 0)
++	p.SetCreditsDetailed("expiring", 5000, 5000)
++	p.SetRandomSource(newDeterministicSource())
++
++	counts := map[string]int{}
++	const rounds = 1000
++	for i := 0; i < rounds; i++ {
++		uid := p.WeightedPickAmong([]string{"plain", "expiring"}, "")
++		if uid == "" {
++			t.Fatalf("第 %d 次选号返回空串（候选两个账号均可用）", i)
++		}
++		counts[uid]++
++	}
++	// 权重：plain = 1 + 5000/5000×10 + 闲置满分 5 = 16；
++	//       expiring = 1 + 10 + 1.0×8 + 5 = 24 → 期望 60% / 40%。
++	if counts["expiring"] <= counts["plain"] {
++		t.Fatalf("快过期号被选中 %d 次，未超过无快过期号的 %d 次（权重未生效）",
++			counts["expiring"], counts["plain"])
++	}
++	if ratio := float64(counts["expiring"]) / rounds; ratio < 0.52 || ratio > 0.68 {
++		t.Errorf("快过期号占比 %.3f 偏离期望 0.60（±0.08）", ratio)
++	}
++}
++
++// TestWeightedPickAmongEmptyCandidates 空候选返回空串，不 panic、不随便选一个。
++func TestWeightedPickAmongEmptyCandidates(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	if got := p.WeightedPickAmong(nil, ""); got != "" {
++		t.Errorf("空候选应返回空串，got %q", got)
++	}
++	if got := p.WeightedPickAmong([]string{}, "m"); got != "" {
++		t.Errorf("空候选应返回空串，got %q", got)
++	}
++}
++
++// TestWeightedPickAmongSkipsUnavailable 手动停用 / 未知 uid 必须被排除：把不可用的号
++// 绑给会话会让下一跳立刻解绑重分配，白跑一轮。
++func TestWeightedPickAmongSkipsUnavailable(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "off"})
++	p.SetManualDisabled("off", true, "维护中")
++
++	if got := p.WeightedPickAmong([]string{"off", "ghost"}, ""); got != "" {
++		t.Fatalf("候选全不可用时应返回空串，got %q", got)
++	}
++	if got := p.WeightedPickAmong([]string{"off", "ghost"}, ""); got == "off" || got == "ghost" {
++		t.Fatalf("不可用账号被选中：%q", got)
++	}
++}
++
++// TestWeightedPickAmongHonoursModelCooldown 被 6004 模型级冷却的账号在该模型上不可选，
++// 但对其他模型仍可选（与 healthyForModel 的口径一致，勿在此处另立标准）。
++func TestWeightedPickAmongHonoursModelCooldown(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "cooled"})
++	p.Add(&auth.Auth{UID: "warm"})
++	p.SetCredits("cooled", 1000)
++	p.SetCredits("warm", 1000)
++	// 用上游真实路径写冷却，不手工往 map 里塞（那样绕过 softRateMax 截断与 modelCooldowns 的初始化）。
++	p.CooldownSoftForModel("cooled", time.Hour, time.Now().Add(time.Hour), "hy4-preview", "6004")
++
++	if got := p.WeightedPickAmong([]string{"cooled", "warm"}, "hy4-preview"); got != "warm" {
++		t.Errorf("模型级冷却号在该模型上不可选，got %q", got)
++	}
++	// 换一个未冷却的模型：两个都可用，冷却号必须重新进入候选（不因冷却而被永久摘除）。
++	seen := map[string]bool{}
++	p.SetRandomSource(newDeterministicSource())
++	for i := 0; i < 200; i++ {
++		seen[p.WeightedPickAmong([]string{"cooled", "warm"}, "other-model")] = true
++	}
++	if !seen["cooled"] {
++		t.Error("其他模型上冷却号应重新可选，200 次抽样一次都没选中")
++	}
++}
++
++// TestWeightedPickAmongKeepsSelectionState 绑定不等于消耗：本方法不得写 lastUsed /
++// usedSeq，否则一次绑定就把闲置补偿清零，而粘性会持续命中该号，整个 TTL 都背着惩罚。
++func TestWeightedPickAmongKeepsSelectionState(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.SetCredits("u1", 100)
++	p.SetRandomSource(newDeterministicSource())
++
++	if got := p.WeightedPickAmong([]string{"u1"}, ""); got != "u1" {
++		t.Fatalf("单候选应命中 u1，got %q", got)
++	}
++	p.mu.RLock()
++	e := p.byUID["u1"]
++	lastUsed, usedSeq, pickSeq := e.lastUsed, e.usedSeq, p.pickSeq
++	p.mu.RUnlock()
++	if !lastUsed.IsZero() {
++		t.Errorf("lastUsed 被改写为 %s，粘性首绑不应推进使用时刻", lastUsed)
++	}
++	if usedSeq != 0 {
++		t.Errorf("usedSeq 被改写为 %d，粘性首绑不应推进使用序号", usedSeq)
++	}
++	if pickSeq != 0 {
++		t.Errorf("pickSeq 被改写为 %d，粘性首绑不应占用选号序号", pickSeq)
++	}
++}
+diff --git a/internal/session/session.go b/internal/session/session.go
+index 2e238fb..1b16626 100644
+--- a/internal/session/session.go
++++ b/internal/session/session.go
+@@ -4,7 +4,8 @@
+ // 但改为纯内存 + redisstore 异步镜像：
+ //   - 命中走 RLock 快查（绝大多数请求已绑定）；
+ //   - 未命中/失效走写锁 re-check 后分配，避免同 key 并发重复分配（TOCTOU 防护）；
+-//   - 分配优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
++//   - 分配优先"空闲账号"（未绑定任何会话的可用号），其次全池（双段策略）；
++//     段内默认按哈希取模，注入 PickForModel 时改按账号池三因子权重选号（issue #265）；
+ //   - LastActive 滚动续期，TTL 过期由后台 GC 或快路径惰性过期清理；
+ //   - 每次绑定变更 fire-and-forget 镜像到 redisstore（防重启丢粘性）。
+ package session
+@@ -42,6 +43,20 @@ type Config struct {
+ 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
+ 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
+ 	AvailableForModel func(model string) []string
++	// PickForModel 在给定候选集内按账号池真实权重选一个 uid（空串 = 该集合此刻无可用）。
++	// 供粘性**首绑**使用（issue #265）；nil 时回落 hashIndex 稳定散列（旧行为，
++	// 无 pool 依赖的调用方与既有测试保留该语义）。
++	//
++	// 为什么传候选集而不只是 model：双段策略（优先未绑定任何会话的空闲号）属于路由侧
++	// 职责，pool 只在"给定候选集内"回答谁更该先被消耗——两个包的边界因此不互相侵入。
++	//
++	// 为什么需要它：哈希取模只看 key 字节，不看积分余额、快过期积分、闲置时长，于是
++	// pool 里为「积分过期」设计的三因子权重在默认开启的粘性下几乎失效——带会话标识的
++	// 请求在首轮就被哈希分配并滚动续期，永远走不到 Pool.pick。
++	//
++	// 实现方注意：本回调在 Router 写锁内被调用，实现不得回调本 Router（会有死锁风险），
++	// 也不应长时间阻塞。
++	PickForModel func(model string, candidates []string) string
+ }
+ 
+ // Router 会话粘性路由器。
+@@ -188,7 +203,28 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
+ 	if len(pool2) == 0 {
+ 		pool2 = uids
+ 	}
+-	uid := pool2[hashIndex(key, len(pool2))]
++	// 段内选谁（issue #265）：
++	//   注入 PickForModel → 按账号池三因子权重（credits / 快过期积分 / 闲置）选，
++	//     让「快过期积分优先消耗」在粘性首绑上同样成立；
++	//   未注入 / 回调给出空串或候选集外的 uid → 回落 hashIndex 稳定散列（旧语义）。
++	// 为什么要校验返回值落在 pool2 内：回调按池内实时状态过滤，可能刚好把候选全部滤掉
++	// （返回空串，属正常）；但若实现侧给了一个不在候选里的 uid，绑上去就是一个本不该
++	// 参与本模型/本段分配的号——那正是「粘性钉在不可用号上反复失败」的老问题，所以宁可
++	// 回落哈希也不采信越界值。
++	var uid string
++	if r.cfg.PickForModel != nil {
++		if picked := r.cfg.PickForModel(model, pool2); picked != "" {
++			for _, u := range pool2 {
++				if u == picked {
++					uid = picked
++					break
++				}
++			}
++		}
++	}
++	if uid == "" {
++		uid = pool2[hashIndex(key, len(pool2))]
++	}
+ 
+ 	prev, existed := r.entries[key]
+ 	r.entries[key] = entry{uid: uid, lastActive: now}
+diff --git a/internal/session/session_pick_test.go b/internal/session/session_pick_test.go
+new file mode 100644
+index 0000000..6548ac4
+--- /dev/null
++++ b/internal/session/session_pick_test.go
+@@ -0,0 +1,131 @@
++package session
++
++import (
++	"testing"
++	"time"
++)
++
++// TestResolveForModelUsesPickForModel 注入 PickForModel 后，**首绑必须走权重回调**
++// （issue #265）：这是「快过期积分优先消耗」在会话粘性下生效的唯一入口。
++func TestResolveForModelUsesPickForModel(t *testing.T) {
++	r := routerWith(newCountingStore(), []string{"a1", "a2", "a3"}, time.Minute)
++	var gotModel string
++	var gotCandidates []string
++	r.cfg.PickForModel = func(model string, candidates []string) string {
++		gotModel = model
++		gotCandidates = append([]string(nil), candidates...)
++		return "a3"
++	}
++
++	uid, ok := r.ResolveForModel("c1", "cn:deepseek-v4.1-flash")
++	if !ok || uid != "a3" {
++		t.Fatalf("ResolveForModel=%q ok=%v want a3/true（应采信回调结果）", uid, ok)
++	}
++	if gotModel != "cn:deepseek-v4.1-flash" {
++		t.Errorf("回调收到的模型名=%q，必须原样透传（realm 前缀剥离由注入侧负责）", gotModel)
++	}
++	if len(gotCandidates) != 3 {
++		t.Errorf("回调收到的候选数=%d want 3（首绑时无绑定 → 全部可用号都是空闲号）: %v",
++			len(gotCandidates), gotCandidates)
++	}
++}
++
++// TestResolveForModelStickyHitSkipsPickForModel 命中已有绑定后不得再调回调：粘性的
++// 意义就是「同一会话固定走同一账号」，每次命中都重新加权等于把粘性关掉。
++func TestResolveForModelStickyHitSkipsPickForModel(t *testing.T) {
++	r := routerWith(newCountingStore(), []string{"a1", "a2"}, time.Minute)
++	calls := 0
++	r.cfg.PickForModel = func(string, []string) string {
++		calls++
++		return "a2"
++	}
++
++	first, ok1 := r.ResolveForModel("c1", "m1")
++	second, ok2 := r.ResolveForModel("c1", "m1")
++	if !ok1 || !ok2 || first != "a2" || second != "a2" {
++		t.Fatalf("两次解析应稳定命中 a2，got %q/%q ok=%v/%v", first, second, ok1, ok2)
++	}
++	if calls != 1 {
++		t.Errorf("回调被调用 %d 次，第二次应走粘性命中（want 1）", calls)
++	}
++}
++
++// TestResolveForModelFallsBackToHashWhenPickReturnsEmpty 回调给出空串（候选被实时状态
++// 全部滤掉）时必须回落哈希分配，而不是返回 ok=false 让整条请求失败。
++func TestResolveForModelFallsBackToHashWhenPickReturnsEmpty(t *testing.T) {
++	uids := []string{"a1", "a2", "a3"}
++	r := routerWith(newCountingStore(), uids, time.Minute)
++	r.cfg.PickForModel = func(string, []string) string { return "" }
++
++	uid, ok := r.ResolveForModel("c1", "m1")
++	if !ok {
++		t.Fatal("回调返回空串时应回落哈希分配，不该 ok=false")
++	}
++	if want := uids[hashIndex("c1", len(uids))]; uid != want {
++		t.Errorf("回落结果=%q want %q（hashIndex 旧语义）", uid, want)
++	}
++}
++
++// TestResolveForModelRejectsOutOfCandidatePick 回调返回候选集外的 uid 时不得采信，
++// 否则会把一个本不该参与本次分配的号绑给会话（粘性钉在不可用号上的老问题）。
++func TestResolveForModelRejectsOutOfCandidatePick(t *testing.T) {
++	uids := []string{"a1", "a2"}
++	r := routerWith(newCountingStore(), uids, time.Minute)
++	r.cfg.PickForModel = func(string, []string) string { return "not-in-candidates" }
++
++	uid, ok := r.ResolveForModel("c1", "m1")
++	if !ok {
++		t.Fatal("越界 uid 应回落哈希分配，不该整条失败")
++	}
++	if uid != "a1" && uid != "a2" {
++		t.Fatalf("绑定了候选集外的账号 %q", uid)
++	}
++}
++
++// TestResolveForModelWithoutHookKeepsHashAllocation 未注入回调时行为必须与打补丁前
++// 逐字一致（哈希取模），避免影响无 pool 依赖的调用方与既有部署。
++//
++// 每个 key 必须用**独立的 Router**：双段策略下，前一个会话绑定后会把它从"空闲号"
++// 候选里摘掉，后续 hashIndex 的模数随之变化——共用一个 Router 就测不出哈希语义了。
++func TestResolveForModelWithoutHookKeepsHashAllocation(t *testing.T) {
++	uids := []string{"a1", "a2", "a3", "a4"}
++
++	for _, key := range []string{"c1", "c2", "c3", "c4", "c5"} {
++		r := routerWith(newCountingStore(), uids, time.Minute)
++		uid, ok := r.ResolveForModel(key, "m1")
++		if !ok {
++			t.Fatalf("key=%s 解析失败", key)
++		}
++		if want := uids[hashIndex(key, len(uids))]; uid != want {
++			t.Errorf("key=%s got %q want %q（未注入回调时应保持哈希语义）", key, uid, want)
++		}
++	}
++}
++
++// TestResolveForModelPickForModelOnModelSwitch 会话换模型触发重分配时，同样要按新模型
++// 的候选集做加权——被 6004 限额后重绑的路径不能悄悄退回哈希。
++func TestResolveForModelPickForModelOnModelSwitch(t *testing.T) {
++	r := routerWith(newCountingStore(), []string{"a1", "a2"}, time.Minute)
++	r.cfg.AvailableForModel = func(model string) []string {
++		if model == "limited-model" {
++			return []string{"a2"}
++		}
++		return []string{"a1", "a2"}
++	}
++	var models []string
++	r.cfg.PickForModel = func(model string, candidates []string) string {
++		models = append(models, model)
++		return candidates[0] // 取该模型候选集里的第一个
++	}
++
++	if uid, ok := r.ResolveForModel("c1", "normal-model"); !ok || uid != "a1" {
++		t.Fatalf("首次绑定应为 a1，got %q ok=%v", uid, ok)
++	}
++	// 换到限流模型：a1 不在候选里 → 命中失效 → 重分配，回调应被再次调用且拿到 a2。
++	if uid, ok := r.ResolveForModel("c1", "limited-model"); !ok || uid != "a2" {
++		t.Fatalf("换模型重分配应为 a2，got %q ok=%v", uid, ok)
++	}
++	if len(models) != 2 || models[1] != "limited-model" {
++		t.Errorf("换模型时回调收到的模型序列=%v，want 第二次为 limited-model", models)
++	}
++}

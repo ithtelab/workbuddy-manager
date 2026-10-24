@@ -168,7 +168,6 @@ class SigReadyAwarenessTest(unittest.TestCase):
 
         with mock.patch.object(updater, '_read_cache', return_value=dict(cache)), \
              mock.patch.object(updater, '_write_cache'), \
-             mock.patch.object(updater, '_local_upstream_head', return_value=''), \
              mock.patch.object(updater, '_gh_get', side_effect=fake_gh):
             out = updater.check_updates()
         self.assertTrue(calls, '产物未就绪时 6 分钟的旧结论应触发重查（短 TTL）')
@@ -183,7 +182,6 @@ class SigReadyAwarenessTest(unittest.TestCase):
         calls: list[str] = []
         with mock.patch.object(updater, '_read_cache', return_value=dict(cache)), \
              mock.patch.object(updater, '_write_cache'), \
-             mock.patch.object(updater, '_local_upstream_head', return_value=''), \
              mock.patch.object(updater, '_gh_get',
                                side_effect=lambda url: calls.append(url) or {}):
             updater.check_updates()

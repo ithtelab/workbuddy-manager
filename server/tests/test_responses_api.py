@@ -1350,5 +1350,41 @@ class EndpointTest(unittest.TestCase):
         self.assertIn('boom', r.content.decode())
 
 
+class StructuredOutputInstructionTest(unittest.TestCase):
+    """issue #258：Responses 的 `text.format` 不能丢。
+
+    上游 Chat Completions 没有 Responses 的 `text` 对象；不转成提示词，
+    Codex guardian 这类要求 JSON 的调用会拿到自然语言，校验恒失败。
+    """
+
+    def test_json_schema_is_turned_into_system_instruction(self) -> None:
+        schema = {'type': 'object', 'properties': {'answer': {'type': 'string'}},
+                  'required': ['answer'], 'additionalProperties': False}
+        out = R.to_chat_request({
+            'model': 'm', 'input': 'What is 2+2?',
+            'text': {'format': {'type': 'json_schema', 'name': 'ans',
+                                'strict': True, 'schema': schema}},
+        })
+        self.assertEqual(out['messages'][0]['role'], 'system')
+        self.assertIn('JSON Schema', out['messages'][0]['content'])
+        self.assertIn('"answer"', out['messages'][0]['content'])
+        self.assertEqual(out['messages'][-1]['content'], 'What is 2+2?')
+
+    def test_existing_instructions_are_extended_not_duplicated(self) -> None:
+        out = R.to_chat_request({
+            'model': 'm', 'instructions': 'Follow the project rules.',
+            'input': 'hi', 'text': {'format': {'type': 'json_object'}},
+        })
+        systems = [m for m in out['messages'] if m['role'] == 'system']
+        self.assertEqual(len(systems), 1, '不应新建第二条 system 消息')
+        self.assertIn('Follow the project rules.', systems[0]['content'])
+        self.assertIn('valid JSON object', systems[0]['content'])
+
+    def test_plain_text_format_is_untouched(self) -> None:
+        out = R.to_chat_request({'model': 'm', 'input': 'hi',
+                                 'text': {'format': {'type': 'text'}}})
+        self.assertEqual([m['role'] for m in out['messages']], ['user'])
+
+
 if __name__ == '__main__':
     unittest.main()

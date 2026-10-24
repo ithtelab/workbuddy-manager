@@ -62,7 +62,11 @@ const DOCK_TIP_STORAGE_KEY = 'workbuddy-manager:dock-tip-dismissed';
 // 「别再挡我」的确定性选项 —— 拖回去靠的是「记得它本来在哪」。
 const DOCK_MODE_STORAGE_KEY = 'workbuddy-manager:dock-mode';
 const DOCK_MARGIN = 16;
-const DOCK_LONG_PRESS_MS = 180;
+// 180ms 太短：正常慢点击也会越过阈值，进入拖动后 pointerup 还会吞掉 click。
+// 500ms 与系统长按手势一致；拖动前还要再确认「指针没先移动」。
+const DOCK_LONG_PRESS_MS = 500;
+const DOCK_DRAG_CANCEL_DISTANCE = 8;
+const DOCK_DRAG_MOVE_EPSILON = 2;
 const DOCK_CLICK_SUPPRESS_MS = 220;
 const DOCK_INTERACTIVE_SELECTOR = 'a,button,input,textarea,select,[role="button"],[data-dock-no-drag="true"]';
 
@@ -119,7 +123,9 @@ export function ManagementBar() {
   const dragOffsetRef = useRef({x: 0, y: 0});
   const dockPressTimerRef = useRef<number | null>(null);
   const pressStartRef = useRef({x: 0, y: 0});
+  const pressCleanupRef = useRef<(() => void) | null>(null);
   const isDraggingRef = useRef(false);
+  const dragMovedRef = useRef(false);
   const suppressClickUntilRef = useRef(0);
 
   const getViewport = useCallback((): DockViewport => (window.innerWidth >= 768 ? 'desktop' : 'mobile'), []);
@@ -434,8 +440,17 @@ export function ManagementBar() {
       y: clientY - dockPosition.y,
     };
     isDraggingRef.current = true;
+    dragMovedRef.current = false;
+    const pressStart = pressStartRef.current;
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
+      const dx = moveEvent.clientX - pressStart.x;
+      const dy = moveEvent.clientY - pressStart.y;
+      // 长按后没移动就不算拖动：否则 pointerup 会吞掉一次正常点击。
+      if (!dragMovedRef.current &&
+          Math.hypot(dx, dy) < DOCK_DRAG_MOVE_EPSILON) return;
+      dragMovedRef.current = true;
+
       const nextPosition = clampDockPosition({
         x: moveEvent.clientX - dragOffsetRef.current.x,
         y: moveEvent.clientY - dragOffsetRef.current.y,
@@ -453,7 +468,10 @@ export function ManagementBar() {
       setDockPosition(nextPosition);
       writeDockPosition(dockViewportRef.current, nextPosition);
       isDraggingRef.current = false;
-      suppressClickUntilRef.current = Date.now() + DOCK_CLICK_SUPPRESS_MS;
+      if (dragMovedRef.current) {
+        suppressClickUntilRef.current = Date.now() + DOCK_CLICK_SUPPRESS_MS;
+      }
+      dragMovedRef.current = false;
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
       window.removeEventListener('pointercancel', handlePointerUp);
@@ -473,11 +491,46 @@ export function ManagementBar() {
 
     pressStartRef.current = {x: event.clientX, y: event.clientY};
     clearDockPressTimer();
+    // 上一轮按下如果还在等长按，先撤掉它的 window 监听。
+    pressCleanupRef.current?.();
+    pressCleanupRef.current = null;
+
+    function cleanupPressListeners() {
+      window.removeEventListener('pointermove', handlePreDragMove);
+      window.removeEventListener('pointerup', handlePreDragEnd);
+      window.removeEventListener('pointercancel', handlePreDragEnd);
+      pressCleanupRef.current = null;
+    }
+    function handlePreDragMove(moveEvent: PointerEvent) {
+      const dx = moveEvent.clientX - pressStartRef.current.x;
+      const dy = moveEvent.clientY - pressStartRef.current.y;
+      // 还没到长按时间就先移动了 → 这是点击/滑动，不是拖动底栏。
+      if (Math.hypot(dx, dy) < DOCK_DRAG_CANCEL_DISTANCE) return;
+      clearDockPressTimer();
+      cleanupPressListeners();
+    }
+    function handlePreDragEnd() {
+      clearDockPressTimer();
+      cleanupPressListeners();
+    }
+
+    window.addEventListener('pointermove', handlePreDragMove);
+    window.addEventListener('pointerup', handlePreDragEnd);
+    window.addEventListener('pointercancel', handlePreDragEnd);
+    pressCleanupRef.current = cleanupPressListeners;
+
     dockPressTimerRef.current = window.setTimeout(() => {
+      cleanupPressListeners();
       beginDockDrag(pressStartRef.current.x, pressStartRef.current.y);
       dockPressTimerRef.current = null;
     }, DOCK_LONG_PRESS_MS);
   }, [beginDockDrag, clearDockPressTimer, dockMode, dockPosition]);
+
+  useEffect(() => () => {
+    // 卸载时别把等待中的长按 timer 留到下一次挂载后再触发。
+    clearDockPressTimer();
+    pressCleanupRef.current?.();
+  }, [clearDockPressTimer]);
 
   const handleDockPointerEnd = useCallback(() => {
     if (!isDraggingRef.current) {
@@ -572,6 +625,7 @@ export function ManagementBar() {
       customComponent: (
         <div
           data-slot="dock-quick-add"
+          data-dock-no-drag="true"
           onClick={() => {
             if (isAdmin) setAddOpen(true);
           }}
@@ -591,6 +645,7 @@ export function ManagementBar() {
             <DialogTrigger asChild>
               <div
                 data-slot="dock-profile-trigger"
+                data-dock-no-drag="true"
                 className="w-full h-full flex items-center justify-center cursor-pointer rounded transition-colors"
               >
                 <User className="h-4 w-4" />

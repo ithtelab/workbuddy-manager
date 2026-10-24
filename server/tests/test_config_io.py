@@ -182,6 +182,29 @@ class UpstreamConfigRoundTrip(unittest.TestCase):
         wb2api.save_upstream_config({'api_key': 'hacked'})
         self.assertEqual(read_cfg(self.cfg_path)['api_key'], 'secret')
 
+    # ── 顶层标量：思考内容兜底（reasoning_as_content）──────────
+    def test_reasoning_as_content_written_at_top_level(self) -> None:
+        """它在上游是**根级**布尔；写进 features 段等于改了不生效。"""
+        write_cfg(self.cfg_path, {'api_key': 'secret', 'features': {'sanitize_blacklist_fingerprints': True}})
+        wb2api.save_upstream_config({'reasoning_as_content': False})
+        got = read_cfg(self.cfg_path)
+        self.assertIs(got['reasoning_as_content'], False)
+        # 不能污染 features 段，也不能动其它顶层键
+        self.assertEqual(got['features'], {'sanitize_blacklist_fingerprints': True})
+        self.assertEqual(got['api_key'], 'secret')
+
+    def test_reasoning_as_content_defaults_to_true_when_absent(self) -> None:
+        """缺省时按上游默认回显 true —— 界面要显示实际生效的状态。"""
+        write_cfg(self.cfg_path, {'api_key': 'secret'})
+        self.assertIs(wb2api.load_upstream_config()['reasoning_as_content'], True)
+
+    def test_reasoning_as_content_rejects_non_bool_without_writing(self) -> None:
+        """字符串 "false" 会让 Go 侧 json 解析失败、上游起不来，必须拒绝。"""
+        write_cfg(self.cfg_path, {'reasoning_as_content': True})
+        with self.assertRaises(ValueError):
+            wb2api.save_upstream_config({'reasoning_as_content': 'false'})
+        self.assertIs(read_cfg(self.cfg_path)['reasoning_as_content'], True)
+
     # ── prompt / server / upstream（新增段）─────────────────
     def test_prompt_mode_round_trip(self) -> None:
         write_cfg(self.cfg_path, {'prompt': {'mode': 'custom'}})

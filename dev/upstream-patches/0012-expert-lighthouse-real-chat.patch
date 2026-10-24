@@ -1,0 +1,233 @@
+diff --git a/scripts/task_runner.py b/scripts/task_runner.py
+index 8c85583..53777c8 100644
+--- a/scripts/task_runner.py
++++ b/scripts/task_runner.py
+@@ -85,7 +85,7 @@ linguo2625469/workbuddy2api-panel（autotask.go/desktop.go/report.go/tasks.go 
+     machineId/sessionId 由 uid+盐 md5 稳定派生，勿每次随机）；library 走 web 域 web 指纹。
+   - 日志前缀 [task_runner]，行为 action ∈ query/accept/report/claim，汇总行 task_runner done: ...
+ """
+-import sys, os, json, time, argparse, glob, urllib.request
++import sys, os, json, time, argparse, glob, re, urllib.request, urllib.error
+ 
+ # Windows 中文区域的 stdout 默认按 ANSI 代码页（cp936）编码：账号昵称里带 emoji
+ # （🏅）时，打印昵称的那一行会抛 UnicodeEncodeError，整个脚本就死在那儿
+@@ -598,6 +598,106 @@ def desktop_chat_sequence(auth, conversation_id, request_id, message_id,
+     return ev
+ 
+ 
++# ── Expert_lighthouse：真实对话链（issue #221）───────────────────────────
++# 服务端对这条任务的判据与 expert_5 不同：需要「召唤三连 + 带 has_expert 的
++# 桌面对话六连 + expert_actual_use」，且 actual_use 的 requestId 必须是 chat
++# 接口返回的服务端 id（cmb-… / 32 位 hex）。自造 UUID 上报 200 但不计数，
++# 于是进度永远停在 0/1。下面的实现对齐参考实现 autotask.go/desktop.go。
++_LIGHTHOUSE_ID_RE = re.compile(r"^(cmb-)?[0-9a-f]{32}$")
++
++
++def _lighthouse_real_chat(auth, expert_id):
++    """发一次真实桌面对话，返回 (conversation_id, server_request_id, error)。
++
++    只负责建立对话并取服务端 requestId；失败时返回可读原因，由调用方跳过本轮，
++    不退回自造 UUID（那正是这条任务一直 0/1 的原因）。
++    """
++    now_ns = time.time_ns()
++    conv = f"wb2api-conv-{now_ns}"
++    body = {
++        "model": "fast-model",
++        "messages": [
++            {"role": "system",
++             "content": "You are a helpful assistant. 当前处于中文环境，使用简体中文回答。"},
++            {"role": "user", "content": "1+1等于几？直接回答。"},
++        ],
++        "agent": "cli", "temperature": 1, "stream": True,
++        "stream_options": {"include_usage": True},
++    }
++    headers = tc._headers(auth)
++    headers.update({
++        "Accept": "text/event-stream", "User-Agent": DESKTOP_UA,
++        "X-Domain": tc.chat_base(auth), "X-Product": "SaaS",
++        "X-User-Id": auth["uid"], "X-Conversation-ID": conv,
++        "X-Request-ID": str(now_ns), "X-Agent-Intent": "craft",
++        "X-Agent-Type": "main", "X-IDE-Name": "WorkBuddy",
++        "X-IDE-Type": "WorkBuddy", "X-IDE-Version": "5.5.6",
++        "x-codebuddy-request": "1", "X-Expert-Id": expert_id,
++    })
++    req = urllib.request.Request(
++        tc.chat_base(auth) + tc.PATH_CHAT,
++        data=json.dumps(body).encode(), headers=headers, method="POST")
++    try:
++        with urllib.request.urlopen(req, timeout=90) as resp:
++            if resp.status != 200:
++                return conv, "", f"chat http {resp.status}"
++            for raw in resp:
++                line = raw.decode("utf-8", "replace")
++                if not line.startswith("data: "):
++                    continue
++                payload = line[6:].strip()
++                if not payload or payload == "[DONE]":
++                    continue
++                try:
++                    obj = json.loads(payload)
++                except Exception:
++                    continue
++                rid = obj.get("id") if isinstance(obj, dict) else None
++                if isinstance(rid, str) and _LIGHTHOUSE_ID_RE.match(rid):
++                    return conv, rid, ""
++            return conv, "", "SSE 中未找到服务端 requestId"
++    except urllib.error.HTTPError as exc:
++        return conv, "", f"chat http {exc.code}"
++    except Exception as exc:  # noqa: BLE001 —— 网络/解析失败统一交给调用方记日志
++        return conv, "", repr(exc)[:200]
++
++
++def desktop_expert_summon_sequence(expert):
++    """召唤三连（对齐参考实现 DesktopExpertSummonSequence 的抓包形状）。"""
++    eid, m = expert
++    cat = m.get("category") or "expert-all"
++    ver = m.get("version") or "1.0.0"
++    name = m.get("name") or eid
++    return [
++        {"eventCode": "web_element_click", "source": eid, "type": cat,
++         "version": ver, "elementId": "expert_summon_click",
++         "elementName": "立即召唤",
++         "pageURL": "/C:/Program%20Files/WorkBuddy/resources/app.asar/renderer/index.html"},
++        {"eventCode": "expert_summon_click", "id": eid, "name": name,
++         "expertTitle": name, "type": "expert-all", "position": 0,
++         "expertType": m.get("expertType") or "agent", "version": ver,
++         "mode": "LOCAL"},
++        {"eventCode": "expert_summoned", "id": eid, "name": name,
++         "expertTitle": name, "type": "expert-all"},
++    ]
++
++
++def desktop_expert_actual_use_local(expert, conversation_id, request_id):
++    """mode=LOCAL 的 expert_actual_use（轻量云判据：type 为空、cost=0）。"""
++    eid, m = expert
++    name = m.get("name") or eid
++    return {
++        "eventCode": "expert_actual_use", "mode": "LOCAL", "id": eid,
++        "name": name, "expertTitle": name, "type": "",
++        "expertType": m.get("expertType") or "agent", "source": "builtin",
++        "version": m.get("version") or "1.0.0", "cost": 0, "characterCount": 14,
++        "conversationId": conversation_id, "requestId": request_id,
++        "messageId": "msg-" + request_id[-8:],
++        "requestModelId": "fast-model", "requestModelName": "fast-model",
++    }
++
++
++
+ def desktop_buddy5_sequence(auth, buddy_id, buddy_name):
+     """fork DesktopBuddyAppSequence 同款五连「进入 Buddy 应用」事件（点亮 Buddy_App/_QQ）。
+ 
+@@ -1414,6 +1514,40 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
+             if i < need - 1:
+                 time.sleep(opts.gap)
+         time.sleep(2.0)  # 服务端归账可能异步
++    elif spec["kind"] == "lighthouse":
++        # 轻量云专家：召唤三连 → 真实桌面对话（取服务端 requestId）→ 带
++        # has_expert 的六连 → expert_actual_use(LOCAL)。不能沿用通用分支：
++        # 自造 requestId 服务端不计数（issue #221，进度恒 0/1）。
++        ids = ids_for("lighthouse", auth, need, offset=cur)
++        if not ids:
++            print(f"[task_runner] {uid8} {code}: report 无可用对象 id，skip")
++            stats["fail"] += 1
++            return
++        for i, expert in enumerate(ids):
++            eid = expert[0]
++            st_s, sc_s = report_desktop_events(auth, desktop_expert_summon_sequence(expert))
++            print(f"[task_runner] {uid8} {code}: report summon {i + 1}/{need} "
++                  f"{st_s} code={sc_s} id={eid}")
++            conv, req_id, err = _lighthouse_real_chat(auth, eid)
++            if err:
++                print(f"[task_runner] {uid8} {code}: 真实对话失败({err})，本轮跳过")
++                stats["fail"] += 1
++                continue
++            events = desktop_chat_sequence(auth, conv, req_id,
++                                           "msg-" + req_id[-8:], "fast-model", "fast-model")
++            for ev in events:
++                if ev.get("eventCode") == "agent_task_created":
++                    ev["has_expert"] = True
++                    ev["expert_id"] = eid
++                    ev["expert_name"] = expert[1].get("name") or eid
++                    ev["expert_industry_id"] = ""
++            events.append(desktop_expert_actual_use_local(expert, conv, req_id))
++            st_r, sc = report_desktop_events(auth, events)
++            print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} "
++                  f"code={sc} lighthouse req={req_id}")
++            if i < len(ids) - 1:
++                time.sleep(opts.gap)
++        time.sleep(2.0)  # 服务端归账可能异步
+     elif spec["kind"] == "buddy5":
+         # 五连「进入 Buddy 应用」事件（fork DesktopBuddyAppSequence，两账号实测点亮）；
+         # 上报失败（非 200 / code!=0）降级为单发 buddyapp_enter_click（旧形状兜底）。
+diff --git a/scripts/test_task_lighthouse.py b/scripts/test_task_lighthouse.py
+new file mode 100644
+index 0000000..e5e9745
+--- /dev/null
++++ b/scripts/test_task_lighthouse.py
+@@ -0,0 +1,66 @@
++"""Expert_lighthouse 真实对话链（issue #221）。
++
++服务端对这条任务的判据是「召唤三连 + 带 has_expert 的桌面对话六连 +
++expert_actual_use」，且 requestId 必须是 chat 接口返回的服务端 id。这里钉住
++最容易回归的两点：SSE 解析与事件形状。
++"""
++import json
++import unittest
++from unittest import mock
++
++import task_runner as runner
++
++
++class _Resp:
++    status = 200
++
++    def __init__(self, lines):
++        self._lines = [line.encode() for line in lines]
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        return False
++
++    def __iter__(self):
++        return iter(self._lines)
++
++
++class LighthouseTest(unittest.TestCase):
++    def test_real_chat_takes_server_request_id(self) -> None:
++        rid = 'cmb-' + 'a1' * 16
++        resp = _Resp([
++            'data: {"choices":[{"delta":{"content":"1"}}]}\n',
++            'data: {"id":"%s","choices":[]}\n' % rid,
++            'data: [DONE]\n',
++        ])
++        with mock.patch.object(runner.urllib.request, 'urlopen', return_value=resp):
++            conv, got, err = runner._lighthouse_real_chat({'uid': 'u1', 'token': 't'}, 'ex_1')
++        self.assertEqual(got, rid)
++        self.assertEqual(err, '')
++        self.assertTrue(conv.startswith('wb2api-conv-'))
++
++    def test_real_chat_rejects_client_made_id(self) -> None:
++        resp = _Resp(['data: {"id":"wb-run-123","choices":[]}\n', 'data: [DONE]\n'])
++        with mock.patch.object(runner.urllib.request, 'urlopen', return_value=resp):
++            _, got, err = runner._lighthouse_real_chat({'uid': 'u1', 'token': 't'}, 'ex_1')
++        self.assertEqual(got, '')
++        self.assertIn('requestId', err)
++
++    def test_event_shapes_match_reference(self) -> None:
++        expert = ('ex_1', {'name': '腾讯轻量云专家', 'category': '02-Engineering',
++                           'expertType': 'agent', 'version': '1.0.2'})
++        summon = runner.desktop_expert_summon_sequence(expert)
++        self.assertEqual([e['eventCode'] for e in summon],
++                         ['web_element_click', 'expert_summon_click', 'expert_summoned'])
++        self.assertEqual(summon[0]['elementId'], 'expert_summon_click')
++        use = runner.desktop_expert_actual_use_local(expert, 'conv', 'cmb-' + 'b2' * 16)
++        self.assertEqual(use['mode'], 'LOCAL')
++        self.assertEqual(use['type'], '')
++        self.assertEqual(use['cost'], 0)
++        self.assertEqual(use['requestId'], 'cmb-' + 'b2' * 16)
++
++
++if __name__ == '__main__':
++    unittest.main()

@@ -291,5 +291,23 @@ class WindowsScriptLayoutTest(unittest.TestCase):
                               f'{cmd} 没有按 %~dp0 调同目录的 {ps1}')
 
 
+class WindowsPythonIsolationTest(unittest.TestCase):
+    """issue #268：预置运行时不能被用户级 site-packages 覆盖。"""
+
+    def test_python_env_disables_user_site(self) -> None:
+        src = (_ROOT / 'windows' / 'python-env.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn("$env:PYTHONNOUSERSITE = '1'", src,
+                      'python-env.ps1 没有禁用用户级 site-packages；'
+                      '用户目录里的旧 typing_extensions 会盖住内置运行时')
+
+    def test_runtime_scripts_source_the_common_env(self) -> None:
+        """启动/准备/更新/服务脚本都必须 dot-source 这个公共设置。"""
+        for name in ('prepare.ps1', 'start.ps1', 'update.ps1', 'service-tools.ps1'):
+            with self.subTest(script=name):
+                src = (_ROOT / 'windows' / name).read_text(encoding='utf-8-sig')
+                self.assertIn('python-env.ps1', src,
+                              f'{name} 没加载 python-env.ps1，无法继承 PYTHONNOUSERSITE')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -55,6 +55,76 @@ def dummy_verify(pwd: str) -> None:
     verify_pwd(pwd, _DUMMY_HASH)
 
 
+# ── 管理端密码策略 ─────────────────────────────────────
+#
+# 生产事故复盘：公网面板的 admin 密码被设成了 `admin123`，攻击者直接登录，
+# 导出了全部账号凭据。登录失败锁定拦不住「已知弱口令」——必须在设置密码时
+# 就拒绝，而不是等到被撞开以后。这里只做最小、确定的规则：
+#   · 至少 12 位；
+#   · 常见弱口令（含 admin/password/123456 等变体）直接拒绝；
+#   · 不允许「用户名 + 纯数字」；
+#   · 不允许纯数字或单一重复字符。
+# 不做复杂度打分/字典工程：规则越复杂越容易误伤，真正兜底的是长度与黑名单。
+MIN_PASSWORD_LENGTH = 12
+
+_WEAK_PASSWORDS = frozenset({
+    'admin', 'admin123', 'admin1234', 'admin12345', 'admin123456',
+    'admin1234567', 'admin12345678', 'admin123456789',
+    'password', 'password123', 'password1234', 'password12345',
+    '123456789012', '1234567890123', '12345678901234',
+    'qwertyuiop', 'qwerty123456', 'qwertyuiop123',
+    'workbuddy', 'workbuddy123', 'workbuddy1234', 'workbuddy2024',
+    'letmein12345', 'iloveyou1234', '111111111111', '000000000000',
+})
+
+
+def password_problem(pwd: str, username: str = '') -> str | None:
+    """返回密码不合规的原因；合规返回 None。
+
+    给 bootstrap（WB_ADMIN_PASSWORD）、新建用户、重置密码共用同一套判据，
+    避免「启动时能设弱口令、界面改密码时却被拦」这种不一致。
+    """
+    value = str(pwd or '')
+    if len(value) < MIN_PASSWORD_LENGTH:
+        return f'密码至少 {MIN_PASSWORD_LENGTH} 位'
+    low = value.lower()
+    if low in _WEAK_PASSWORDS:
+        return '密码过于常见，请换一个'
+    if username:
+        user = str(username).strip().lower()
+        if user and low.startswith(user) and low[len(user):].isdigit():
+            return '密码不能是用户名加数字'
+    if value.isdigit():
+        return '密码不能全是数字'
+    if len(set(value)) == 1:
+        return '密码不能是重复字符'
+    return None
+
+
+def weak_admin_passwords() -> list[str]:
+    """启动时检测**存量**管理员是否仍在用已知弱口令。
+
+    新密码在设置入口就被拦了，但升级上来的 users.json 里可能已经有
+    `admin123` 这类值（本次生产事故就是如此）。这里只拿小的静态黑名单去比对
+    哈希，命中就返回用户名，让启动日志能明确点出来；不直接拒绝启动——
+    否则用户会被锁在面板外，连改密码的入口都没有。
+    """
+    try:
+        cfg = load_users()
+    except Exception:  # noqa: BLE001
+        return []
+    found: list[str] = []
+    for item in cfg.get('users', []):
+        if item.get('role') != 'admin':
+            continue
+        stored = str(item.get('pwd_hash') or '')
+        for candidate in _WEAK_PASSWORDS:
+            if verify_pwd(candidate, stored):
+                found.append(str(item.get('username') or ''))
+                break
+    return found
+
+
 # ── 用户存储 ─────────────────────────────────────────────
 def load_users() -> dict:
     """读取 users.json。
@@ -151,7 +221,15 @@ def bootstrap_users() -> dict:
     import sys
 
     env_pwd = os.environ.get('WB_ADMIN_PASSWORD', '').strip()
-    pwd = env_pwd or secrets.token_urlsafe(9)
+    if env_pwd:
+        problem = password_problem(env_pwd, 'admin')
+        if problem:
+            raise RuntimeError(
+                f'WB_ADMIN_PASSWORD 不符合管理端密码策略：{problem}。'
+                f'请使用至少 {MIN_PASSWORD_LENGTH} 位、非常见弱口令的密码。'
+            )
+    # 随机密码也留足长度；token_urlsafe(12) 约 16 字符。
+    pwd = env_pwd or secrets.token_urlsafe(12)
     data = {
         'secret': config.new_secret(),
         'users': [{'username': 'admin', 'role': 'admin', 'pwd_hash': make_hash(pwd)}],
@@ -469,13 +547,16 @@ def revoke_sessions(username: str) -> int:
     return new_sv
 
 
-def audit(actor: dict | None, action: str, target: str = '', detail: str = '') -> None:
+def audit(actor: dict | None, action: str, target: str = '', detail: str = '',
+          ip: str = '') -> None:
     """记录一条管理端审计日志。
 
     为什么必须做：本次事故中，攻击者改掉管理员密码、建了自己的账号，而**服务端
     没有留下任何痕迹**——只能靠反代 access log 去猜。管理端是公网入口，
     敏感操作（登录、改密码、增删用户、改安全配置）必须可追溯。
 
+    `ip` 是可选的结构化来源地址。历史调用把来源写进 detail（`来源 x.x.x.x`），
+    这里保留兼容；新调用应同时传 `ip`，方便按列筛选/告警，不必再解析文本。
     审计属于旁路，任何异常都不能影响请求本身（与请求日志同样的处理原则）。
     """
     try:
@@ -485,6 +566,7 @@ def audit(actor: dict | None, action: str, target: str = '', detail: str = '') -
             str(action),
             str(target or ''),
             str(detail or '')[:500],
+            str(ip or '')[:64],
         )
     except Exception:  # noqa: BLE001
         pass

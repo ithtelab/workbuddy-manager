@@ -45,7 +45,7 @@ export function ConfirmDialog({
   contentClassName?: string;
   confirmText?: string;
   destructive?: boolean;
-  /** 条件不满足时锁住确认键（例如密码不足 8 位），比点完再报错少一次往返 */
+  /** 条件不满足时锁住确认键（例如密码不足 12 位），比点完再报错少一次往返 */
   confirmDisabled?: boolean;
   onConfirm: () => void | Promise<void>;
   /**

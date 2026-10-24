@@ -1,0 +1,14 @@
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,5 +1,11 @@
+ # syntax=docker/dockerfile:1
+ FROM golang:1.26-alpine AS build
++# go mod download 默认走 proxy.golang.org，国内网络不可达时上游容器构建失败，
++# 面板更新因此停在“同步随包上游”的重建步骤。默认改走 goproxy.cn（公共 CDN，
++# 海外同样可达，回源走 direct）。要换代理时用构建参数覆盖：
++#   docker compose build --build-arg GOPROXY=https://proxy.golang.org,direct
++ARG GOPROXY=https://goproxy.cn,direct
++ENV GOPROXY=${GOPROXY}
+ WORKDIR /src
+ COPY go.mod ./
+ RUN go mod download

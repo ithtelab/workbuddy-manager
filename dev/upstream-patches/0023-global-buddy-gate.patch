@@ -1,0 +1,65 @@
+diff --git a/internal/scheduler/travel.go b/internal/scheduler/travel.go
+--- a/internal/scheduler/travel.go
++++ b/internal/scheduler/travel.go
+@@ -157,6 +157,9 @@
+ // 对话量补满——此时是「门槛刚达成」的新状态，不算对上游重试轰炸，放行重试。
+ // 有猫账号 BuddyInfo 非空时直接跳过（不重复领养）。
+ func (s *Scheduler) travelAdoptForce(a *auth.Auth) {
++	if a.IsGlobal() {
++		return // D4 门控：国际版任务中心没有 first_buddy / chat_5，不发起领养调用
++	}
+ 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
+ 	if err != nil {
+ 		log.Printf("activity %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
+diff --git a/internal/scheduler/gating_test.go b/internal/scheduler/gating_test.go
+--- a/internal/scheduler/gating_test.go
++++ b/internal/scheduler/gating_test.go
+@@ -4,6 +4,7 @@
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
++	"strings"
+ 	"sync/atomic"
+ 	"testing"
+ 
+@@ -169,6 +170,40 @@
+ 	}
+ 	if n := cnCalls.Load(); n != 0 {
+ 		t.Errorf("global account 不应打到 CN base: cn_calls=%d", n)
++	}
++}
++
++// TestRunActivityGlobalDoesNotAdoptBuddy issue #264：global 任务中心没有
++// first_buddy / chat_5，活跃上报后不应再尝试 buddy/info → buddy/first。
++// 旧实现 travelAdoptForce 没有 IsGlobal 门控，9 个 global 号每天各失败一次。
++func TestRunActivityGlobalDoesNotAdoptBuddy(t *testing.T) {
++	fastActivity(t)
++
++	var buddyCalls atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch {
++		case r.URL.Path == "/v2/report":
++			w.Write([]byte(`{"code":0,"msg":"OK"}`))
++		case strings.Contains(r.URL.Path, "/activity/growth/buddy/"):
++			buddyCalls.Add(1)
++			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
++		default:
++			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
++		}
++	}))
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "g1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
++		Domain: "www.workbuddy.ai"})
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL,
++		BillingBaseGlobal: srv.URL, GlobalEnabled: true}
++	s := New(Config{Pool: p, Upstream: up, ActivityReportCount: 1})
++
++	s.RunActivityNow()
++
++	if n := buddyCalls.Load(); n != 0 {
++		t.Errorf("global account buddy calls=%d want 0（国际版没有领养任务）", n)
+ 	}
+ }
+ 

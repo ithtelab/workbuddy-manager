@@ -55,6 +55,10 @@ class ForceSetCoolingTest(unittest.TestCase):
         self.assertEqual(target['reason'], '防刷保护')
         self.assertEqual(target['cool_kind'], 0)
         self.assertEqual(target['soft_streak'], 0)
+        self.assertTrue(target.get('manual_disabled'))
+        self.assertTrue(str(target.get('manual_reason') or '').startswith('手动冷却'))
+        self.assertIn('防刷保护', target.get('manual_reason') or '')
+        self.assertIn(until, target.get('manual_reason') or '')
         self.assertEqual(target['credits'], 123)
         self.assertEqual(data['accounts']['other']['credits'], 9)
         self.assertTrue(pathlib.Path(result['backup']).is_file())
@@ -62,6 +66,58 @@ class ForceSetCoolingTest(unittest.TestCase):
     def test_empty_uid_raises(self) -> None:
         with self.assertRaises(ValueError):
             wb2api.set_account_cooling_state('', '2099-01-01T00:00:00Z')
+
+    def test_expired_manual_cooling_is_detected_and_cleared(self) -> None:
+        wb2api.set_account_cooling_state(
+            'target', '2020-01-01T00:00:00Z', '临时保护')
+        self.assertEqual(wb2api.expired_manual_cooling_uids(), ['target'])
+
+        with mock.patch.object(
+            wb2api, '_set_upstream_running',
+            new=mock.AsyncMock(side_effect=[(True, 'stopped'), (True, 'started')]),
+        ) as control:
+            cleared = asyncio.run(wb2api.clear_expired_manual_cooling())
+
+        self.assertEqual(cleared, 1)
+        target = json.loads(self.state_path.read_text(encoding='utf-8'))['accounts']['target']
+        self.assertFalse(target.get('manual_disabled'))
+        self.assertNotIn('manual_reason', target)
+        self.assertEqual(control.await_args_list[0].args, (False,))
+        self.assertEqual(control.await_args_list[1].args, (True,))
+
+    def test_permanent_or_user_manual_disable_is_not_cleared(self) -> None:
+        wb2api.set_account_cooling_state(
+            'target', '2099-01-01T00:00:00Z', '永久保护')
+        self.assertEqual(wb2api.expired_manual_cooling_uids(), [])
+
+        data = json.loads(self.state_path.read_text(encoding='utf-8'))
+        data['accounts']['target']['manual_reason'] = '我主动摘的'
+        data['accounts']['target']['until'] = '2020-01-01T00:00:00Z'
+        self.state_path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        self.assertEqual(wb2api.expired_manual_cooling_uids(), [])
+
+    def test_upstream_checkin_resetting_until_does_not_expire_cooling(self) -> None:
+        """签到会把 until 重置成零值；到期判断必须看 reason 里的标记。"""
+        wb2api.set_account_cooling_state(
+            'target', '2099-01-01T00:00:00Z', '长时间保护')
+        data = json.loads(self.state_path.read_text(encoding='utf-8'))
+        data['accounts']['target']['until'] = '0001-01-01T00:00:00Z'
+        self.state_path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        self.assertEqual(wb2api.expired_manual_cooling_uids(), [],
+                         'until 被签到重置后，未来到期的冷却不能被当成已过期')
+
+    def test_clear_does_not_unset_user_manual_disable_with_cooling_word(self) -> None:
+        """用户手动停用的 reason 即使含“冷却”，也不该被清除冷却顺手解掉。"""
+        data = json.loads(self.state_path.read_text(encoding='utf-8'))
+        data['accounts']['target']['manual_disabled'] = True
+        data['accounts']['target']['manual_reason'] = '上游冷却中，先摘掉'
+        data['accounts']['target']['until'] = '0001-01-01T00:00:00Z'
+        self.state_path.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+
+        wb2api.clear_account_cooling_state('target')
+        target = json.loads(self.state_path.read_text(encoding='utf-8'))['accounts']['target']
+        self.assertTrue(target.get('manual_disabled'))
+        self.assertEqual(target.get('manual_reason'), '上游冷却中，先摘掉')
 
     def test_force_set_cooling_stops_and_starts_upstream(self) -> None:
         until = '2099-01-01T12:00:00Z'

@@ -2,8 +2,8 @@
 
 import {useMemo, useState} from 'react';
 import {Check, ChevronsUpDown, Search, X} from 'lucide-react';
-import {upstreamApi} from '@/lib/api';
-import type {ModelInfo} from '@/lib/types';
+import {modelApi} from '@/lib/api';
+import type {CatalogModel} from '@/lib/types';
 import type {Realm} from '@/lib/realm-context';
 import {useT} from '@/lib/i18n/provider';
 import {Button} from '@/components/ui/button';
@@ -57,7 +57,9 @@ export function ModelWhitelistInput({
   const [draft, setDraft] = useState('');
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const [catalog, setCatalog] = useState<{cn: ModelInfo[]; global: ModelInfo[]} | null>(null);
+  const [catalog, setCatalog] = useState<{cn: CatalogModel[]; global: CatalogModel[]} | null>(null);
+  /** 只看上游标注为「限时免费」的模型（issue #208）；tags 缺失时按不在免费目录处理 */
+  const [freeOnly, setFreeOnly] = useState(false);
   const [failed, setFailed] = useState(false);
 
   /** 勾选/取消：按当前顺序重建字符串（去重，保持用户看到的次序） */
@@ -80,9 +82,11 @@ export function ModelWhitelistInput({
   async function ensureCatalog() {
     if (catalog || failed) return;
     try {
+      // 用模型目录而不是 /api/models：只有目录条目带 tags（含「限时免费」），
+      // 白名单的免费筛选依赖它。目录有后端缓存，打开弹窗时拉一次即可。
       const [cn, global] = await Promise.all([
-        upstreamApi.models('cn'),
-        upstreamApi.models('global'),
+        modelApi.catalog('cn'),
+        modelApi.catalog('global'),
       ]);
       setCatalog({cn: cn.models, global: global.models});
     } catch {
@@ -91,7 +95,8 @@ export function ModelWhitelistInput({
   }
 
   // 与密钥「限定版本」一致的那一组排前面：国内版密钥最可能选的是国内版模型。
-  const groups: {key: Realm; label: string; models: ModelInfo[]}[] = [];
+  const isFree = (m: CatalogModel) => (m.tags || []).some((tag) => tag.includes('免费'));
+  const groups: {key: Realm; label: string; models: CatalogModel[]}[] = [];
   if (catalog) {
     groups.push({key: 'cn', label: t('realm.cn'), models: catalog.cn});
     groups.push({key: 'global', label: t('realm.global'), models: catalog.global});
@@ -103,7 +108,8 @@ export function ModelWhitelistInput({
   const filtered = groups
     .map((g) => ({
       ...g,
-      models: needle ? g.models.filter((m) => m.id.toLowerCase().includes(needle)) : g.models,
+      models: g.models.filter((m) =>
+        (!needle || m.id.toLowerCase().includes(needle)) && (!freeOnly || isFree(m))),
     }))
     .filter((g) => g.models.length > 0);
 
@@ -196,6 +202,29 @@ export function ModelWhitelistInput({
                 className="w-full bg-transparent text-xs outline-none"
               />
             </div>
+            <div className="mb-2 flex items-center gap-1.5">
+              <button
+                type="button"
+                aria-pressed={freeOnly}
+                onClick={() => setFreeOnly((v) => !v)}
+                className={cn(
+                  'rounded-full px-2 py-0.5 text-[11px] transition-colors',
+                  freeOnly ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                    : 'bg-muted text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {t('keys.freeOnly')}
+              </button>
+              {freeOnly && filtered.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => emit([...names, ...filtered.flatMap((g) => g.models.map((m) => m.id))])}
+                  className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground hover:text-foreground"
+                >
+                  {t('keys.freeSelectAll')}
+                </button>
+              )}
+            </div>
             <div className="max-h-[260px] overflow-y-auto">
               {failed && (
                 <p className="px-2 py-6 text-center text-xs text-muted-foreground">
@@ -239,6 +268,11 @@ export function ModelWhitelistInput({
                           {picked && <Check className="h-2.5 w-2.5" />}
                         </span>
                         <span className="min-w-0 flex-1 truncate font-mono">{m.id}</span>
+                        {isFree(m) && (
+                          <span className="shrink-0 rounded-full bg-emerald-500/15 px-1.5 text-[10px] text-emerald-700 dark:text-emerald-300">
+                            {t('keys.freeBadge')}
+                          </span>
+                        )}
                         {typeof m.context_length === 'number' && (
                           <span className="shrink-0 text-[11px] text-muted-foreground">
                             {Math.round(m.context_length / 1000)}k

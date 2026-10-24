@@ -80,6 +80,9 @@ services:
       WB_HTTP_PROXY: ${WB_HTTP_PROXY:-}
       # 一键更新的下载代理（可选，只认 http/https）
       WB_UPDATE_PROXY: ${WB_UPDATE_PROXY:-}
+      # GitHub 镜像加速（可选，issue #216）：国内机器直连 GitHub 超时时填基址，
+      # 例如 https://gh-proxy.com/ 。版本检测与发布包下载先走镜像，失败回退直连。
+      WB_GITHUB_MIRROR: ${WB_GITHUB_MIRROR:-}
       # 新账号默认绑定的命名线路（名字要在上游 config.json 的 proxies 里）
       WB_DEFAULT_ACCOUNT_PROXY: ${WB_DEFAULT_ACCOUNT_PROXY:-}
     ports:

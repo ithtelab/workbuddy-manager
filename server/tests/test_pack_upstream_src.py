@@ -79,6 +79,23 @@ class SecretExclusionTest(unittest.TestCase):
             self.assertNotIn(rel, got, f'{rel} 是运行时数据/凭据，不能进公开资产')
 
 
+class UpstreamIdTest(unittest.TestCase):
+    """`.upstream-id` 是面板判断「这次发布带没带上游」的依据。"""
+
+    def test_id_ignores_generated_notice_but_tracks_sources(self) -> None:
+        mod = _load_packer()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'scripts').mkdir()
+            (root / 'scripts' / 'task_runner.py').write_bytes(b'print(1)\n')
+            (root / 'UPSTREAM-SRC.txt').write_bytes(b'note\n')
+            first = mod.tree_id(root)
+            (root / 'UPSTREAM-SRC.txt').write_bytes(b'note changed\n')
+            self.assertEqual(mod.tree_id(root), first, '说明文件的时间戳/文案不该改变 id')
+            (root / 'scripts' / 'task_runner.py').write_bytes(b'print(2)\n')
+            self.assertNotEqual(mod.tree_id(root), first, '源码变化必须改变 id')
+
+
 class PackRoundTripTest(unittest.TestCase):
     """真打一次包：脚本落地必须是 LF，二进制原样，可执行位保留。"""
 

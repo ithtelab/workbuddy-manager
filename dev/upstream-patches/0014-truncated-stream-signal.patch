@@ -1,0 +1,230 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index e8c4997..9993e9e 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -912,6 +912,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				// 502 观测没有意义）。
+ 				st.status = http.StatusBadGateway
+ 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
++			} else if upstream.IsTruncatedStreamError(sErr) {
++				// 上游 200 但流中途断掉（转发过内容帧、无 finish_reason、无 [DONE]）：
++				// StreamHint 已在 [DONE] 之前补一条 error 帧（客户端由此判失败而非
++				// 「完成」）。这里同样把日志/状态收敛到 502 —— 不这么做，日志里留下
++				// 的是一条 tok=... 的假成功，正是本问题此前查不出来的原因。
++				st.status = http.StatusBadGateway
++				log.Printf("WARN: [server] stream acct=%s model=%s: upstream truncated (no finish_reason/[DONE])", logfmt.Label(acct.UID, acct.Nickname), bareModel)
+ 			}
+ 			st.ttfb = stats.TTFB()
+ 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
+diff --git a/internal/server/handler_stream_empty_test.go b/internal/server/handler_stream_empty_test.go
+index 2fe68ef..9d2068f 100644
+--- a/internal/server/handler_stream_empty_test.go
++++ b/internal/server/handler_stream_empty_test.go
+@@ -33,3 +33,33 @@ func TestChatStreamEmptyUpstreamLogged502(t *testing.T) {
+ 		t.Errorf("log row status must be 502 (empty stream is upstream failure), got:\n%s", out)
+ 	}
+ }
++
++// TestChatStreamTruncatedLogged502 上游 200 + 流中途断掉（转发过内容帧，但既没有
++// finish_reason 也没有 [DONE]）：客户端必须在 [DONE] 之前收到 error 帧 —— 否则半截
++// 回答被当成「模型说完了」，客户端不再续跑；日志状态同时收敛为 502。
++// 此前这种流被无条件补成 [DONE]，客户端按正常收尾处理，日志里只留一条 tok=... 的
++// 假成功，问题因此长期不可见。
++func TestChatStreamTruncatedLogged502(t *testing.T) {
++	withChatLog(t)
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		// 有内容帧，然后连接直接结束：不发 finish_reason、不发 [DONE]。
++		return 200, "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n", true
++	})
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up})
++	rec := httptest.NewRecorder()
++	out := captureStdout(t, func() {
++		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++			strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
++	})
++	body := rec.Body.String()
++	if !strings.Contains(body, "upstream_truncated") {
++		t.Errorf("client must be told the stream was truncated:\n%s", body)
++	}
++	if strings.Index(body, "upstream_truncated") > strings.Index(body, "data: [DONE]") {
++		t.Errorf("truncation error frame must precede [DONE]:\n%s", body)
++	}
++	if !strings.Contains(out, "| 502 |") {
++		t.Errorf("log row status must be 502 (truncated stream is upstream failure), got:\n%s", out)
++	}
++}
+diff --git a/internal/upstream/sse.go b/internal/upstream/sse.go
+index 2f05d45..db2452e 100644
+--- a/internal/upstream/sse.go
++++ b/internal/upstream/sse.go
+@@ -24,6 +24,17 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
+ // upstream_parse 同语义），与客户端断连类错误区分。
+ func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
+ 
++// errTruncatedStream 上游流「中途断掉」：转发过有效帧，但既没有 finish_reason
++// 也没有 data: [DONE] 就 EOF（服务端流超时、限流后直接关 TCP 等）。
++// 与 errEmptyStream 分开：那是「一帧都没有」，这是「有内容但没正常收尾」——
++// 两种上游缺陷在日志里应能区分。
++var errTruncatedStream = errors.New("upstream stream ended before completion")
++
++// IsTruncatedStreamError 报告错误是否为「上游截断」——供 handler 在流式路径把
++// 截断记为失败观测（HTTP 头已发出只能 200，但日志/状态不应留下成功）。
++// 告知客户端的义务由 StreamHint 在 [DONE] 之前插入的 error 帧承担。
++func IsTruncatedStreamError(err error) bool { return errors.Is(err, errTruncatedStream) }
++
+ // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
+ // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
+ // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
+@@ -510,6 +521,11 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string)
+ 	// 「只看正文的客户端不再空回复」这个修复对它们完全无效。
+ 	var tailBuf []string
+ 	tailing := false
++	// 收尾判据（**独立于 ReasoningFallback 开关**，关掉时也要生效）：
++	// 上游是否显式发过 data: [DONE]、是否出现过带 finish_reason 的帧。
++	// 两者皆无而流已结束 = 中途断掉，不是「模型说完了」。
++	sawDone := false
++	sawFinish := false
+ 	flushTail := func() error {
+ 		for _, p := range tailBuf {
+ 			if _, err := io.WriteString(w, "data: "+p+"\n\n"); err != nil {
+@@ -607,8 +623,12 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string)
+ 			if raw, err := json.Marshal(normalizeFrame(obj)); err == nil {
+ 				payload = string(raw)
+ 			}
+-			valid = 1
+-			// 帧序修正：出现 finish_reason 后（含本条）先缓冲，等补发正文后再发。
++		valid = 1
++		// 收尾观测：出现过 finish_reason 即算上游正常收了尾（与开关无关）。
++		if frameHasFinish(obj) {
++			sawFinish = true
++		}
++		// 帧序修正：出现 finish_reason 后（含本条）先缓冲，等补发正文后再发。
+ 			// 开关关闭时整段不执行 —— 与改造前逐字节一致。
+ 			if ReasoningFallbackEnabled() && (tailing || frameHasFinish(obj)) {
+ 				tailing = true
+@@ -635,6 +655,7 @@ readLoop:
+ 		case strings.HasPrefix(trimmed, "data: [DONE]"):
+ 			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
+ 			// [DONE] 统一在循环结束后写出，保证恰好一个。
++			sawDone = true
+ 			break readLoop
+ 		case strings.HasPrefix(trimmed, "data: "):
+ 			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
+@@ -699,6 +720,27 @@ readLoop:
+ 	if err := flushTail(); err != nil {
+ 		return err
+ 	}
++	// 截断判定：转发过有效帧，但上游既没给 finish_reason、也没给 [DONE] 就结束
++	// —— 连接中断（流超时 / 限流后直接关 TCP），不是「模型说完了」。
++	//
++	// 为什么保留 [DONE] 兜底而不换掉它：管理端 responses 转换层依赖 chat 流以
++	// [DONE] 收尾来补齐推理事件，去掉会让 /v1/responses 的思考内容显示不全
++	// （实测回归过、已回退）。所以收尾契约不动，只在 [DONE] **之前**插一条 error
++	// 帧：客户端（NarraFork 等）优先识别 error → 判失败 / 可续跑，不再把半截
++	// 回答当成完成；管理端 responses.py 也会把无 choices 的 error 帧转成
++	// response.failed。
++	//
++	// 判据与非流式 Aggregate 同构：那边同样以 !sawDone 认定「未正常收尾」。
++	// 空流（validFrames == 0）走上方的 errEmptyStream 分支，不重复判定。
++	truncated := validFrames > 0 && !sawDone && !sawFinish
++	if truncated {
++		// 本地判定帧不走 writeRaw：它的 hintFn 是给**上游** error 帧配建议用的，
++		// 这里不是上游错误，不编造 hint。
++		if _, werr := io.WriteString(w,
++			"data: {\"error\":{\"message\":\"upstream stream ended before completion\",\"type\":\"upstream_error\",\"code\":\"upstream_truncated\"}}\n\n"); werr != nil {
++			return werr
++		}
++	}
+ 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+ 		return err
+ 	}
+@@ -708,6 +750,9 @@ readLoop:
+ 	if validFrames == 0 {
+ 		return errEmptyStream
+ 	}
++	if truncated {
++		return errTruncatedStream
++	}
+ 	return nil
+ }
+ 
+diff --git a/internal/upstream/sse_test.go b/internal/upstream/sse_test.go
+index 68f8699..2d7083e 100644
+--- a/internal/upstream/sse_test.go
++++ b/internal/upstream/sse_test.go
+@@ -765,18 +765,26 @@ func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
+ }
+ 
+ func TestStreamDoneFallback(t *testing.T) {
+-	// 上游流在无 [DONE] 时 EOF，Stream 必须兜底写一个 [DONE]
++	// 上游流在无 [DONE] 时 EOF：仍兜底写一个 [DONE]（收尾契约不变），但在它之前
++	// 补一条 error 帧 —— 这是「中途断流」，不是「模型说完了」。
+ 	rec := httptest.NewRecorder()
+ 	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+-	if err != nil {
+-		t.Fatal(err)
++	if !IsTruncatedStreamError(err) {
++		t.Fatalf("err=%v want errTruncatedStream", err)
+ 	}
+ 	body := rec.Body.String()
+ 	if !strings.HasSuffix(strings.TrimRight(body, "\n"), "data: [DONE]") {
+ 		t.Errorf("missing [DONE] fallback: %q", body)
+ 	}
++	if !strings.Contains(body, `"code":"upstream_truncated"`) {
++		t.Errorf("missing truncation error frame: %q", body)
++	}
++	// error 帧必须在 [DONE] 之前：客户端顺序消费，终止帧之后的错误等于没发。
++	if strings.Index(body, "upstream_truncated") > strings.Index(body, "data: [DONE]") {
++		t.Errorf("error frame must precede [DONE]: %q", body)
++	}
+ 
+-	// 已有 [DONE] 时只写一次，不重复
++	// 已有 [DONE]：只写一次、不重复，且不算截断、不补 error 帧
+ 	rec2 := httptest.NewRecorder()
+ 	if err := Stream(rec2, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n")); err != nil {
+ 		t.Fatal(err)
+@@ -784,6 +792,24 @@ func TestStreamDoneFallback(t *testing.T) {
+ 	if n := strings.Count(rec2.Body.String(), "data: [DONE]"); n != 1 {
+ 		t.Errorf("[DONE] count=%d want 1: %q", n, rec2.Body.String())
+ 	}
++	if strings.Contains(rec2.Body.String(), "upstream_truncated") {
++		t.Errorf("unexpected truncation error frame: %q", rec2.Body.String())
++	}
++}
++
++// TestStreamTruncatedDetectedWithFallbackOff 截断判定必须独立于 ReasoningFallback
++// 开关（那个开关只管「整轮无正文时补发思考」）——关掉它同样要识别中途断流，
++// 否则关掉兜底的部署仍会把半截回答当成功收尾。
++func TestStreamTruncatedDetectedWithFallbackOff(t *testing.T) {
++	withReasoningFallback(t, false)
++	rec := httptest.NewRecorder()
++	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
++	if !IsTruncatedStreamError(err) {
++		t.Fatalf("err=%v want errTruncatedStream (fallback off)", err)
++	}
++	if !strings.Contains(rec.Body.String(), `"code":"upstream_truncated"`) {
++		t.Errorf("truncation error frame missing with fallback off: %q", rec.Body.String())
++	}
+ }
+ 
+ func TestStreamPassthrough(t *testing.T) {
+@@ -983,14 +1009,16 @@ func TestStreamGarbageAfterDone(t *testing.T) {
+ }
+ 
+ // TestStreamNormalPassthroughRegression 校验正常透传回归：帧被 normalize 后透传、
+-// 末尾恰好一个 [DONE]、无 error 帧；上游漏发 DONE 时自动补。
++// 末尾恰好一个 [DONE]、无 error 帧；上游正常收尾但漏发 DONE 时自动补上，且**不**
++// 被误判成截断 —— 判据看的是「有没有 finish_reason / [DONE]」，不是「有没有 [DONE]」。
+ func TestStreamNormalPassthroughRegression(t *testing.T) {
+ 	cases := []struct {
+ 		name string
+ 		raw  string
+ 	}{
+ 		{"带 DONE 的正常流", sseFixture},
+-		{"漏发 DONE 自动补", "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"},
++		{"有 finish_reason 但漏发 DONE（不判截断）", "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
++			"data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"},
+ 	}
+ 	for _, c := range cases {
+ 		t.Run(c.name, func(t *testing.T) {
