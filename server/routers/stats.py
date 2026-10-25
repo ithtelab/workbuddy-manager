@@ -467,6 +467,47 @@ def _credit_income_by_day(since: str, realm: str | None) -> dict[str, float]:
     return {str(r['day']): float(r['income'] or 0) for r in rows if r['day']}
 
 
+def _credit_income_by_hour(day: str, realm: str | None) -> dict[int, float]:
+    """收入按小时聚合（`credits_flow` 的 days=1 下探用）。
+
+    口径与 `_credit_income_by_day` 完全一致，只把分桶换成小时：流水归到余额
+    查询发生的那个小时（两次查询之间的多次增加合并计入下一次查询，这一近似
+    与按天版相同）。过滤仍写 `ts >= ? AND ts < ?` 走索引，只有 GROUP BY 用
+    `hour_sql` 表达式（与 `_hourly_failures` 同一取舍）。
+    """
+    uids = _realm_uids(realm)
+    if uids is not None and not uids:
+        return {}
+    start = db.day_start_ts(day)
+    sql = (f"SELECT {db.hour_sql('ts')} AS bucket, COALESCE(SUM(credits),0) AS income "
+           "FROM task_logs WHERE kind = 'credit' AND ts >= ? AND ts < ?")
+    args: list = [start, start + 86400]
+    if uids is not None:
+        sql += f' AND uid IN ({",".join("?" * len(uids))})'
+        args.extend(sorted(uids))
+    sql += ' GROUP BY bucket'
+    out: dict[int, float] = {}
+    for r in db.query(sql, tuple(args)):
+        bucket = str(r['bucket'] or '')
+        # hour_sql 产出 'YYYY-MM-DD HH'，小时在末两位
+        if len(bucket) >= 13:
+            out[int(bucket[11:13])] = float(r['income'] or 0)
+    return out
+
+
+def _credit_expense_by_hour(day: str, realm: str | None) -> dict[int, float]:
+    """支出按小时聚合。`usage_hourly` 与 `usage_daily` 是同一条写入路径累计的，
+    按天合计与按小时合计天然一致，不会出现卡片一个数、图上另一个数。"""
+    rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
+    rargs: tuple = (realm,) if rf else ()
+    rows = db.query(
+        'SELECT hour, COALESCE(SUM(credit),0) AS credit '
+        f'FROM usage_hourly WHERE day = ?{rf} GROUP BY hour',
+        (day,) + rargs,
+    )
+    return {int(r['hour']): float(r['credit'] or 0) for r in rows}
+
+
 @router.get('/credits')
 def credits_flow(days: int = 30, realm: str | None = None,
                  user: dict = Depends(security.current_user)) -> dict:
@@ -487,6 +528,15 @@ def credits_flow(days: int = 30, realm: str | None = None,
     `usage_daily.credit` 是每次调用上游返回的真实扣费（`usage.credit`）当日合计，
     精确到每次请求。两个口径精度不同，所以不把「净额」当作唯一结论，而是收入 /
     支出 / 净额三项都列。
+
+    ## 单日下探到小时
+
+    days=1（当天）时按天聚合只有一个点，折线画不出来，与用量趋势图当年一根
+    柱子是同一个问题。此时额外返回 `granularity='hour'` 与 `hourly`：固定
+    24 个小时桶（补零，含还没到的小时）。支出取 `usage_hourly`（与 `usage_daily`
+    同一条写入路径，合计一致），收入按 `hour_sql(ts)` 分桶、归到余额查询发生
+    的那个小时（近似口径与按天版相同）。days>1 时不返回这两个键，响应与原先
+    一致。
     """
     d = _clamp_days(days, 30)
     since = _since(d)
@@ -521,7 +571,20 @@ def credits_flow(days: int = 30, realm: str | None = None,
         exp = sum(r['expense'] for r in rows)
         return {'income': inc, 'expense': exp, 'net': inc - exp}
 
-    return {
+    # days=1（当天）时按天只有一个点，折线画不出来：下探到小时，固定 24 桶
+    # （含还没到的小时，补零），一天内的起伏才读得出。多日范围不返回小时数据。
+    hourly: list[dict] | None = None
+    if d == 1:
+        inc_h = _credit_income_by_hour(today, realm)
+        exp_h = _credit_expense_by_hour(today, realm)
+        hourly = []
+        for h in range(24):
+            inc = inc_h.get(h, 0.0)
+            exp = exp_h.get(h, 0.0)
+            hourly.append({'day': today, 'hour': h, 'income': inc,
+                           'expense': exp, 'net': inc - exp})
+
+    out = {
         'days': d,
         'from': daily[0]['day'] if daily else since,
         'to': today,
@@ -530,6 +593,10 @@ def credits_flow(days: int = 30, realm: str | None = None,
         'total': _sum(daily),
         'daily': daily,
     }
+    if hourly is not None:
+        out['granularity'] = 'hour'
+        out['hourly'] = hourly
+    return out
 
 
 @router.get('/by-model')

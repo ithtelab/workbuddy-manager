@@ -709,6 +709,16 @@ export interface CreditsFlowPoint {
   net: number;
 }
 
+/** 一小时的积分收入 / 支出（`/api/stats/credits` 在 days=1 时返回的 hourly 项） */
+export interface CreditsFlowHourPoint {
+  day: string;
+  /** 0-23（本地时区） */
+  hour: number;
+  income: number;
+  expense: number;
+  net: number;
+}
+
 /**
  * 积分收支统计。
  *
@@ -724,6 +734,10 @@ export interface CreditsFlow {
   week: {income: number; expense: number; net: number};
   total: {income: number; expense: number; net: number};
   daily: CreditsFlowPoint[];
+  /** days=1（当天）时为 'hour'，其余时段不返回（视为按天） */
+  granularity?: 'day' | 'hour';
+  /** 单日下探的 24 个小时桶，仅 granularity 为 'hour' 时返回（issue #285） */
+  hourly?: CreditsFlowHourPoint[];
 }
 
 export interface UsageBreakdown {
