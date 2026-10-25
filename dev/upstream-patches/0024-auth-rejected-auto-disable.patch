@@ -1,0 +1,125 @@
+diff --git a/internal/pool/state.go b/internal/pool/state.go
+index 0f25737..166e3b6 100644
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -32,6 +32,18 @@ func (p *Pool) Disable(uid, reason string) {
+ // 即使账号已 disabled，计数仍累计并返回 false 前 N-1 次——但 keepalive 会跳过
+ // disabled 号，实际只有「已 disabled 后复活且计数未清」这类场景才会走到这里。
+ func (p *Pool) NoteSessionDead(uid string) bool {
++	return p.NoteAuthFailure(uid, sessionDeadReason)
++}
++
++// NoteAuthFailure 记录一次**账号级授权失败**——12153 session 失效（ErrSessionDead）
++// 与「无 12153 的纯 401」（ErrAuthRejected）共用同一套连续计数：
++// 计数 +1，达到 sessionDeadThreshold → Disable（reason 由调用方给出）并清计数。
++//
++// 为什么两类共用一套计数：两者表达的是同一件事（凭证被上游拒绝），只是上游的
++// 响应形态不同 —— 有业务码 12153 时能直接定性，没有时（APISIX 网关 401 页 / 空体）
++// 只能靠连续命中来区分「偶发抖动」与「真失效」。共用计数意味着同一账号先撞 2 次
++// 12153 再撞 1 次纯 401 也会被判死，这正是期望行为（凭证状态不会自己好转）。
++func (p *Pool) NoteAuthFailure(uid, reason string) bool {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+ 	e, ok := p.byUID[uid]
+@@ -44,7 +56,7 @@ func (p *Pool) NoteSessionDead(uid string) bool {
+ 		return false
+ 	}
+ 	e.sessionDeadFails = 0
+-	p.disableLocked(e, sessionDeadReason)
++	p.disableLocked(e, reason)
+ 	return true
+ }
+ 
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 49b152d..e5290b6 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -1225,6 +1225,12 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
+ 	case upstream.ErrSessionDead:
+ 		h.cfg.Pool.Disable(uid, "12153 session dead")
++	case upstream.ErrAuthRejected:
++		// 纯 401（无 12153、无业务信封）：凭证被上游拒绝，但单次可能是网关抖动
++		// 或 token 轮换竞态 —— 不直接 Disable（chat 路径误判一次就是永久杀号），
++		// 改走连续计数，达到 sessionDeadThreshold 才禁用。计数器与 12153 共用：
++		// 同一账号先后撞到两种形态，本来就说明凭证不会自己好转。
++		h.cfg.Pool.NoteAuthFailure(uid, "401 auth rejected")
+ 	case upstream.ErrNotFound:
+ 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
+ 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index f4aa73b..a54af5b 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -47,6 +47,16 @@ const (
+ 	// 不能落 ErrModelBlocked —— handler 会写 6 小时 (账号,模型) 负缓存，十几个号轮
+ 	// 一圈就是整池 503；也不该按 ErrClient 喂连败计数（失败的是路径不是账号）。
+ 	ErrFallbackModelMissing
++	// ErrAuthRejected 401 但**不带 12153**：上游网关的拦截页 / 空体 / 纯 HTML 401
++	// （APISIX 常见形态，body 里没有任何业务信封）。
++	//
++	// 为什么不能落 ErrClient：那条路只换号 + 连败降权（10 分钟后自动回池），坏号
++	// 会一直留在池里被反复选中，表现为「面板显示健康、每次命中都 503」。
++	// 为什么不能直接判 ErrSessionDead：chat 路径上的 ErrSessionDead 一次即
++	// Disable（applyErrorPolicy），而纯 401 可能是网关抖动或 token 轮换竞态，
++	// 一次误判就是永久杀号。故单列一类，由 handler 走「连续 N 次才禁用」的计数
++	// 路径（与 12153 的 NoteSessionDead 同口径、共用计数器）。
++	ErrAuthRejected
+ )
+ 
+ func (k ErrKind) String() string {
+@@ -81,6 +91,8 @@ func (k ErrKind) String() string {
+ 		return "tool_call_mismatch"
+ 	case ErrFallbackModelMissing:
+ 		return "fallback_model_missing"
++	case ErrAuthRejected:
++		return "auth_rejected"
+ 	case ErrClient:
+ 		return "client"
+ 	default:
+@@ -609,6 +621,13 @@ func Classify(status int, body string) ErrKind {
+ 	if sessionDeadRule.hit(body, lower) {
+ 		return ErrSessionDead
+ 	}
++	// 401 兜底（**无 12153** 的纯 401）：上游网关拦截页、空体、纯 HTML 都落到
++	// 这里。单列 ErrAuthRejected 而不是 ErrClient —— 见该 errkind 的注释：
++	// ErrClient 只换号不罚号，坏号会在池里反复被选中；而这一类的正确处置是
++	// 「连续 N 次后禁用」（handler.applyErrorPolicy 走 NoteAuthFailure）。
++	if status == http.StatusUnauthorized {
++		return ErrAuthRejected
++	}
+ 	// 渠道校验（/v2 上的新强校验，2026-10-17）：归**账号级**分类，但 applyErrorPolicy
+ 	// 里最先判它、只做软冷却（绝不禁用，理由见那里的注释）。不在这里归类的话：没带
+ 	// `request illegal` 字样的渠道校验会落通用 4xx「只换号不罚号」，坏号留在池里
+diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
+index 7681b73..93aa042 100644
+--- a/internal/upstream/client_test.go
++++ b/internal/upstream/client_test.go
+@@ -84,7 +84,13 @@ func TestClassify(t *testing.T) {
+ 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
+ 		{401, `Offline user session not found`, ErrSessionDead},
+ 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
+-		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
++		// 401 但**没有** 12153 业务码：网关拦截页 / 空体 / 非信封 JSON。归
++		// auth_rejected 而不是 client —— ErrClient 只换号不罚号（10 分钟降权后
++		// 自动回池），坏号会被反复选中；auth_rejected 由 handler 走连续计数，
++		// 达阈值才禁用。空体与 HTML 是 APISIX 401 的真实形态，一并锁住。
++		{401, `{"code":9999,"msg":"bad token"}`, ErrAuthRejected},
++		{401, ``, ErrAuthRejected},
++		{401, `<html><body>401 Unauthorized</body></html>`, ErrAuthRejected},
+ 		{500, `boom`, ErrServer},
+ 		{503, `unavailable`, ErrServer},
+ 		{200, ``, ErrNone},
+diff --git a/internal/upstream/hint.go b/internal/upstream/hint.go
+index 55bfa24..a138020 100644
+--- a/internal/upstream/hint.go
++++ b/internal/upstream/hint.go
+@@ -57,6 +57,8 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
+ 		return "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"
+ 	case ErrSessionDead:
+ 		return "account session expired at upstream; the account is disabled until re-login"
++	case ErrAuthRejected:
++		return "account credential rejected by upstream (401); the gateway disables this account after repeated hits"
+ 	case ErrHardCredit:
+ 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
+ 	case ErrModelBlocked:
