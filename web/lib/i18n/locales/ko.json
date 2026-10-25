@@ -394,6 +394,8 @@
     "taskRunAllAccounts": "모든 계정",
     "restarted": "업스트림을 재시작했습니다",
     "disabledReason": "비활성화 사유: {reason}",
+    "disabledQueueHint": "'재로그인 대기열'에서 재로그인하여 해제할 수 있습니다",
+    "disabledQueueHintAdminOff": "먼저 '설정 → 업스트림'에서 계정 관리 API를 켜야 재로그인으로 해제할 수 있습니다",
     "badgeDisabled": "● 비활성화됨",
     "badgeDisabledTitle": "업스트림이 이 계정을 자동으로 비활성화했습니다(세션 만료 반복 또는 업스트림 차단). 오른쪽의 \"사용\"을 누르면 시스템 비활성화가 해제되어 계정 풀에 돌아갑니다. 다시 로그인하라는 안내가 나오면 한 번 더 로그인하세요(로그인 자체도 비활성화를 자동 해제합니다).",
     "badgeDisabledByPanel": "● 일시중지",
@@ -533,7 +535,17 @@
     "sharedInstanceTitle": "이 그룹은 기본 그룹과 같은 업스트림 인스턴스를 공유합니다",
     "sharedInstanceHint": "이 그룹의 계정 파일은 패널이 따로 관리하지만, 업스트림은 기본 그룹의 디렉터리만 읽습니다. 그래서 여기에 넣은 계정(이 그룹에서 QR로 새로 추가한 계정 포함)은 계속 “미로드”로 표시되고, 포워딩과 체크인에도 사용되지 않습니다. 풀을 실제로 분리하려면 서버에 workbuddy2api를 하나 더 배포하고 이 그룹의 업스트림 주소를 그 인스턴스로 바꾸세요.",
     "sharedInstanceAction": "설정 → 업스트림에서 주소 변경",
-    "refreshFailed": "계정 목록 새로 고침에 실패했습니다. 표시된 내용이 오래되었을 수 있습니다. 다시 시도하세요."
+    "refreshFailed": "계정 목록 새로 고침에 실패했습니다. 표시된 내용이 오래되었을 수 있습니다. 다시 시도하세요.",
+    "reloginQueueTitle": "재로그인 대기열",
+    "reloginQueueTitleTip": "차단 계정을 순서대로 재로그인하여 해제",
+    "reloginQueueCount": "차단된 계정 {count}개",
+    "reloginQueueCurrent": "처리 중",
+    "reloginQueueWaiting": "대기 중",
+    "reloginQueueRelogin": "재로그인",
+    "reloginQueueReloginCurrent": "현재 계정 재로그인",
+    "reloginQueueReason": "차단 사유: ",
+    "reloginQueuePing": "ping 테스트",
+    "reloginQueueAdvanceHint": "재로그인에 성공하면 계정이 대기열에서 빠지고 다음 계정으로 자동 진행됩니다."
   },
   "keys": {
     "title": "API 키",

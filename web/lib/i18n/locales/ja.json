@@ -394,6 +394,8 @@
     "taskRunAllAccounts": "すべてのアカウント",
     "restarted": "上流を再起動しました",
     "disabledReason": "無効化の理由: {reason}",
+    "disabledQueueHint": "「再ログインキュー」から再ログインして解除できます",
+    "disabledQueueHintAdminOff": "先に「設定 → 上流」でアカウント管理 API を有効にすると、再ログインで解除できます",
     "badgeDisabled": "● 無効",
     "badgeDisabledTitle": "上流がこのアカウントを自動的に無効化しました（セッション失効の連続、または上流側での BAN）。右側の「有効化」でシステム無効を解除し、アカウントプールに戻せます。再ログインが必要と表示された場合は、もう一度ログインしてください（ログイン自体も無効化を自動解除します）。",
     "badgeDisabledByPanel": "● 停止中",
@@ -533,7 +535,17 @@
     "sharedInstanceTitle": "このグループはデフォルトグループと同じ上流インスタンスを共有しています",
     "sharedInstanceHint": "このグループのアカウントファイルはパネルが独自に管理していますが、上流が読み込むのはデフォルトグループのディレクトリだけです。そのため、ここに置いたアカウント（このグループで QR から追加したものも含む）は「未読み込み」のまま表示され、転送やチェックインにも使われません。プールを本当に分けるには、サーバーにもう 1 つ workbuddy2api を配備し、このグループの「上流 URL」をそのインスタンスに変更してください。",
     "sharedInstanceAction": "「設定 → 上流」で URL を変更",
-    "refreshFailed": "アカウント一覧の更新に失敗しました。表示は古い可能性があります。再試行してください。"
+    "refreshFailed": "アカウント一覧の更新に失敗しました。表示は古い可能性があります。再試行してください。",
+    "reloginQueueTitle": "再ログインキュー",
+    "reloginQueueTitleTip": "ブロックされたアカウントを順に再ログイン",
+    "reloginQueueCount": "ブロックされたアカウント {count} 件",
+    "reloginQueueCurrent": "処理中",
+    "reloginQueueWaiting": "待機中",
+    "reloginQueueRelogin": "再ログイン",
+    "reloginQueueReloginCurrent": "現在のアカウントを再ログイン",
+    "reloginQueueReason": "ブロック理由：",
+    "reloginQueuePing": "ping テスト",
+    "reloginQueueAdvanceHint": "再ログインに成功するとアカウントはキューから外れ、次のアカウントへ自動的に進みます。"
   },
   "keys": {
     "title": "API キー",

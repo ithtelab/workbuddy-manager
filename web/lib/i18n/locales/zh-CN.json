@@ -394,6 +394,8 @@
     "taskRunAllAccounts": "全部账号",
     "restarted": "已重启上游",
     "disabledReason": "禁用原因：{reason}",
+    "disabledQueueHint": "可通过「解禁队列」重新登录解封",
+    "disabledQueueHintAdminOff": "需先在「设置 → 上游」开启账号管理接口，重登才能解封",
     "badgeDisabled": "● 已禁用",
     "badgeDisabledTitle": "上游已自动禁用该账号（连续登录失效，或被上游封禁）。点右侧的「启用」即可解除系统禁用、把它放回账号池；若提示需要重新登录，请先重新扫码登录一次（重新登录本身也会自动解除禁用）。",
     "badgeDisabledByPanel": "● 已停用",
@@ -533,7 +535,17 @@
     "sharedInstanceTitle": "这一组和默认分组共用同一套上游实例",
     "sharedInstanceHint": "这一组的账号文件由面板单独管理，而上游只读默认分组的账号目录——所以放进这一组的账号（包括在这里新扫码加的）都会一直显示「未加载」，转发与签到也不会用到它们。要真正把账号池分开，请在服务器上再部署一套 workbuddy2api，再把这一组的「上游地址」改成那套实例。",
     "sharedInstanceAction": "去「设置 → 上游」改地址",
-    "refreshFailed": "账号列表这次刷新没成功 —— 下面可能是旧数据，点重试再取一次。"
+    "refreshFailed": "账号列表这次刷新没成功 —— 下面可能是旧数据，点重试再取一次。",
+    "reloginQueueTitle": "解禁队列",
+    "reloginQueueTitleTip": "封控账号排队逐个重登解封",
+    "reloginQueueCount": "共 {count} 个封控账号",
+    "reloginQueueCurrent": "当前处理",
+    "reloginQueueWaiting": "待处理",
+    "reloginQueueRelogin": "重登",
+    "reloginQueueReloginCurrent": "重登当前账号",
+    "reloginQueueReason": "封控原因：",
+    "reloginQueuePing": "ping 测试",
+    "reloginQueueAdvanceHint": "重登成功后该账号会自动退出队列，前进到下一位。"
   },
   "keys": {
     "title": "API 密钥",

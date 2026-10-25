@@ -421,6 +421,8 @@
     "taskRunAllAccounts": "all accounts",
     "restarted": "Upstream restarted",
     "disabledReason": "Disabled reason: {reason}",
+    "disabledQueueHint": "Re-login via the Re-login Queue to unblock",
+    "disabledQueueHintAdminOff": "Enable the account management API in Settings → Upstreams first, then re-login can unblock it",
     "badgeDisabled": "● Disabled",
     "badgeDisabledTitle": "The upstream disabled this account automatically (repeated session failures, or a ban on the upstream side). Click \"Enable\" on the right to clear the system disable and put it back in the pool. If it says you need to sign in again, re-run the login once — signing in also clears the disable automatically.",
     "badgeDisabledByPanel": "● Paused",
@@ -560,7 +562,17 @@
     "sharedInstanceTitle": "This group shares the same upstream instance as the default group",
     "sharedInstanceHint": "This group’s account files are managed by the panel on their own, but the upstream only reads the default group’s directory — so any account placed here (including ones you add by QR in this group) will keep showing “not loaded”, and will not be used for forwarding or check-in. To truly separate the pools, deploy a second workbuddy2api instance on your server and point this group’s upstream URL at it.",
     "sharedInstanceAction": "Change the URL in Settings → Upstreams",
-    "refreshFailed": "Refreshing the account list failed — what you see may be stale. Try again."
+    "refreshFailed": "Refreshing the account list failed — what you see may be stale. Try again.",
+    "reloginQueueTitle": "Re-login Queue",
+    "reloginQueueTitleTip": "Re-login blocked accounts one by one",
+    "reloginQueueCount": "{count} blocked accounts",
+    "reloginQueueCurrent": "Current",
+    "reloginQueueWaiting": "Queued",
+    "reloginQueueRelogin": "Re-login",
+    "reloginQueueReloginCurrent": "Re-login current account",
+    "reloginQueueReason": "Block reason: ",
+    "reloginQueuePing": "Ping",
+    "reloginQueueAdvanceHint": "After a successful re-login the account leaves the queue and the next one is selected automatically."
   },
   "keys": {
     "title": "API keys",

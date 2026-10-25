@@ -394,6 +394,8 @@
     "taskRunAllAccounts": "全部帳號",
     "restarted": "已重新啟動上游",
     "disabledReason": "停用原因：{reason}",
+    "disabledQueueHint": "可透過「解禁佇列」重新登入解封",
+    "disabledQueueHintAdminOff": "需先在「設定 → 上游」開啟帳號管理介面，重新登入才能解封",
     "badgeDisabled": "● 已停用",
     "badgeDisabledTitle": "上游已自動停用該帳號（連續登入失效，或被上游封禁）。點右側的「啟用」即可解除系統停用、把它放回帳號池；若提示需要重新登入，請先重新掃碼登入一次（重新登入本身也會自動解除停用）。",
     "badgeDisabledByPanel": "● 已停用",
@@ -533,7 +535,17 @@
     "sharedInstanceTitle": "這一組和預設分組共用同一套上游實例",
     "sharedInstanceHint": "這一組的帳號檔案由面板單獨管理，而上游只讀預設分組的帳號目錄——所以放進這一組的帳號（包括在這裡新掃碼加的）都會一直顯示「未載入」，轉發與簽到也不會用到它們。要真正把帳號池分開，請在伺服器上再部署一套 workbuddy2api，再把這一組的「上游位址」改成那套實例。",
     "sharedInstanceAction": "去「設定 → 上游」改位址",
-    "refreshFailed": "帳號列表這次重新整理沒成功 —— 下面可能是舊資料，點重試再取一次。"
+    "refreshFailed": "帳號列表這次重新整理沒成功 —— 下面可能是舊資料，點重試再取一次。",
+    "reloginQueueTitle": "解禁佇列",
+    "reloginQueueTitleTip": "封控帳號排隊逐個重登解封",
+    "reloginQueueCount": "共 {count} 個封控帳號",
+    "reloginQueueCurrent": "目前處理",
+    "reloginQueueWaiting": "待處理",
+    "reloginQueueRelogin": "重新登入",
+    "reloginQueueReloginCurrent": "重新登入目前帳號",
+    "reloginQueueReason": "封控原因：",
+    "reloginQueuePing": "ping 測試",
+    "reloginQueueAdvanceHint": "重新登入成功後該帳號會自動退出佇列，前進到下一位。"
   },
   "keys": {
     "title": "API 金鑰",

@@ -74,6 +74,7 @@ import {MoveAccountDialog} from '@/components/common/accounts/MoveAccountDialog'
 import {UpstreamFormDialog} from '@/components/common/upstreams/UpstreamFormDialog';
 import {AccountCoolingDialog} from '@/components/common/accounts/AccountCoolingDialog';
 import {AccountTaskDialog} from '@/components/common/accounts/AccountTaskDialog';
+import {ReloginQueueDialog} from '@/components/common/accounts/ReloginQueue';
 import {ModelProbeDialog} from '@/components/common/accounts/ModelProbeDialog';
 import {useAuth} from '@/lib/auth-context';
 import {realmLabel, useRealm} from '@/lib/realm-context';
@@ -96,6 +97,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import {Tooltip, TooltipContent, TooltipTrigger} from '@/components/ui/tooltip';
 
 /**
  * 一页显示多少个账号。
@@ -120,6 +122,7 @@ export default function AccountsPage() {
   const t = useT();
   const {isAdmin} = useAuth();
   const [addOpen, setAddOpen] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
   const [proxyRoutes, setProxyRoutes] = useState<string[] | null>(null);
   // 备注编辑（issue #67）：记的是**哪个账号**而不是布尔——弹窗要以该账号当前的
   // 备注为初值，否则会拿上一个账号的内容去保存。
@@ -485,6 +488,35 @@ export default function AccountsPage() {
     [visible],
   );
 
+  /** 封控中（上游自动禁用，需重新登录解封）的账号数 */
+  const blockedCount = useMemo(
+    () => visible.filter((a) => availabilityOf(a) === 'disabled').length,
+    [visible],
+  );
+
+  /**
+   * 上游「账号管理接口」（admin.enabled）开关。null = 未知/读取中/读取失败。
+   *
+   * 解封的最后一步要调上游的 revive 接口，而这组接口默认关闭（admin.enabled
+   * 默认 false）。开关没开时，重登只换令牌、清不掉禁用位——因此「是否可解封」
+   * 的提示必须区分两种情况，不能一概说「可通过解禁队列解封」误导用户。
+   */
+  const [adminApiEnabled, setAdminApiEnabled] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!isAdmin) return;
+    let alive = true;
+    accountApi.adminApiStatus()
+      .then((d) => { if (alive) setAdminApiEnabled(d.enabled); })
+      .catch(() => { if (alive) setAdminApiEnabled(null); });
+    return () => { alive = false; };
+  }, [isAdmin]);
+
+  /** 封禁账号的「解禁出路」提示：按上游管理接口开关是否已开启，如实告知。 */
+  const reloginHint =
+    adminApiEnabled === false
+      ? t('accounts.disabledQueueHintAdminOff')
+      : t('accounts.disabledQueueHint');
+
   /** 执行单账号操作（签到 / 测活 / 刷新 / 删除），成功后同步底栏计数 */
   async function run(
     file: string,
@@ -574,14 +606,31 @@ export default function AccountsPage() {
 
     if (tier === 'disabled') {
       const reason = String(a.disabled_reason || '');
+      // 悬停提示两行：封禁原因 + （管理员）解禁出路。
+      // 为什么用 Tooltip 而不是原生 title：原生提示有 1~2 秒延迟且部分环境
+      // 根本不弹（用户实测「移上去没效果」）；Radix Tooltip 悬停即显。
+      // 移动端没有 hover，原因在下方卡片里直接铺一行小字（见移动端卡片区）。
+      const tipLines = [
+        reason ? t('accounts.disabledReason', {reason}) : null,
+        isAdmin ? reloginHint : null,
+      ].filter(Boolean) as string[];
       return (
-        <Badge
-          variant="destructive"
-          className="rounded-full"
-          title={reason ? t('accounts.disabledReason', {reason}) : undefined}
-        >
-          {label}
-        </Badge>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="destructive" className="cursor-help rounded-full">
+              {label}
+            </Badge>
+          </TooltipTrigger>
+          {tipLines.length > 0 && (
+            <TooltipContent className="max-w-[280px] py-2">
+              <div className="space-y-1 text-left leading-4">
+                {tipLines.map((line, i) => (
+                  <p key={i}>{line}</p>
+                ))}
+              </div>
+            </TooltipContent>
+          )}
+        </Tooltip>
       );
     }
     if (tier === 'disabledByPanel') {
@@ -1159,6 +1208,7 @@ export default function AccountsPage() {
   return (
     <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
       <PageHeader
+        stacked
         title={t('accounts.title')}
         description={
           realm === 'global'
@@ -1167,6 +1217,7 @@ export default function AccountsPage() {
         }
         actions={
           <>
+            {/* 「强制重启」= 重启上游容器（确认后执行）。 */}
             {isAdmin && (
               <ConfirmDialog
                 title={t('accounts.restartTitle')}
@@ -1187,18 +1238,18 @@ export default function AccountsPage() {
                 对它们没有意义 —— 显示出来只会点了报 403（issue #56 之后权限
                 是明确的：force 仍限管理员）。与上面几个管理员操作同一个口径。 */}
             {isAdmin && (
-            <Button
-              size="sm"
-              variant="outline"
-              className="rounded-full"
-              onClick={refreshCredits}
-              disabled={creditsBusy || !visible.length}
-              title={t('accounts.refreshCreditsTitle')}
-            >
-              <Coins className={creditsBusy ? 'animate-pulse' : ''} />
-              <span className="hidden sm:inline">{t('accounts.refreshCredits')}</span>
-              <span className="sm:hidden">{t('accounts.creditsShort')}</span>
-            </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="rounded-full"
+                onClick={refreshCredits}
+                disabled={creditsBusy || !visible.length}
+                title={t('accounts.refreshCreditsTitle')}
+              >
+                <Coins className={creditsBusy ? 'animate-pulse' : ''} />
+                <span className="hidden sm:inline">{t('accounts.refreshCredits')}</span>
+                <span className="sm:hidden">{t('accounts.creditsShort')}</span>
+              </Button>
             )}
             {/* 「一键刷新令牌」= 对所有账号真实续期 accessToken（逐个用 refreshToken
                 换新令牌），末尾只重载一次上游。与逐行那个 KeyRound 按钮同一套实现，
@@ -1261,6 +1312,31 @@ export default function AccountsPage() {
               </Button>
             )}
             {isAdmin && (
+              <span className="relative inline-flex">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="rounded-full"
+                  onClick={() => setQueueOpen(true)}
+                  title={t('accounts.reloginQueueTitleTip')}
+                >
+                  <Users className="h-3.5 w-3.5" />
+                  <span>{t('accounts.reloginQueueTitle')}</span>
+                  {blockedCount > 0 && (
+                    <span className="tabular-nums font-semibold opacity-80">{blockedCount}</span>
+                  )}
+                </Button>
+                {/* 新功能角标（issue 约定：为新 UI 功能加红色 NEW 角标，稳定后移除）。
+                    只在存在封禁账号、队列真正有内容时显示——没有待解封账号时
+                    光秃秃的 NEW 没有引导意义。 */}
+                {blockedCount > 0 && (
+                  <span className="pointer-events-none absolute -right-1.5 -top-1.5 z-10 rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] font-bold leading-none text-white">
+                    NEW
+                  </span>
+                )}
+              </span>
+            )}
+            {isAdmin && (
               <UploadAccountsButton upstreamId={groupId} groups={groups} onSuccess={reloadAll} />
             )}
             {isAdmin && (
@@ -1273,66 +1349,67 @@ export default function AccountsPage() {
         }
       />
 
-      {/* 二级导航（批次 4 ②：本页吸收了「任务记录」——账号是「主体」，
-          任务记录是「这个主体干了什么」，用户在两分钟内必然要一起看）。
-          本页没有早返回的整页守卫（取不到账号时只在下面给错误态），
-          所以放在这里一处即可。 */}
-      <PageSectionTabs />
-
-
       {/* 账号分组（多账号池）：默认分组 = 升级前那套（环境变量 / 上游
           config.json）；「添加分组」只填名称即可（地址默认沿用默认分组的、
           账号目录自动带出建议路径，其余字段到「设置 → 上游」再调）。
-          密钥绑定哪个分组，请求就走那一组的接入点。 */}
-      <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant={groupId == null ? 'default' : 'outline'}
-          size="sm"
-          className="rounded-full"
-          onClick={() => setGroupId(null)}
-        >
-          {t('accounts.groupDefault')}
-        </Button>
-        {groups
-          .filter((g) => !g.is_default && g.id != null)
-          .map((g) => (
-            <Button
-              key={g.id}
-              variant={groupId === g.id ? 'default' : 'outline'}
-              size="sm"
-              className="rounded-full"
-              onClick={() => setGroupId(g.id as number)}
-            >
-              {g.name}
-              {!g.enabled ? t('accounts.groupDisabledSuffix') : ''}
-            </Button>
-          ))}
-        {isAdmin && (
+          密钥绑定哪个分组，请求就走那一组的接入点。
+          「账号 / 任务」二级导航与本条同行、靠右——它只有两项，单独占一行
+          太稀疏；与窄的分组切换条互补成一行，页面更紧凑。 */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button
-            variant="ghost"
+            variant={groupId == null ? 'default' : 'outline'}
             size="sm"
             className="rounded-full"
-            onClick={() => setGroupDialogOpen(true)}
+            onClick={() => setGroupId(null)}
           >
-            <Plus className="h-3.5 w-3.5" />
-            {t('accounts.groupAdd')}
+            {t('accounts.groupDefault')}
           </Button>
-        )}
-        {isAdmin && groupId != null && (
-          <ConfirmDialog
-            title={t('accounts.groupDeleteTitle', {name: groupInfo?.name || ''})}
-            description={t('accounts.groupDeleteDesc')}
-            confirmText={t('accounts.groupDelete')}
-            destructive
-            onConfirm={() => deleteGroup()}
-            trigger={
-              <Button variant="ghost" size="sm" className="rounded-full text-destructive">
-                <Trash2 className="h-3.5 w-3.5" />
-                {t('accounts.groupDelete')}
+          {groups
+            .filter((g) => !g.is_default && g.id != null)
+            .map((g) => (
+              <Button
+                key={g.id}
+                variant={groupId === g.id ? 'default' : 'outline'}
+                size="sm"
+                className="rounded-full"
+                onClick={() => setGroupId(g.id as number)}
+              >
+                {g.name}
+                {!g.enabled ? t('accounts.groupDisabledSuffix') : ''}
               </Button>
-            }
-          />
-        )}
+            ))}
+          {isAdmin && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="rounded-full"
+              onClick={() => setGroupDialogOpen(true)}
+            >
+              <Plus className="h-3.5 w-3.5" />
+              {t('accounts.groupAdd')}
+            </Button>
+          )}
+          {isAdmin && groupId != null && (
+            <ConfirmDialog
+              title={t('accounts.groupDeleteTitle', {name: groupInfo?.name || ''})}
+              description={t('accounts.groupDeleteDesc')}
+              confirmText={t('accounts.groupDelete')}
+              destructive
+              onConfirm={() => deleteGroup()}
+              trigger={
+                <Button variant="ghost" size="sm" className="rounded-full text-destructive">
+                  <Trash2 className="h-3.5 w-3.5" />
+                  {t('accounts.groupDelete')}
+                </Button>
+              }
+            />
+          )}
+        </div>
+        {/* 二级导航（批次 4 ②：本页吸收了「任务记录」——账号是「主体」，
+            任务记录是「这个主体干了什么」，用户在两分钟内必然要一起看）。
+            本页没有早返回的整页守卫（取不到账号时只在下面给错误态）。 */}
+        <PageSectionTabs />
       </div>
       {groupInfo && !groupInfo.manageable && groupId != null && (
         <p className="px-1 text-[11px] leading-4 text-muted-foreground">
@@ -1467,6 +1544,19 @@ export default function AccountsPage() {
                   {renderModelLimit(a)}
                 </div>
               </div>
+
+              {/* 封禁原因直接铺出来：移动端没有 hover，title 提示不可见（用户实测反馈）。
+                  管理员额外给出解禁出路 —— 与桌面端徽章的悬停提示同一套文案。 */}
+              {availabilityOf(a) === 'disabled' && (a.disabled_reason || isAdmin) && (
+                <div className="text-[11px] leading-4 text-rose-600 dark:text-rose-400">
+                  {a.disabled_reason
+                    ? t('accounts.disabledReason', {reason: String(a.disabled_reason)})
+                    : t('accounts.badgeDisabled')}
+                  {isAdmin && (
+                    <span className="text-muted-foreground"> · {reloginHint}</span>
+                  )}
+                </div>
+              )}
 
               <div className="flex items-center justify-between gap-3">
                 <div className="flex shrink-0 items-center gap-1.5">
@@ -1642,6 +1732,14 @@ export default function AccountsPage() {
 
       <AddAccountDialog open={addOpen} onOpenChange={setAddOpen} onSuccess={reloadAll}
                         upstreamId={groupId} />
+      <ReloginQueueDialog
+        open={queueOpen}
+        onOpenChange={setQueueOpen}
+        accounts={visible}
+        upstreamId={groupId}
+        onSuccess={reloadAll}
+        adminApiEnabled={adminApiEnabled}
+      />
       <MoveAccountDialog
         account={moveTarget}
         open={moveTarget !== null}
