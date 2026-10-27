@@ -1,0 +1,282 @@
+diff --git a/internal/prompt/move_test.go b/internal/prompt/move_test.go
+new file mode 100644
+index 0000000..747beea
+--- /dev/null
++++ b/internal/prompt/move_test.go
+@@ -0,0 +1,61 @@
++package prompt
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func TestMoveSystemToUserMovesTextAndKeepsUserContent(t *testing.T) {
++	body := []byte(`{"model":"m","messages":[` +
++		`{"role":"system","content":"PERSONA-A"},` +
++		`{"role":"developer","content":"PERSONA-B"},` +
++		`{"role":"user","content":"hello"},` +
++		`{"role":"assistant","content":"hi"}]}`)
++	out, ok := MoveSystemToUser(body)
++	if !ok {
++		t.Fatal("有 system 文本与 user 消息时应成功")
++	}
++	var req struct {
++		Messages []struct {
++			Role    string `json:"role"`
++			Content string `json:"content"`
++		} `json:"messages"`
++	}
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatalf("输出不是合法 JSON: %v", err)
++	}
++	if len(req.Messages) != 3 {
++		t.Fatalf("两条 system 应合并为一条中性 system，got %d 条", len(req.Messages))
++	}
++	if req.Messages[0].Role != "system" || req.Messages[0].Content != Degraded {
++		t.Fatalf("首条应换成中性提示词，got %+v", req.Messages[0])
++	}
++	if req.Messages[1].Role != "user" {
++		t.Fatalf("第二条应仍是 user，got %+v", req.Messages[1])
++	}
++	if !strings.Contains(req.Messages[1].Content, "PERSONA-A") ||
++		!strings.Contains(req.Messages[1].Content, "PERSONA-B") ||
++		!strings.HasSuffix(req.Messages[1].Content, "hello") {
++		t.Fatalf("system 文本应原样搬到 user 前部、原 user 内容在尾部，got %q", req.Messages[1].Content)
++	}
++	if req.Messages[2].Content != "hi" {
++		t.Fatalf("后续消息应逐字不动，got %+v", req.Messages[2])
++	}
++}
++
++func TestMoveSystemToUserBails(t *testing.T) {
++	cases := map[string]string{
++		"非 JSON":     `not json`,
++		"无 messages": `{}`,
++		"没有 system":  `{"messages":[{"role":"user","content":"hi"}]}`,
++		"没有 user":    `{"messages":[{"role":"system","content":"s"}]}`,
++		"user 非纯文本": `{"messages":[{"role":"system","content":"s"},` +
++			`{"role":"user","content":[{"type":"text","text":"hi"}]}]}`,
++	}
++	for name, body := range cases {
++		if _, ok := MoveSystemToUser([]byte(body)); ok {
++			t.Errorf("%s 应保守返回 false", name)
++		}
++	}
++}
+diff --git a/internal/prompt/prompt.go b/internal/prompt/prompt.go
+index 1ba0e06..4bc5293 100644
+--- a/internal/prompt/prompt.go
++++ b/internal/prompt/prompt.go
+@@ -12,6 +12,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
++	"strings"
+ )
+ 
+ //go:embed defaultprompt.md
+@@ -151,3 +152,81 @@ func Rewrite(body []byte, systemPrompt string) []byte {
+ 	}
+ 	return out
+ }
++
++// MoveSystemToUser 把 system/developer 消息的文本搬进首条 user 消息，system 换成
++// 最小中性提示词（Degraded）。
++//
++// 用途（11128 渠道校验）：上游按 system 通道内容做校验，同一段文本放进 user 通道
++// 可以通过。请求本身可能完全合法（例如带人格设定的系统提示词），所以给调用方一次
++// **请求级**重试机会，而不是把账号判成故障。文本一字不改，只换承载通道。
++//
++// 保守返回 (nil,false)：无 system/developer 文本、没有 user 消息、或首条 user 的
++// content 不是纯文本（数组/多模态）时，调用方按原错误处理。
++func MoveSystemToUser(body []byte) ([]byte, bool) {
++	if len(body) == 0 {
++		return nil, false
++	}
++	var obj map[string]any
++	if err := json.Unmarshal(body, &obj); err != nil {
++		return nil, false
++	}
++	msgs, ok := obj["messages"].([]any)
++	if !ok || len(msgs) == 0 {
++		return nil, false
++	}
++	var sysTexts []string
++	firstUser := -1
++	for i, m := range msgs {
++		mm, ok := m.(map[string]any)
++		if !ok {
++			continue
++		}
++		role, _ := mm["role"].(string)
++		switch role {
++		case "system", "developer":
++			if s, ok := mm["content"].(string); ok && s != "" {
++				sysTexts = append(sysTexts, s)
++			}
++		case "user":
++			if firstUser < 0 {
++				firstUser = i
++			}
++		}
++	}
++	if len(sysTexts) == 0 || firstUser < 0 {
++		return nil, false
++	}
++	um, ok := msgs[firstUser].(map[string]any)
++	if !ok {
++		return nil, false
++	}
++	userText, ok := um["content"].(string)
++	if !ok {
++		return nil, false
++	}
++	// 系统文本放前、user 原有内容放后：语义顺序不变（设定先于用户输入）。
++	moved := strings.Join(sysTexts, "\n\n") + "\n\n" + userText
++	rewritten := make([]any, 0, len(msgs)-len(sysTexts)+1)
++	rewritten = append(rewritten, map[string]any{"role": "system", "content": Degraded})
++	for i, m := range msgs {
++		mm, ok := m.(map[string]any)
++		if !ok {
++			rewritten = append(rewritten, m)
++			continue
++		}
++		role, _ := mm["role"].(string)
++		if role == "system" || role == "developer" {
++			continue
++		}
++		if i == firstUser {
++			mm["content"] = moved
++		}
++		rewritten = append(rewritten, mm)
++	}
++	obj["messages"] = rewritten
++	out, err := json.Marshal(obj)
++	if err != nil {
++		return nil, false
++	}
++	return out, true
++}
+diff --git a/internal/server/channel_check_test.go b/internal/server/channel_check_test.go
+index d81a9fc..bca1c7a 100644
+--- a/internal/server/channel_check_test.go
++++ b/internal/server/channel_check_test.go
+@@ -1,6 +1,7 @@
+ package server
+ 
+ import (
++	"encoding/json"
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -142,3 +143,69 @@ func TestConsoleFallbackModelMissingDoesNotBlockModel(t *testing.T) {
+ 		t.Errorf("账号不该被冷却/禁用: cooling=%v disabled=%v", st.Cooling, st.Disabled)
+ 	}
+ }
++
++// 11128 按 system 内容判定：合法系统提示词不该把账号拖下水。
++//
++// 同一请求体先被渠道校验拦下（/v2 与 /console 都拒），handler 把 system 文本
++// 搬进首条 user 后重试成功；账号不冷却、不禁用。
++func TestChatChannelCheckMovesSystemIntoUserAndRetries(t *testing.T) {
++	var bodies []string
++	up := &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			b, _ := io.ReadAll(r.Body)
++			bodies = append(bodies, string(b))
++			if systemHasPersona(b) {
++				return sseResponse(400, channelCheckBody()), nil
++			}
++			return sseResponse(200, sseOK), nil
++		})},
++		ChatBaseCN:    "https://fake.example",
++		BillingBaseCN: "https://fake.example",
++	}
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "passthrough", SoftCooldown: 600 * time.Second})
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[`+
++			`{"role":"system","content":"PERSONA-SAFE"},`+
++			`{"role":"user","content":"hi"}]}`)))
++	if rec.Code != 200 {
++		t.Fatalf("system 文本搬进 user 后应成功，got code=%d body=%s", rec.Code, rec.Body.String())
++	}
++	if len(bodies) < 2 {
++		t.Fatalf("应至少重试一次，实际上游请求 %d 次", len(bodies))
++	}
++	last := bodies[len(bodies)-1]
++	if systemHasPersona([]byte(last)) {
++		t.Fatalf("重试请求仍是原始 system，未搬迁: %s", last)
++	}
++	if !strings.Contains(last, "PERSONA-SAFE") {
++		t.Fatalf("重试请求丢了 system 文本: %s", last)
++	}
++	st, _ := p.Status("u1")
++	if st.Cooling || st.Disabled {
++		t.Fatalf("内容问题不该罚账号：cooling=%v disabled=%v", st.Cooling, st.Disabled)
++	}
++}
++
++// systemHasPersona 判断请求体里是否还有「原始 system 内容」（persona 标记仍在
++// system 通道）。出站前 client 会 normalize 重排消息字段，所以按 JSON 解析判断，
++// 不依赖字段顺序。
++func systemHasPersona(body []byte) bool {
++	var req struct {
++		Messages []struct {
++			Role    string `json:"role"`
++			Content string `json:"content"`
++		} `json:"messages"`
++	}
++	if json.Unmarshal(body, &req) != nil {
++		return false
++	}
++	for _, m := range req.Messages {
++		if m.Role == "system" && strings.Contains(m.Content, "PERSONA") {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index c198049..896789b 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -618,6 +618,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
+ 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
+ 	degradedApplied := false
++	// 11128 请求级抢救：把 system 文本搬进首条 user 只做一次（搬两次没有意义，
++	// 第二次仍被拦说明触发词在 user 侧或请求其它部分）。
++	systemMoved := false
+ 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
+ 		body = prompt.Rewrite(body, h.cfg.PromptText)
+ 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
+@@ -884,6 +887,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				st.status = http.StatusBadRequest
+ 				return
+ 			}
++			// 11128 渠道校验：实测判定依据是 system 消息的内容（同一 body 换号结果
++			// 一致；把 system 文本原样搬进首条 user、system 换中性提示词即通过），
++			// 请求本身可能完全合法（带人格设定的系统提示词）。换号/换路径都救不了
++			// 内容问题，所以先做一次**请求级**重试；仍被拦才按原策略处理（账号软
++			// 冷却 + 换号）——不把内容问题记成账号问题。
++			if kind == upstream.ErrAccountFault && !systemMoved &&
++				(h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") &&
++				upstream.IsChannelCheck(string(respBody)) {
++				if moved, ok := prompt.MoveSystemToUser(body); ok {
++					body = moved
++					systemMoved = true
++					// 单账号池也能拿到重试机会（重试占一次轮换名额，与原账号解绑）。
++					delete(tried, acct.UID)
++					releaseHeld()
++					log.Printf("WARN: [server] channel-check (system content) -> moved system into user, retry")
++					continue
++				}
++			}
+ 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
+ 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
+ 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
