@@ -1,0 +1,52 @@
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index 0e5efd6..46ae31e 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -1480,7 +1480,12 @@ func (c *Client) chatPaths(a *auth.Auth) []string {
+ 	// 被渠道校验拦过的账号：优先走官方客户端路径 /console（issue #296）。
+ 	// /v2 仍是主路径（#119 的 /console WAF 取舍不变），这里只调整**顺序**：
+ 	// 上一次撞过 11128 的账号，下一轮不必再白跑一次 /v2。
+-	if a != nil && c.channelBlockedFor(a.UID) {
++	//
++	// 仅对 global 生效：CN 的 /console 不提供 deepseek-v4.1-flash 等模型，提前换过去
++	// 会让该账号之后 10 分钟的**所有**请求都吃 11102（model service info not found）。
++	// 一个账号被 11128 拦一次就把整池打成 503，比原问题更严重；CN 保持 /v2 优先，
++	// 11128 由调用方按请求级处理。
++	if a != nil && a.Realm() != "cn" && c.channelBlockedFor(a.UID) {
+ 		return []string{chatConsolePath, chatCompletionsPath}
+ 	}
+ 	return []string{chatCompletionsPath, chatConsolePath}
+diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
+index ceb1dca..ba68600 100644
+--- a/internal/upstream/client_test.go
++++ b/internal/upstream/client_test.go
+@@ -1046,3 +1046,29 @@ func TestRefreshTokenExpiresInWithinCapApplied(t *testing.T) {
+ 		t.Errorf("ExpiresAt=%d want ~%d (60d 正常推进)", a.ExpiresAt, want)
+ 	}
+ }
++
++// issue #296 后续：/console 优先只能用于 global。
++//
++// CN 的 /console 不提供 deepseek-v4.1-flash 等模型，账号一旦在 /v2 撞过 11128，
++// 提前换到 /console 会让它之后 10 分钟的每个请求都吃 11102，一个号被拦一次就能
++// 把整池打成 503。
++func TestChatPathsConsoleFirstOnlyForGlobal(t *testing.T) {
++	c := &Client{}
++	cn := &auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"}
++	global := &auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"}
++
++	c.markChannelBlocked(cn.UID)
++	if got := c.chatPaths(cn); len(got) != 2 || got[0] != chatCompletionsPath {
++		t.Fatalf("CN 账号撞过渠道校验后仍应 /v2 优先，got %v", got)
++	}
++
++	c.markChannelBlocked(global.UID)
++	if got := c.chatPaths(global); len(got) != 2 || got[0] != chatConsolePath {
++		t.Fatalf("global 账号撞过渠道校验后应 /console 优先（issue #296），got %v", got)
++	}
++
++	fresh := &auth.Auth{UID: "new1", Domain: "www.workbuddy.ai"}
++	if got := c.chatPaths(fresh); got[0] != chatCompletionsPath {
++		t.Fatalf("未撞过渠道校验的账号应 /v2 优先，got %v", got)
++	}
++}
