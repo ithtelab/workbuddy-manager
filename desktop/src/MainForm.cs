@@ -46,6 +46,7 @@ internal sealed class MainForm : Form
     private TrayPopupForm? _trayPopup;
     private string? _sessionToken;
     private bool _rememberHintShown;
+    private bool _wouldHide;
     private RegisteredWaitHandle? _showWait;
 
     public int ExitCode { get; private set; }
@@ -81,6 +82,13 @@ internal sealed class MainForm : Form
         BuildWindow();
         BuildTray();
         BuildTimer();
+
+        // 静默启动：先把窗口设为透明/不占任务栏，服务起完再真正隐藏，避免闪一下
+        _wouldHide = settings.SilentStart;
+        if (_wouldHide)
+        {
+            Opacity = 0;
+        }
     }
 
     // ── 窗口 ────────────────────────────────────────────────
@@ -132,6 +140,20 @@ internal sealed class MainForm : Form
         {
             await InitializeWebViewAsync();
             await StartServiceAsync();
+            if (_wouldHide)
+            {
+                _wouldHide = false;
+                Hide();
+                Opacity = 1;
+                AppLog.Info("静默启动：已隐藏主窗口，驻留托盘");
+                if (!_settings.TrayHintShown)
+                {
+                    _settings.TrayHintShown = true;
+                    _settings.Save();
+                    _tray.ShowBalloonTip(4000, "已在后台启动",
+                        "右键托盘图标可以打开面板、重启或退出。", ToolTipIcon.Info);
+                }
+            }
         };
 
         FormClosing += OnFormClosing;
@@ -139,7 +161,18 @@ internal sealed class MainForm : Form
         Move += (_, _) => SaveBounds();
 
         _showWait = ThreadPool.RegisterWaitForSingleObject(_showEvent,
-            (_, _) => BeginInvoke(ShowFromTray), null, Timeout.Infinite, executeOnlyOnce: false);
+            (_, _) =>
+            {
+                AppLog.Info("收到二次启动信号，显示主窗口");
+                try
+                {
+                    BeginInvoke(ShowFromTray);
+                }
+                catch (Exception ex)
+                {
+                    AppLog.Error("显示主窗口失败", ex);
+                }
+            }, null, Timeout.Infinite, executeOnlyOnce: false);
     }
 
     private static bool IsOnAnyScreen(Rectangle bounds)
@@ -213,6 +246,7 @@ internal sealed class MainForm : Form
 
     private void ShowFromTray()
     {
+        AppLog.Info($"显示主窗口（state={WindowState}）");
         Show();
         if (WindowState == FormWindowState.Minimized)
         {
@@ -785,6 +819,7 @@ internal sealed class MainForm : Form
             port = _service.Port,
             upstream,
             autoLogin = _settings.AutoLogin,
+            silentStart = _settings.SilentStart,
             autoStart = AutoStartManager.IsEnabled(),
             pendingUpdate = _pendingRelease?.Tag,
             user = _settings.LoginUser,
@@ -832,6 +867,11 @@ internal sealed class MainForm : Form
                 break;
             case "toggleAutoLogin":
                 _settings.AutoLogin = !_settings.AutoLogin;
+                _settings.Save();
+                _trayPopup?.Refresh();
+                break;
+            case "toggleSilentStart":
+                _settings.SilentStart = !_settings.SilentStart;
                 _settings.Save();
                 _trayPopup?.Refresh();
                 break;

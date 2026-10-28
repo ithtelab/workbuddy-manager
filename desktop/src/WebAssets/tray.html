@@ -150,6 +150,10 @@
           <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.4"/><path d="M5 20c1-3.6 3.8-5.2 7-5.2s6 1.6 7 5.2"/></svg></span>
           <span class="grow">自动登录</span><span class="switch" id="swAutoLogin"></span>
         </div>
+        <div class="item" data-action="toggleSilentStart">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg></span>
+          <span class="grow">静默启动</span><span class="switch" id="swSilentStart"></span>
+        </div>
         <div class="item" data-action="toggleAutoStart">
           <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4c3 0 6 3 6 6-2.5 1-5 1-7 3l-2-2c2-2 2-4.5 3-7z"/><path d="M9 11l-3 3 3 3 3-3"/><path d="M7 17l-2 2"/></svg></span>
           <span class="grow">开机自启</span><span class="switch" id="swAutoStart"></span>
@@ -231,6 +235,7 @@
     $('upstreamText').textContent = c.upstream ? '正常' : '未启动';
     $('upstreamText').style.color = c.upstream ? 'var(--ok)' : 'var(--danger)';
     $('swAutoLogin').classList.toggle('on', !!c.autoLogin);
+    $('swSilentStart').classList.toggle('on', !!c.silentStart);
     $('swAutoStart').classList.toggle('on', !!c.autoStart);
     const badge = $('updateBadge');
     if (c.pendingUpdate) { badge.textContent = c.pendingUpdate; badge.classList.remove('hidden'); }

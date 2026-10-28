@@ -169,6 +169,7 @@ internal sealed class AppSettings
     public string? LoginUser { get; set; }
     public string? LoginSecret { get; set; }
     public bool AutoLogin { get; set; } = true;
+    public bool SilentStart { get; set; }
     public bool AutoStart { get; set; }
 
     public static AppSettings Load()
