@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>启动失败</title>
+<style>
+  :root{
+    --bg:#0c0c0e; --card:#131316; --border:rgba(255,255,255,.08);
+    --text:#f4f4f5; --muted:#a1a1aa; --danger:#ef4444; --track:rgba(255,255,255,.06);
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#fafafa; --card:#fff; --border:rgba(0,0,0,.08);
+           --text:#18181b; --muted:#71717a; --track:rgba(0,0,0,.05); }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei UI","PingFang SC",sans-serif;
+    display:flex;align-items:center;justify-content:center;padding:32px;overflow:hidden;
+  }
+  .card{
+    width:min(720px,100%);max-height:100%;display:flex;flex-direction:column;gap:16px;
+    background:var(--card);border:1px solid var(--border);border-radius:16px;padding:28px;
+    box-shadow:0 24px 60px rgba(0,0,0,.18);
+  }
+  .head{display:flex;align-items:center;gap:14px}
+  .badge{
+    width:40px;height:40px;border-radius:12px;display:grid;place-items:center;
+    background:rgba(239,68,68,.12);color:var(--danger);font-size:20px;flex:0 0 auto;
+  }
+  h1{font-size:18px;margin:0;font-weight:600}
+  .sub{font-size:12px;color:var(--muted);margin-top:2px}
+  .message{
+    font-size:13px;line-height:1.7;color:var(--text);white-space:pre-wrap;word-break:break-word;
+    background:var(--track);border-radius:12px;padding:14px 16px;max-height:220px;overflow:auto;
+  }
+  details{font-size:12px;color:var(--muted)}
+  summary{cursor:pointer;user-select:none;outline:none}
+  pre{
+    margin:10px 0 0;padding:12px;border-radius:10px;background:var(--track);
+    max-height:180px;overflow:auto;white-space:pre-wrap;word-break:break-all;
+    font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;font-size:11px;line-height:1.55;
+  }
+  .actions{display:flex;gap:10px;justify-content:flex-end;margin-top:4px;flex-wrap:wrap}
+  button{
+    appearance:none;border:1px solid var(--border);background:transparent;color:var(--text);
+    border-radius:10px;padding:9px 16px;font-size:13px;cursor:pointer;transition:.15s;
+    font-family:inherit;
+  }
+  button:hover{background:var(--track)}
+  button.primary{background:var(--text);color:var(--bg);border-color:transparent;font-weight:500}
+  button.primary:hover{opacity:.9}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="head">
+    <div class="badge">!</div>
+    <div>
+      <h1>服务没有启动起来</h1>
+      <div class="sub" id="sub">可以重试，或者查看日志定位原因</div>
+    </div>
+  </div>
+  <div class="message" id="message"></div>
+  <details id="logBox">
+    <summary>查看日志</summary>
+    <pre id="log"></pre>
+  </details>
+  <div class="actions">
+    <button onclick="send('folder')">打开项目文件夹</button>
+    <button onclick="send('quit')">退出</button>
+    <button class="primary" onclick="send('retry')">重试</button>
+  </div>
+</div>
+<script>
+  const $ = (id) => document.getElementById(id);
+  function send(type){ window.chrome?.webview?.postMessage({ type }); }
+  function render(state){
+    if (!state) return;
+    $('message').textContent = state.message || '未知错误';
+    if (state.log){ $('log').textContent = state.log; $('logBox').style.display = ''; }
+    if (state.address) $('sub').textContent = state.address;
+  }
+  window.chrome?.webview?.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'state') render(event.data);
+  });
+  window.chrome?.webview?.postMessage({ type: 'ready' });
+</script>
+</body>
+</html>

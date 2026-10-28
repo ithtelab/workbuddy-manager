@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WorkBuddy Manager</title>
+<style>
+  :root{
+    --bg:#0c0c0e; --card:#131316; --border:rgba(255,255,255,.08);
+    --text:#f4f4f5; --muted:#a1a1aa; --accent:#f59e0b; --track:rgba(255,255,255,.08);
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#fafafa; --card:#ffffff; --border:rgba(0,0,0,.08);
+           --text:#18181b; --muted:#71717a; --track:rgba(0,0,0,.07); }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei UI","PingFang SC",sans-serif;
+    display:flex; align-items:center; justify-content:center;
+    -webkit-font-smoothing:antialiased; user-select:none; overflow:hidden;
+  }
+  .wrap{display:flex;flex-direction:column;align-items:center;gap:20px;padding:40px}
+  .logo{width:84px;height:84px;filter:drop-shadow(0 10px 30px rgba(0,0,0,.25));animation:float 3.6s ease-in-out infinite}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}
+  h1{font-size:20px;font-weight:600;letter-spacing:.2px;margin:0}
+  .version{font-size:12px;color:var(--muted);margin-top:-12px;font-variant-numeric:tabular-nums}
+  .status{font-size:13px;color:var(--muted);min-height:20px;display:flex;align-items:center;gap:8px}
+  .dots{display:inline-flex;gap:4px}
+  .dots i{width:4px;height:4px;border-radius:50%;background:var(--accent);opacity:.35;animation:blink 1.4s infinite}
+  .dots i:nth-child(2){animation-delay:.2s}.dots i:nth-child(3){animation-delay:.4s}
+  @keyframes blink{0%,80%,100%{opacity:.25;transform:translateY(0)}40%{opacity:1;transform:translateY(-2px)}}
+  .bar{width:280px;height:3px;border-radius:99px;background:var(--track);overflow:hidden;position:relative}
+  .bar::after{
+    content:"";position:absolute;inset:0;width:38%;border-radius:99px;
+    background:linear-gradient(90deg,transparent,var(--accent),transparent);
+    animation:sweep 1.5s cubic-bezier(.4,0,.2,1) infinite;
+  }
+  @keyframes sweep{0%{transform:translateX(-110%)}100%{transform:translateX(300%)}}
+  .addr{font-size:11px;color:var(--muted);opacity:.7;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+    <rect width="64" height="64" rx="16" fill="#1c1c1e"/>
+    <circle cx="32" cy="11" r="4" fill="#f59e0b"/>
+    <rect x="31" y="13" width="2" height="9" rx="1" fill="#e5e5e5"/>
+    <rect x="16" y="22" width="32" height="26" rx="10" fill="#f4f4f5"/>
+    <rect x="10" y="30" width="6" height="12" rx="3" fill="#f4f4f5"/>
+    <rect x="48" y="30" width="6" height="12" rx="3" fill="#f4f4f5"/>
+    <circle cx="26" cy="33" r="3.2" fill="#1c1c1e"/>
+    <circle cx="38" cy="33" r="3.2" fill="#1c1c1e"/>
+    <path d="M26 42c3 2.5 9 2.5 12 0" stroke="#1c1c1e" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+  </svg>
+  <h1>WorkBuddy Manager</h1>
+  <div class="version" id="version"></div>
+  <div class="bar"></div>
+  <div class="status"><span id="message">正在准备…</span><span class="dots"><i></i><i></i><i></i></span></div>
+  <div class="addr" id="address"></div>
+</div>
+<script>
+  const $ = (id) => document.getElementById(id);
+  function render(state){
+    if (!state) return;
+    if (state.version) $('version').textContent = state.version;
+    if (state.message) $('message').textContent = state.message;
+    if (state.address) $('address').textContent = state.address;
+  }
+  window.chrome?.webview?.addEventListener('message', (event) => {
+    const data = event.data;
+    if (data && data.type === 'state') render(data);
+  });
+  window.chrome?.webview?.postMessage({ type: 'ready' });
+</script>
+</body>
+</html>

@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>卸载 WorkBuddy Manager</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:#fff;color:#111;overflow:hidden;
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei UI","PingFang SC",sans-serif;
+    -webkit-font-smoothing:antialiased;user-select:none;
+  }
+  .app{height:100vh;display:flex;flex-direction:column}
+  .main{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 52px;min-height:0}
+  .logo-wrap{width:104px;height:104px;border-radius:50%;background:#fff;display:grid;place-items:center;
+    box-shadow:0 16px 48px rgba(0,0,0,.10),0 2px 8px rgba(0,0,0,.05);margin-bottom:20px}
+  .logo-wrap svg{width:66px;height:66px}
+  h1{font-size:22px;font-weight:700;margin:0}
+  .sub{font-size:12.5px;color:#8a8a8e;margin:8px 0 0;text-align:center}
+  .views{width:100%;max-width:540px;margin-top:24px}
+  .hidden{display:none !important}
+
+  .path{font-size:12px;color:#3a3a3e;background:#f5f5f7;border:1px solid #e5e5ea;border-radius:10px;
+    padding:10px 12px;word-break:break-all;line-height:1.5;margin-bottom:18px}
+  .check{display:flex;align-items:flex-start;gap:9px;font-size:12.5px;color:#3a3a3e;margin:10px 0;cursor:pointer;line-height:1.55}
+  .check input{width:16px;height:16px;accent-color:#111;margin:1px 0 0}
+  .note{font-size:11.5px;color:#9a9aa0;line-height:1.7;margin-top:14px}
+  .error{font-size:12px;color:#dc2626;background:rgba(220,38,38,.06);border-radius:10px;padding:10px 12px;margin-top:12px;white-space:pre-wrap}
+
+  .progress{height:8px;border-radius:99px;background:#ececf1;overflow:hidden}
+  .progress > i{display:block;height:100%;width:0;background:#111;border-radius:99px;transition:width .25s ease}
+  .progress-text{text-align:center;font-size:13px;color:#6b6b70;margin-top:16px}
+
+  .done{display:flex;flex-direction:column;align-items:center;text-align:center}
+  .done-icon{width:60px;height:60px;border-radius:50%;background:rgba(34,197,94,.12);color:#16a34a;
+    display:grid;place-items:center;font-size:28px;font-weight:700;margin-bottom:14px}
+  .done-title{font-size:19px;font-weight:700}
+  .kept{font-size:11.5px;color:#8a8a8e;margin-top:10px;word-break:break-all;line-height:1.6}
+
+  .footer{padding:14px 52px 34px;display:flex;gap:12px;justify-content:center}
+  .footer button{appearance:none;border:1px solid #e5e5ea;background:#fff;color:#111;border-radius:11px;
+    width:170px;height:44px;font-size:13.5px;font-family:inherit;cursor:pointer;transition:.15s}
+  .footer button:hover{background:#f5f5f7}
+  .footer button.primary{background:#111;color:#fff;border-color:transparent;font-weight:500}
+  .footer button.primary:hover{opacity:.88;background:#111}
+  .footer button.danger{background:#dc2626;color:#fff;border-color:transparent;font-weight:500}
+  .footer button.danger:hover{background:#dc2626;opacity:.9}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="main">
+    <div class="logo-wrap">
+      <svg viewBox="0 0 64 64" aria-hidden="true">
+        <rect width="64" height="64" rx="16" fill="#1c1c1e"/>
+        <circle cx="32" cy="11" r="4" fill="#f59e0b"/>
+        <rect x="31" y="13" width="2" height="9" rx="1" fill="#e5e5e5"/>
+        <rect x="16" y="22" width="32" height="26" rx="10" fill="#f4f4f5"/>
+        <rect x="10" y="30" width="6" height="12" rx="3" fill="#f4f4f5"/>
+        <rect x="48" y="30" width="6" height="12" rx="3" fill="#f4f4f5"/>
+        <circle cx="26" cy="33" r="3.2" fill="#1c1c1e"/>
+        <circle cx="38" cy="33" r="3.2" fill="#1c1c1e"/>
+        <path d="M26 42c3 2.5 9 2.5 12 0" stroke="#1c1c1e" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <h1>卸载 WorkBuddy Manager</h1>
+    <p class="sub">只会删除本程序的安装目录、快捷方式和注册表项，不会动其他文件</p>
+
+    <div class="views">
+      <div id="viewConfirm">
+        <div class="path" id="path"></div>
+        <label class="check"><input type="checkbox" id="keepData" checked><span>保留账号与配置数据（data 目录），卸载后会备份到本机设置目录</span></label>
+        <label class="check"><input type="checkbox" id="removeSettings" checked><span>同时删除本软件的设置、日志与登录缓存</span></label>
+        <div class="note">卸载前会自动停止正在运行的服务；安装目录之外的文件不会被删除。</div>
+        <div class="error hidden" id="errorBox"></div>
+      </div>
+
+      <div id="viewProgress" class="hidden">
+        <div class="progress"><i id="bar"></i></div>
+        <div class="progress-text" id="progressText">正在准备…</div>
+      </div>
+
+      <div id="viewDone" class="hidden done">
+        <div class="done-icon">✓</div>
+        <div class="done-title">卸载完成</div>
+        <div class="kept hidden" id="kept"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer" id="footer">
+    <button id="cancel" class="primary">取消</button>
+    <button id="confirm" class="danger">卸载</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let mode = 'confirm';
+
+  function post(type, extra) {
+    window.chrome?.webview?.postMessage(Object.assign({ type }, extra || {}));
+  }
+
+  function setMode(next) {
+    mode = next;
+    $('viewConfirm').classList.toggle('hidden', next !== 'confirm');
+    $('viewProgress').classList.toggle('hidden', next !== 'progress');
+    $('viewDone').classList.toggle('hidden', next !== 'done');
+    $('footer').classList.toggle('hidden', next === 'progress');
+    $('cancel').classList.toggle('hidden', next === 'done');
+    $('confirm').classList.toggle('hidden', next === 'done');
+    if (next === 'done') {
+      $('confirm').classList.add('hidden');
+      $('cancel').classList.remove('hidden');
+      $('cancel').textContent = '完成';
+      $('cancel').classList.add('primary');
+    }
+  }
+
+  $('cancel').addEventListener('click', () => post('close'));
+  $('confirm').addEventListener('click', () => {
+    $('errorBox').classList.add('hidden');
+    post('uninstall', {
+      keepData: $('keepData').checked,
+      removeSettings: $('removeSettings').checked
+    });
+    setMode('progress');
+  });
+
+  window.chrome?.webview?.addEventListener('message', (event) => {
+    const data = event.data;
+    if (!data) return;
+    if (data.type === 'init') {
+      $('path').textContent = data.root || '';
+      setMode('confirm');
+    } else if (data.type === 'progress') {
+      setMode('progress');
+      const percent = Math.max(0, Math.min(100, Number(data.percent) || 0));
+      $('bar').style.width = percent + '%';
+      $('progressText').textContent = data.message || ('正在卸载… ' + percent + '%');
+    } else if (data.type === 'done') {
+      $('kept').textContent = data.kept ? ('账号与配置已备份到：' + data.kept) : '';
+      $('kept').classList.toggle('hidden', !data.kept);
+      setMode('done');
+    } else if (data.type === 'error') {
+      setMode('confirm');
+      $('errorBox').textContent = data.message || '卸载失败';
+      $('errorBox').classList.remove('hidden');
+    }
+  });
+
+  window.chrome?.webview?.postMessage({ type: 'ready' });
+})();
+</script>
+</body>
+</html>

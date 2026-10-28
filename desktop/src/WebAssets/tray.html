@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WorkBuddy Manager</title>
+<style>
+  :root{
+    --bg:#f4f4f6; --card:#ffffff; --card2:#f7f7f9; --border:rgba(0,0,0,.07);
+    --text:#1c1c1e; --muted:#8e8e93; --accent:#f59e0b; --track:#ececf1;
+    --ok:#22c55e; --danger:#ef4444;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#131316; --card:#1b1b1f; --card2:#202024; --border:rgba(255,255,255,.08);
+           --text:#f4f4f5; --muted:#a1a1aa; --track:#2a2a30; }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--bg);color:var(--text);overflow:hidden;
+    font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei UI","PingFang SC",sans-serif;
+    -webkit-font-smoothing:antialiased;user-select:none;
+    display:flex;flex-direction:column;
+  }
+  header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px 8px;flex:0 0 auto}
+  .brand{font-size:14px;font-weight:600;letter-spacing:.2px}
+  .gear{background:none;border:0;color:var(--muted);cursor:pointer;padding:4px;border-radius:8px;display:grid;place-items:center}
+  .gear:hover{background:var(--card2);color:var(--text)}
+  .segmented{display:flex;gap:4px;margin:0 14px 10px;padding:3px;background:var(--track);border-radius:10px;flex:0 0 auto}
+  .segmented button{flex:1;border:0;background:transparent;color:var(--muted);font-size:12.5px;
+    padding:6px 0;border-radius:8px;cursor:pointer;font-family:inherit}
+  .segmented button.active{background:var(--card);color:var(--text);font-weight:600;
+    box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  main{flex:0 0 auto;overflow:visible;padding:0 14px}
+  .hidden{display:none !important}
+
+  .service-card{display:flex;align-items:center;gap:12px;background:var(--card);border:1px solid var(--border);
+    border-radius:14px;padding:12px 14px;cursor:pointer}
+  .service-card:hover{border-color:rgba(245,158,11,.45)}
+  .service-icon{width:40px;height:40px;border-radius:11px;background:#1c1c1e;display:grid;place-items:center;flex:0 0 auto}
+  .service-text{flex:1;min-width:0}
+  .service-title{font-size:14px;font-weight:600;line-height:1.3}
+  .service-sub{font-size:11.5px;color:var(--muted);margin-top:3px;line-height:1.35}
+  .status-dot{width:8px;height:8px;border-radius:50%;background:var(--ok);flex:0 0 auto;box-shadow:0 0 0 3px rgba(34,197,94,.13)}
+  .status-dot.off{background:var(--danger);box-shadow:0 0 0 3px rgba(239,68,68,.12)}
+
+  .meta{display:flex;justify-content:space-between;align-items:center;padding:6px 4px;font-size:12px;color:var(--muted)}
+  .meta b{color:var(--text);font-weight:500}
+
+  .list{background:var(--card);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+  .item{display:flex;align-items:center;gap:10px;padding:10px 14px;font-size:13px;cursor:pointer;min-height:44px}
+  .item + .item{border-top:1px solid var(--border)}
+  .item:hover{background:var(--card2)}
+  .item .ic{width:16px;height:16px;flex:0 0 16px;color:var(--muted);display:grid;place-items:center}
+  .item .ic svg{width:16px;height:16px}
+  .item .grow{flex:1}
+  .item .chev{color:var(--muted);font-size:15px;line-height:1}
+  .badge{font-size:10.5px;color:#b45309;background:rgba(245,158,11,.14);border-radius:999px;padding:1px 7px;white-space:nowrap}
+  .badge.hidden{display:none}
+
+  .switch{width:34px;height:20px;border-radius:999px;background:var(--track);position:relative;transition:.18s;flex:0 0 auto}
+  .switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+    background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:.18s}
+  .switch.on{background:var(--accent)}
+  .switch.on::after{transform:translateX(14px)}
+
+  .range{display:flex;gap:4px;margin-bottom:10px}
+  .range button{flex:1;border:1px solid var(--border);background:var(--card);color:var(--muted);
+    border-radius:9px;padding:6px 0;font-size:11.5px;cursor:pointer;font-family:inherit}
+  .range button.active{color:var(--text);border-color:transparent;background:var(--track);font-weight:600}
+
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 12px}
+  .card .label{font-size:11px;color:var(--muted)}
+  .card .value{font-size:16px;font-weight:600;margin-top:4px;font-variant-numeric:tabular-nums}
+
+  .chart-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 12px 8px}
+  .chart-head{display:flex;justify-content:space-between;font-size:11.5px;color:var(--muted);margin-bottom:8px}
+  .chart{display:flex;align-items:flex-end;gap:3px;height:104px}
+  .chart .bar{flex:1;min-width:2px;background:var(--accent);border-radius:3px 3px 0 0;opacity:.9}
+  .chart .bar:hover{opacity:1}
+  .axis{display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-top:6px}
+  .empty{color:var(--muted);font-size:12px;text-align:center;padding:16px 0}
+
+  footer{flex:0 0 auto;border-top:1px solid var(--border);margin-top:8px;padding:6px 14px 10px}
+  footer .item{border-radius:10px;padding:9px 12px;color:var(--muted);min-height:40px}
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">WorkBuddy Manager</div>
+    <button class="gear" title="设置" data-action="settings">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15 4.6a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.14.6.66 1.02 1.28 1H21a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15z"/>
+      </svg>
+    </button>
+  </header>
+
+  <div class="segmented">
+    <button id="tabConfig" class="active">配置</button>
+    <button id="tabUsage">用量</button>
+  </div>
+
+  <main>
+    <section id="viewConfig">
+      <div class="service-card" data-action="open">
+        <div class="service-icon">
+          <svg width="26" height="26" viewBox="0 0 64 64" aria-hidden="true">
+            <circle cx="32" cy="11" r="4" fill="#f59e0b"/>
+            <rect x="31" y="13" width="2" height="9" rx="1" fill="#e5e5e5"/>
+            <rect x="16" y="22" width="32" height="26" rx="10" fill="#f4f4f5"/>
+            <rect x="10" y="30" width="6" height="12" rx="3" fill="#f4f4f5"/>
+            <rect x="48" y="30" width="6" height="12" rx="3" fill="#f4f4f5"/>
+            <circle cx="26" cy="33" r="3.2" fill="#1c1c1e"/>
+            <circle cx="38" cy="33" r="3.2" fill="#1c1c1e"/>
+            <path d="M26 42c3 2.5 9 2.5 12 0" stroke="#1c1c1e" stroke-width="2.4" fill="none" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div class="service-text">
+          <div class="service-title">WorkBuddy Manager</div>
+          <div class="service-sub" id="serviceSub">本地 · 127.0.0.1:7864</div>
+        </div>
+        <div class="status-dot" id="serviceDot"></div>
+      </div>
+
+      <div class="meta"><span>版本</span><b id="versionText">—</b></div>
+      <div class="meta" style="padding-top:2px"><span>上游网关</span><b id="upstreamText">—</b></div>
+
+      <div class="list">
+        <div class="item" data-action="open">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M3 9h18"/></svg></span>
+          <span class="grow">打开主窗口</span><span class="chev">›</span>
+        </div>
+        <div class="item" data-action="update">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg></span>
+          <span class="grow">检查更新</span><span class="badge hidden" id="updateBadge"></span><span class="chev">›</span>
+        </div>
+        <div class="item" data-action="restart">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v9"/><path d="M6.4 6.4a8 8 0 1 0 11.2 0"/></svg></span>
+          <span class="grow">重启服务</span><span class="chev">›</span>
+        </div>
+        <div class="item" data-action="folder">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.5h6l2 2.5h10v8.5a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 18.5z"/></svg></span>
+          <span class="grow">打开安装目录</span><span class="chev">›</span>
+        </div>
+      </div>
+
+      <div class="list" style="margin-top:10px">
+        <div class="item" data-action="toggleAutoLogin">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="3.4"/><path d="M5 20c1-3.6 3.8-5.2 7-5.2s6 1.6 7 5.2"/></svg></span>
+          <span class="grow">自动登录</span><span class="switch" id="swAutoLogin"></span>
+        </div>
+        <div class="item" data-action="toggleAutoStart">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4c3 0 6 3 6 6-2.5 1-5 1-7 3l-2-2c2-2 2-4.5 3-7z"/><path d="M9 11l-3 3 3 3 3-3"/><path d="M7 17l-2 2"/></svg></span>
+          <span class="grow">开机自启</span><span class="switch" id="swAutoStart"></span>
+        </div>
+      </div>
+    </section>
+
+    <section id="viewUsage" class="hidden">
+      <div class="range">
+        <button data-range="today">当天</button>
+        <button data-range="7">近 7 天</button>
+        <button data-range="30" class="active">近 30 天</button>
+        <button data-range="all">全部</button>
+      </div>
+
+      <div class="cards">
+        <div class="card"><div class="label">总请求数</div><div class="value" id="uReq">—</div></div>
+        <div class="card"><div class="label">总 Tokens</div><div class="value" id="uTok">—</div></div>
+        <div class="card"><div class="label">总消耗积分</div><div class="value" id="uCredit">—</div></div>
+        <div class="card"><div class="label">缓存命中率</div><div class="value" id="uCache">—</div></div>
+      </div>
+
+      <div class="chart-card">
+        <div class="chart-head"><span>使用趋势</span><span>成本</span></div>
+        <div class="chart" id="chart"></div>
+        <div class="axis"><span id="axisStart"></span><span id="axisEnd"></span></div>
+      </div>
+      <div class="empty hidden" id="usageEmpty"></div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="item" data-action="quit">
+      <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v9"/><path d="M6.4 6.4a8 8 0 1 0 11.2 0"/></svg></span>
+      <span class="grow">退出</span>
+    </div>
+  </footer>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let config = {};
+  let usage = {};
+  let currentRange = '30';
+
+  const fmtNum = (n) => {
+    const v = Number(n) || 0;
+    if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
+    if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
+    if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+    return String(Math.round(v));
+  };
+  const fmtCredit = (n) => (Number(n) || 0).toFixed(2);
+  const fmtPct = (v) => (typeof v === 'number' && v >= 0) ? (v * 100).toFixed(1) + '%' : '—';
+
+  function act(name) { window.chrome?.webview?.postMessage({ type: 'action', name }); }
+  function tab(which) {
+    $('tabConfig').classList.toggle('active', which === 'config');
+    $('tabUsage').classList.toggle('active', which === 'usage');
+    $('viewConfig').classList.toggle('hidden', which !== 'config');
+    $('viewUsage').classList.toggle('hidden', which !== 'usage');
+    if (which === 'usage' && !usage.points) window.chrome?.webview?.postMessage({ type: 'range', value: currentRange });
+    reportHeight();
+  }
+  function range(value) {
+    currentRange = value;
+    document.querySelectorAll('.range button').forEach(b => b.classList.toggle('active', b.dataset.range === value));
+    window.chrome?.webview?.postMessage({ type: 'range', value });
+  }
+
+  function renderConfig() {
+    const c = config || {};
+    $('serviceSub').textContent = c.state === 'external'
+      ? '外部实例 · 只读'
+      : ('本地 · ' + (c.host || '127.0.0.1') + ':' + (c.port || 7864));
+    $('versionText').textContent = c.version || '—';
+    const ready = c.state === 'ready' || c.state === 'external';
+    $('serviceDot').classList.toggle('off', !ready);
+    $('upstreamText').textContent = c.upstream ? '正常' : '未启动';
+    $('upstreamText').style.color = c.upstream ? 'var(--ok)' : 'var(--danger)';
+    $('swAutoLogin').classList.toggle('on', !!c.autoLogin);
+    $('swAutoStart').classList.toggle('on', !!c.autoStart);
+    const badge = $('updateBadge');
+    if (c.pendingUpdate) { badge.textContent = c.pendingUpdate; badge.classList.remove('hidden'); }
+    else badge.classList.add('hidden');
+    reportHeight();
+  }
+
+  function renderUsage() {
+    const u = usage || {};
+    if (u.error) {
+      $('usageEmpty').textContent = u.error;
+      $('usageEmpty').classList.remove('hidden');
+      return;
+    }
+    $('usageEmpty').classList.add('hidden');
+    $('uReq').textContent = fmtNum(u.requests);
+    $('uTok').textContent = fmtNum(u.tokens);
+    $('uCredit').textContent = fmtCredit(u.credit);
+    $('uCache').textContent = fmtPct(u.cache);
+
+    const points = Array.isArray(u.points) ? u.points : [];
+    const chart = $('chart');
+    chart.innerHTML = '';
+    if (!points.length) {
+      $('axisStart').textContent = '';
+      $('axisEnd').textContent = '';
+      return;
+    }
+    const max = Math.max(1, ...points.map(p => Number(p.credit) || 0));
+    for (const p of points) {
+      const bar = document.createElement('div');
+      bar.className = 'bar';
+      const value = Number(p.credit) || 0;
+      bar.style.height = Math.max(2, Math.round(value / max * 100)) + '%';
+      bar.title = (p.day || '') + ' · ' + fmtCredit(value);
+      chart.appendChild(bar);
+    }
+    $('axisStart').textContent = points[0].day || '';
+    $('axisEnd').textContent = points[points.length - 1].day || '';
+    reportHeight();
+  }
+
+  let lastHeight = 0;
+  function reportHeight() {
+    requestAnimationFrame(() => {
+      const height = Math.ceil(document.body.getBoundingClientRect().height);
+      if (height > 0 && height !== lastHeight) {
+        lastHeight = height;
+        window.chrome?.webview?.postMessage({ type: 'resize', height: height });
+      }
+    });
+  }
+
+  $('tabConfig').addEventListener('click', () => tab('config'));
+  $('tabUsage').addEventListener('click', () => tab('usage'));
+  document.querySelectorAll('.range button').forEach((b) => {
+    b.addEventListener('click', () => range(b.dataset.range));
+  });
+  document.querySelectorAll('[data-action]').forEach((el) => {
+    el.addEventListener('click', () => act(el.dataset.action));
+  });
+
+  window.chrome?.webview?.addEventListener('message', (event) => {
+    const data = event.data;
+    if (!data) return;
+    if (data.type === 'config') { config = data; renderConfig(); }
+    else if (data.type === 'usage') { usage = data; renderUsage(); }
+  });
+
+  window.chrome?.webview?.postMessage({ type: 'ready' });
+  reportHeight();
+})();
+</script>
+</body>
+</html>
