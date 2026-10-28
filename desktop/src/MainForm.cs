@@ -65,6 +65,10 @@ internal sealed class MainForm : Form
             _env.Save();
             AppLog.Info("已校正 .env 中指向旧目录的路径");
         }
+        var updateProxy = _env.Get("WB_UPDATE_PROXY");
+        if (string.IsNullOrWhiteSpace(updateProxy)) updateProxy = _env.Get("WB_HTTP_PROXY");
+        if (!string.IsNullOrWhiteSpace(updateProxy)) ReleaseClient.SetPreferredProxy(updateProxy);
+
         _service = new ServiceController(root, _env);
         _updater = new Updater(root, _service);
         _credentials = new CredentialStore(settings);

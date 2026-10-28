@@ -25,24 +25,94 @@ internal static class ReleaseClient
         "http://127.0.0.1:7897",
         "http://127.0.0.1:7890",
         "http://127.0.0.1:10809",
+        "http://127.0.0.1:10808",
+        "http://127.0.0.1:7891",
     };
 
     private const string DirectProxy = "::direct::";
 
+    private static string? _preferredProxy;
+    private static List<string>? _reachableLocal;
+    private static DateTime _localCheckedAt = DateTime.MinValue;
+
+    /// <summary>面板 .env 里配置的更新代理（WB_UPDATE_PROXY / WB_HTTP_PROXY）。</summary>
+    public static void SetPreferredProxy(string? proxy)
+    {
+        if (string.IsNullOrWhiteSpace(proxy)) return;
+        _preferredProxy = proxy.Trim();
+        AppLog.Info("更新下载优先使用代理：" + _preferredProxy);
+    }
+
+    private static bool IsLoopbackProxy(string proxy) =>
+        proxy.Contains("127.0.0.1", StringComparison.OrdinalIgnoreCase)
+        || proxy.Contains("localhost", StringComparison.OrdinalIgnoreCase);
+
+    private static List<string> ReachableLocalProxies()
+    {
+        if (_reachableLocal is not null && (DateTime.UtcNow - _localCheckedAt).TotalMinutes < 5)
+        {
+            return _reachableLocal;
+        }
+
+        var list = new List<string>();
+        foreach (var proxy in LocalProxies)
+        {
+            try
+            {
+                var uri = new Uri(proxy);
+                using var client = new System.Net.Sockets.TcpClient();
+                var task = client.ConnectAsync(uri.Host, uri.Port);
+                if (task.Wait(150) && client.Connected) list.Add(proxy);
+            }
+            catch
+            {
+            }
+        }
+        _reachableLocal = list;
+        _localCheckedAt = DateTime.UtcNow;
+        if (list.Count > 0) AppLog.Info("检测到本机代理：" + string.Join(", ", list));
+        return list;
+    }
+
+    private static void RememberProxy(string? proxy)
+    {
+        if (string.IsNullOrWhiteSpace(proxy) || proxy == DirectProxy) return;
+        _preferredProxy = proxy;
+    }
+
     private static IEnumerable<string?> ProxyCandidates()
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        yield return DirectProxy; // 先直连：很多环境直连可用，代理反而是坏的
-        yield return null;        // 系统代理
+        var locals = ReachableLocalProxies();
+
+        // 本机代理优先：用户明确要求有代理就用代理，直连在部分网络下很慢
+        if (!string.IsNullOrWhiteSpace(_preferredProxy))
+        {
+            var preferred = _preferredProxy!;
+            // 指向本机但端口已经关掉的代理跳过，免得先白等一次超时
+            if (!IsLoopbackProxy(preferred) || locals.Contains(preferred, StringComparer.OrdinalIgnoreCase))
+            {
+                if (seen.Add(preferred)) yield return preferred;
+            }
+            else
+            {
+                _preferredProxy = null;
+            }
+        }
+
+        foreach (var proxy in locals)
+        {
+            if (seen.Add(proxy)) yield return proxy;
+        }
+
         foreach (var key in new[] { "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy" })
         {
             var value = Environment.GetEnvironmentVariable(key);
             if (!string.IsNullOrWhiteSpace(value) && seen.Add(value)) yield return value;
         }
-        foreach (var proxy in LocalProxies)
-        {
-            if (seen.Add(proxy)) yield return proxy;
-        }
+
+        yield return null;        // 系统代理
+        yield return DirectProxy; // 兜底直连
     }
 
     private static HttpClient BuildClient(string? proxy, TimeSpan timeout, bool allowRedirects = true)
@@ -89,6 +159,7 @@ internal static class ReleaseClient
                 using var response = await client.GetAsync(url, ct).ConfigureAwait(false);
                 if (!response.IsSuccessStatusCode) continue;
                 var text = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                RememberProxy(proxy);
                 return new Attempt<string> { Value = text, Proxy = proxy };
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -255,54 +326,78 @@ internal static class ReleaseClient
         return null;
     }
 
+    private static readonly string[] MirrorPrefixes =
+    {
+        "https://gh-proxy.com/",
+        "https://ghfast.top/",
+        "https://ghproxy.net/",
+    };
+
     public static async Task DownloadAsync(string url, string destination, string? proxy,
         IProgress<(long received, long? total)> progress, CancellationToken ct)
     {
-        var candidates = new List<string?> { null, proxy, DirectProxy };
-        candidates.AddRange(ProxyCandidates());
-        var seen = new HashSet<string?>(StringComparer.OrdinalIgnoreCase);
+        // GitHub 资源在部分网络下会被限速（实测同一份包镜像能快一个数量级）。
+        // 先试镜像、再试官方源；包内容最终用发布页 sha256 校验，镜像改不了内容。
+        var targets = new List<string>();
+        foreach (var mirror in MirrorPrefixes)
+        {
+            targets.Add(mirror + url);
+        }
+        targets.Add(url);
+
+        var proxyCandidates = new List<string?>();
+        if (!string.IsNullOrWhiteSpace(proxy)) proxyCandidates.Add(proxy);
+        proxyCandidates.AddRange(ProxyCandidates());
 
         Exception? last = null;
-        foreach (var candidate in candidates)
+        foreach (var target in targets)
         {
-            if (!seen.Add(candidate)) continue;
-            try
+            var sourceHost = new Uri(target).Host;
+            var seen = new HashSet<string?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var candidate in proxyCandidates)
             {
-                using var client = BuildClient(candidate, TimeSpan.FromMinutes(5));
-                using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct)
-                    .ConfigureAwait(false);
-                response.EnsureSuccessStatusCode();
-                var total = response.Content.Headers.ContentLength;
-                await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-                await using var target = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None,
-                    81920, useAsync: true);
-
-                var buffer = new byte[81920];
-                long received = 0;
-                while (true)
-                {
-                    var read = await source.ReadAsync(buffer, ct).ConfigureAwait(false);
-                    if (read == 0) break;
-                    await target.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                    received += read;
-                    progress.Report((received, total));
-                }
-                return;
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                last = ex;
-                AppLog.Info($"下载尝试失败（{candidate ?? "系统代理"}）：{ex.Message}");
+                if (!seen.Add(candidate)) continue;
                 try
                 {
-                    if (File.Exists(destination)) File.Delete(destination);
+                    using var client = BuildClient(candidate, TimeSpan.FromMinutes(5));
+                    using var response = await client
+                        .GetAsync(target, HttpCompletionOption.ResponseHeadersRead, ct)
+                        .ConfigureAwait(false);
+                    response.EnsureSuccessStatusCode();
+                    RememberProxy(candidate);
+                    AppLog.Info("开始下载发布包（" + (candidate ?? "系统代理") + "，源：" + sourceHost + "）");
+                    var total = response.Content.Headers.ContentLength;
+                    await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                    await using var file = new FileStream(destination, FileMode.Create, FileAccess.Write,
+                        FileShare.None, 81920, useAsync: true);
+
+                    var buffer = new byte[81920];
+                    long received = 0;
+                    while (true)
+                    {
+                        var read = await source.ReadAsync(buffer, ct).ConfigureAwait(false);
+                        if (read == 0) break;
+                        await file.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                        received += read;
+                        progress.Report((received, total));
+                    }
+                    return;
                 }
-                catch
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    AppLog.Info($"下载尝试失败（{candidate ?? "系统代理"}，源：{sourceHost}）：{ex.Message}");
+                    try
+                    {
+                        if (File.Exists(destination)) File.Delete(destination);
+                    }
+                    catch
+                    {
+                    }
                 }
             }
         }
