@@ -1,0 +1,292 @@
+--- a/internal/pool/cooldown.go
++++ b/internal/pool/cooldown.go
+@@ -115,8 +115,11 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
+ //
+ // 语义与 6004 正交：6004 是「模型被限流、对齐重置墙钟」，本入口是「官方确定该后端无此模型、
+ // 重试无意义，只能换模型/换账号」。退避按 reference model_blocks.py 口径（吸收语义、不抄实现）：
+-//   - 首次命中 TTL = modelBlockBaseTTL（6h）；
+-//   - 半开到期后允许放行重试；再次命中 Hits++ → TTL = base × 2^min(hits-1, modelBlockShift)；
++//   - 首次命中 TTL = modelBlockBaseTTL（5min）：上游 11102 多为**瞬时**抖动
++//     （同一账号同一模型前后几秒一个 11102、一个 200），6h 起跳会把一次抖动
++//     放大成半天 503；短 TTL + 成功即清（BlockModelClear）能把代价压到分钟级。
++//   - 半开到期后允许放行重试；再次命中 Hits++ → TTL = base × 2^min(hits-1, modelBlockShift)
++//     （5m, 10m, 20m … 真·下线的模型很快升到 24h 封顶，抖动只痛一次 5 分钟）；
+ //   - 封顶 modelBlockMaxTTL（24h，最多一天再试一次）；
+ //   - 该模型请求成功即由 BlockModelClear 清除（注意：6004 的 NoteSuccess 不清 modelCooldowns，
+ //     故清理必须由 handler 在成功且 model 命中 11102 条目时显式调用，见 BlockModelClear）。
+@@ -181,6 +184,40 @@ func (p *Pool) BlockModelClear(uid, model string) {
+ 	p.dirty.Store(true)
+ }
+ 
++// ClearModelBlocks 清掉**所有账号**上该模型的 11102 负缓存，返回清理条数。
++//
++// 用途（2026-10-28 现场）：上游 11102 有时是瞬时故障（模型注册表抖动 / 灰度切换）。
++// 一次抖动会让每个被选中的账号各写一条 6h 起的指数退避负缓存，全池写满后对外就是
++// 「一整天 503 no_healthy_account」，而实际模型早已恢复（实测 20/20 账号直连均 200）。
++// 选号侧发现「该模型 0 个可用账号」时调用本方法自愈：清一次、重试一次。
++// 只清 reason 以 "11102" 开头的条目，不碰 6004 的独立冷却表。
++func (p *Pool) ClearModelBlocks(model string) int {
++	if model == "" {
++		return 0
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	n := 0
++	for _, e := range p.byUID {
++		if len(e.modelCooldowns) == 0 {
++			continue
++		}
++		mc, ok := e.modelCooldowns[model]
++		if !ok || !strings.HasPrefix(mc.Reason, "11102") {
++			continue
++		}
++		delete(e.modelCooldowns, model)
++		if len(e.modelCooldowns) == 0 {
++			e.modelCooldowns = nil
++		}
++		n++
++	}
++	if n > 0 {
++		p.dirty.Store(true)
++	}
++	return n
++}
++
+ // CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。
+ //
+ // 语义：
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -677,6 +677,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+ 
++	modelBlocksCleared := false
+ 	for i := 0; i < h.cfg.MaxRotate; i++ {
+ 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
+ 		var acct *auth.Auth
+@@ -693,6 +694,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+ 		}
+ 		if acct == nil {
++			// 自愈（2026-10-28）：全池被同一个模型挡死时，几乎都是上游**瞬时** 11102
++			// （模型注册表抖动 / 灰度切换），而不是所有账号真的缺这个模型。6h 起的指数
++			// 退避会把一次抖动放大成半天 503（实测 deepseek-v4.1-flash 20/20 账号被拉黑，
++			// 直连全部 200）。这里对「该模型 0 个可用账号」清一次负缓存并重试；
++			// 只清一次，避免真的缺模型时死循环。
++			if !modelBlocksCleared && bareModel != "" && len(h.cfg.Pool.AvailableUIDsForModel(bareModel)) == 0 {
++				if n := h.cfg.Pool.ClearModelBlocks(bareModel); n > 0 {
++					modelBlocksCleared = true
++					tried = map[string]bool{}
++					log.Printf("WARN: [server] model=%s: all accounts blocked by 11102 negative cache, cleared %d and retrying (suspect transient upstream)", bareModel, n)
++					continue
++				}
++			}
+ 			st.status = http.StatusServiceUnavailable
+ 			break
+ 		}
+@@ -1173,6 +1187,21 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		// 或 token 轮换竞态 —— 不直接 Disable（chat 路径误判一次就是永久杀号），
+ 		// 改走连续计数，达到 sessionDeadThreshold 才禁用。计数器与 12153 共用：
+ 		// 同一账号先后撞到两种形态，本来就说明凭证不会自己好转。
++		//
++		// 本地增强（2026-10-24）：先做一次同步刷新——AT 失效而 RT 仍有效时，
++		// 刷新即可恢复（实测：把正常账号的 AT 改坏，刷新成功后文件里的 AT 被自动
++		// 更新，账号无需重登）；刷新失败才喂连续计数。
++		if a := h.cfg.Pool.AuthByUID(uid); a != nil {
++			if err := h.cfg.Upstream.RefreshToken(a); err == nil {
++				a.BackfillRealm()
++				if serr := a.SaveAtomic(); serr != nil {
++					log.Printf("WARN: [server] 401 refresh acct=%s: save auth failed: %v",
++						logfmt.Label(a.UID, a.Nickname), serr)
++				}
++				h.cfg.Pool.Cooldown(uid, pool.CoolSoft, 30*time.Second, "401 access token refreshed")
++				return
++			}
++		}
+ 		h.cfg.Pool.NoteAuthFailure(uid, "401 auth rejected")
+ 	case upstream.ErrNotFound:
+ 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -51,19 +51,19 @@ type Status struct {
+ 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
+ 	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
+ 	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
+-	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
+-	Disabled          bool               `json:"disabled"`
+-	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
++	ModelCosts     []ModelCostStatus `json:"model_costs,omitempty"`
++	Disabled       bool              `json:"disabled"`
++	DisabledReason string            `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+ 	// ManualDisabled 运维手动停用（issue #138/#118）——与 disabled **并列独立**，
+ 	// 叠加态分别透出不合并（面板据此区分「系统判定坏了」与「我主动摘的」，
+ 	// 两种可用操作不同：前者可 revive，后者该 enable）。
+ 	// 零值也显式写出（运维口径，同 consecutive_fails：缺失会让人误以为"没记录"）。
+-	ManualDisabled bool   `json:"manual_disabled"`
+-	ManualReason   string `json:"manual_reason,omitempty"` // 仅手动停用：停用原因（运维可见）
+-	SuccessCount      int64              `json:"success_count,omitempty"`
+-	ErrTotal          int64              `json:"err_total,omitempty"`
+-	LastSuccessTime   time.Time          `json:"last_success,omitempty"`
+-	LastErrTime       time.Time          `json:"last_err,omitempty"`
++	ManualDisabled  bool      `json:"manual_disabled"`
++	ManualReason    string    `json:"manual_reason,omitempty"` // 仅手动停用：停用原因（运维可见）
++	SuccessCount    int64     `json:"success_count,omitempty"`
++	ErrTotal        int64     `json:"err_total,omitempty"`
++	LastSuccessTime time.Time `json:"last_success,omitempty"`
++	LastErrTime     time.Time `json:"last_err,omitempty"`
+ 	// ConsecutiveFails 连续失败计数（连败降权用，见 entry.consecutiveFails）。
+ 	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
+ 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
+@@ -111,23 +111,23 @@ type entry struct {
+ 	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
+ 	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
+ 	creditsExpiring int64
+-	successCount    int64     // 累计成功
++	successCount    int64 // 累计成功
+ 	// errTotal 累计错误（终身累计，仅状态展示用；选号权重不消费——原「成功率」
+ 	// 因子已删，见 pick.weightOf 注释与 success-ema-review）。
+-	errTotal    int64         // 累计错误（终身累计，供状态展示；选号权重不消费，原成功率因子已删）
+-	lastErr     time.Time     // 最近一次错误时间
+-	lastSuccess     time.Time // 最近一次成功时间
+-	coolKind        CoolKind
+-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+-	disabled        bool
+-	reason          string
++	errTotal    int64     // 累计错误（终身累计，供状态展示；选号权重不消费，原成功率因子已删）
++	lastErr     time.Time // 最近一次错误时间
++	lastSuccess time.Time // 最近一次成功时间
++	coolKind    CoolKind
++	until       time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
++	disabled    bool
++	reason      string
+ 	// manualDisabled 运维手动停用（issue #138/#118）：与 disabled 并列的独立状态位。
+ 	// 语义是「对话流量摘除」而非「账号冻结」——停用期间签到/token 保活/排程照常执行，
+ 	// 凭证与积分都是活的，只是不参与选号。与 disabled 各自独立清除，两位都清才回池。
+ 	// 持久化（stateAccount.ManualDisabled）：重启保留运维意图。
+ 	manualDisabled bool
+ 	manualReason   string
+-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
++	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
+ 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
+ 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
+ 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效（高并发/低精度时钟下：
+@@ -277,7 +277,7 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
+ // 从不回收——即「map 只增不减」。而 entry.modelCost 的注释明确声称
+ // 「落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活（同 modelCooldowns 口径）」，
+ // 模型级冷却表正是靠 pruneExpiredModelCooldowns 在 pick 写锁路径做真正删除的
+-//（见 pick.go「map 不无限膨胀」）。两者口径不一致：一旦某模型的观测过期，它就会
++// （见 pick.go「map 不无限膨胀」）。两者口径不一致：一旦某模型的观测过期，它就会
+ // 永久占据一条内存（进程重启才清），并在后续每一轮 pick 的遍历、每次 status 遍历里
+ // 被反复判定为过期（只是没人删）。
+ //
+@@ -345,17 +345,17 @@ func (e *entry) fallbackKind(now time.Time) string {
+ 
+ // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
+ type stateAccount struct {
+-	Credits      int64     `json:"credits"`
+-	Disabled     bool      `json:"disabled"`
+-	Reason       string    `json:"reason,omitempty"`
++	Credits  int64  `json:"credits"`
++	Disabled bool   `json:"disabled"`
++	Reason   string `json:"reason,omitempty"`
+ 	// ManualDisabled 运维手动停用（issue #138/#118）。持久化——重启保留运维意图，
+ 	// 这也正是该功能要解决的痛点之一（旧权宜做法改 state.json 会被 5s flush 覆盖，
+ 	// 入口化后无需再碰文件）。零值也显式写出（运维口径，同 err_total 注释）。
+-	ManualDisabled bool   `json:"manual_disabled"`
+-	ManualReason   string `json:"manual_reason,omitempty"`
+-	Until        time.Time `json:"until,omitempty"`
+-	CoolKind     CoolKind  `json:"cool_kind"`
+-	SuccessCount int64     `json:"success_count,omitempty"`
++	ManualDisabled bool      `json:"manual_disabled"`
++	ManualReason   string    `json:"manual_reason,omitempty"`
++	Until          time.Time `json:"until,omitempty"`
++	CoolKind       CoolKind  `json:"cool_kind"`
++	SuccessCount   int64     `json:"success_count,omitempty"`
+ 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
+ 	// 仅作一次性迁移，不再回写 err_count。
+ 	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring）
+@@ -475,12 +475,12 @@ const (
+ const defaultSoftRateMax = 2 * time.Hour
+ 
+ // 11102「该后端无此模型」负缓存的退避参数（吸收 model_blocks.py 语义，复用 modelCooldowns
+-// 机制承载）。首次命中冷却 6h，半开到期放行重试；再命中按 Hits 指数退避（×2^min(hits-1,6)），
++// 机制承载）。首次命中冷却 5min，半开到期放行重试；再命中按 Hits 指数退避（×2^min(hits-1,12)），
+ // 封顶 24h（最多一天再试一次）；该模型请求成功即清。6004 限流不参与本退避（各自独立语义）。
+ const (
+-	modelBlockBaseTTL = 6 * time.Hour
++	modelBlockBaseTTL = 5 * time.Minute
+ 	modelBlockMaxTTL  = 24 * time.Hour
+-	modelBlockShift   = 6 // 2^6=64 倍后封顶：6h×64>24h，实际封顶锚定 24h
++	modelBlockShift   = 12 // 2^12=4096 倍后封顶：5min×4096 远超 24h，实际封顶锚定 24h
+ )
+ 
+ // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
+--- a/internal/pool/modelcooldown_test.go
++++ b/internal/pool/modelcooldown_test.go
+@@ -703,7 +703,11 @@ func TestBlockModelBackoffExponentialTtl(t *testing.T) {
+ 	if hits != 2 {
+ 		t.Errorf("hits=%d want 2", hits)
+ 	}
+-	if d := second - 12*time.Hour; d > time.Second || d < -time.Second {
++	wantSecond := modelBlockBaseTTL * 2
++	if wantSecond > modelBlockMaxTTL {
++		wantSecond = modelBlockMaxTTL
++	}
++	if d := second - wantSecond; d > time.Second || d < -time.Second {
+ 		t.Errorf("二次 TTL=%v want ~12h", second)
+ 	}
+ 
+--- /dev/null
++++ b/internal/pool/modelblocks_clear_test.go
+@@ -0,0 +1,50 @@
++package pool
++
++import (
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++// ClearModelBlocks 只清 11102 负缓存，不碰 6004 的独立冷却表。
++func TestClearModelBlocks(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.Add(&auth.Auth{UID: "u2"})
++
++	now := time.Now()
++	block := func() modelCooldown {
++		return modelCooldown{Until: now.Add(6 * time.Hour), Reason: "11102 model not available"}
++	}
++	p.mu.Lock()
++	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
++		"glm-5.3":             block(),
++		"deepseek-v4.1-flash": block(),
++	}
++	p.byUID["u2"].modelCooldowns = map[string]modelCooldown{
++		"deepseek-v4.1-flash": block(),
++		// 6004 是配额重置语义，不能被本方法顺带清掉
++		"glm-5.3": {Until: now.Add(time.Hour), ResetAt: now.Add(time.Hour), Reason: "6004"},
++	}
++	p.mu.Unlock()
++
++	if n := p.ClearModelBlocks("deepseek-v4.1-flash"); n != 2 {
++		t.Fatalf("ClearModelBlocks = %d, want 2", n)
++	}
++	if n := p.ClearModelBlocks("deepseek-v4.1-flash"); n != 0 {
++		t.Fatalf("重复清理 = %d, want 0", n)
++	}
++	if n := p.ClearModelBlocks("glm-5.3"); n != 1 {
++		t.Fatalf("glm-5.3 清理 = %d, want 1（只清 u1 的 11102）", n)
++	}
++	p.mu.RLock()
++	_, kept := p.byUID["u2"].modelCooldowns["glm-5.3"]
++	p.mu.RUnlock()
++	if !kept {
++		t.Fatal("u2 的 6004 冷却不应被清掉")
++	}
++	if n := p.ClearModelBlocks(""); n != 0 {
++		t.Fatalf("空模型名 = %d, want 0", n)
++	}
++}
