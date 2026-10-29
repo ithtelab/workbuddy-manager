@@ -796,7 +796,7 @@
     "colAccount": "Account",
     "rowAccount": "Account",
     "accountPending": "not captured yet (backfills automatically)",
-    "accountBackfillHint": "Backfill source is {mode} ({source}), but the account column is still empty: ",
+    "accountBackfillHint": "Account backfill ({mode} · {source}): ",
     "accountBackfillRecheck": "Check again",
     "colLatency": "Latency",
     "streamShort": "stream",

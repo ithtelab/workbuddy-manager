@@ -206,8 +206,13 @@ def parse_request_lines_with_mtime(lines: list[str], mtime: float | None) -> lis
 
 # 最近一次采集的事实快照，供「为什么账号列一直是空的」自诊断用。
 # 采集循环每轮覆盖，读侧拿到的是一份一致的小字典。
+#
+# `already`：这批条目里有多少条在匹配窗口内**已经存在**本地记录（不论账号填没
+# 填）。回填只更新 `account IS NULL` 的行，所以「本轮填了 0 条」绝大多数时候
+# 只是「这批请求早填过了」——没有这个字段，诊断只能拿 `filled` 当唯一判据，
+# 于是每轮都会误报「对不上本地记录」（issue #232）。
 _last: dict = {
-    'checked_at': 0, 'lines': 0, 'parsed': 0, 'filled': 0, 'error': '',
+    'checked_at': 0, 'lines': 0, 'parsed': 0, 'filled': 0, 'already': 0, 'error': '',
 }
 
 
@@ -223,15 +228,18 @@ def _collect_once() -> int:
     _last['checked_at'] = int(time.time())
     _last['lines'] = len(lines)
     if not lines:
-        _last.update(parsed=0, error='')
+        _last.update(parsed=0, filled=0, already=0, error='')
         return 0
     entries = parse_request_lines_with_mtime(lines, mtime)
     _last['parsed'] = len(entries)
     if not entries:
-        _last['error'] = ''
+        _last.update(filled=0, already=0, error='')
         return 0
     filled = db.attach_request_accounts(entries)
-    _last.update(filled=filled, error='')
+    # 只在「一条都没填」时才去数一遍「其实早就填过多少条」：这是唯一会让人
+    # 怀疑回填坏了的场景，正常轮次（填了 1~2 条）没必要多查一次。
+    already = db.count_entries_present(entries) if not filled else 0
+    _last.update(filled=filled, already=already, error='')
     return filled
 
 
@@ -291,8 +299,14 @@ def status() -> dict:
         info['hint'] = ('读到了日志，但没有一行符合上游的请求格式。多半是上游版本变化改了'
                         '日志排版 —— 请把日志里一条 chat 请求的原文贴出来。')
     elif snap['parsed'] and not snap['filled']:
-        info['hint'] = ('解析出了请求行，但对不上本地请求记录（时间窗口 3 秒、模型名需一致）。'
-                        '常见于上游与面板时钟不同步，或日志里只有更早的请求。')
+        if snap.get('already'):
+            # 正常状态：这批请求早就回填过了，只是本轮没有新记录可填。
+            # 这里必须留空，否则每 15 秒弹一次「对不上」的黄条（issue #232）。
+            info['hint'] = ''
+        else:
+            info['hint'] = ('解析出了请求行，但在匹配窗口内找不到对应的本地记录'
+                            '（时间窗口 3 秒、模型名需一致）。常见于上游与面板时钟不同步，'
+                            '或日志里只有更早的请求。')
     else:
         info['hint'] = ''
     return info

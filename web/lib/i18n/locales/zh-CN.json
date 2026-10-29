@@ -769,7 +769,7 @@
     "colAccount": "账号",
     "rowAccount": "账号",
     "accountPending": "未采集（稍后自动回填）",
-    "accountBackfillHint": "日志来自 {mode}（{source}），但账号列仍为空：",
+    "accountBackfillHint": "账号回填（{mode} · {source}）：",
     "accountBackfillRecheck": "重新检查",
     "colLatency": "总耗时",
     "streamShort": "流",

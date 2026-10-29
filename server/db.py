@@ -1255,6 +1255,49 @@ def attach_request_accounts(entries: Iterable[dict]) -> int:
     return filled
 
 
+def count_entries_present(entries: Iterable[dict]) -> int:
+    """这批采集条目里，有多少条在匹配窗口内**确实存在**对应的本地记录。
+
+    为什么需要它（issue #232 的误报）：回填只更新 `account IS NULL` 的行，
+    所以「本轮填了 0 条」是**正常状态**——最近这批请求早就填过了。只看
+    `filled` 会把这种正常状态判成「对不上本地记录」，界面上弹出「账号列仍为
+    空」的告警，而列里明明全是账号。
+
+    判据与 `attach_request_accounts` 同一份窗口与模型口径：窗口内、模型名
+    命中即算存在，**不看账号是否已填**。一次范围查询在内存里比对，避免为
+    几百条条目各查一遍（`request_logs.ts` 有索引，但批量仍然更快）。
+    """
+    items = [e for e in entries if isinstance(e, dict)]
+    stamps = [e['ts'] for e in items
+              if isinstance(e.get('ts'), int) and not isinstance(e.get('ts'), bool)]
+    models = sorted({_clean(e.get('model'), 128) for e in items} - {''})
+    if not stamps or not models:
+        return 0
+    lo = min(stamps) - _ACCOUNT_MATCH_WINDOW
+    hi = max(stamps) + _ACCOUNT_MATCH_WINDOW
+    marks = ','.join('?' * len(models))
+    rows = query(
+        'SELECT ts, model, mapped_model FROM request_logs '
+        f'WHERE ts BETWEEN ? AND ? AND (model IN ({marks}) OR mapped_model IN ({marks}))',
+        (lo, hi, *models, *models),
+    )
+    # 模型名 → 该模型所有记录的 ts；同一行可能两个名字都命中，去重不影响判断
+    index: dict[str, list[int]] = {}
+    for row in rows:
+        for name in (row['model'], row['mapped_model']):
+            if name:
+                index.setdefault(name, []).append(int(row['ts']))
+    hits = 0
+    for entry in items:
+        ts = entry.get('ts')
+        model = _clean(entry.get('model'), 128)
+        if not isinstance(ts, int) or isinstance(ts, bool) or not model:
+            continue
+        if any(abs(t - ts) <= _ACCOUNT_MATCH_WINDOW for t in index.get(model, ())):
+            hits += 1
+    return hits
+
+
 def add_ip_access_log(ip: object, path: object, blocked: bool, ua: object,
                       reason: object = None) -> None:
     """写入一条入站访问日志：清洗 + 截断 + 行数上限。

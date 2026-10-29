@@ -769,7 +769,7 @@
     "colAccount": "帳號",
     "rowAccount": "帳號",
     "accountPending": "未擷取（稍後自動回填）",
-    "accountBackfillHint": "日誌來自 {mode}（{source}），但帳號欄仍為空：",
+    "accountBackfillHint": "帳號回填（{mode} · {source}）：",
     "accountBackfillRecheck": "重新檢查",
     "colLatency": "總耗時",
     "streamShort": "串流",
