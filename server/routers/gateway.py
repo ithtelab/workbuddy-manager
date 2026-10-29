@@ -909,11 +909,18 @@ async def list_models(request: Request):
                                     headers=_upstream_headers(upstream))
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', resp.status_code, 0, 0, latency, request.headers.get('user-agent'), None, False)
-        payload = _scope_models(resp.json(), key)
+        # provider 决定清单裁剪路径：qoder 桥的模型 id 无 cn/global 前缀、也不在
+        # 腾讯目录里（C1/C2），裁剪方式与 CodeBuddy 完全不同（见 _scope_models）。
+        # codebuddy（含全部存量行）执行序列与改前逐条相同。
+        provider = str((upstream or {}).get('provider') or 'codebuddy')
+        payload = _scope_models(resp.json(), key, provider=provider)
         # 目录收缩（issue #239）：上游模型表可能仍列着腾讯已经下架的 id，
         # 客户端选中后才 503。模型中心直连腾讯的目录是当前可用的权威清单，
         # 取得到且来源是腾讯时按它裁一次；取不到就原样透传。
-        payload = await _drop_models_outside_catalog(payload, key)
+        # qoder 上游必须跳过：目录来源是腾讯接口，qoder 模型不在其中，
+        # 不跳过会把整份清单裁空（C1）。
+        if provider != 'qoder':
+            payload = await _drop_models_outside_catalog(payload, key)
         # 能力字段兜底（issue #211）：随包上游的版本可能比面板旧 —— 补丁只在上游
         # 侧时，下游经面板拿到的清单仍缺字段，客户端会整条跳过模型。
         payload = _listing_compat_models(payload)
@@ -1073,7 +1080,8 @@ async def _drop_models_outside_catalog(payload: object, key: dict | None) -> obj
     return _filter_catalog_models(payload, key, realm, ids)
 
 
-def _scope_models(payload: object, key: dict | None) -> object:
+def _scope_models(payload: object, key: dict | None,
+                  provider: str = 'codebuddy') -> object:
     """按密钥的**版本**与**模型白名单**裁剪模型列表。
 
     这个接口要回答的是「**你能用**什么模型」——客户端普遍拿它当模型选择器
@@ -1089,6 +1097,12 @@ def _scope_models(payload: object, key: dict | None) -> object:
     """
     key = key or {}
     want = keysvc._norm_realm(key.get('realm'))
+    # qoder 模型 id 无 realm 前缀（C2）：`_model_realm_of` 恒归 cn，版本裁剪会把
+    # global 密钥的清单裁成空。qoder 的版本隔离已由「密钥×上游」匹配
+    # （upstreamsvc.resolve_for_key）承担，清单维度只保留白名单——所以这里把
+    # 版本位清空，而不是在前缀上做文章（模型名加前缀会改变发往 bridge 的 id）。
+    if provider == 'qoder':
+        want = ''
     allow = [str(x) for x in (key.get('models') or []) if str(x).strip()]
     if not want and not allow:
         return payload

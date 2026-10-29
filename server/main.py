@@ -17,7 +17,8 @@ from .iputil import client_ip
 from .stdio_utf8 import force_utf8_stdio
 from .routers import (
     accounts, anthropic, auth, gateway, keys, logs, models, playground,
-    pgsync as pgsync_router, redpackets, responses, security as security_router,
+    pgsync as pgsync_router, qoder as qoder_router, redpackets, responses,
+    security as security_router,
     proxies, settings, stats, system, tokens, upstreams, watchdog as watchdog_router,
 )
 from .services import (
@@ -301,6 +302,9 @@ app.include_router(pgsync_router.router)
 app.include_router(watchdog_router.router)
 # 多上游（账号池分组）：密钥绑定上游 = 请求走那个池，见 upstreamsvc
 app.include_router(upstreams.router)
+# Qoder 上游的管理面代理（console 只读 + 轻写）：/api/qoder/* 与现有任何路由
+# 无交集，注册顺序无敏感性；紧挨 upstreams 放是可读性（都是「接入点」这一层）。
+app.include_router(qoder_router.router)
 app.include_router(system.router)
 app.include_router(models.router)
 app.include_router(playground.router)

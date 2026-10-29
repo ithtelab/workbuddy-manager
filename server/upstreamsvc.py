@@ -35,6 +35,15 @@ MAX_NOTE = 200
 MAX_URL = 500
 MAX_PATH = 500
 
+# 上游接入点的 provider 类型。唯一定义处（全仓库的判定只写 `== 'qoder'`）：
+# **禁止**写 `!= 'codebuddy'` 之类的放行条件——未知/脏值必须落回 codebuddy 原路径
+# （fail-safe 方向：新分支只对显式声明者生效，存量部署升级后行为逐字不变）。
+PROVIDERS: tuple[str, ...] = ('codebuddy', 'qoder')
+DEFAULT_PROVIDER = 'codebuddy'
+# 上游的版本归属取值（仅 provider='qoder' 时消费）：'' = 不限；
+# 'cn'/'global' 与密钥的 realm 做「密钥×上游」匹配（见 resolve_for_key）。
+QODER_REALMS: tuple[str, ...] = ('', 'cn', 'global')
+
 
 class UpstreamUnavailable(Exception):
     """密钥绑定的上游不可用（已被删除或已停用）。
@@ -94,6 +103,32 @@ def normalize_container(value: object) -> str:
     return s
 
 
+def normalize_provider(value: object) -> str:
+    """归一化上游类型；非法值直接报错（**不静默兜底**）。
+
+    为什么与 realm 的「吃掉脏值」方向相反：上游类型是**结构性选择**——它决定
+    模型清单裁剪、版本门、探活三处行为。猜一个（比如把拼错的 `qoder ` 兜成
+    codebuddy）会把一个本该是 qoder 的接入点悄悄接进 CodeBuddy 池，调用全部
+    401/404，而用户看到的是「保存成功了」。宁可当场报错让管理员改。
+    """
+    v = _clean(value, 32).lower()
+    if v not in PROVIDERS:
+        raise ValueError(f'上游类型必须是 {PROVIDERS} 之一：{v!r}')
+    return v
+
+
+def normalize_qoder_realm(value: object) -> str:
+    """归一化上游的版本归属（仅 qoder 上游消费）；空 = 不限。
+
+    同样不静默兜底：'cn' 拼成 'CN ' 之外的任何脏值都会让「密钥×上游」匹配
+    变成一把没人能预测的锁，保存时拒掉比转发时猜要便宜。
+    """
+    v = _clean(value, 32).lower()
+    if v not in QODER_REALMS:
+        raise ValueError(f'版本归属必须是 {QODER_REALMS} 之一（空 = 不限）：{v!r}')
+    return v
+
+
 def _row_to_dict(row) -> dict:
     return {
         'id': int(row['id']),
@@ -104,6 +139,10 @@ def _row_to_dict(row) -> dict:
         'enabled': bool(row['enabled']),
         'auth_dir': str(row['auth_dir'] or ''),
         'container': str(row['container'] or ''),
+        # 新键只增不改：`or` 兜底迁移前的 NULL（ALTER 加列对已有行回填默认值，
+        # 但极端情况下库可能被旧版本进程短写过）——兜底值与列默认值一致。
+        'provider': str(row['provider'] or DEFAULT_PROVIDER),
+        'realm': str(row['realm'] or ''),
         'created_at': row['created_at'],
         'updated_at': row['updated_at'],
         'is_default': False,
@@ -123,6 +162,11 @@ def default_upstream() -> dict:
         # （改了它只会让面板与上游看到两个目录，属于配置漂移而不是功能）。
         'auth_dir': str(config.AUTH_DIR),
         'container': config.WB2API_CONTAINER,
+        # 默认上游永远是 CodeBuddy 那一套（WB2API_BASE）：qoder 只能以显式
+        # 建行的上游接入——它的桥地址与桥 token 都是配置项，没有「环境变量
+        # 默认值」可言，硬编码任何一个都是错的。
+        'provider': DEFAULT_PROVIDER,
+        'realm': '',
         'created_at': None,
         'updated_at': None,
         'is_default': True,
@@ -154,18 +198,30 @@ def list_upstreams(*, include_default: bool = True) -> list[dict]:
 
 def create_upstream(name: object, base_url: object, api_key: object = '',
                     note: object = '', enabled: object = True,
-                    auth_dir: object = '', container: object = '') -> dict:
+                    auth_dir: object = '', container: object = '',
+                    provider: object = DEFAULT_PROVIDER,
+                    realm: object = '') -> dict:
     nm = _clean(name, MAX_NAME)
     if not nm:
         raise ValueError('上游名称不能为空')
     url = normalize_base_url(base_url)
+    # 类型与版本归属先归一：后面「qoder 必填桥 token」的判定要用归一后的值。
+    prov = normalize_provider(provider)
+    up_realm = normalize_qoder_realm(realm) if prov == 'qoder' else ''
+    key = _clean(api_key, MAX_URL)
+    # qoder 上游的 api_key 是**桥接 token**（qoder2api bridge authMiddleware 收
+    # Bearer/x-api-key），必填但**不硬编码默认值**——上游默认 token 是它自己的
+    # 配置，面板侧必须显式填写（值可从 console /api/settings 读取回显到表单）。
+    # codebuddy 侧 api_key 仍允许为空（不鉴权的自建实例），语义不同、不共用校验。
+    if prov == 'qoder' and not key:
+        raise ValueError('qoder 上游必须填写桥接 token（qoder2api 的 bridge_token）')
     now = int(time.time())
     uid = db.execute(
         'INSERT INTO upstreams(name, base_url, api_key, note, enabled, auth_dir, container, '
-        'created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        (nm, url, _clean(api_key, MAX_URL), _clean(note, MAX_NOTE),
+        'provider, realm, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (nm, url, key, _clean(note, MAX_NOTE),
          1 if enabled else 0, normalize_auth_dir(auth_dir), normalize_container(container),
-         now, now),
+         prov, up_realm, now, now),
     )
     row = db.query_one('SELECT * FROM upstreams WHERE id = ?', (uid,))
     return _row_to_dict(row)
@@ -198,7 +254,22 @@ def update_upstream(upstream_id: object, patch: dict) -> dict | None:
         fields['auth_dir'] = normalize_auth_dir(patch['auth_dir'])
     if 'container' in patch:
         fields['container'] = normalize_container(patch['container'])
+    if 'provider' in patch:
+        fields['provider'] = normalize_provider(patch['provider'])
+    if 'realm' in patch:
+        # 与 api_key 的 `'key' in patch` 同口径：显式传 '' 是「清空 = 不限」，
+        # 能生效的动作，不能被真值判断吞掉。
+        fields['realm'] = normalize_qoder_realm(patch['realm'])
     if fields:
+        # 「改成 qoder」时按 patch 值 ∪ current 值合并后判桥 token 非空：
+        # 只传 provider 不传 api_key 的 PATCH 也要拦——否则一个没带 token 的
+        # qoder 上游会静默生效，转发到 bridge 全 401，管理员对着网关日志排查。
+        # codebuddy 行不经过这段（provider 只在显式传键时才变）。
+        target_provider = str(fields.get('provider', current['provider']))
+        if target_provider == 'qoder':
+            target_key = str(fields.get('api_key', current['api_key']) or '')
+            if not target_key.strip():
+                raise ValueError('qoder 上游必须填写桥接 token（qoder2api 的 bridge_token）')
         fields['updated_at'] = int(time.time())
         assignments = ', '.join(f'{k} = ?' for k in fields)
         db.execute(f'UPDATE upstreams SET {assignments} WHERE id = ?',
@@ -279,6 +350,22 @@ def resolve_for_key(key: dict | None) -> dict:
     if not row['enabled']:
         raise UpstreamUnavailable(
             f'密钥绑定的上游「{row["name"]}」已停用 —— 启用它，或把密钥改绑到其它上游')
+    # 「密钥×上游」版本匹配（仅 qoder 上游）：keysvc.validate 的版本门按模型名的
+    # `global:` 前缀判版本，而 qoder 模型 id 无前缀、恒归 cn——global 密钥会被
+    # 那道门误杀。qoder 的版本语义在**上游行**上，所以在这道门被跳过之后（见
+    # keysvc.validate），由这里承担等价的隔离：key.realm 为空放行一切；上游
+    # realm 为空表示该池不区分版本，也放行；两者都非空则必须相等。
+    # 本地归一而不 import keysvc：本模块只依赖 (db, config)，引 keysvc 会成环。
+    if str(row['provider'] or DEFAULT_PROVIDER) == 'qoder':
+        key_realm = str((key or {}).get('realm') or '').strip().lower()
+        key_realm = key_realm if key_realm in ('cn', 'global') else ''
+        up_realm = str(row['realm'] or '').strip().lower()
+        if key_realm and up_realm and key_realm != up_realm:
+            raise UpstreamUnavailable(
+                f'密钥版本 {"国际版" if key_realm == "global" else "国内版"} 与上游'
+                f'「{row["name"]}」的版本 '
+                f'{"国际版" if up_realm == "global" else "国内版"} 不匹配——'
+                '请把密钥改绑到同版本的上游，或把上游版本改为不限')
     return row
 
 
@@ -313,6 +400,25 @@ async def probe(upstream: dict) -> tuple[bool, str]:
     base = str(upstream.get('base_url') or '')
     if not base:
         return False, '上游地址为空'
+    # qoder 分支探 `/v1/models` 而非 `/healthz`：bridge 只暴露 4 个端点
+    # （chat/messages/models/responses），没有 /healthz——拿它探活恒 404，
+    # 会把一个健康的桥误报成「不可达」。用带桥接 token 的模型清单探测，
+    # 顺带验证 token 本身是好的（401 说明 token 错，比「不通」更有指向性）。
+    if str(upstream.get('provider') or DEFAULT_PROVIDER) == 'qoder':
+        headers = {}
+        token = forward_api_key(upstream)
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        try:
+            async with config.http_client(10, connect=3) as client:
+                resp = await client.get(f'{base}/v1/models', headers=headers)
+            if resp.status_code == 200:
+                return True, '桥接可达'
+            if resp.status_code == 401:
+                return False, '桥接 token 不对（bridge 返回 401 invalid api key）'
+            return False, f'桥接返回 {resp.status_code}'
+        except Exception as exc:                 # noqa: BLE001 —— 探测失败原因原样返回给界面
+            return False, f'无法连接：{exc}'
     try:
         async with config.http_client(10, connect=3) as client:
             resp = await client.get(f'{base}/healthz')

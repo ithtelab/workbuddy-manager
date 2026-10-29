@@ -326,6 +326,16 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'POST /api/settings/pg-sync/test',
         'POST /api/settings/pg-sync/export',
         'POST /api/settings/pg-sync/import',
+        # Qoder 管理面代理（设置 → Qoder）：保存的是 qoder2api console 的明文密码，
+        # 签到 / 切激活 / 桥启停是「以管理员身份对外部系统做动作」——与「保存上游」
+        # 同级（改配置级凭据 + 影响账号行为），只对会话开放。测试连接（无状态变更）
+        # 也一并收紧：它会拿**已保存的密码**去登录外部系统，与 upstash/test 同理。
+        'PUT /api/qoder/settings',
+        'POST /api/qoder/settings/test',
+        'POST /api/qoder/checkin',
+        'POST /api/qoder/active',
+        'POST /api/qoder/bridge/start',
+        'POST /api/qoder/bridge/stop',
     }
     # 写方法但只要求「已登录」——只读令牌也能调。必须逐个有理由。
     ANY_LOGGED_IN = {

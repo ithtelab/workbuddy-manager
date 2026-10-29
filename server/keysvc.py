@@ -12,6 +12,11 @@ from .iputil import ip_matches
 
 TOKEN_PREFIX = 'wbk_'
 
+# 延迟引用的模块别名：upstreamsvc 只依赖 (db, config)，keysvc → upstreamsvc
+# 不成环（upstreamsvc **不得**反向 import keysvc，见架构文档 §3.0 的方向约定）。
+# 放函数体内 import 也行，但判定在热路径（每次请求一次），顶层 import 更省。
+from . import upstreamsvc as _upstreamsvc  # noqa: E402  （语义上是本文件的一部分）
+
 
 class Rejection(str):
     """拒绝原因 + 该用哪个 HTTP 状态码回。
@@ -385,7 +390,8 @@ def _strip_realm_prefix(name: str) -> str:
 
 
 def unknown_whitelist_entries(models: list[str], known_by_realm: dict,
-                             aliases: list[str] | set[str] = ()) -> list[str]:
+                             aliases: list[str] | set[str] = (),
+                             extra_known: set[str] | None = None) -> list[str]:
     """白名单里**匹配不到任何已知模型**的条目（多半是拼错了）。
 
     为什么需要（issue #46 的可选做法 2）：白名单是自由文本框，填错了不会报错，
@@ -397,6 +403,12 @@ def unknown_whitelist_entries(models: list[str], known_by_realm: dict,
 
     `known_by_realm`：`{'cn': {...} | None, 'global': {...} | None}`，
     值为该版本的模型 id 集合；`None` = **该版本的清单拿不到**。
+
+    `extra_known`：**不分组**的额外已知模型 id（当前来源：qoder bridge 的清单
+    缓存）。qoder 模型名无 cn/global 前缀，按「前缀定 realm」的规则会落进
+    `cn` 桶、拿腾讯清单去判——必然判成"找不到"（C5 假警报）。它得有第三个
+    出口：在这个集合里就放行，不进 realm 判定。None = 来源不可用，退化为
+    原两清单判定（调用方约定：拿不到就不判）。
 
     ## 每个名字只跟自己版本的清单比
 
@@ -416,6 +428,7 @@ def unknown_whitelist_entries(models: list[str], known_by_realm: dict,
     if not models:
         return []
     alias_bare = {_strip_realm_prefix(str(x)).strip() for x in aliases}
+    extra = {str(x).strip() for x in (extra_known or ()) if str(x).strip()}
     out: list[str] = []
     for raw in models:
         entry = str(raw).strip()
@@ -423,6 +436,9 @@ def unknown_whitelist_entries(models: list[str], known_by_realm: dict,
             continue
         # 先按**请求名**判别名：别名匹配发生在鉴权之后，用的是客户端发来的原样名字
         if entry in alias_bare or _strip_realm_prefix(entry) in alias_bare:
+            continue
+        # 第三出口：跨源清单（qoder bridge）的 id 不参与 realm 分桶，直接认
+        if extra and (entry in extra or _strip_realm_prefix(entry) in extra):
             continue
         realm = 'global' if entry.lower().startswith('global:') else 'cn'
         known = known_by_realm.get(realm)
@@ -433,6 +449,22 @@ def unknown_whitelist_entries(models: list[str], known_by_realm: dict,
             continue
         out.append(entry)
     return out
+
+
+def _bound_provider(key: dict) -> str:
+    """该密钥绑定的上游类型（'codebuddy' | 'qoder'）。
+
+    未绑定 / 绑定的上游不存在 → 'codebuddy'：后者该请求稍后会被
+    `upstreamsvc.resolve_for_key` 以 UpstreamUnavailable 打回，版本门无需
+    先行猜——猜错（比如猜成 qoder）反而会在 503 之前多拦一道说不清的 400。
+    """
+    uid = (key or {}).get('upstream_id')
+    if uid in (None, '', 0, '0'):
+        return 'codebuddy'
+    row = _upstreamsvc.get_upstream(uid)
+    if row is None:
+        return 'codebuddy'
+    return str(row.get('provider') or 'codebuddy')
 
 
 def validate(key: dict, ip: str, model: str | None,
@@ -497,7 +529,13 @@ def validate(key: dict, ip: str, model: str | None,
     # 「别名 → 带前缀的真名」的密钥永远被判成错版本。
     effective = (mapped_model or model)
     want = _norm_realm(key.get('realm'))
-    if want and not is_model_list:
+    # qoder 分支（C2）：`db.realm_of_model` 按 `global:` 前缀判版本，而 qoder
+    # 模型名无前缀、恒归 cn——global 密钥调 qmodel 会被这里误杀。qoder 的版本
+    # 语义在**上游行**上，由 `upstreamsvc.resolve_for_key` 的「密钥×上游」匹配
+    # 承担；两道门合起来恰好等价于「密钥版本 ⊆ 上游版本」。唯一触发条件是
+    # `== 'qoder'`：codebuddy / 默认上游（全部存量）逐字走原分支。
+    bound_qoder = _bound_provider(key) == 'qoder'
+    if want and not is_model_list and not bound_qoder:
         if not isinstance(effective, str) or not effective.strip():
             return Rejection(
                 f'该密钥限定了{"国际版" if want == "global" else "国内版"}模型，请求必须指定 model',

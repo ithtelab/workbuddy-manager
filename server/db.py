@@ -387,6 +387,15 @@ CREATE TABLE IF NOT EXISTS upstreams (
   auth_dir   TEXT    NOT NULL DEFAULT '',
   -- 该分组上游实例的容器名（可选）：面板「重启该分组」按它 docker restart。
   container  TEXT    NOT NULL DEFAULT '',
+  -- 上游接入点的 provider 类型（'codebuddy' | 'qoder'）。存量行与全新库统一为
+  -- 'codebuddy'——升级后每一条既有路径（默认上游、分组转发、模型清单裁剪）的
+  -- 判定都是 provider != 'qoder' → 走原分支，行为与升级前逐字相同；只有显式
+  -- 建了 qoder 上游才会进入新分支。读侧用 `or 'codebuddy'` 兜底 NULL。
+  provider   TEXT    NOT NULL DEFAULT 'codebuddy',
+  -- 上游的版本归属（仅 provider='qoder' 时消费）：'' = 不限；'cn'/'global' 与
+  -- 密钥的 realm 做「密钥×上游」匹配（见 upstreamsvc.resolve_for_key）。
+  -- codebuddy 行恒为 '' 且从不读取——不加语义、不迁移。
+  realm      TEXT    NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -683,6 +692,17 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 客户端渠道（issue #233）：UA 归类结果，用于排查「哪类客户端在打冷账号」。
     # 旧记录为 NULL（界面显示「—」），不推断。
     ('request_logs', 'channel', 'TEXT'),
+    # 上游接入点的 provider 类型（'codebuddy' | 'qoder'）。存量行与全新库统一为
+    # 'codebuddy'——升级后每一条既有路径（默认上游、分组转发、模型清单裁剪）的
+    # 判定都是 provider != 'qoder' → 走原分支，行为与升级前逐字相同；只有显式
+    # 建了 qoder 上游才会进入新分支。读侧用 `or 'codebuddy'` 兜底 NULL。
+    # 必须走迁移而不只是改建表语句：`CREATE TABLE IF NOT EXISTS` 对已存在的表
+    # 什么都不做（与上面 red_packets.code 那条的双路径原则一致）。
+    ('upstreams', 'provider', "TEXT NOT NULL DEFAULT 'codebuddy'"),
+    # 上游的版本归属（仅 provider='qoder' 时消费）：'' = 不限；'cn'/'global' 与
+    # 密钥的 realm 做「密钥×上游」匹配（见 upstreamsvc.resolve_for_key）。
+    # codebuddy 行恒为 '' 且从不读取——不加语义、不迁移。
+    ('upstreams', 'realm', "TEXT NOT NULL DEFAULT ''"),
 )
 
 

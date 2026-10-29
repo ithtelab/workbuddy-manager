@@ -30,6 +30,11 @@ class UpstreamIn(BaseModel):
     auth_dir: str = Field(default='', max_length=500)
     # 分组上游实例的容器名（可选）：面板「重启该分组」按它 docker restart。
     container: str = Field(default='', max_length=64)
+    # 上游类型（codebuddy | qoder）与版本归属（仅 qoder 消费，'' = 不限）。
+    # 校验在 svc 层（normalize_provider / normalize_qoder_realm），这里是纯透传；
+    # 不传 = 默认值 = 存量调用方行为逐字不变。
+    provider: str = Field(default='codebuddy', max_length=32)
+    realm: str = Field(default='', max_length=32)
 
 
 class UpstreamPatch(BaseModel):
@@ -40,6 +45,9 @@ class UpstreamPatch(BaseModel):
     enabled: bool | None = None
     auth_dir: str | None = None
     container: str | None = None
+    # 与 UpstreamIn 同口径：PATCH 只透传显式提交的字段（exclude_unset 语义）。
+    provider: str | None = None
+    realm: str | None = None
 
 
 def _serialize(items: list[dict]) -> list[dict]:
@@ -83,6 +91,7 @@ def create_upstream(body: UpstreamIn, request: Request,
             name=body.name, base_url=body.base_url, api_key=body.api_key,
             note=body.note, enabled=body.enabled,
             auth_dir=body.auth_dir, container=body.container,
+            provider=body.provider, realm=body.realm,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

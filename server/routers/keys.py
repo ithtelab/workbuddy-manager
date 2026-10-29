@@ -125,13 +125,20 @@ def check_models(body: WhitelistCheckIn,
     known_by_realm: dict[str, set[str] | None] = {
         r: modelcatalog.cached_ids(r) for r in ('cn', 'global')
     }
-    if all(v is None for v in known_by_realm.values()):
+    # 第三来源：qoder bridge 的模型清单（只读缓存，不发网络——与上面的口径
+    # 一致，清单由「设置 → Qoder」页顺手暖）。qoder 模型名无前缀，落不进
+    # 任何一个 realm 桶（C5），必须作为独立集合传下去，否则会被腾讯清单
+    # 判成 unknown 假警报。未暖缓存时是 None → 判定式退化原行为。
+    from ..services import qoder as qoder_svc
+    extra = qoder_svc.cached_model_ids()
+    if all(v is None for v in known_by_realm.values()) and extra is None:
         return {'checked': False, 'unknown': [],
                 'reason': '暂时读不到模型清单（去「模型」页刷新一次再回来）'}
 
     # 只认真实别名：兜底那条（`*`）不是模型名，不该被当成"用户写的白名单项是对的"。
     aliases = modelmap.aliases(db.get_setting('model_map', {}) or {})
-    unknown = keysvc.unknown_whitelist_entries(names, known_by_realm, aliases)
+    unknown = keysvc.unknown_whitelist_entries(names, known_by_realm, aliases,
+                                               extra_known=extra)
     return {'checked': True, 'unknown': unknown}
 
 
