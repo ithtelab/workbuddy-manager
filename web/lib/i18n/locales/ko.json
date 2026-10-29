@@ -589,8 +589,7 @@
     "reloginQueueReloginCurrent": "현재 계정 재로그인",
     "reloginQueueReason": "차단 사유: ",
     "reloginQueuePing": "ping 테스트",
-    "reloginQueueAdvanceHint": "재로그인에 성공하면 계정이 대기열에서 빠지고 다음 계정으로 자동 진행됩니다."
-,
+    "reloginQueueAdvanceHint": "재로그인에 성공하면 계정이 대기열에서 빠지고 다음 계정으로 자동 진행됩니다.",
     "reloginQueueDesc": "제한된 계정을 순서대로 다시 로그인해 해제합니다. 아래 목록의 행을 클릭하면 대상을 전환할 수 있습니다.",
     "reloginQueueEmptyTitle": "현재 제한된 계정이 없습니다",
     "reloginQueueEmptyDesc": "모든 계정이 정상 온라인 또는 정상 스케줄 중입니다. 다시 로그인할 필요가 없습니다.",

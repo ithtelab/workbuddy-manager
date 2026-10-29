@@ -589,8 +589,7 @@
     "reloginQueueReloginCurrent": "重新登入目前帳號",
     "reloginQueueReason": "封控原因：",
     "reloginQueuePing": "ping 測試",
-    "reloginQueueAdvanceHint": "重新登入成功後該帳號會自動退出佇列，前進到下一位。"
-,
+    "reloginQueueAdvanceHint": "重新登入成功後該帳號會自動退出佇列，前進到下一位。",
     "reloginQueueDesc": "封控帳號排隊重新登入解封；點擊下方列表中的任意帳號可直接切換。",
     "reloginQueueEmptyTitle": "目前沒有封控中的帳號",
     "reloginQueueEmptyDesc": "所有帳號均正常線上或在正常調度中，無需重新登入解封。",

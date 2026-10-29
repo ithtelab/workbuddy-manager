@@ -589,8 +589,7 @@
     "reloginQueueReloginCurrent": "現在のアカウントを再ログイン",
     "reloginQueueReason": "ブロック理由：",
     "reloginQueuePing": "ping テスト",
-    "reloginQueueAdvanceHint": "再ログインに成功するとアカウントはキューから外れ、次のアカウントへ自動的に進みます。"
-,
+    "reloginQueueAdvanceHint": "再ログインに成功するとアカウントはキューから外れ、次のアカウントへ自動的に進みます。",
     "reloginQueueDesc": "凍結されたアカウントを順番に再ログインして解除します。下の一覧の行をクリックすると対象を切り替えられます。",
     "reloginQueueEmptyTitle": "現在、凍結中のアカウントはありません",
     "reloginQueueEmptyDesc": "すべてのアカウントは正常にオンラインまたはスケジュール実行中です。再ログインは不要です。",
