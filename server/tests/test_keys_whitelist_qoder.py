@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from server import config, db, keysvc, security  # noqa: E402
-from server.services import qoder as qoder_svc  # noqa: E402
+from server.services import modelcatalog, qoder as qoder_svc  # noqa: E402
 
 
 class UnknownWhitelistEntriesUnitTest(unittest.TestCase):
@@ -67,6 +67,10 @@ class CheckModelsQoderEndpointTest(unittest.TestCase):
             'api_keys': [],
         })
         qoder_svc._model_cache.clear()
+        # modelcatalog 的缓存是**进程级**单例：整段跑的时候其它测试可能已经暖过
+        # 腾讯清单，本文件的「缓存未暖 → 退化/不校验」用例会被污染。这里显式清空，
+        # 与「三来源全空」的前置条件对齐（test_qoder_service 同款处理）。
+        modelcatalog._cache.clear()
         from server.main import app
         self.client = TestClient(app)
         r = self.client.post('/api/login', json={'username': 'admin', 'password': 'pw'})
@@ -81,6 +85,7 @@ class CheckModelsQoderEndpointTest(unittest.TestCase):
         config.DB_PATH = self._orig_db
         config.USERS_FILE = self._orig_users
         qoder_svc._model_cache.clear()
+        modelcatalog._cache.clear()
         try:
             self._tmp.cleanup()
         except PermissionError:
@@ -99,12 +104,19 @@ class CheckModelsQoderEndpointTest(unittest.TestCase):
         self.assertEqual(out['unknown'], [])
 
     def test_cold_cache_degrades_to_realm_sources(self) -> None:
-        """缓存未暖（None）→ 退化为原两清单判定：qmodel 落 cn 桶、cn 清单拿不到
-        → 不判（不假警报）。"""
+        """bridge 缓存未暖（None）→ 退化为原两清单判定。
+
+        退化是有代价的：qmodel 落 cn 桶，若腾讯清单恰好暖着，它会被报成
+        unknown（这正是 C5 要修的假警报——所以「设置 → Qoder」页要顺手暖
+        缓存；这里钉的是「退化后行为与改造前一致」，不是退化后没有假警报）。
+        """
+        from server.services import modelcatalog
         self.assertIsNone(qoder_svc.cached_model_ids())
-        out = self._check(['qmodel'])
+        with mock.patch.object(modelcatalog, 'cached_ids',
+                               side_effect=lambda r: {'glm-5.2'} if r == 'cn' else None):
+            out = self._check(['qmodel'])
         self.assertTrue(out['checked'])
-        self.assertEqual(out['unknown'], [])
+        self.assertEqual(out['unknown'], ['qmodel'], '退化 = 按原两清单判定（与改造前一致）')
 
     def test_all_sources_missing_reports_unchecked(self) -> None:
         """三来源全空 → checked:false（如实显示「暂时无法校验」）。"""
