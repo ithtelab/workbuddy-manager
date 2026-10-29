@@ -43,7 +43,7 @@ const STUB = {
   'nav.stats': '统计', 'nav.logs': '日志', 'nav.security': '安全', 'nav.settings': '设置',
   'nav.groupOverview': '总览', 'nav.groupOps': '运营', 'nav.groupGovernance': '治理',
   'settings.tabUpstream': '上游配置', 'settings.tabProxy': '代理',
-  'settings.tabModels': '模型映射',
+  'settings.tabModels': '模型映射', 'settings.tabQoder': 'Qoder',
   'settings.tabUsers': '用户', 'settings.tabTokens': '令牌', 'settings.tabSystem': '系统',
   'settings.tabWatchdog': '页面监控',
   'settings.tabBackup': '数据备份',

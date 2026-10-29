@@ -38,6 +38,13 @@ import {
 } from '@/components/animate-ui/radix/dialog';
 import {Input} from '@/components/ui/input';
 import {Label} from '@/components/ui/label';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import {Switch} from '@/components/ui/switch';
 import {Textarea} from '@/components/ui/textarea';
 
@@ -49,6 +56,10 @@ interface FormState {
   enabled: boolean;
   auth_dir: string;
   container: string;
+  /** 上游类型（'codebuddy' | 'qoder'）：决定版本隔离与清单裁剪的行为分支。 */
+  provider: string;
+  /** 版本归属（仅 qoder 消费）：'' = 不限 / 'cn' / 'global'。 */
+  realm: string;
 }
 
 const emptyForm: FormState = {
@@ -59,6 +70,8 @@ const emptyForm: FormState = {
   enabled: true,
   auth_dir: '',
   container: '',
+  provider: 'codebuddy',
+  realm: '',
 };
 
 /**
@@ -122,6 +135,8 @@ export function UpstreamFormDialog({
         // 还没配账号目录的分组：带出建议路径，用户直接保存即可开始用
         auth_dir: editing.auth_dir || suggestAuthDir(defaultDir, editing.name),
         container: editing.container || '',
+        provider: editing.provider || 'codebuddy',
+        realm: editing.realm || '',
       });
       setDirTouched(!!editing.auth_dir);
     } else {
@@ -141,6 +156,12 @@ export function UpstreamFormDialog({
     const baseUrl = form.base_url.trim() || (simple ? defaultBaseUrl : '');
     if (!form.name.trim() || !baseUrl) {
       notify.err(t('upstreams.nameUrlRequired'));
+      return;
+    }
+    // qoder 上游的桥接 token 必填（后端同样拦，但在这里拦能省一次往返，
+    // 而且错误落点就在输入框旁边）
+    if (form.provider === 'qoder' && !(editing ? (form.api_key.trim() || editing.has_key) : form.api_key.trim())) {
+      notify.err(t('upstreams.qoderTokenRequired'));
       return;
     }
     const payload = {...form, base_url: baseUrl};
@@ -204,6 +225,19 @@ export function UpstreamFormDialog({
                   </p>
                 </div>
                 <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldProvider')}</Label>
+                  <Select value={form.provider} onValueChange={(v) => setForm({...form, provider: v})}>
+                    <SelectTrigger className="bg-background" aria-label={t('upstreams.fieldProvider')}><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="codebuddy">{t('upstreams.providerCodebuddy')}</SelectItem>
+                      <SelectItem value="qoder">{t('upstreams.providerQoder')}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <p className="text-[11px] leading-4 text-muted-foreground">
+                    {t('upstreams.fieldProviderHint')}
+                  </p>
+                </div>
+                <div className="space-y-1.5">
                   <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldKey')}</Label>
                   <Input
                     value={form.api_key}
@@ -214,7 +248,30 @@ export function UpstreamFormDialog({
                       : t('upstreams.fieldKeyPlaceholder')}
                     maxLength={500}
                   />
+                  {/* qoder 时 api_key 的语义是桥接 token（必填）：换个提示口径，
+                      别让用户以为这是可选的上游 api_key（C4：两边的鉴权语义不同）。 */}
+                  {form.provider === 'qoder' && (
+                    <p className="text-[11px] leading-4 text-muted-foreground">
+                      {t('upstreams.fieldKeyQoderHint')}
+                    </p>
+                  )}
                 </div>
+                {form.provider === 'qoder' && (
+                  <div className="space-y-1.5">
+                    <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldRealm')}</Label>
+                    <Select value={form.realm || 'any'} onValueChange={(v) => setForm({...form, realm: v === 'any' ? '' : v})}>
+                      <SelectTrigger className="bg-background" aria-label={t('upstreams.fieldRealm')}><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="any">{t('upstreams.realmAny')}</SelectItem>
+                        <SelectItem value="cn">{t('upstreams.realmCn')}</SelectItem>
+                        <SelectItem value="global">{t('upstreams.realmGlobal')}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <p className="text-[11px] leading-4 text-muted-foreground">
+                      {t('upstreams.fieldRealmHint')}
+                    </p>
+                  </div>
+                )}
                 <div className="space-y-1.5">
                   <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldDir')}</Label>
                   <Input

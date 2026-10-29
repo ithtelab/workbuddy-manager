@@ -22,6 +22,7 @@ import {
   KeyRound,
   Route,
   Radar,
+  Boxes,
 } from 'lucide-react';
 import {usePathname} from 'next/navigation';
 import {notify} from '@/lib/toast';
@@ -57,6 +58,7 @@ import {TokensPanel} from '@/components/common/settings/TokensPanel';
 import {ChangelogPanel} from '@/components/common/settings/ChangelogPanel';
 import {WatchdogPanel} from '@/components/common/settings/WatchdogPanel';
 import {UpstreamReloadNotice} from '@/components/common/settings/UpstreamReloadNotice';
+import {QoderPanel} from '@/components/common/settings/QoderPanel';
 import {CopyButton} from '@/components/ui/copy-button';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
@@ -936,6 +938,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
     upstream: {icon: <Server className="h-3.5 w-3.5" />},
     proxy: {icon: <Route className="h-3.5 w-3.5" />},
     models: {icon: <Shuffle className="h-3.5 w-3.5" />},
+    qoder: {icon: <Boxes className="h-3.5 w-3.5" />},
     users: {icon: <Users className="h-3.5 w-3.5" />},
     tokens: {icon: <KeyRound className="h-3.5 w-3.5" />},
     system: {icon: <DownloadCloud className="h-3.5 w-3.5" />},
@@ -2184,6 +2187,11 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
 
         <TabsContent value="tokens" className="mt-4 space-y-4">
           <TokensPanel />
+        </TabsContent>
+
+        {/* ═══ Qoder（qoder2api 管理面代理）═══ */}
+        <TabsContent value="qoder" className="mt-4 space-y-4">
+          <QoderPanel />
         </TabsContent>
 
         {/* ═══ 系统更新 ═══ */}

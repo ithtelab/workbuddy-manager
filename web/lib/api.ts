@@ -63,6 +63,9 @@ import type {
   UpstreamEndpoint,
   UpstreamStats,
   UpstreamStatus,
+  QoderAccount,
+  QoderConsoleConfig,
+  QoderStatus,
   UsageBreakdown,
   UsageHourPoint,
   UsagePoint,
@@ -465,6 +468,13 @@ export type UpstreamWrite = {
   auth_dir?: string;
   /** 该分组上游实例的容器名（可选）：「重启该分组」按它 docker restart。 */
   container?: string;
+  /**
+   * 上游类型（'codebuddy' | 'qoder'）。qoder 时 `api_key` 语义变为**桥接 token**
+   * （必填，不硬编码默认值——值可从 Qoder 页的 console 设置里读取）。
+   */
+  provider?: string;
+  /** 上游的版本归属（仅 qoder 消费）：'' = 不限 / 'cn' / 'global'。 */
+  realm?: string;
 };
 
 export const upstreamsApi = {
@@ -475,6 +485,31 @@ export const upstreamsApi = {
   remove: (id: number) => del<{ok: boolean}>(`/api/upstreams/${id}`),
   /** 探测该上游是否可达（走它的 /healthz）；失败原因原样返回给界面。 */
   probe: (id: number) => post<{ok: boolean; message: string}>(`/api/upstreams/${id}/probe`),
+};
+
+/* ── Qoder（qoder2api 管理面代理）─────────────────────
+ * console 的响应是**原样代理**（见 server/routers/qoder.py），字段随上游版本
+ * 演进——类型只声明界面真正消费的键。写操作是会话管理员专属（保存的是 console
+ * 的明文密码，与「保存上游」同级）。 */
+export const qoderApi = {
+  /** 配置的对外形状：只回 configured / url / password_set，密码绝不出接口 */
+  settings: () => get<QoderConsoleConfig>('/api/qoder/settings'),
+  /** password 传 null = 不修改（PATCH 语义）；空串 = 清空 */
+  saveSettings: (body: {url: string; password?: string | null}) =>
+    put<QoderConsoleConfig>('/api/qoder/settings', body),
+  /** 测试连接（无状态变更；会拿已保存的密码去登录 console） */
+  test: () => post<{ok: boolean; message: string}>('/api/qoder/settings/test'),
+  status: () => get<QoderStatus>('/api/qoder/status'),
+  accounts: () => get<{accounts?: QoderAccount[]} & Record<string, unknown>>('/api/qoder/accounts'),
+  quota: () => get<Record<string, unknown>>('/api/qoder/accounts/quota'),
+  /** console 模型视图；后端会顺手为每个 qoder 上游暖 bridge 模型缓存 */
+  models: () => get<Record<string, unknown>>('/api/qoder/models'),
+  /** console 自身设置（可能含凭据，后端收紧到会话管理员） */
+  consoleSettings: () => get<Record<string, unknown>>('/api/qoder/console-settings'),
+  checkin: () => post<Record<string, unknown>>('/api/qoder/checkin'),
+  activate: (id: string) => post<Record<string, unknown>>('/api/qoder/active', {id}),
+  bridgeStart: () => post<Record<string, unknown>>('/api/qoder/bridge/start'),
+  bridgeStop: () => post<Record<string, unknown>>('/api/qoder/bridge/stop'),
 };
 
 export const keyApi = {

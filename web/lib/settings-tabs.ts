@@ -19,6 +19,9 @@ export const SETTINGS_TABS = [
   'upstream',
   'proxy',
   'models',
+  // 「Qoder」紧挨「模型映射」：它管的是另一套上游（qoder2api）的接入与账号池，
+  // 和上游配置/模型清单回答的是同一类问题——「这个面板接了哪些模型来源」。
+  'qoder',
   'users',
   'tokens',
   'system',
@@ -60,6 +63,7 @@ export const SETTINGS_TAB_LABEL_KEYS: Record<SettingsTab, string> = {
   upstream: 'settings.tabUpstream',
   proxy: 'settings.tabProxy',
   models: 'settings.tabModels',
+  qoder: 'settings.tabQoder',
   users: 'settings.tabUsers',
   tokens: 'settings.tabTokens',
   system: 'settings.tabSystem',

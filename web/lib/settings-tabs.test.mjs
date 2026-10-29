@@ -39,10 +39,10 @@ function check(name, got, want) {
 /* ── 清单本身 ─────────────────────────────────────────────────── */
 
 check(
-  '清单就是这 10 项，顺序固定（导航顺序 = 路由顺序 = i18n 键顺序）',
+  '清单就是这 11 项，顺序固定（导航顺序 = 路由顺序 = i18n 键顺序）',
   SETTINGS_TABS,
-  ['upstream', 'proxy', 'models', 'users', 'tokens', 'system', 'watchdog',
-   'backup', 'changelog', 'about'],
+  ['upstream', 'proxy', 'models', 'qoder', 'users', 'tokens', 'system',
+   'watchdog', 'backup', 'changelog', 'about'],
 );
 
 check('清单里没有重复项', new Set(SETTINGS_TABS).size, SETTINGS_TABS.length);

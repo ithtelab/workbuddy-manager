@@ -48,10 +48,11 @@ _NODE = shutil.which('node')
 # 只跑 .mjs，不碰 .ts —— Node 的 type stripping 从 22.6 起才有
 _MIN_MAJOR = 22
 
-# 面板里的条目数：底栏 8 个目的地 + 被吸收的 3 页 + 设置页 10 个 Tab（含代理与监控）。
-# 写死是**有意**的：数量变了说明有人加了页面却没想清楚它该出现在哪，
-# 那一步值得被问一句。三处来源的并集也在同一条断言里交叉核对。
-_EXPECTED_TOTAL = 21
+# 面板里的条目数：底栏 8 个目的地 + 被吸收的 3 页 + 设置页 11 个 Tab（含代理、
+# 监控与 Qoder——Qoder 融合批次从 10 → 11）。写死是**有意**的：数量变了说明
+# 有人加了页面却没想清楚它该出现在哪，那一步值得被问一句。
+# 三处来源的并集也在同一条断言里交叉核对。
+_EXPECTED_TOTAL = 22
 
 # 必须渲染出来的定位标记。验收脚本按它们断言；少一个就有一条断言恒真。
 _REQUIRED_SLOTS = (
@@ -195,8 +196,8 @@ class CommandPaletteInvariantTest(unittest.TestCase):
             f'从 section-nav.ts 里解析出 {len(self.sections)} 项（期望 6）：{self.sections}',
         )
         self.assertEqual(
-            len(self.settings), 10,
-            f'从 settings-tabs.ts 里解析出 {len(self.settings)} 个 Tab（期望 10）：{self.settings}',
+            len(self.settings), 11,
+            f'从 settings-tabs.ts 里解析出 {len(self.settings)} 个 Tab（期望 11）：{self.settings}',
         )
         self.assertGreaterEqual(
             len(self.entries), _EXPECTED_TOTAL,

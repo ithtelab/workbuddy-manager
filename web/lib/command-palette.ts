@@ -108,6 +108,8 @@ export const NAV_COMMANDS: readonly NavSeed[] = [
    keywords: 'proxy route socks5 egress 代理 线路 出口'},
   {href: '/settings/models', labelKey: 'settings.tabModels', groupKey: 'nav.settings',
    keywords: 'model map alias 模型 映射 别名'},
+  {href: '/settings/qoder', labelKey: 'settings.tabQoder', groupKey: 'nav.settings',
+   keywords: 'qoder bridge console bridge token 桥接 控制台'},
   {href: '/settings/users', labelKey: 'settings.tabUsers', groupKey: 'nav.settings',
    keywords: 'users user member 用户 成员'},
   {href: '/settings/tokens', labelKey: 'settings.tabTokens', groupKey: 'nav.settings',

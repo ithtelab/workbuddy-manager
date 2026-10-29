@@ -424,10 +424,60 @@ export interface UpstreamEndpoint {
    * 空串 = 不能从面板重启（账号文件的增删改由上游热加载自动收录）。
    */
   container: string;
+  /**
+   * 上游类型（'codebuddy' | 'qoder'）。qoder = 该接入点是一个 qoder2api bridge：
+   * 模型清单裁剪、版本隔离与探活走 qoder 分支（见 server/upstreamsvc.py）。
+   */
+  provider: string;
+  /**
+   * 上游的版本归属（仅 qoder 消费）：'' = 不限；'cn' / 'global' 与密钥的 realm
+   * 做「密钥×上游」匹配。codebuddy 行恒为 ''。
+   */
+  realm: string;
   /** 有多少把密钥绑定在它上面（默认上游那行 = 未绑定上游的密钥数） */
   bound_keys: number;
   created_at?: number | null;
   updated_at?: number | null;
+}
+
+/* ── Qoder（qoder2api 管理面代理，见 server/services/qoder.py）───────── */
+
+/**
+ * Qoder 控制台连接配置的**对外形状**。密码 write-only：
+ * 只回「有没有配」，明文绝不出接口（与 github_token 同口径）。
+ */
+export interface QoderConsoleConfig {
+  configured: boolean;
+  url: string;
+  password_set: boolean;
+}
+
+/**
+ * console `/api/status` 的原样代理形状。上游字段会随版本增加，这里只声明
+ * 界面真正读的键，其余照 raw 透传——不要为了「类型好看」去猜上游没承诺的字段。
+ */
+export interface QoderStatus {
+  running?: boolean;
+  port?: number;
+  active_account?: string;
+  api_mode?: string;
+  cn_active?: string;
+  global_active?: string;
+  global_running?: boolean;
+  [key: string]: unknown;
+}
+
+/** console `/api/accounts` 的账号条目（refs/qoder2api/account/model.go 的可见子集）。 */
+export interface QoderAccount {
+  id?: string;
+  name?: string;
+  email?: string;
+  region?: string;
+  plan?: string;
+  auth_mode?: string;
+  api_mode?: string;
+  active?: boolean;
+  [key: string]: unknown;
 }
 
 export interface ApiKey {
