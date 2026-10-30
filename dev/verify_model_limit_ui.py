@@ -1,13 +1,7 @@
-"""模型受限徽章显示具体模型名的验收（用户反馈）——真服务 + 真浏览器。
+"""模型受限入口与详情验收（模拟上游 + 真服务 + 真浏览器）。
 
-用户看到的是「模型受限（2 个模型）」，看不出是哪两个模型，于是没法换模型、
-也没法告诉调用方避开。这个脚本造三个账号（受限 1 / 2 / 4 个模型），交给
-`dev/verify_model_limit.mjs` 断言徽章里给的是**模型名**，并在多于两个时用
-「+N」带过、完整清单留在悬停里。
-
-    python dev/verify_model_limit_ui.py
-
-数据落在 dev/.model-limit/（已 gitignore），截图在 dev/.shots-model-limit/。
+造受限 1 / 2 / 4 个模型的账号，验证「模型受限」/「+1」/「+3」及点击后的完整清单。
+运行 python dev/verify_model_limit_ui.py；数据和截图沿用 dev/.model-limit 与 dev/.shots-model-limit。
 """
 from __future__ import annotations
 

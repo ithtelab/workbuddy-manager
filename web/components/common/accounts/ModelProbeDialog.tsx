@@ -1,7 +1,7 @@
 'use client';
 
 import {useMemo, useRef, useState} from 'react';
-import {Loader2, ScanSearch, TriangleAlert} from 'lucide-react';
+import {CheckCheck, Loader2, ScanSearch, TriangleAlert, X} from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {
   Dialog,
@@ -79,6 +79,7 @@ export function ModelProbeDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState<ProbeModelsResponse | null>(null);
+  const [resultSelection, setResultSelection] = useState<{accounts: Account[]; models: string[]}>({accounts: [], models: []});
   const [completed, setCompleted] = useState(0);
   const [stopping, setStopping] = useState(false);
   const stopRequested = useRef(false);
@@ -107,6 +108,11 @@ export function ModelProbeDialog({
     setBusy(true);
     setError('');
     setResult(null);
+    // 结果属于本次探测；为下一次勾选账号/模型时，不重画旧结果的行列。
+    setResultSelection({
+      accounts: accounts.filter((a) => pickedAccounts.includes(a.file)),
+      models: [...pickedModels],
+    });
     setCompleted(0);
     setStopping(false);
     stopRequested.current = false;
@@ -136,8 +142,8 @@ export function ModelProbeDialog({
 
   return (
     <Dialog open={open} onOpenChange={(v) => { if (!busy) onOpenChange(v); }}>
-      <DialogContent className="max-h-[88vh] max-w-[760px] overflow-y-auto">
-        <DialogHeader>
+      <DialogContent className="flex max-h-[88vh] min-w-0 max-w-[760px] flex-col">
+        <DialogHeader className="shrink-0">
           <DialogTitle className="flex items-center gap-2">
             <ScanSearch className="size-4" />
             {t('accounts.probeTitle')}
@@ -147,166 +153,175 @@ export function ModelProbeDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="grid gap-4 sm:grid-cols-2">
-          {/* 账号 */}
-          <div>
-            <div className="mb-1 flex items-center justify-between text-xs font-medium">
-              <span>{t('accounts.probeAccounts')}</span>
-              <button
-                type="button"
-                disabled={busy}
-                className="text-[11px] text-primary hover:underline"
-                onClick={() => setPickedAccounts(
-                  pickedAccounts.length === accounts.length ? [] : accounts.map((a) => a.file),
-                )}
-              >
-                {pickedAccounts.length === accounts.length ? t('accounts.probeClear') : t('accounts.probeSelectAll')}
-              </button>
-            </div>
-            <div className="max-h-[150px] overflow-y-auto rounded-xl border p-2">
-              {accounts.length === 0 && (
-                <div className="p-2 text-[11px] text-muted-foreground">
-                  {t('dashboard.noAccounts')}
-                </div>
-              )}
-              {accounts.map((a) => (
-                <label key={a.file}
-                       className="flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-[12px] hover:bg-muted">
-                  <input
-                    type="checkbox"
-                    disabled={busy}
-                    checked={pickedAccounts.includes(a.file)}
-                    onChange={() => setPickedAccounts((v) => toggle(v, a.file))}
-                  />
-                  <span className="truncate">{a.nickname || a.uid || a.file}</span>
-                </label>
-              ))}
-            </div>
-          </div>
-
-          {/* 模型 */}
-          <div>
-            <div className="mb-1 flex items-center justify-between text-xs font-medium">
-              <span>{t('accounts.probeModels')}</span>
-              <button
-                type="button"
-                disabled={busy}
-                className="text-[11px] text-primary hover:underline"
-                onClick={() => setPickedModels(
-                  pickedModels.length === models.length ? [] : models.map((m) => m.id),
-                )}
-              >
-                {pickedModels.length === models.length ? t('accounts.probeClear') : t('accounts.probeSelectAll')}
-              </button>
-            </div>
-            <div className="max-h-[150px] overflow-y-auto rounded-xl border p-2">
-              {models.length === 0 && (
-                <div className="p-2 text-[11px] text-muted-foreground">
-                  {t('accounts.probeNoModels')}
-                </div>
-              )}
-              {models.map((m) => (
-                <label key={m.id}
-                       className="flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-[12px] hover:bg-muted">
-                  <input
-                    type="checkbox"
-                    disabled={busy}
-                    checked={pickedModels.includes(m.id)}
-                    onChange={() => setPickedModels((v) => toggle(v, m.id))}
-                  />
-                  <span className="truncate" title={m.id}>{m.name || m.id}</span>
-                </label>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-          <span>{t('accounts.probeRequests', {n: combos})}</span>
-          <span>{t('accounts.probeBatchProgress', {done: completed, total: combos, batches: batches.length})}</span>
-          <button type="button" className="text-primary hover:underline" disabled={busy}
+        <div className="min-h-0 min-w-0 space-y-3 overflow-y-auto px-6 pb-2">
+          <div className="grid min-w-0 gap-4 sm:grid-cols-2">
+            {/* 账号 */}
+            <div className="min-w-0">
+              <div className="mb-1 flex items-center justify-between text-xs font-medium">
+                <span>{t('accounts.probeAccounts')}</span>
+                <Button
+                  type="button"
+                  variant="outline" size="sm"
+                  disabled={busy || accounts.length === 0}
+                  className="h-7 cursor-pointer gap-1 rounded-full text-[11px]"
                   onClick={() => {
-                    const restricted = accounts.filter((a) => (a.rate_limited_models ?? []).some((m) => m.reason?.startsWith('11102')));
-                    setPickedAccounts(restricted.map((a) => a.file));
-                    setPickedModels([...new Set(restricted.flatMap((a) => (a.rate_limited_models ?? [])
-                      .filter((m) => m.reason?.startsWith('11102')).map((m) => m.model)))]);
-                  }}>
-            {t('accounts.probeSelectRestricted')}
-          </button>
-        </div>
-        <p className="text-[11px] leading-relaxed text-muted-foreground">{t('accounts.probeAutoRecoveryHint')}</p>
-        {busy && <progress className="h-1.5 w-full accent-primary" max={Math.max(1, combos)} value={completed} />}
+                    setPickedAccounts(pickedAccounts.length === accounts.length ? [] : accounts.map((a) => a.file));
+                    setCompleted(0);
+                  }}
+                >
+                  {pickedAccounts.length === accounts.length ? <X className="size-3" /> : <CheckCheck className="size-3" />}
+                  {pickedAccounts.length === accounts.length ? t('accounts.probeClear') : t('accounts.probeSelectAll')}
+                </Button>
+              </div>
+              <div className="max-h-[150px] overflow-y-auto rounded-xl border p-2">
+                {accounts.length === 0 && (
+                  <div className="p-2 text-[11px] text-muted-foreground">
+                    {t('dashboard.noAccounts')}
+                  </div>
+                )}
+                {accounts.map((a) => (
+                  <label key={a.file}
+                         className="flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-[12px] hover:bg-muted">
+                    <input
+                      type="checkbox"
+                      disabled={busy}
+                      checked={pickedAccounts.includes(a.file)}
+                      onChange={() => { setPickedAccounts((v) => toggle(v, a.file)); setCompleted(0); }}
+                    />
+                    <span className="truncate">{a.nickname || a.uid || a.file}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
 
-        {error && (
-          <div className="flex items-start gap-2 rounded-xl bg-red-500/10 px-3 py-2 text-[11px] text-red-600">
-            <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
-            <span>{error}</span>
+            {/* 模型 */}
+            <div className="min-w-0">
+              <div className="mb-1 flex items-center justify-between text-xs font-medium">
+                <span>{t('accounts.probeModels')}</span>
+                <Button
+                  type="button"
+                  variant="outline" size="sm"
+                  disabled={busy || models.length === 0}
+                  className="h-7 cursor-pointer gap-1 rounded-full text-[11px]"
+                  onClick={() => {
+                    setPickedModels(pickedModels.length === models.length ? [] : models.map((m) => m.id));
+                    setCompleted(0);
+                  }}
+                >
+                  {pickedModels.length === models.length ? <X className="size-3" /> : <CheckCheck className="size-3" />}
+                  {pickedModels.length === models.length ? t('accounts.probeClear') : t('accounts.probeSelectAll')}
+                </Button>
+              </div>
+              <div className="max-h-[150px] overflow-y-auto rounded-xl border p-2">
+                {models.length === 0 && (
+                  <div className="p-2 text-[11px] text-muted-foreground">
+                    {t('accounts.probeNoModels')}
+                  </div>
+                )}
+                {models.map((m) => (
+                  <label key={m.id}
+                         className="flex cursor-pointer items-center gap-2 rounded-md px-1.5 py-1 text-[12px] hover:bg-muted">
+                    <input
+                      type="checkbox"
+                      disabled={busy}
+                      checked={pickedModels.includes(m.id)}
+                      onChange={() => { setPickedModels((v) => toggle(v, m.id)); setCompleted(0); }}
+                    />
+                    <span className="truncate" title={m.id}>{m.name || m.id}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
           </div>
-        )}
 
-        {result && (
-          <div className="space-y-2">
-            <div className="flex flex-wrap gap-1.5">
-              <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
-                {t('accounts.probeSynced', {n: result.results.filter((r) => r.gateway_synced).length})}
-              </span>
-              {STATUS_ORDER.filter((s) => (result.summary[s] ?? 0) > 0).map((s) => (
-                <span key={s}
-                      className={`rounded-full px-2 py-0.5 text-[10px] ${STATUS_STYLE[s]}`}>
-                  {t(STATUS_KEY[s])} {result.summary[s]}
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+            <span>{t('accounts.probeRequests', {n: combos})}</span>
+            <span>{t('accounts.probeBatchProgress', {done: completed, total: combos, batches: batches.length})}</span>
+            <button type="button" className="text-primary hover:underline" disabled={busy}
+                    onClick={() => {
+                      const restricted = accounts.filter((a) => (a.rate_limited_models ?? []).some((m) => m.reason?.startsWith('11102')));
+                      setPickedAccounts(restricted.map((a) => a.file));
+                      setPickedModels([...new Set(restricted.flatMap((a) => (a.rate_limited_models ?? [])
+                        .filter((m) => m.reason?.startsWith('11102')).map((m) => m.model)))]);
+                      setCompleted(0);
+                    }}>
+              {t('accounts.probeSelectRestricted')}
+            </button>
+          </div>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">{t('accounts.probeAutoRecoveryHint')}</p>
+          {busy && <progress className="h-1.5 w-full accent-primary" max={Math.max(1, combos)} value={completed} />}
+
+          {error && (
+            <div className="flex items-start gap-2 rounded-xl bg-red-500/10 px-3 py-2 text-[11px] text-red-600">
+              <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+
+          {result && (
+            <div className="min-w-0 space-y-2">
+              <div className="flex flex-wrap gap-1.5">
+                <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] text-primary">
+                  {t('accounts.probeSynced', {n: result.results.filter((r) => r.gateway_synced).length})}
                 </span>
-              ))}
-            </div>
-            {result.results.some((r) => r.gateway_synced === false && !r.gateway_sync_skipped) && (
-              <p className="text-[11px] text-amber-600">{t('accounts.probeSyncFailed')}</p>
-            )}
-            <div className="max-h-[32vh] overflow-auto rounded-xl border">
-              <table className="w-full border-collapse text-[11px]">
-                <thead className="sticky top-0 z-10 bg-background">
-                  <tr className="border-b bg-muted/50">
-                    <th className="whitespace-nowrap px-2 py-1.5 text-left font-medium">
-                      {t('accounts.probeAccounts')}
-                    </th>
-                    {pickedModels.map((m) => (
-                      <th key={m} className="whitespace-nowrap px-2 py-1.5 text-center font-medium"
-                          title={m}>
-                        {modelName(m)}
+                {STATUS_ORDER.filter((s) => (result.summary[s] ?? 0) > 0).map((s) => (
+                  <span key={s}
+                        className={`whitespace-nowrap rounded-full px-2 py-0.5 text-[10px] ${STATUS_STYLE[s]}`}>
+                    {t(STATUS_KEY[s])} {result.summary[s]}
+                  </span>
+                ))}
+              </div>
+              {result.results.some((r) => r.gateway_synced === false && !r.gateway_sync_skipped) && (
+                <p className="text-[11px] text-amber-600">{t('accounts.probeSyncFailed')}</p>
+              )}
+              <div className="max-h-[32vh] min-w-0 max-w-full overflow-auto rounded-xl border">
+                <table className="w-full border-collapse text-[11px]">
+                  <thead className="sticky top-0 z-10 bg-background">
+                    <tr className="border-b bg-muted/50">
+                      <th className="whitespace-nowrap px-2 py-1.5 text-left font-medium">
+                        {t('accounts.probeAccounts')}
                       </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {accounts.filter((a) => pickedAccounts.includes(a.file)).map((a) => (
-                    <tr key={a.file} className="border-b last:border-0">
-                      <td className="max-w-[160px] truncate px-2 py-1.5" title={a.file}>
-                        {a.nickname || a.uid || a.file}
-                      </td>
-                      {pickedModels.map((m) => {
-                        const r = matrix.get(`${a.file}\u0000${m}`);
-                        return (
-                          <td key={m} className="px-1.5 py-1 text-center">
-                            {r ? (
-                              <span
-                                className={`inline-block rounded-full px-2 py-0.5 ${STATUS_STYLE[r.status]}`}
-                                title={`${t(STATUS_KEY[r.status])}\n${r.message}${r.gateway_sync_message ? `\n${r.gateway_sync_message}` : ''}`}
-                              >
-                                {t(STATUS_KEY[r.status])}
-                              </span>
-                            ) : (
-                              <span className="text-muted-foreground">—</span>
-                            )}
-                          </td>
-                        );
-                      })}
+                      {resultSelection.models.map((m) => (
+                        <th key={m} className="whitespace-nowrap px-2 py-1.5 text-center font-medium"
+                            title={m}>
+                          {modelName(m)}
+                        </th>
+                      ))}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {resultSelection.accounts.map((a) => (
+                      <tr key={a.file} className="border-b last:border-0">
+                        <td className="max-w-[160px] truncate px-2 py-1.5" title={a.file}>
+                          {a.nickname || a.uid || a.file}
+                        </td>
+                        {resultSelection.models.map((m) => {
+                          const r = matrix.get(`${a.file}\u0000${m}`);
+                          return (
+                            <td key={m} className="px-1.5 py-1 text-center">
+                              {r ? (
+                                <span
+                                  className={`inline-block whitespace-nowrap rounded-full px-2 py-0.5 ${STATUS_STYLE[r.status]}`}
+                                  title={`${t(STATUS_KEY[r.status])}\n${r.message}${r.gateway_sync_message ? `\n${r.gateway_sync_message}` : ''}`}
+                                >
+                                  {t(STATUS_KEY[r.status])}
+                                </span>
+                              ) : (
+                                <span className="text-muted-foreground">—</span>
+                              )}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
 
-        <DialogFooter className="sticky bottom-0 bg-background pt-2">
+        <DialogFooter className="shrink-0 pt-2">
           <Button variant="ghost" size="sm" className="rounded-full"
                   disabled={stopping} onClick={() => {
                     if (busy) { stopRequested.current = true; setStopping(true); }

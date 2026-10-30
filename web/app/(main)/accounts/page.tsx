@@ -73,6 +73,7 @@ import {AccountWeightDialog} from '@/components/common/accounts/AccountWeightDia
 import {MoveAccountDialog} from '@/components/common/accounts/MoveAccountDialog';
 import {UpstreamFormDialog} from '@/components/common/upstreams/UpstreamFormDialog';
 import {AccountCoolingDialog} from '@/components/common/accounts/AccountCoolingDialog';
+import {AccountModelLimitsDialog} from '@/components/common/accounts/AccountModelLimitsDialog';
 import {AccountTaskDialog} from '@/components/common/accounts/AccountTaskDialog';
 import {ReloginQueueDialog} from '@/components/common/accounts/ReloginQueue';
 import {ModelProbeDialog} from '@/components/common/accounts/ModelProbeDialog';
@@ -131,6 +132,7 @@ export default function AccountsPage() {
   // 权重写上游账号文件，混在一起容易让人以为「改了不用重启」。
   const [weightTarget, setWeightTarget] = useState<Account | null>(null);
   const [coolingTarget, setCoolingTarget] = useState<Account | null>(null);
+  const [modelLimitTarget, setModelLimitTarget] = useState<Account | null>(null);
   // 活动任务（单账号执行成长任务）的目标账号；null = 对话框关闭
   const [taskTarget, setTaskTarget] = useState<Account | null>(null);
   /** 账号 × 模型主动探测（issue #270） */
@@ -715,10 +717,10 @@ export default function AccountsPage() {
       return (
         <Badge
           variant="secondary"
-          className="rounded-full text-amber-600 dark:text-amber-400"
+          className="max-w-full flex-wrap justify-start whitespace-normal rounded-full text-left text-amber-600 dark:text-amber-400"
           title={tip || undefined}
         >
-          {label}{left ? ` · ${left}` : ''}
+          <span>{label}{left ? ` · ${left}` : ''}</span>
           {total > 0 && <span className="ml-1 opacity-70">{t('accounts.modelsCount', {count: total, n: total})}</span>}
         </Badge>
       );
@@ -769,51 +771,19 @@ export default function AccountsPage() {
     );
   }
 
-  /** 模型级限流标记（issue #43）。
-   *
-   *  为什么单独做一个徽章、而不是并进状态列：**账号本身是在线的**，只是某个
-   *  模型暂时被腾讯限流（6004）。用户的实际观察是「换个模型就能继续用」，
-   *  但状态列显示「在线」，于是「这个模型用不了」这件事在面板上完全不可见
-   *  —— 有人只能进容器翻 state.json 才知道。
-   *
-   *  所以它与状态徽章**并列**展示（不是替代）：账号确实可用，只是有模型受限。
-   *  徽章里列具体有哪些模型受限，悬停再给出每个模型的恢复时间——上游台账里
-   *  带权威的重置时刻。 */
+  /** 模型详情按需展开，避免长模型名或大量受限模型撑高账号行。 */
   function renderModelLimit(a: Account) {
     const limited = rateLimitedModels(a);
     if (!limited.length) return null;
-    const sep = t('common.listSeparator');
-    const lines = limited.map((m) => {
-      const until = a.rate_limited_models?.find((x) => x.model === m.model)?.until;
-      // 用统一格式化（跟随界面语言，并带日期）：只给时分秒时跨天就分不清
-      // 「今晚恢复」还是「明晚恢复」。
-      const at = until ? fmtDateTime(Date.parse(until) / 1000) : '';
-      // 11102（该账号没有这个模型）与 6004（限流）含义不同：前者等多久都不会好，
-      // 该换模型；后者等一会儿就恢复。上游的 reason 前缀就是判据。
-      const why = m.reason.startsWith('11102')
-        ? t('accounts.modelMissing')
-        : at
-          ? t('accounts.modelLimitUntil', {at})
-          : t('accounts.modelLimited');
-      return `${m.model} · ${why}`;
-    });
-    // 徽章里**直接给出模型名**（用户反馈：只知道「有 2 个模型受限」不够用，得知道
-    // 是哪些，才能换模型或者告诉调用方避开它们）。名字可能很长（`global:` 前缀的
-    // 型号尤甚），所以最多列两个，其余用「+N」带过；完整清单与各自恢复时间仍在
-    // 悬停里——那里才是逐条说明的地方。
-    const MAX_INLINE = 2;
-    const names = limited.slice(0, MAX_INLINE).map((m) => m.model).join(sep);
-    const shown = limited.length > MAX_INLINE
-      ? `${names} +${limited.length - MAX_INLINE}`
-      : names;
     return (
-      <Badge
-        variant="secondary"
-        className="rounded-full text-amber-600 dark:text-amber-400"
-        title={[t('accounts.modelLimitTitle'), ...lines].join(String.fromCharCode(10))}
+      <Button
+        variant="outline" size="sm"
+        className="h-auto max-w-full cursor-pointer whitespace-normal rounded-lg px-2 py-1 text-left text-[11px] text-amber-600 dark:text-amber-400"
+        aria-haspopup="dialog"
+        onClick={() => setModelLimitTarget(a)}
       >
-        {t('accounts.modelLimitBadge', {models: shown})}
-      </Badge>
+        {t('accounts.modelLimitBadge', {extra: limited.length > 1 ? ` +${limited.length - 1}` : ''})}
+      </Button>
     );
   }
 
@@ -854,38 +824,38 @@ export default function AccountsPage() {
           ? 'text-amber-600 dark:text-amber-400'
           : 'text-foreground';
     return (
-      // 固定列宽后这一列只有 12%：余额 + 来源徽标 + 到期倒计时挤在一行会**溢出**
-      // 并被下一列裁掉（issue #298 的现场就是「到期信息被 token 有效期列遮挡」）。
-      // 允许换行：空间够时仍是一行，窄窗口下倒计时自动落到第二行，而不是被切掉。
-      <span className="inline-flex max-w-full flex-wrap items-center gap-1.5">
-        <span className={`text-xs font-medium tabular-nums ${tone}`} title={t('accounts.creditsTitle')}>
-          {fmtNumber(value)}
-        </span>
-        {fromSnapshot ? (
-          <span
-            className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] leading-3 text-muted-foreground"
-            title={t('accounts.snapshotTitle')}
-          >
-            {t('accounts.snapshot')}
+      // 余额与来源放在首行，到期提示固定放在下方并左对齐。
+      <span className="inline-flex max-w-full flex-col items-start gap-1.5">
+        <span className="inline-flex max-w-full flex-wrap items-center gap-1.5">
+          <span className={`text-xs font-medium tabular-nums ${tone}`} title={t('accounts.creditsTitle')}>
+            {fmtNumber(value)}
           </span>
-        ) : (
-          meta &&
-          (meta.cached ? (
+          {fromSnapshot ? (
             <span
-              className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-amber-600 dark:text-amber-400"
-              title={t('accounts.cacheTitle')}
+              className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] leading-3 text-muted-foreground"
+              title={t('accounts.snapshotTitle')}
             >
-              {meta.cache_age != null ? t('accounts.cacheAge', {n: meta.cache_age}) : t('accounts.cache')}
+              {t('accounts.snapshot')}
             </span>
           ) : (
-            <span
-              className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-emerald-600 dark:text-emerald-400"
-              title={t('accounts.liveTitle')}
-            >
-              {t('accounts.live')}
-            </span>
-          ))
-        )}
+            meta &&
+            (meta.cached ? (
+              <span
+                className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-amber-600 dark:text-amber-400"
+                title={t('accounts.cacheTitle')}
+              >
+                {meta.cache_age != null ? t('accounts.cacheAge', {n: meta.cache_age}) : t('accounts.cache')}
+              </span>
+            ) : (
+              <span
+                className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] leading-3 text-emerald-600 dark:text-emerald-400"
+                title={t('accounts.liveTitle')}
+              >
+                {t('accounts.live')}
+              </span>
+            ))
+          )}
+        </span>
         <CreditCountdown expiries={fromSnapshot ? undefined : meta?.expiries} />
       </span>
     );
@@ -1594,8 +1564,8 @@ export default function AccountsPage() {
           <TableHeader>
             <TableRow className="border-b border-border/60 hover:bg-transparent">
               <TableHead className="w-[17%] pl-4 text-[11px] text-muted-foreground">{t('accounts.colNickname')}</TableHead>
-              <TableHead className="w-[19%] text-[11px] text-muted-foreground">UID</TableHead>
-              <TableHead className="w-[9%] text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
+              <TableHead className="w-[14%] text-[11px] text-muted-foreground">UID</TableHead>
+              <TableHead className="w-[14%] text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
               <TableHead className="w-[14%] text-[11px] text-muted-foreground">{t('metric.credits')}</TableHead>
               <TableHead className="w-[13%] text-[11px] text-muted-foreground">{t('accounts.colExpiry')}</TableHead>
               {hasProxyUi && <TableHead className="w-[10%] text-[11px] text-muted-foreground">{t('accounts.proxyLine')}</TableHead>}
@@ -1631,9 +1601,7 @@ export default function AccountsPage() {
                   <div className="flex flex-wrap items-center gap-1.5">
                     {renderStatus(a)}
                   </div>
-                  {/* 模型限流/缺模的提示放在状态**下面**另起一行：原先它与状态徽章
-                      挤在同一个 flex 行里，长模型名会把这一列撑宽、盖住右侧 UID 列
-                      （issue #313）。整行宽度给它，长名字也能读全。 */}
+                  {/* 状态与模型受限入口分行显示，详情点击展开。 */}
                   {renderModelLimit(a) && (
                     <div className="mt-1 max-w-full">{renderModelLimit(a)}</div>
                   )}
@@ -1784,6 +1752,11 @@ export default function AccountsPage() {
         onOpenChange={(open) => { if (!open) setCoolingTarget(null); }}
         onSuccess={reloadAll}
         upstreamId={groupId}
+      />
+      <AccountModelLimitsDialog
+        account={modelLimitTarget}
+        open={modelLimitTarget !== null}
+        onOpenChange={(open) => { if (!open) setModelLimitTarget(null); }}
       />
       <AccountTaskDialog
         account={taskTarget}
