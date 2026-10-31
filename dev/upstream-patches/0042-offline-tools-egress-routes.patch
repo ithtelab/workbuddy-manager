@@ -1,0 +1,267 @@
+diff --git a/cmd/activity/main.go b/cmd/activity/main.go
+index 6f79141..fa6ac4b 100644
+--- a/cmd/activity/main.go
++++ b/cmd/activity/main.go
+@@ -115,6 +115,9 @@ func main() {
+ // 但 GlobalEnabled=false 会把工具自造的 global 账号请求路由到 CN base（codebuddy.cn）而必然失败。
+ // 与 cmd/signin、cmd/credit、cmd/trial 同风格：显式接线，避免 Producer 误读成「未适配」。
+ func newUpstream(c *cfgFile) *upstream.Client {
++	// 出口线路（issue #210 补充）：独立二进制必须自己加载 proxies 段，
++	// 否则账号绑定的线路名解析不到，上报请求会走家宽出口或直接报错。
++	upstream.LoadRoutesAndLog(log.Printf)
+ 	up := upstream.New()
+ 	up.GlobalEnabled = true
+ 	if c.Upstream.TimeoutSeconds > 0 {
+diff --git a/cmd/credit/main.go b/cmd/credit/main.go
+index 70a7f92..95136e1 100644
+--- a/cmd/credit/main.go
++++ b/cmd/credit/main.go
+@@ -18,6 +18,7 @@ package main
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"log"
+ 	"os"
+ 	"time"
+ 
+@@ -42,6 +43,9 @@ func main() {
+ 	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
+ 		authDir = v
+ 	}
++	// 出口线路（issue #210 补充）：查积分同样是上游请求，绑了线路的账号必须从
++	// 对应出口走，否则「查余额」这一个动作就足以把家宽 IP 暴露给平台。
++	upstream.LoadRoutesAndLog(log.Printf)
+ 	up := upstream.New()
+ 	up.GlobalEnabled = true // 允许按 realm 路由：global 账查积分走 workbuddy.ai
+ 	accounts := collect(authDir, up)
+diff --git a/cmd/signin/main.go b/cmd/signin/main.go
+index d145354..9560236 100644
+--- a/cmd/signin/main.go
++++ b/cmd/signin/main.go
+@@ -37,6 +37,10 @@ func main() {
+ 		fmt.Fprintf(os.Stderr, "no auth files in %s\n", dir)
+ 		os.Exit(1)
+ 	}
++	// 出口线路（issue #210 补充）：独立二进制不走 cmd/server 的 config 解析，
++	// 必须自己读 config.json 的 proxies 段，否则绑了线路的账号在这里会直接报
++	// 「出口线路不可用」，没绑的则静默走家宽默认出口——两者都不是想要的。
++	upstream.LoadRoutesAndLog(log.Printf)
+ 	up := upstream.New()
+ 	// 允许按 realm 路由：global 账号的签到/余额会打到 global base（workbuddy.ai），
+ 	// 由幂等码兜底为「未开启/不适用」，而不是误打到 CN base 产生签到成功的假象。
+diff --git a/cmd/trial/main.go b/cmd/trial/main.go
+index fe9776d..dd43a8e 100644
+--- a/cmd/trial/main.go
++++ b/cmd/trial/main.go
+@@ -21,6 +21,7 @@ package main
+ 
+ import (
+ 	"fmt"
++	"log"
+ 	"os"
+ 	"path/filepath"
+ 
+@@ -71,6 +72,8 @@ func main() {
+ 		fmt.Fprintf(os.Stderr, "no auth files in %s\n", authDir)
+ 		os.Exit(1)
+ 	}
++	// 出口线路（issue #210 补充）：trial 同样是上游写请求，必须按账号线路出站。
++	upstream.LoadRoutesAndLog(log.Printf)
+ 	up := upstream.New()
+ 	// trial 是 global 专属端点：必须开启 global realm 路由，否则 upstream.New() 的
+ 	// GlobalEnabled 零值 false 会把请求路由到 CN base（codebuddy.cn）而必然失败。
+diff --git a/internal/upstream/routes_file.go b/internal/upstream/routes_file.go
+new file mode 100644
+index 0000000..8b23bd2
+--- /dev/null
++++ b/internal/upstream/routes_file.go
+@@ -0,0 +1,83 @@
++package upstream
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// 账号级出口线路的「非 server 入口」加载器（issue #210 补齐）。
++//
++// 背景：线路表原先只在 cmd/server 启动时由 config 包解析后 ConfigureProxies 注入。
++// 独立二进制（cmd/signin、cmd/trial、cmd/activity、cmd/credit）直接用
++// upstream.New() 发上游请求，线路表为空，于是**账号绑了线路时这些工具全部报
++// 「账号 X 出口线路不可用：上游没有配置任何线路」**——看起来像隔离生效了，实际是
++// 工具根本跑不起来；不报错的那几条路径则退回进程级默认出口（家宽 IP）。
++//
++// 这里提供只读 `proxies` 段的最小加载器，与 cmd/server 的 Config.Proxies 同一份真源
++// （同一个 config.json 的同一个键），不引入第二套线路配置。
++
++// defaultConfigPath 容器内默认配置位置（与 docker-compose 的 -config 入参一致）。
++const defaultConfigPath = "/app/conf/config.json"
++
++// ConfigPathFromEnv 返回独立二进制应读取的 config.json 路径（不保证文件存在）。
++//
++// 解析顺序：$WB2A_CONFIG → 当前目录 config.json → /app/conf/config.json。
++func ConfigPathFromEnv() string {
++	if v := strings.TrimSpace(os.Getenv("WB2A_CONFIG")); v != "" {
++		return v
++	}
++	if _, err := os.Stat("config.json"); err == nil {
++		if abs, aerr := filepath.Abs("config.json"); aerr == nil {
++			return abs
++		}
++		return "config.json"
++	}
++	return defaultConfigPath
++}
++
++// LoadRoutesFromFile 读取 config.json 的 proxies 段并注入线路表，返回已加载线路名（升序）。
++//
++// 语义与 cmd/server 一致：未配置 proxies 段 → 空表、nil 错误（不报错，行为等同「全部走默认出口」）；
++// 文件读不到 / 解析失败 → 返回错误，调用方应打日志后继续（工具本身仍可用，只是绑了线路的账号会显式报错）。
++func LoadRoutesFromFile(path string) ([]string, error) {
++	if strings.TrimSpace(path) == "" {
++		path = ConfigPathFromEnv()
++	}
++	raw, err := os.ReadFile(path)
++	if err != nil {
++		return nil, fmt.Errorf("读取配置 %s: %w", path, err)
++	}
++	var doc struct {
++		Proxies map[string]string `json:"proxies"`
++	}
++	if err := json.Unmarshal(raw, &doc); err != nil {
++		return nil, fmt.Errorf("解析配置 %s: %w", path, err)
++	}
++	ConfigureProxies(doc.Proxies)
++	return RouteNames(), nil
++}
++
++// LoadRoutesFromEnv 是 LoadRoutesFromFile 的默认路径版本，供各 cmd main 一行接线。
++func LoadRoutesFromEnv() ([]string, error) {
++	return LoadRoutesFromFile("")
++}
++
++// LoadRoutesAndLog 是独立二进制的标准接线：加载线路表并把结果打到 log。
++//
++// 三种结局都要留痕——「配了没生效」和「没配」在排障时看起来一样，正是 issue #210
++// 那一类「以为隔离了其实没有」的成因。
++func LoadRoutesAndLog(logf func(string, ...any)) []string {
++	names, err := LoadRoutesFromEnv()
++	switch {
++	case err != nil:
++		logf("出口线路未加载：%v（绑了线路的账号会显式报错，未绑的走默认出口）", err)
++	case len(names) == 0:
++		logf("出口线路：config.json 未配置 proxies 段，全部账号走默认出口")
++	default:
++		logf("出口线路已加载：%d 条（%s）", len(names), strings.Join(names, ", "))
++	}
++	return names
++}
+diff --git a/internal/upstream/routes_file_test.go b/internal/upstream/routes_file_test.go
+new file mode 100644
+index 0000000..b90e861
+--- /dev/null
++++ b/internal/upstream/routes_file_test.go
+@@ -0,0 +1,100 @@
++package upstream
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// 独立二进制加载线路表的回归测试（issue #210 补充）。
++//
++// 这批断言锁的是「配了线路的工具必须真的拿到线路表」——此前 signin/trial/
++// activity/credit 四个 cmd 各自 upstream.New() 后就发请求，线路表永远空，
++// 绑了线路的账号一律报「出口线路不可用」，没绑的静默走家宽。
++
++func writeJSON(t *testing.T, name, body string) string {
++	t.Helper()
++	p := filepath.Join(t.TempDir(), name)
++	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
++		t.Fatalf("write %s: %v", p, err)
++	}
++	return p
++}
++
++func TestLoadRoutesFromFileLoadsProxies(t *testing.T) {
++	p := writeJSON(t, "config.json", `{
++		"listen": ":7863",
++		"proxies": {
++			"yunserver": "socks5://u:p@127.0.0.1:17891",
++			"lisa": "socks5://u:p@192.0.2.10:20291"
++		}
++	}`)
++	t.Cleanup(func() { ConfigureProxies(nil) })
++
++	names, err := LoadRoutesFromFile(p)
++	if err != nil {
++		t.Fatalf("LoadRoutesFromFile: %v", err)
++	}
++	if len(names) != 2 || names[0] != "lisa" || names[1] != "yunserver" {
++		t.Fatalf("线路名 = %v, 期望 [lisa yunserver]", names)
++	}
++	// 线路必须真的能被解析成 Transport（账号 clientFor 会走这条路径）。
++	if _, err := TransportFor("yunserver"); err != nil {
++		t.Fatalf("TransportFor(yunserver): %v", err)
++	}
++}
++
++// 没有 proxies 段不算错误：纯直连部署必须零回归。
++func TestLoadRoutesFromFileWithoutProxies(t *testing.T) {
++	p := writeJSON(t, "config.json", `{"listen": ":7863"}`)
++	t.Cleanup(func() { ConfigureProxies(nil) })
++
++	names, err := LoadRoutesFromFile(p)
++	if err != nil {
++		t.Fatalf("无 proxies 段不该报错，得到 %v", err)
++	}
++	if len(names) != 0 {
++		t.Fatalf("无 proxies 段应得空表，得到 %v", names)
++	}
++}
++
++// 读不到文件要报错，让调用方决定降级；静默当成「没有线路」正是问题成因。
++func TestLoadRoutesFromFileMissing(t *testing.T) {
++	p := filepath.Join(t.TempDir(), "nope.json")
++	if _, err := LoadRoutesFromFile(p); err == nil {
++		t.Fatal("缺失配置文件应返回错误")
++	}
++}
++
++func TestLoadRoutesFromFileBadJSON(t *testing.T) {
++	p := writeJSON(t, "config.json", `{"proxies": `)
++	if _, err := LoadRoutesFromFile(p); err == nil {
++		t.Fatal("非法 JSON 应返回错误")
++	}
++}
++
++// $WB2A_CONFIG 优先级最高（面板/容器可覆盖默认路径）。
++func TestConfigPathFromEnvPrefersEnv(t *testing.T) {
++	t.Setenv("WB2A_CONFIG", "/tmp/wb2a-explicit.json")
++	if got := ConfigPathFromEnv(); got != "/tmp/wb2a-explicit.json" {
++		t.Fatalf("ConfigPathFromEnv() = %q", got)
++	}
++}
++
++// LoadRoutesAndLog 三种结局都要留痕（配了没生效 / 没配 / 读不到）。
++func TestLoadRoutesAndLogSpeaks(t *testing.T) {
++	p := writeJSON(t, "config.json", `{"proxies":{"route-a":"socks5://u:p@127.0.0.1:1080"}}`)
++	t.Setenv("WB2A_CONFIG", p)
++	t.Cleanup(func() { ConfigureProxies(nil) })
++
++	var lines []string
++	names := LoadRoutesAndLog(func(format string, args ...any) {
++		lines = append(lines, format)
++	})
++	if len(names) != 1 {
++		t.Fatalf("应加载 1 条线路，得到 %v", names)
++	}
++	if len(lines) == 0 {
++		t.Fatal("应输出一行加载结果日志")
++	}
++}
