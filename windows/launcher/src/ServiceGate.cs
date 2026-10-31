@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -140,13 +140,13 @@ namespace WorkBuddyLauncher
     /// 目标端口是否已被占用（用与监听等效的地址试绑定判断）。
     internal static class PortCheck
     {
-        public static bool InUse(string connectHost, int port)
+        /// 入参是**监听地址**（不是连接地址）：通配地址必须映射到对应的 Any，
+        /// 否则「服务监听 0.0.0.0、却拿 127.0.0.1 试绑」会把占用中的端口判成空闲。
+        public static bool InUse(string bindHost, int port)
         {
             try
             {
-                IPAddress addr = connectHost == "0.0.0.0" || connectHost == "::"
-                    ? IPAddress.Any
-                    : IPAddress.Parse(connectHost == "[::1]" ? "::1" : connectHost);
+                IPAddress addr = EnvConfig.ToBindAddress(bindHost);
                 var listener = new TcpListener(addr, port);
                 listener.Start();
                 listener.Stop();

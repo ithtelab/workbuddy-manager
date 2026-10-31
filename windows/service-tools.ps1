@@ -34,6 +34,19 @@ if (Test-Path $envPath) {
 }
 $port = [int]$bindPort
 
+# 监听地址 → 可连接地址（与 start.ps1、启动器 C# 侧同一套规则）：
+# 通配地址（0.0.0.0 / ::）与 localhost 都归到 127.0.0.1 —— server/serve.py 把 ::
+# 绑成双栈，IPv4 回环必然可连；其余 IPv6 一律加方括号。
+function Get-WbConnectHost($addr) {
+    $h = "$addr".Trim()
+    if (-not $h) { return '127.0.0.1' }
+    if ($h -match '^\[(.*)\]$') { $h = $Matches[1] }
+    if ($h -eq '0.0.0.0' -or $h -eq '*' -or $h -eq '::' -or $h -eq '::0') { return '127.0.0.1' }
+    if ($h -ieq 'localhost') { return '127.0.0.1' }
+    if ($h -match ':') { return "[$h]" }
+    return $h
+}
+
 function Get-ManagerProcess {
     $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
     if (-not $conns) { return @() }
@@ -76,11 +89,13 @@ function Start-Manager {
     # UnicodeDecodeError，任务记录页拿不到上游日志。子进程继承这里的变量。
     $env:PYTHONUTF8 = '1'
     $env:PYTHONIOENCODING = 'utf-8'
+    # 走 server.serve 而不是 `-m uvicorn`：绑 :: 时它会把 v6only 关掉（双栈），
+    # 否则 IPv4（本机虚拟网卡 / 回环）都访问不到。
     $uvicornArgs = @(
-        '-m', 'uvicorn', 'server.main:app',
-        '--env-file', '.env',
+        '-m', 'server.serve',
         '--host', $bindHost,
-        '--port', $bindPort
+        '--port', $bindPort,
+        '--env-file', '.env'
     )
     $proc = Start-Process -FilePath $python -ArgumentList $uvicornArgs `
         -WorkingDirectory $root -WindowStyle Hidden `
@@ -104,7 +119,8 @@ switch ($Action) {
             $names = ($procs | ForEach-Object { "PID $($_.Id) ($($_.ProcessName))" }) -join ', '
             Write-Host "WorkBuddy Manager 运行中：$names"
             try {
-                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$port/api/healthz" -UseBasicParsing -TimeoutSec 5
+                # 监听在 :: 时只能走 [::1]（v6only），写死 127.0.0.1 会一直探测失败
+                $resp = Invoke-WebRequest -Uri "http://$(Get-WbConnectHost $bindHost):$port/api/healthz" -UseBasicParsing -TimeoutSec 5
                 Write-Host "健康检查：$($resp.StatusCode) $($resp.Content)"
             } catch {
                 Write-Host "健康检查失败：$($_.Exception.Message)"

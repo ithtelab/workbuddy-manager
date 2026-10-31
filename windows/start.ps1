@@ -31,6 +31,19 @@ if (Test-Path $envPath) {
     }
 }
 
+# 监听地址 → 可连接地址：通配地址（0.0.0.0 / ::）与 localhost 都换成 127.0.0.1，
+# 裸 IPv6 加方括号。`::` 也归到 127.0.0.1 —— server/serve.py 会把它绑成双栈，
+# IPv4 回环必然可连。脚本之间不 dot-source，与 C# 侧 EnvConfig.ToConnectHost 各留一份。
+function Get-WbConnectHost($addr) {
+    $h = "$addr".Trim()
+    if (-not $h) { return '127.0.0.1' }
+    if ($h -match '^\[(.*)\]$') { $h = $Matches[1] }
+    if ($h -eq '0.0.0.0' -or $h -eq '*' -or $h -eq '::' -or $h -eq '::0') { return '127.0.0.1' }
+    if ($h -ieq 'localhost') { return '127.0.0.1' }
+    if ($h -match ':') { return "[$h]" }
+    return $h
+}
+
 # 4. 联动启动上游服务
 $upstreamScript = Join-Path $root 'upstream\start-workbuddy2api.cmd'
 $upstreamStopScript = Join-Path $root 'upstream\stop-workbuddy2api.cmd'
@@ -40,11 +53,16 @@ if (Test-Path $upstreamScript) {
 }
 
 # 5. 启动主控面板并唤起浏览器
-Write-Host "[INFO] WorkBuddy Manager 已就绪: http://${bindHost}:${bindPort}（按 Ctrl+C 退出）" -ForegroundColor Green
-Start-Process "http://${bindHost}:${bindPort}"
+# 显示与浏览器必须用**可连接**地址：监听地址是通配时（0.0.0.0 / ::）拿它拼 URL
+# 会得到 http://:::7864 这种非法地址，浏览器打不开还会让人以为服务没起来。
+$connectHost = Get-WbConnectHost $bindHost
+Write-Host "[INFO] WorkBuddy Manager 已就绪: http://${connectHost}:${bindPort}（按 Ctrl+C 退出）" -ForegroundColor Green
+Start-Process "http://${connectHost}:${bindPort}"
 
 try {
-    & $python -m uvicorn server.main:app --env-file .env --host $bindHost --port $bindPort
+    # 走 server/serve.py 而不是 `-m uvicorn`：只有前者能在绑 :: 时关掉 v6only，
+    # 让 IPv4（本机虚拟网卡 / 127.0.0.1）也能访问；uvicorn --host 做不到。
+    & $python -m server.serve --host $bindHost --port $bindPort --env-file .env
 } finally {
     if (Test-Path $upstreamStopScript) {
         & cmd.exe /c $upstreamStopScript

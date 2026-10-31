@@ -467,9 +467,11 @@ namespace WorkBuddyLauncher
             UpdateAddressLabel();
 
             // 端口已被其他程序占用时立即提示（常见：机器上另有一个实例占着默认端口），
-            // 而不是进入「启动中…」傻等健康检查超时
+            // 而不是进入「启动中…」傻等健康检查超时。
+            // 探测用连接地址，占用判断用**监听地址**（`::` 与 `0.0.0.0` 各自映射到
+            // 对应的 Any，否则通配监听会被误判成端口空闲）。
             if (!HealthProbe.Check(EnvConfig.ToConnectHost(host), port, 1000) &&
-                PortCheck.InUse(EnvConfig.ToConnectHost(host), port))
+                PortCheck.InUse(host, port))
             {
                 MessageBox.Show(this,
                     "端口 " + port + " 已被其他程序占用，无法在此端口启动。\n" +

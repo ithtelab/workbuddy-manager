@@ -1,7 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -95,14 +96,62 @@ namespace WorkBuddyLauncher
             File.WriteAllLines(envPath, lines.ToArray(), new UTF8Encoding(false));
         }
 
-        /// 探测与打开浏览器用的主机：通配监听地址（0.0.0.0 / ::）归一化为本机回环地址。
+        /// 探测与打开浏览器用的主机：把监听地址归一化为**本机可连接**的地址。
+        ///
+        /// 通配地址不能拿去连：`0.0.0.0` 与 `::` 只是绑定语义，拼进 URL 就是
+        /// `http://:::7864` 这种打不开的地址。两者都归到 127.0.0.1 —— `::` 由
+        /// server/serve.py 绑成**双栈**（关掉 Windows 默认的 v6only），IPv4 回环
+        /// 必然可连。
+        ///
+        /// 规则：
+        ///   · `0.0.0.0` / `*`  → 127.0.0.1
+        ///   · `::` / `::0`     → 127.0.0.1（双栈监听，IPv4 可达）
+        ///   · `localhost` / 空 → 127.0.0.1
+        ///   · 其余 IPv6 地址   → 加方括号（URL 与 HttpWebRequest 的要求）
+        ///   · 其余 IPv4 地址   → 原样
         public static string ToConnectHost(string host)
         {
             host = (host ?? string.Empty).Trim();
             if (host.Length == 0) { return DefaultHost; }
-            if (host == "0.0.0.0" || host == "::" || host == "*") { return "127.0.0.1"; }
-            if (host == "::1") { return "[::1]"; }
+            string bare = StripBrackets(host);
+
+            if (bare == "0.0.0.0" || bare == "*") { return "127.0.0.1"; }
+            if (bare == "::" || bare == "::0") { return "127.0.0.1"; }
+            if (string.Equals(bare, "localhost", StringComparison.OrdinalIgnoreCase)) { return "127.0.0.1"; }
+
+            IPAddress parsed;
+            if (IPAddress.TryParse(bare, out parsed) && parsed.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                // 已带方括号的保持原样，避免套两层
+                return host[0] == '[' ? host : "[" + bare + "]";
+            }
+            return bare;
+        }
+
+        /// 去掉 `[::1]` 这种 URL 形态的方括号，便于交给 IPAddress 解析。
+        public static string StripBrackets(string host)
+        {
+            host = (host ?? string.Empty).Trim();
+            if (host.Length >= 2 && host[0] == '[' && host[host.Length - 1] == ']')
+            {
+                return host.Substring(1, host.Length - 2);
+            }
             return host;
+        }
+
+        /// 监听地址 → 试绑定用的 IP（端口占用判断用）。
+        /// 通配地址必须映射到对应的 Any（否则「服务监听 0.0.0.0，却去试绑 127.0.0.1」
+        /// 会误判成端口空闲）。
+        public static IPAddress ToBindAddress(string host)
+        {
+            string bare = StripBrackets(host);
+            if (bare.Length == 0) { return IPAddress.Loopback; }
+            if (bare == "0.0.0.0" || bare == "*") { return IPAddress.Any; }
+            if (bare == "::" || bare == "::0") { return IPAddress.IPv6Any; }
+            if (string.Equals(bare, "localhost", StringComparison.OrdinalIgnoreCase)) { return IPAddress.Loopback; }
+            IPAddress parsed;
+            if (IPAddress.TryParse(bare, out parsed)) { return parsed; }
+            return IPAddress.Loopback;
         }
     }
 }
