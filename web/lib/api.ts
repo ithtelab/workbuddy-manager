@@ -499,6 +499,15 @@ export const keyApi = {
   remove: (id: number) => del<{ok: boolean}>(`/api/keys/${id}`),
   resetUsage: (id: number) => post<{ok: boolean}>(`/api/keys/${id}/reset-usage`),
   /**
+   * 取回一把已创建密钥的明文（「再复制一次」）。
+   *
+   * 面板现在把明文也存了一份（只为这一下；网关校验仍走哈希）。这条接口要求
+   * **会话管理员**，且每次调用都写一条审计日志——列表只回前缀，只能在这里拿。
+   * 存量密钥（保存明文之前的版本）回 409，界面据此提示「需要重新建一把」。
+   */
+  reveal: (id: number) => post<{id: number; name: string; prefix: string; key: string}>(
+    `/api/keys/${id}/reveal`),
+  /**
    * 检查模型白名单里哪些名字匹配不到已知模型（issue #46）。
    *
    * 判据在后端（与调用侧同一份），前端只负责显示——不然就是第二份事实来源。

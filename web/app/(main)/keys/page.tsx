@@ -1,7 +1,7 @@
 'use client';
 
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw} from 'lucide-react';
+import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw, Eye, Loader2} from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {notify} from '@/lib/toast';
@@ -140,6 +140,15 @@ export default function KeysPage() {
   const [form, setForm] = useState<FormState>(emptyForm);
   const [busy, setBusy] = useState(false);
   const [issued, setIssued] = useState<string | null>(null);
+  /**
+   * 「再复制一次」：正在查看的密钥（含明文）与正在请求的那一行。
+   *
+   * 明文只在点开时向后端要一次（`POST /api/keys/{id}/reveal`，会话管理员 +
+   * 审计日志），**不随列表下发** —— 列表只读账号也能调，凭据不该跟着列表走。
+   * `revealing` 记的是哪一行在等，避免连点把同一行请求两次。
+   */
+  const [revealed, setRevealed] = useState<{name: string; key: string} | null>(null);
+  const [revealing, setRevealing] = useState<number | null>(null);
   /**
    * 一次性展示弹窗里选中的导出目标（cc-switch 还要分 Claude / Codex）。
    *
@@ -328,6 +337,29 @@ export default function KeysPage() {
       reload();
     } catch (e) {
       notify.err(errText(e));
+    }
+  }
+
+  /**
+   * 「再复制一次」：向后端要一次明文，拿到后直接展示在弹窗里（带复制按钮）。
+   *
+   * 为什么不直接 `navigator.clipboard` 悄悄复制了事：面板常部署在 http + 内网
+   * 域名上，非安全上下文里 Clipboard API 不可用，静默失败的话用户只会觉得
+   * 「点了没反应」。展示 + 复制按钮两条路都留给他（CopyButton 内部有降级）。
+   *
+   * 取不回来（存量密钥，库里只有哈希）时后端回 409 且说明该怎么办，
+   * 这里原样弹给他，不再自己编一句。
+   */
+  async function reveal(k: ApiKey) {
+    if (revealing !== null) return;
+    setRevealing(k.id);
+    try {
+      const r = await keyApi.reveal(k.id);
+      setRevealed({name: r.name || k.name, key: r.key});
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setRevealing(null);
     }
   }
 
@@ -701,6 +733,20 @@ export default function KeysPage() {
                   {isAdmin && (
                     <TableCell className="pr-4">
                       <div className="flex justify-end gap-1">
+                        {/* 「再复制一次」：明文不随列表下发，点这里才向后端要
+                            （会话管理员 + 审计）。存量密钥取不回来时后端会说明原因。 */}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 rounded-md"
+                          title={t('keys.reveal')}
+                          disabled={revealing !== null}
+                          onClick={() => void reveal(k)}
+                        >
+                          {revealing === k.id
+                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            : <Eye className="h-3.5 w-3.5" />}
+                        </Button>
                         <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('keys.edit')} onClick={() => openEdit(k)}>
                           <Pencil className="h-3.5 w-3.5" />
                         </Button>
@@ -1207,6 +1253,32 @@ export default function KeysPage() {
           </DialogBody>
           <DialogFooter>
             <Button className="rounded-full" onClick={() => { setIssued(null); setExported(null); }}>
+              {t('keys.savedIt')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 再复制一次：查看已创建密钥的明文（管理员 + 审计） */}
+      <Dialog open={!!revealed} onOpenChange={(v) => { if (!v) setRevealed(null); }}>
+        <DialogContent className="w-[min(560px,calc(100vw-2rem))] max-w-[min(560px,calc(100vw-2rem))] sm:max-w-[min(560px,calc(100vw-2rem))]">
+          <DialogHeader>
+            <DialogTitle>{t('keys.revealTitle')}</DialogTitle>
+            <DialogDescription>{t('keys.revealDesc')}</DialogDescription>
+          </DialogHeader>
+          <DialogBody>
+            <div className="space-y-3 px-6 pb-3">
+              {/* 名称单独一行：密钥可能叫「客服组-夜班」，与密钥本身一样长时会挤在一起 */}
+              <p className="break-all text-sm font-medium">{revealed?.name}</p>
+              {/* min-w-0 不能少：flex 项默认 min-width:auto，长密钥会把复制按钮挤出去 */}
+              <div className="flex items-center gap-2 rounded-2xl bg-muted p-3">
+                <code className="min-w-0 flex-1 break-all font-mono text-xs">{revealed?.key}</code>
+                <CopyButton value={revealed?.key || ''} size="sm" showLabel label={t('keys.copyKey')} />
+              </div>
+            </div>
+          </DialogBody>
+          <DialogFooter>
+            <Button className="rounded-full" onClick={() => setRevealed(null)}>
               {t('keys.savedIt')}
             </Button>
           </DialogFooter>
