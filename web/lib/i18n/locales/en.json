@@ -23,6 +23,8 @@
     "retryAt": "Next retry allowed:",
     "resume": "Reviewed — clear protection",
     "resumed": "Protection cleared; other restrictions preserved",
+    "collapse": "Collapse",
+    "expand": "Expand",
     "repeatCount": "Rapid repeat throttles after expiry: {n}"
   },
   "language": {

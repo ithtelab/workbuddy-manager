@@ -1,8 +1,8 @@
 'use client';
 
-import {useState} from 'react';
+import {useEffect, useState} from 'react';
 import Link from 'next/link';
-import {ShieldAlert} from 'lucide-react';
+import {ChevronDown, ChevronUp, ShieldAlert} from 'lucide-react';
 import {accountRiskApi, errText} from '@/lib/api';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {useHeartbeat} from '@/lib/use-heartbeat';
@@ -20,6 +20,11 @@ export function AccountRiskWarnings({upstreamId = null, allGroups = false}: {
   const {isAdmin} = useAuth();
   const t = useT();
   const [history, setHistory] = useState(false);
+  /** 折叠偏好：'1' 收起 / '0' 展开 / null 还没选过。默认在「没有账号被暂停」时收起。 */
+  const [foldPref, setFoldPref] = useState<string | null>(null);
+  useEffect(() => {
+    try { setFoldPref(window.localStorage.getItem('wb.account-risk.collapsed')); } catch { /* 读不到按未选处理 */ }
+  }, []);
   const [busy, setBusy] = useState(false);
   const {values, errors, reload} = useAsyncAll({warnings: () => accountRiskApi.list(realm, upstreamId, allGroups, history)},
     [realm, upstreamId, allGroups, history]);
@@ -29,6 +34,12 @@ export function AccountRiskWarnings({upstreamId = null, allGroups = false}: {
   const items = data?.items ?? [];
   const pausedCount = new Set(items.filter(x => x.paused === true).map(x => `${x.group}:${x.uid}`)).size;
   if (!items.length && !data?.total && !failed) return null;
+  const fold = foldPref === '1';
+  function toggleFold() {
+    const next = !fold;
+    setFoldPref(next ? '1' : '0');
+    try { window.localStorage.setItem('wb.account-risk.collapsed', next ? '1' : '0'); } catch { /* 写不进去只影响下次默认 */ }
+  }
 
   async function resume(id: string) {
     setBusy(true);
@@ -57,7 +68,15 @@ export function AccountRiskWarnings({upstreamId = null, allGroups = false}: {
         {isAdmin && items.some(x => !x.acknowledged) && (
           <Button variant="outline" size="sm" className="ml-auto" disabled={busy} onClick={acknowledge}>{t('risk.acknowledge')}</Button>
         )}
+        {/* 预警有历史记录时会一直占着页面顶部（issue #374）。允许收起/展开，
+            偏好按浏览器记住；没有账号被暂停时默认收起。 */}
+        <Button variant="ghost" size="sm" className={isAdmin && items.some(x => !x.acknowledged) ? '' : 'ml-auto'}
+                aria-expanded={!fold} onClick={toggleFold}>
+          {fold ? <ChevronDown className="mr-1 h-3.5 w-3.5" /> : <ChevronUp className="mr-1 h-3.5 w-3.5" />}
+          {t(fold ? 'risk.expand' : 'risk.collapse')}
+        </Button>
       </div>
+      {!fold && (<>
       <p className="mt-2 text-xs leading-5 text-muted-foreground">{t('risk.explanation')}</p>
       {!failed && pausedCount === 0 && items.every(x => x.paused === false) && <p className="mt-2 text-xs font-medium">{t('risk.noNewPauses')}</p>}
       {failed && <p role="alert" className="mt-2 text-xs text-red-600">{t('risk.loadFailed')} <Button variant="link" size="sm" onClick={reload}>{t('state.retry')}</Button></p>}
@@ -82,6 +101,7 @@ export function AccountRiskWarnings({upstreamId = null, allGroups = false}: {
         </ul>
       </details>
       <p className="mt-2 text-xs text-muted-foreground">{t('risk.recovery')} <Link href="/accounts" className="underline">{t('risk.accounts')}</Link></p>
+      </>)}
     </section>
   );
 }

@@ -23,6 +23,8 @@
     "retryAt": "다음 재시도 허용 시간:",
     "resume": "검토 완료 · 보호 중지 해제",
     "resumed": "보호 중지를 해제했습니다. 다른 제한은 유지됩니다",
+    "collapse": "접기",
+    "expand": "펼치기",
     "repeatCount": "만료 후 단시간 내 반복 제한: {n}회"
   },
   "language": {

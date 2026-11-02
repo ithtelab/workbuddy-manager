@@ -23,6 +23,8 @@
     "retryAt": "再試行の許可時刻：",
     "resume": "確認済み・保護停止を解除",
     "resumed": "保護停止を解除しました。他の制限は維持されます",
+    "collapse": "折りたたむ",
+    "expand": "展開",
     "repeatCount": "期限後の短時間での再制限：{n} 回"
   },
   "language": {

@@ -23,6 +23,8 @@
     "retryAt": "允许重试时间：",
     "resume": "已复核，解除保护暂停",
     "resumed": "保护暂停已解除；其他限制保持原状",
+    "collapse": "收起",
+    "expand": "展开",
     "repeatCount": "恢复后短时重复限流：{n} 次"
   },
   "language": {
