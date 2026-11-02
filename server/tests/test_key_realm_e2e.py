@@ -137,7 +137,8 @@ class GatewayRealmIsolationE2ETest(unittest.TestCase):
                 'Authorization': f"Bearer {self._token(realm='cn')}"})
 
         self.assertEqual([m['id'] for m in gl.json()['data']], ['global:gpt-5.6-sol'])
-        self.assertEqual([m['id'] for m in cn.json()['data']], ['cn:glm-5.2', 'glm-5.1'])
+        # 国内版 id 下发时去掉 `cn:`（与模型中心同一口径），裸名本来就是国内版
+        self.assertEqual([m['id'] for m in cn.json()['data']], ['glm-5.2', 'glm-5.1'])
 
 
 if __name__ == '__main__':

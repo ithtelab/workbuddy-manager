@@ -985,6 +985,8 @@ async def list_models(request: Request):
         # 能力字段兜底（issue #211）：随包上游的版本可能比面板旧 —— 补丁只在上游
         # 侧时，下游经面板拿到的清单仍缺字段，客户端会整条跳过模型。
         payload = _listing_compat_models(payload)
+        # 国内版 id 去掉 `cn:` 前缀，与模型中心显示的名字一致（裸名 = 国内版）。
+        payload = _bare_cn_model_ids(payload)
         # Anthropic 客户端（Claude Code 等）也会调这个路径，但期望的结构不同
         if request.headers.get('anthropic-version'):
             payload = _as_anthropic_models(payload)
@@ -1175,6 +1177,43 @@ def _scope_models(payload: object, key: dict | None) -> object:
     # 别名：白名单可能写的是下游熟悉的别名，它不在清单里，要补进来
     scoped += _alias_entries(in_realm, allow)
     return {**payload, 'data': scoped}
+
+
+def _bare_cn_model_ids(payload: object) -> object:
+    """`/v1/models` 里国内版模型的 id 去掉 `cn:` 前缀，**保留 `global:`**。
+
+    模型中心早已只显示腾讯自带的裸名（`deepseek-v4.1-flash`），但网关的
+    `/v1/models` 仍原样透出上游的 `cn:deepseek-v4.1-flash`：用户在面板上看到
+    的名字和客户端拉到的名字对不上。更实际的问题是 Cherry Studio 等客户端按
+    模型 id 识别推理档位 / 多模态等能力，`cn:xxx` 认不出，推理档位选项直接不出现。
+
+    口径与 `keysvc._bare_model` 一致：上游 `resolveModel` 把裸名当国内版，所以
+    去 `cn:` 安全；`global:` 去掉会被路由到国内账号池，绝不能动。带 `cn:` 的
+    旧调用不受影响（调用侧照旧接受两种写法，白名单也两种都认）。
+
+    去前缀后若与已有条目同名（上游同时列了裸名与 `cn:` 名），只保留一条，
+    取字段更全的那条，免得客户端里出现两个一样的模型。认不出的结构原样透传。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    out: list = []
+    index: dict[str, int] = {}
+    for m in items:
+        if not isinstance(m, dict) or not isinstance(m.get('id'), str) or not m['id']:
+            out.append(m)
+            continue
+        mid = keysvc._bare_model(m['id'])
+        entry = m if mid == m['id'] else {**m, 'id': mid}
+        if mid in index:
+            if len(entry) > len(out[index[mid]]):
+                out[index[mid]] = entry
+            continue
+        index[mid] = len(out)
+        out.append(entry)
+    return {**payload, 'data': out}
 
 
 def _listing_compat_models(payload: object) -> object:
