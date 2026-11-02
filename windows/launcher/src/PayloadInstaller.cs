@@ -99,5 +99,70 @@ namespace WorkBuddyLauncher
             shortcut.Description = description;
             shortcut.Save();
         }
+
+        /// 读取已有快捷方式指向的目标路径；文件不存在或读不到时返回 null。
+        public static string ReadShortcutTarget(string lnkPath)
+        {
+            if (!File.Exists(lnkPath)) { return null; }
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) { return null; }
+                dynamic shell = Activator.CreateInstance(shellType);
+                dynamic shortcut = shell.CreateShortcut(lnkPath);
+                string target = shortcut.TargetPath as string;
+                return string.IsNullOrEmpty(target) ? null : target;
+            }
+            catch { return null; }
+        }
+
+        /// 两个路径是否指向同一文件（规范化后按不区分大小写比较）。
+        private static bool SamePath(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) { return false; }
+            try
+            {
+                return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        /// 目录下是否已存在**任意文件名**、但指向 targetExe 的快捷方式。
+        ///
+        /// 用户可能把桌面快捷方式改过名：这时按固定路径找不到它，重装再建一个
+        /// 就会出现两个图标。所以创建前按「指向」再找一遍。
+        public static bool ShortcutExistsFor(string directory, string targetExe)
+        {
+            try
+            {
+                foreach (string lnk in Directory.GetFiles(directory, "*.lnk"))
+                {
+                    if (SamePath(ReadShortcutTarget(lnk), targetExe)) { return true; }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// 确保快捷方式存在且指向正确 —— 已经对了就一个字都不写。
+        ///
+        /// 为什么不能无脑重建：覆盖安装时重写同名 .lnk 会让 Windows 丢掉用户
+        /// 摆好的桌面图标位置（图标坐标与 lnk 文件关联），装完就「跳位置」。
+        public static void EnsureShortcut(string lnkPath, string targetPath, string workingDir, string description)
+        {
+            string current = ReadShortcutTarget(lnkPath);
+            if (SamePath(current, targetPath)) { return; }
+            if (current == null)
+            {
+                // 目标名的 lnk 不存在，但同目录已有别的快捷方式指向它（用户改过名）
+                string dir = Path.GetDirectoryName(lnkPath);
+                if (!string.IsNullOrEmpty(dir) && ShortcutExistsFor(dir, targetPath)) { return; }
+            }
+            CreateShortcut(lnkPath, targetPath, workingDir, description);
+        }
     }
 }

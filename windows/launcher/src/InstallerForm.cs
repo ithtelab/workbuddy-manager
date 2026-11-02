@@ -334,7 +334,10 @@ namespace WorkBuddyLauncher
                 Maintenance.StopServices(target);
 
                 Report("正在清理旧程序文件…");
-                Maintenance.RemoveShortcutsAndRegistry();
+                // 只清注册表，**不动快捷方式**：重写同名 lnk 会让 Windows 丢掉用户
+                // 摆好的桌面图标位置（表现为每装一次图标就跳一次）。指向是否正确
+                // 交给下面的 EnsureShortcut 判断，目标变了才重建。
+                Maintenance.RemoveRegistryEntry();
                 Maintenance.DeleteProgramFiles(target, true, null,
                     delegate(int done, int total, string name)
                     {
@@ -369,14 +372,16 @@ namespace WorkBuddyLauncher
                 string appExe = Path.Combine(target, LauncherPaths.AppExeName);
                 if (_chkDesktop.Checked)
                 {
-                    PayloadInstaller.CreateShortcut(LauncherPaths.DesktopShortcutPath, appExe, target, LauncherPaths.AppName);
+                    PayloadInstaller.EnsureShortcut(LauncherPaths.DesktopShortcutPath, appExe, target, LauncherPaths.AppName);
                 }
                 if (_chkStartMenu.Checked)
                 {
                     string menuDir = LauncherPaths.StartMenuFolder;
                     Directory.CreateDirectory(menuDir);
-                    PayloadInstaller.CreateShortcut(Path.Combine(menuDir, LauncherPaths.AppName + ".lnk"),
+                    PayloadInstaller.EnsureShortcut(Path.Combine(menuDir, LauncherPaths.AppName + ".lnk"),
                         appExe, target, LauncherPaths.AppName);
+                    // 卸载项始终重建：它必须指向 Uninstall.exe，用户也不会去挪它，
+                    // 不存在「保留图标位置」的需求。
                     PayloadInstaller.CreateShortcut(Path.Combine(menuDir, "卸载 " + LauncherPaths.AppName + ".lnk"),
                         Path.Combine(target, LauncherPaths.UninstallExeName), target, "卸载 " + LauncherPaths.AppName);
                 }
