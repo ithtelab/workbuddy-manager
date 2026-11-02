@@ -218,7 +218,7 @@
   "dashboard": {
     "availableCredits": "可用积分",
     "unavailableCredits": "不可用积分",
-    "creditAvailabilityHint": "可用积分仅含当前在线且可调度账号；封禁、停用、过期、冷却、未加载或状态未知账号的余额计入不可用。模型级限制不代表全账号不可用。",
+    "creditAvailabilityHint": "可用积分包含在线和暂时冷却账号的余额；封禁、停用、保护性暂停、过期、未加载或状态未知账号的余额计入不可用。模型级限制不代表全账号不可用。",
     "creditsUnknown": "{n} 个账号余额未知，未计入",
     "title": "仪表盘",
     "description": "{realm}账号池健康度、反代网关与今日用量总览（每 30 秒自动刷新）",
