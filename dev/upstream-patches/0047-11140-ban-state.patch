@@ -1,0 +1,67 @@
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -1335,11 +1335,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 			return
+ 		}
+ 		if upstream.IsUpstreamRestriction(body) {
+-			// 11140 + 「账号存在异常行为，已被限制使用」→ 账号级风控限制（可申诉）。
+-			// 与「request illegal / auth_forbidden」不同：限制会解除，凭证没坏 ——
+-			// 软冷却期间退出轮换即可，48 分钟后再试，不要永久禁用。
+-			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, upstreamRestrictionCooldown,
+-				"upstream restriction ("+upstreamCodeLabel(body, uerr)+", appealable)")
++			// 11140 + 「账号存在异常行为，已被限制使用」= 上游账号封禁，需向腾讯申诉；
++			// 重新登录不能解除，也不该在池子里反复重试。
++			//
++			// 0043 曾把它当「可自行恢复」做 45 分钟软冷却，但现场反馈是账号一直在
++			// 「冷却中」循环、面板看不出哪个号被封（issue #376）；这里恢复为明确
++			// 禁用并写清原因 —— 面板据此显示「账号被封禁」、移出重登队列、停止
++			// 继续消耗请求（与 #361 的封禁展示同一口径）。
++			h.cfg.Pool.Disable(uid, "account banned by upstream ("+
++				upstreamCodeLabel(body, uerr)+
++				", 账号存在异常行为/已被限制使用, appeal required, re-login ineffective)")
+ 			return
+ 		}
+ 		if strings.Contains(lowerBody, "request illegal") {
+--- a/internal/server/restriction_cooldown_test.go
++++ b/internal/server/restriction_cooldown_test.go
+@@ -9,8 +9,11 @@ import (
+ 	"workbuddy2api/internal/upstream"
+ )
+ 
+-// 11140 + 「账号存在异常行为」= 账号级风控限制 → 软冷却（不 Disable、不清凭证）。
+-func TestApplyErrorPolicyUpstreamRestrictionCools(t *testing.T) {
++// 11140 + 「账号存在异常行为」= 上游账号封禁 → 明确禁用并写清原因（issue #376）。
++//
++// 0043 曾把它改成 45 分钟软冷却，但账号会一直在「冷却中」循环，面板看不出
++// 哪个号被封、也不会提示申诉。恢复禁用后 #361 的封禁分类与提示才能生效。
++func TestApplyErrorPolicyUpstreamRestrictionDisablesAsBan(t *testing.T) {
+ 	p := pool.New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+ 	h := NewHandler(Config{Pool: p})
+@@ -22,18 +25,16 @@ func TestApplyErrorPolicyUpstreamRestrictionCools(t *testing.T) {
+ 	if !ok {
+ 		t.Fatal("账号不存在")
+ 	}
+-	if st.Disabled {
+-		t.Fatalf("风控限制不应永久禁用: %+v", st)
+-	}
+-	if !st.Cooling {
+-		t.Fatalf("风控限制应进入软冷却: %+v", st)
++	if !st.Disabled {
++		t.Fatalf("风控限制应禁用账号: %+v", st)
+ 	}
+-	if !strings.Contains(st.Reason, "upstream restriction") || !strings.Contains(st.Reason, "appealable") {
+-		t.Fatalf("冷却理由应说明是上游限制且可申诉, got %q", st.Reason)
++	if st.Cooling {
++		t.Fatalf("不应退化成冷却（会一直循环、看不出封禁）: %+v", st)
+ 	}
+-	// 冷却时长取 upstreamRestrictionCooldown（45m），明显长于渠道校验的 30s。
+-	if st.CoolRemaining < int64((30 * 60)) {
+-		t.Fatalf("冷却时长过短: %d 秒", st.CoolRemaining)
++	for _, want := range []string{"account banned", "账号存在异常行为", "appeal required"} {
++		if !strings.Contains(st.DisabledReason, want) {
++			t.Fatalf("禁用理由缺少 %q, got %q", want, st.DisabledReason)
++		}
+ 	}
+ }
+ 

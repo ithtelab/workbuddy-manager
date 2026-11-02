@@ -5,7 +5,7 @@
 
 ---
 
-## 一、11140「账号异常行为」按软冷却处理（0043）
+## 一、11140「账号异常行为」的处理（0043 → 0047 已改为硬禁用）
 
 ### 现场
 
@@ -35,6 +35,7 @@ CN 账号调用 `/v2/chat/completions` 返回：
 - 新增 `upstream.IsUpstreamRestriction(body)`：**只认带风控话术的 11140**
   （`unusual activity` / `异常行为` / `異常行為` / `abnormal`）。
 - 命中时按账号级软冷却 45 分钟，理由 `upstream restriction (code 11140, http 403, appealable)`，
+  **（2026-11-02 起由 0047 改为硬禁用，见下方「0047 的修正」）**
   **不 Disable、不清凭证**。
 - 不带风控话术的 `request illegal`（历史 global `auth_forbidden` 语义）**行为不变**，仍硬禁用。
 
@@ -46,6 +47,17 @@ CN 账号调用 `/v2/chat/completions` 返回：
 | 单测 | `TestIsUpstreamRestriction`（5 例）、`TestApplyErrorPolicyUpstreamRestrictionCools`、`TestApplyErrorPolicyPlainRequestIllegalStillDisables` |
 
 ---
+
+
+### 0047 的修正（issue #376）
+
+0043 的软冷却上线后，现场反馈账号会一直在「冷却中」循环、面板看不出哪个号被封，也
+不会提示去申诉。0047 把 11140 + 风控话术恢复为**硬禁用**，理由写成
+`account banned by upstream (…, 账号存在异常行为/已被限制使用, appeal required,
+re-login ineffective)`：面板据此显示「账号被封禁」、移出重登队列（与 #361 同一口径），
+不再每 45 分钟对已封账号重复发一次请求。不带风控话术的 `request illegal` 行为不变。
+
+0047 依赖 0043（修改的是 0043 引入的分支与用例），必须在 0043 之后应用。
 
 ## 二、大上下文请求逐请求轮换（0044）
 
@@ -115,11 +127,12 @@ key=38 / UA=deepseek-harness / 客户端 IP 222.85.110.6
 cd upstream   # v2.11.6 源码根
 git apply /path/to/0043-upstream-restriction-soft-cooldown.patch
 git apply /path/to/0044-large-request-rotation.patch
+git apply /path/to/0047-11140-ban-state.patch
 git apply /path/to/0046-large-request-cache-friendly.patch
 go build ./... && go test ./internal/server/ ./internal/upstream/
 ```
 
-0043 与 0044 互相独立（0044 不依赖 0043）；0046 修正 0044 的默认值，必须在 0044 之后应用。
+0043 与 0044 互相独立（0044 不依赖 0043）；0046 修正 0044 的默认值，必须在 0044 之后应用；0047 修正 0043 的 11140 处理，必须在 0043 之后应用。
 
 ## 未纳入本 PR 的本地改动
 
