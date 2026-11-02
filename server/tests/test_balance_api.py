@@ -186,6 +186,40 @@ class EndpointTest(_Base):
             self._usage(token)
         self.assertEqual(len(calls), 1)
 
+    def test_pool_zero_falls_back_to_snapshot(self) -> None:
+        """上游整池报 0 时按本地快照算 —— 这不是「钱花光了」。
+
+        上游的 credits 只在它自己的定时任务里刷新，重启后 / 两次刷新之间会整池
+        报 0；快照来自腾讯账单，更可信。线上就撞到过这个：池里 4 个号上游报 0，
+        快照刚记到 22233，接口却吐了 0。
+        """
+        token, _ = self._make_key()
+
+        async def zeros(**_: object) -> dict:
+            return {'connected': True, 'accounts': [
+                {'uid': 'a', 'credits': 0}, {'uid': 'b', 'credits': 0}]}
+
+        with mock.patch('server.services.wb2api.get_status', zeros), \
+                mock.patch('server.services.credits.snapshot_entries',
+                           lambda: {'accounts': [{'uid': 'a', 'credits': 4000},
+                                                 {'uid': 'b', 'credits': 6000}]}):
+            data = self._usage(token)['body']['data']
+        self.assertEqual(data['total_available'], 10000.0)
+
+    def test_snapshot_ignores_accounts_outside_pool(self) -> None:
+        """快照不会随账号删除而清理，统计时必须按池内账号过滤。"""
+        token, _ = self._make_key()
+
+        async def zeros(**_: object) -> dict:
+            return {'connected': True, 'accounts': [{'uid': 'a', 'credits': 0}]}
+
+        with mock.patch('server.services.wb2api.get_status', zeros), \
+                mock.patch('server.services.credits.snapshot_entries',
+                           lambda: {'accounts': [{'uid': 'a', 'credits': 100},
+                                                 {'uid': '已删除的号', 'credits': 999}]}):
+            data = self._usage(token)['body']['data']
+        self.assertEqual(data['total_available'], 100.0)
+
     def test_pool_failure_falls_back_to_snapshot(self) -> None:
         """上游不可用时用已登记的余额快照兜底，而不是报 0 或 500。"""
         token, _ = self._make_key()

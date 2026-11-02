@@ -70,23 +70,39 @@ def _amounts(key: dict, pool_credits: float) -> tuple[float, float, float]:
     return total, 0.0, total
 
 
+def _snapshot_total(uids: set[str] | None = None) -> float:
+    """本端已登记的余额快照合计，不发任何网络请求。
+
+    uids 非空时只算这些账号：快照不会随账号删除而清理，不过滤就会把已经
+    不在池里的号也加进来。
+    """
+    try:
+        rows = credits.snapshot_entries().get('accounts') or []
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return sum(_number(row.get('credits')) for row in rows
+               if isinstance(row, dict)
+               and (uids is None or str(row.get('uid')) in uids))
+
+
 def _pool_total(status: dict) -> float | None:
-    """上游 /status 里账号池的积分合计。拿不到返回 None —— 不能拿 0 冒充。"""
+    """账号池的剩余积分。拿不到返回 None —— 不能拿 0 冒充。
+
+    上游整池报 0 时改用本地快照：它的 `credits` 只在自身定时任务里刷新，
+    重启后或两次刷新之间会整池报 0，而这个 0 分不清「真花光」与「没上报」。
+    快照来自腾讯账单，更可信。
+    """
     if not status.get('connected'):
         return None
     accounts = status.get('accounts')
     if not isinstance(accounts, list):
         return None
-    return sum(_number(item.get('credits')) for item in accounts if isinstance(item, dict))
-
-
-def _snapshot_total() -> float:
-    """本端已登记的余额快照合计：上游不可用时的兜底，不发任何网络请求。"""
-    try:
-        rows = credits.snapshot_entries().get('accounts') or []
-    except Exception:  # noqa: BLE001
-        return 0.0
-    return sum(_number(row.get('credits')) for row in rows if isinstance(row, dict))
+    rows = [item for item in accounts if isinstance(item, dict)]
+    total = sum(_number(item.get('credits')) for item in rows)
+    if total:
+        return total
+    uids = {str(item.get('uid')) for item in rows if item.get('uid')}
+    return _snapshot_total(uids)
 
 
 async def _pool_credits(key: dict) -> float:
