@@ -192,6 +192,37 @@ def reset_usage(key_id: int, user: dict = Depends(security.require_admin)) -> di
     return {'ok': True}
 
 
+@router.post('/{key_id}/reveal')
+def reveal_key(key_id: int, request: Request,
+               user: dict = Depends(security.require_admin)) -> dict:
+    """取回一把已创建密钥的明文（「再复制一次」）。
+
+    为什么要单独一条接口、而不是把它加进列表：列表**只读账号（viewer）也能调**，
+    而明文是能用完额度的凭证 —— 直接下发等于把只读账号升格成「能看到所有密钥」。
+    这里要求会话管理员，且每次都留审计：谁在什么时候看过哪把钥匙，事后查得到。
+
+    `require_admin`（会话管理员）而不是 `require_session_admin`：与「建 / 改 / 删
+    密钥」同一档权限，读明文不该比改密钥更宽松。
+
+    取不回明文时回 409 并**说清怎么办**：盲区是「本列引入前建的存量密钥」，
+    它们那时只存了哈希。这里不能回空串让界面复制出一个空文本。
+    """
+    found = keysvc.reveal_key(key_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail='密钥不存在')
+    if not found['key']:
+        raise HTTPException(
+            status_code=409,
+            detail=('这把密钥创建于「面板保存明文」之前的版本，库中只有它的哈希，'
+                    '无法再取回完整密钥。需要继续使用的话，请新建一把并替换掉'
+                    '（旧密钥会继续有效，确认客户端都换完后再停用它）。'),
+        )
+    # 审计只记**哪一把**（id / 名称 / 前缀），绝不记明文本身。
+    security.audit(user, 'reveal_key', f'{key_id} {found["name"]}'.strip(),
+                   f'前缀={found["prefix"]}；来源 {client_ip(request)}')
+    return found
+
+
 @router.delete('/{key_id}')
 def delete_key(key_id: int, request: Request,
                user: dict = Depends(security.require_admin)) -> dict:

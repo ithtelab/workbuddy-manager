@@ -118,7 +118,22 @@ CREATE TABLE IF NOT EXISTS api_keys (
   quota_credit  REAL    NOT NULL DEFAULT 0,
   used_credit   REAL    NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL,
-  last_used_at  INTEGER
+  last_used_at  INTEGER,
+  -- 密钥明文（供管理员在密钥页再次查看 / 复制）。
+  --
+  -- 为什么密钥也存一份明文
+  -- ----------------------
+  -- 网关校验走的是 `key_hash`（明文永不参与比对），这一列**只为「再看一眼」**：
+  -- 用户把密钥发给同事后自己手上没有，只能删掉重建 —— 而重建会让所有客户端
+  -- 配置同时失效。这与 `red_packet_shares.token` 是同一个取舍（那里是因为
+  -- 领取者抽奖时才需要明文），理由一致：面板刻意保持窄依赖，不自己写加密
+  -- （自造的加密比明文更危险 —— 会让人以为它是安全的）。
+  --
+  -- 代价必须说清：**能读到这份库文件 = 能拿到全部密钥**（原先只有哈希）。
+  -- 缓解：这一列只经 `POST /api/keys/{id}/reveal` 输出，那条接口要求会话管理员、
+  -- 每次都写审计日志；列表接口（只读账号也能调）永远不带它。
+  -- 存量密钥这一列为空（本列引入前建的），界面上会明确说明「无法取回」。
+  key_plain     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_keys_prefix ON api_keys(prefix);
 
@@ -639,6 +654,10 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ('request_logs', 'cache_write_tokens', 'INTEGER'),
     ('api_keys', 'quota_credit', 'REAL NOT NULL DEFAULT 0'),
     ('api_keys', 'used_credit', 'REAL NOT NULL DEFAULT 0'),
+    # 密钥明文（供「密钥页再次查看 / 复制」，见 SCHEMA 里这一列的说明）。
+    # 存量密钥为空串 = 取不回明文：那一版只存哈希，界面上要说清「去重建一把」，
+    # 而不是显示一个空密钥让人以为复制坏了。
+    ('api_keys', 'key_plain', "TEXT NOT NULL DEFAULT ''"),
     # 入站请求被拦的**原因**（issue #33）。
     #
     # 此前这张表只有一个 blocked 布尔：界面显示「已拦截」，但看不出是「没带

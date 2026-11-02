@@ -1,14 +1,14 @@
 'use client';
 
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw} from 'lucide-react';
+import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw, Copy, Check, Loader2} from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {notify} from '@/lib/toast';
 import {keyApi, upstreamsApi, errText} from '@/lib/api';
 import {BASE_PATH} from '@/lib/base-path';
 import type {ApiKey, KeyImportResult, KeyImportStatus, UpstreamEndpoint} from '@/lib/types';
-import {fmtDateTime, fmtNumber} from '@/lib/format';
+import {copyText, fmtDateTime, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
@@ -140,6 +140,17 @@ export default function KeysPage() {
   const [form, setForm] = useState<FormState>(emptyForm);
   const [busy, setBusy] = useState(false);
   const [issued, setIssued] = useState<string | null>(null);
+  /**
+   * 「再复制一次」：正在查看的密钥（含明文）与正在请求的那一行。
+   *
+   * 明文只在点开时向后端要一次（`POST /api/keys/{id}/reveal`，会话管理员 +
+   * 审计日志），**不随列表下发** —— 列表只读账号也能调，凭据不该跟着列表走。
+   * `revealing` 记的是哪一行在等，避免连点把同一行请求两次。
+   */
+  const [revealed, setRevealed] = useState<{name: string; key: string} | null>(null);
+  const [revealing, setRevealing] = useState<number | null>(null);
+  /** 刚复制成功的那一行（短暂显示对勾，移动端看不到 toast 时也有反馈） */
+  const [copiedId, setCopiedId] = useState<number | null>(null);
   /**
    * 一次性展示弹窗里选中的导出目标（cc-switch 还要分 Claude / Codex）。
    *
@@ -328,6 +339,36 @@ export default function KeysPage() {
       reload();
     } catch (e) {
       notify.err(errText(e));
+    }
+  }
+
+  /**
+   * 「再复制一次」：向后端要一次明文，然后直接写进剪贴板。
+   *
+   * 为什么点一下就是复制、而不是先开弹窗：用户来这一行就是为了复制（密钥本身
+   * 贴进客户端配置），多一次点击没有意义。`copyText` 在非安全上下文里会退回
+   * `execCommand('copy')`；两条路都不行时（浏览器拦了）才把密钥显示出来让他手动
+   * 选中复制 —— 静默失败只会变成「点了没反应」。
+   *
+   * 取不回来（存量密钥，库里只有哈希）时后端回 409 且说明该怎么办，
+   * 这里原样弹给他，不再自己编一句。
+   */
+  async function copyKey(k: ApiKey) {
+    if (revealing !== null) return;
+    setRevealing(k.id);
+    try {
+      const r = await keyApi.reveal(k.id);
+      if (await copyText(r.key)) {
+        notify.ok(t('keys.keyCopied'), r.name || k.name);
+        setCopiedId(k.id);
+        window.setTimeout(() => setCopiedId(null), 1500);
+      } else {
+        setRevealed({name: r.name || k.name, key: r.key});
+      }
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setRevealing(null);
     }
   }
 
@@ -701,6 +742,23 @@ export default function KeysPage() {
                   {isAdmin && (
                     <TableCell className="pr-4">
                       <div className="flex justify-end gap-1">
+                        {/* 「复制密钥」：明文不随列表下发，点这里才向后端要
+                            （会话管理员 + 审计）。存量密钥取不回来时后端会说明原因。 */}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 rounded-md"
+                          title={t('keys.copyKey')}
+                          aria-label={t('keys.copyKey')}
+                          disabled={revealing !== null}
+                          onClick={() => void copyKey(k)}
+                        >
+                          {revealing === k.id
+                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            : copiedId === k.id
+                              ? <Check className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                              : <Copy className="h-3.5 w-3.5" />}
+                        </Button>
                         <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md" title={t('keys.edit')} onClick={() => openEdit(k)}>
                           <Pencil className="h-3.5 w-3.5" />
                         </Button>
@@ -1207,6 +1265,32 @@ export default function KeysPage() {
           </DialogBody>
           <DialogFooter>
             <Button className="rounded-full" onClick={() => { setIssued(null); setExported(null); }}>
+              {t('keys.savedIt')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 再复制一次：查看已创建密钥的明文（管理员 + 审计） */}
+      <Dialog open={!!revealed} onOpenChange={(v) => { if (!v) setRevealed(null); }}>
+        <DialogContent className="w-[min(560px,calc(100vw-2rem))] max-w-[min(560px,calc(100vw-2rem))] sm:max-w-[min(560px,calc(100vw-2rem))]">
+          <DialogHeader>
+            <DialogTitle>{t('keys.revealTitle')}</DialogTitle>
+            <DialogDescription>{t('keys.revealDesc')}</DialogDescription>
+          </DialogHeader>
+          <DialogBody>
+            <div className="space-y-3 px-6 pb-3">
+              {/* 名称单独一行：密钥可能叫「客服组-夜班」，与密钥本身一样长时会挤在一起 */}
+              <p className="break-all text-sm font-medium">{revealed?.name}</p>
+              {/* min-w-0 不能少：flex 项默认 min-width:auto，长密钥会把复制按钮挤出去 */}
+              <div className="flex items-center gap-2 rounded-2xl bg-muted p-3">
+                <code className="min-w-0 flex-1 break-all font-mono text-xs">{revealed?.key}</code>
+                <CopyButton value={revealed?.key || ''} size="sm" showLabel label={t('keys.copyKey')} />
+              </div>
+            </div>
+          </DialogBody>
+          <DialogFooter>
+            <Button className="rounded-full" onClick={() => setRevealed(null)}>
               {t('keys.savedIt')}
             </Button>
           </DialogFooter>

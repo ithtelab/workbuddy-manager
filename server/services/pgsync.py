@@ -309,12 +309,26 @@ _SETTING_ALLOWLIST = frozenset({
 })
 
 
-def _filter_settings_rows(table: str, columns: list[str], rows: list) -> list:
-    """只保留 settings 白名单里的行；其它表原样返回。
+def _filter_rows(table: str, columns: list[str], rows: list) -> list:
+    """按表做**值级**过滤：settings 白名单 + 密钥明文抹掉；其它表原样返回。
 
-    拿不到 `key` 列时返回空：结构不认识就不搬，避免把整表（可能含凭据）
-    当成普通数据写进镜像。
+    settings：拿不到 `key` 列时返回空 —— 结构不认识就不搬，避免把整表（可能含
+    凭据）当成普通数据写进镜像。
+
+    api_keys：`key_plain` 置空。它只为「管理员在面板里再复制一次」而存在
+    （见 db.py 该列的说明），而镜像可能躺在别人的云 PG 里 —— 一份备份不该
+    帮别人把全部网关密钥（能直接花额度）带走。`key_hash` 照旧搬，恢复后
+    密钥仍然可用，只是**取不回明文**（界面上会说清是存量密钥）。
     """
+    if not rows:
+        return rows
+    if table == 'api_keys':
+        try:
+            index = columns.index('key_plain')
+        except ValueError:
+            return rows        # 老库 / 老镜像没有这一列
+        return [tuple('' if i == index else v for i, v in enumerate(row))
+                for row in rows]
     if table != 'settings':
         return rows
     try:
@@ -365,7 +379,7 @@ class _SqliteSource:
             chunk = cur.fetchmany(batch)
             if not chunk:
                 break
-            filtered = _filter_settings_rows(
+            filtered = _filter_rows(
                 table, columns, [tuple(r) for r in chunk])
             if filtered:
                 yield filtered
@@ -411,7 +425,7 @@ class _PgSource:
                 chunk = cur.fetchmany(batch)
                 if not chunk:
                     break
-                filtered = _filter_settings_rows(
+                filtered = _filter_rows(
                     table, columns, [tuple(r) for r in chunk])
                 if filtered:
                     yield filtered
