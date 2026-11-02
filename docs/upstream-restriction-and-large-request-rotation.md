@@ -69,24 +69,43 @@ key=38 / UA=deepseek-harness / 客户端 IP 222.85.110.6
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `large_request_bytes` | `262144`（256 KiB） | 请求体 ≥ 该值视为大上下文请求；`<=0` 关闭 |
-| `large_request_cooldown` | `"90s"` | 窗口内不再把大请求给同一个号 |
+| `large_request_cooldown` | `"0s"`（关闭） | 大于 0 才启用逐请求轮换，窗口内不再把大请求给同一个号 |
 
-请求体超阈值时：
+`large_request_cooldown` 大于 0 时，请求体超阈值会：
 
 1. **放弃会话粘性**（不按会话绑号，成功后也不写绑定）；
 2. 选号时排除窗口内已承接过大请求的号 → **逐请求轮换**；
 3. 被选中即登记（无论成败），保证窗口内不复用；
 4. 若所有号都在窗口内，退化为普通轮换，避免直接 503。
 
-小请求（< 阈值）行为完全不变。
+默认 `"0s"` 时完全不轮换，大请求与小请求一样按会话粘性选号。原因见下节。
+
+### 修正：默认关闭轮换（0046，2026-11-01）
+
+0044 上线当天，长上下文的缓存命中率从 97% 掉到 50–70%。同一账号池、同一模型实测：
+
+| 请求体 | 连发两次的结果 |
+| --- | --- |
+| 120 KB | 第一次命中 0，第二次命中 27776（全部前缀） |
+| 205 KB | 第一次命中 27904（上一轮前缀），第二次命中 47488 |
+| 300 KB（触发轮换） | 两次都命中 0 |
+
+上游的前缀缓存按账号存放（与 `server/services/accountlog.py` 的说明一致）：
+换号后整段上下文都算未命中，输入侧按全量计费。300 KB 的请求体在长对话里很常见，
+轮换等于让每一个多轮长对话都反复重算前缀。
+
+风控侧的收益则没有被验证：0044 只是把同一批大请求分摊到更多账号，总请求量与内容
+不变。因此默认关闭轮换，把选择权交给运维：确实观察到 11140 限制时再把
+`large_request_cooldown` 设为 `"90s"`，接受这些请求的缓存代价。
 
 ### 验证
 
 | 项 | 结果 |
 | --- | --- |
-| 连发 10 条 300 KB 请求 | **10 个不同账号、各 1 次**，全部 200 |
+| 连发 10 条 300 KB 请求（轮换开启） | 10 个不同账号、各 1 次，全部 200 |
 | 连发 10 条小请求（同 UA） | 仍集中 1 个账号（粘性未变） |
-| 单测 | `TestLargeExclusionsWindow` / `TestLargeExclusionsDisabled` |
+| 单测 | `TestLargeRotationOffByDefault` / `TestLargeExclusionsWindow` / `TestLargeExclusionsDisabled` |
+| 端到端 | `TestChatLargeRequestKeepsStickyByDefault`（默认写绑定）/ `TestChatLargeRequestRotationDoesNotBind`（显式开启后不写） |
 
 ---
 
@@ -96,10 +115,11 @@ key=38 / UA=deepseek-harness / 客户端 IP 222.85.110.6
 cd upstream   # v2.11.6 源码根
 git apply /path/to/0043-upstream-restriction-soft-cooldown.patch
 git apply /path/to/0044-large-request-rotation.patch
+git apply /path/to/0046-large-request-cache-friendly.patch
 go build ./... && go test ./internal/server/ ./internal/upstream/
 ```
 
-两个补丁互相独立（0044 不依赖 0043），都基于 v2.11.6 上游源码。
+0043 与 0044 互相独立（0044 不依赖 0043）；0046 修正 0044 的默认值，必须在 0044 之后应用。
 
 ## 未纳入本 PR 的本地改动
 
