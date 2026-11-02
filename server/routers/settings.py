@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .. import db, security
+from ..services import pricing
 from ..iputil import client_ip
 from ..services import autoupdate, modelmap, reload, updater, wb2api
 
@@ -114,6 +117,94 @@ def save_model_map(body: dict[str, str], user: dict = Depends(security.require_a
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.set_setting('model_map', clean)
     return clean
+
+# ── 计费价目（issue #380）────────────────────────────────
+#
+# 价目表默认随版本分发（server/services/pricing.json）。管理员可以在这里覆盖：
+# 官方调价后不必等上游发版，改完立刻生效。**只影响之后的调用** —— 已经落库的
+# 费用按当时的价目算好并存着，不会被改写（历史账不跟着变，见 pricing 模块说明）。
+@router.get('/settings/pricing')
+def get_pricing(user: dict = Depends(security.current_user)) -> dict:
+    """价目表 + 当前生效档 + 是否用了覆盖 + 节假日表缺哪些年份。"""
+    return pricing.describe()
+
+
+def _validate_pricing(body: Any) -> dict | None:
+    """校验覆盖价目：结构不对就 400，别把坏数据落库。
+
+    只拦「落库后一定算错」的形态：版本列表里每一条都得有可解析的
+    `effective_from` 和至少一个模型；单价必须是数字。宁可拒绝，也不要存进去
+    之后让整张费用表变成「—」——那种故障没有报错，只有沉默。
+    """
+    if body in (None, {}, []):
+        return None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail='价目表必须是 JSON 对象')
+    versions = body.get('versions')
+    if versions is None:
+        return None
+    if not isinstance(versions, list):
+        raise HTTPException(status_code=400, detail='versions 必须是数组')
+    clean_versions: list[dict] = []
+    for idx, item in enumerate(versions):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f'第 {idx + 1} 条价目不是对象')
+        start = str(item.get('effective_from') or '').strip()
+        try:
+            time.strptime(start, '%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f'第 {idx + 1} 条价目的 effective_from 不是 YYYY-MM-DD：{start!r}',
+            ) from None
+        models = item.get('models')
+        if not isinstance(models, dict) or not models:
+            raise HTTPException(status_code=400,
+                                detail=f'第 {idx + 1} 条价目没有 models')
+        for name, table in models.items():
+            if not isinstance(table, dict):
+                raise HTTPException(status_code=400,
+                                    detail=f'{name} 的价目不是对象')
+            for field in ('cache_hit', 'cache_miss', 'output'):
+                band = table.get(field)
+                if band is None:
+                    continue
+                if not isinstance(band, dict):
+                    raise HTTPException(status_code=400,
+                                        detail=f'{name}.{field} 必须是 {{peak, off_peak}}')
+                for key, val in band.items():
+                    if key not in ('peak', 'off_peak'):
+                        raise HTTPException(status_code=400,
+                                            detail=f'{name}.{field} 只能有 peak / off_peak')
+                    if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
+                        raise HTTPException(status_code=400,
+                                            detail=f'{name}.{field}.{key} 必须是非负数字')
+            if 'cache_miss' not in table or 'output' not in table:
+                raise HTTPException(status_code=400,
+                                    detail=f'{name} 至少要给 cache_miss 与 output 两档价')
+        clean_versions.append(item)
+    out = {'versions': clean_versions}
+    if isinstance(body.get('model_aliases'), dict):
+        out['model_aliases'] = body['model_aliases']
+    if body.get('currency'):
+        out['currency'] = str(body['currency'])
+    return out
+
+
+@router.put('/settings/pricing')
+def save_pricing(body: Any = Body(None),
+                 user: dict = Depends(security.require_admin)) -> dict:
+    """保存（或清除）覆盖价目。传 null / 空对象 = 恢复成随版本分发的那份。
+
+    `Body(None)` 而不是 `Body(...)`：清除覆盖最自然的请求就是 body 为 `null`，
+    而 `...` 会把 null 判成「字段缺失」回 422 —— 界面上就变成「恢复默认」按钮
+    报错，还看不出是为什么。
+    """
+    clean = _validate_pricing(body)
+    pricing.set_override(clean)
+    pricing.invalidate()
+    return pricing.describe()
+
 
 # ── GitHub Token（版本检测 / 一键更新）────────────────────
 @router.get('/settings/github-token')

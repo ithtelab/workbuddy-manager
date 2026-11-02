@@ -607,6 +607,9 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
     if credit is None:
         credit = _usage_credit(usage)
     cache_hit, cache_miss, cache_write = _usage_cache(usage)
+    # 日志与用量统计必须用**同一个时刻**（issue #380）：费用按调用时刻的价目
+    # 与峰谷档计价，两处各取一次 time.time() 会在整点/整点边界上算出两个价。
+    log_ts = int(time.time())
 
     try:
         # realm 由**实际发往上游的模型名**判定（上游按 `cn:` / `global:` 前缀路由）：
@@ -627,7 +630,7 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
         model_clean = db._clean(model, 128)
         realm = db.realm_of_model(db._clean(mapped, 128) or model_clean)
         db.add_request_log(
-            ts=int(time.time()),
+            ts=log_ts,
             key_id=key['id'] if key else None,
             ip=db._clean(ip, 64),
             model=model_clean,
@@ -661,7 +664,12 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             # 原先只记 token，积分用量就永远是 0，超限判定无从谈起。
             keysvc.touch(key, ip, total, credit)
             if total or credit:
-                db.bump_usage(key['id'], model_clean, pt, ct, credit, realm=realm)
+                # cache 两段与时刻一并传入（issue #380）：费用要按命中价 /
+                # 未命中价、以及高峰 / 空闲两档分别计价，缺任一样就只能估成
+                # 「整段输入按未命中价」，长对话会高估好几倍。
+                db.bump_usage(key['id'], model_clean, pt, ct, credit, realm=realm,
+                              cache_hit=cache_hit, cache_miss=cache_miss,
+                              ts=log_ts)
         except Exception as exc:  # noqa: BLE001
             logger.warning('累计用量失败（不影响请求）: %s', exc)
 

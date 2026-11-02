@@ -8,7 +8,7 @@ import {keyApi, logApi} from '@/lib/api';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {useDebounced} from '@/lib/use-debounce';
 import type {ApiKey, RequestLog} from '@/lib/types';
-import {fmtCredit, fmtDateTime, fmtDateTimeMarked, fmtLatency, fmtNumber} from '@/lib/format';
+import {fmtCredit, fmtDateTime, fmtDateTimeMarked, fmtLatency, fmtMoney, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
@@ -427,6 +427,11 @@ export default function LogsPage() {
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colFirstToken')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colLatency')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">Token</TableHead>
+              {/* 按 DeepSeek 官方价估算的费用（issue #380）。与右边「积分」是两回事：
+                  积分是上游真实扣的，费用是「这些 token 按官方价买要多少钱」。 */}
+              <TableHead className="whitespace-nowrap text-[11px] text-muted-foreground">
+                {t('logs.colCost')}
+              </TableHead>
               <TableHead className="pr-4 text-[11px] text-muted-foreground">{t('metric.paid')}</TableHead>
             </TableRow>
           </TableHeader>
@@ -531,6 +536,15 @@ export default function LogsPage() {
                     </span>
                   ) : null}
                 </TableCell>
+                {/* 费用：null = 这个模型没收录价目（glm / kimi …）或该行在功能上线前
+                    写入，显示「—」。绝不兜底成 ¥0——那会被读成「这次调用免费」。 */}
+                <TableCell className="whitespace-nowrap text-xs tabular-nums">
+                  {l.cost != null ? (
+                    fmtMoney(l.cost)
+                  ) : (
+                    <span className="text-muted-foreground/50">—</span>
+                  )}
+                </TableCell>
                 <TableCell className="pr-4 text-xs tabular-nums">
                   {typeof l.credit === 'number' ? (
                     <span className={l.credit > 0 ? 'text-amber-600 dark:text-amber-400' : ''}>
@@ -611,6 +625,11 @@ export default function LogsPage() {
                     : t('logs.notCollected'),
                 ],
                 ['latency', t('logs.rowLatency'), fmtLatency(detail.latency_ms)],
+                [
+                  'cost',
+                  t('logs.rowCost'),
+                  detail.cost != null ? fmtMoney(detail.cost) : t('logs.costUnavailable'),
+                ],
                 ['promptTokens', 'Prompt Token', fmtNumber(detail.prompt_tokens)],
                 ['completionTokens', 'Completion Token', fmtNumber(detail.completion_tokens)],
                 // 提示词缓存三段（issue #69）。null 显示「未采集」而不是 0：
