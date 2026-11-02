@@ -11,6 +11,8 @@ export interface RefreshRisk {
 }
 
 export interface Account {
+  /** 本面板记录的添加时间（Unix 秒）；旧账号/直接拷贝的文件可能未知。 */
+  added_at?: number | null;
   refresh_risk?: RefreshRisk | null;
   proxy?: string;
   /**

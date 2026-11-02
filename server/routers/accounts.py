@@ -225,6 +225,8 @@ async def upload_accounts(
                     if account['proxy']:
                         saved['proxy'] = account['proxy']
                     tencent._atomic_write_json(path, saved)
+                    if not existed:
+                        db.record_account_added(account['uid'], auth_dir)
                     reload.request_reload_or_restart(account['uid'], upstream=_reload_target(group))
                     item = {'file': filename, 'uid': account['uid'], 'updated': existed}
                     uploaded.append(item)
@@ -482,6 +484,7 @@ async def list_accounts(upstream_id: int | None = Query(None),
     # 备注随列表一次带回（issue #67）：按 uid 取，没有备注的账号给空串而不是缺字段
     # —— 前端两处视图（手机卡片 / 桌面表格）都直接读它，缺字段会多一处判空。
     notes = db.account_notes()
+    added_times = db.account_added_times(base_dir) if base_dir else {}
     # 今日签到状态随列表一次带回（和备注同一个理由：两处视图都直接读它）。
     # 数据源是本端签到记录 —— 腾讯对「今天已签过」回 10001 且我们照记，
     # 所以「本端签过」与「今天已签到」在这里是同一件事。上游自动签到不产
@@ -491,6 +494,7 @@ async def list_accounts(upstream_id: int | None = Query(None),
     for a in accounts:
         uid = str(a.get('uid') or '')
         a['note'] = notes.get(uid, '')
+        a['added_at'] = added_times.get(uid)
         a['checkin_today'] = done_today.get(uid)
     synced = sum(1 for a in accounts if a.get('credits') is not None)
     return {
@@ -937,6 +941,9 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
                 f'不需要重新扫码。'
             ),
         ) from exc
+
+    if not existed:
+        db.record_account_added(str(result['uid']), auth_dir)
 
     # 账号已确实落盘，这时才丢 state（成功路径的收尾）
     tencent.drop_state(state)
@@ -2475,6 +2482,7 @@ async def account_move(
         uid = str((moved.get('account') or {}).get('uid') or '')
     except Exception:  # noqa: BLE001 —— 读不出 uid 不影响移动，只是少了重载收尾
         uid = ''
+    db.move_account_added(uid, src_dir, dst_dir)
     reload.request_reload_or_restart(uid, upstream=_reload_target(dst))
     return {
         'ok': True,
