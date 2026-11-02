@@ -36,7 +36,7 @@ with sync_playwright() as pw:
         if path == '/api/me': data = dict(username='regression',role='admin')
         elif path == '/api/upstreams': data = dict(items=[dict(id=1,name='默认分组',auth_dir='/app/auths',is_default=True,enabled=True)])
         elif path == '/api/accounts': data = dict(total=4, accounts=accounts, manageable=True)
-        elif path == '/api/status': data = dict(connected=True,accounts=accounts,total=4,healthy=1,disabled=2,cooling=1)
+        elif path == '/api/upstream/status': data = dict(connected=True,accounts=accounts,total=4,healthy=1,disabled=2,cooling=1)
         elif path == '/api/accounts/refresh-credits': data = dict(total=4,succeeded=4,failed=[],credits={a['uid']:a['credits'] for a in accounts},meta={})
         elif path == '/api/accounts/admin-api-status': data = dict(enabled=True)
         elif path == '/api/stats/credits': data = dict(days=7,today={},week={},total={},daily=[])
