@@ -217,6 +217,7 @@ export default function LogsPage() {
   // 非管理员没有这个接口的权限：不给 fetcher 就不会打请求（返回 undefined 即跳过）。
   const {
     values: backfillValues,
+    errors: backfillErrors,
     reload: reloadBackfill,
   } = useAsyncAll(
     {backfill: isAdmin ? () => logApi.accountBackfill() : () => Promise.resolve(undefined)},
@@ -228,16 +229,22 @@ export default function LogsPage() {
   const total = values.logs?.total ?? 0;
   const keys: ApiKey[] = keyValues.keys ?? EMPTY_KEYS;
 
-  const failedCount = Object.keys(logErrors).length + Object.keys(keyErrors).length;
+  const failedCount = Object.keys(logErrors).length + Object.keys(keyErrors).length
+    + Object.keys(backfillErrors).length;
 
-  /** 重试：两组一起重来，避免「点了重试、密钥下拉还是空的」 */
+  /** 重试时也更新账号诊断，不能让过期告警一直留在页面上。 */
   const retry = useCallback(() => {
-    reloadLogs();
-    reloadKeys();
-  }, [reloadLogs, reloadKeys]);
+    void reloadLogs();
+    void reloadKeys();
+    if (isAdmin) void reloadBackfill();
+  }, [reloadLogs, reloadKeys, reloadBackfill, isAdmin]);
 
-  // 新请求会不断写入日志；心跳刷新只更新当前筛选下的列表，不会重置筛选条件
-  useHeartbeat(reloadLogs, 60000);
+  // 列表和账号诊断一起更新；后台回填恢复后横幅会自动消失。
+  // useHeartbeat 在标签页隐藏时暂停，重新可见时立即刷新，不重置筛选条件。
+  useHeartbeat(() => {
+    void reloadLogs();
+    if (isAdmin) void reloadBackfill();
+  }, 60000);
 
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 

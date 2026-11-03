@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import logging
 import re
 import time
@@ -180,8 +181,14 @@ def parse_request_lines(lines: list[str]) -> list[dict]:
         acct = _normalize_account(m.group('acct'))
         if not model or not acct or acct == '-':
             continue
-        out.append({'ts': ts, 'model': model, 'account': acct})
+        out.append({'ts': ts, 'model': model, 'account': acct,
+                    'event_id': _event_id(line, ts)})
     return out
+
+
+def _event_id(line: str, ts: int) -> str:
+    """保留 docker 纳秒前缀 / 请求序号；原生加恢复的日期，防止每日序号碰撞。"""
+    return hashlib.sha256(f'{ts}:{line.strip()}'.encode('utf-8')).hexdigest()
 
 
 def parse_request_lines_with_mtime(lines: list[str], mtime: float | None) -> list[dict]:
@@ -200,7 +207,8 @@ def parse_request_lines_with_mtime(lines: list[str], mtime: float | None) -> lis
         acct = _normalize_account(m.group('acct'))
         if not model or not acct or acct == '-':
             continue
-        out.append({'ts': ts, 'model': model, 'account': acct})
+        out.append({'ts': ts, 'model': model, 'account': acct,
+                    'event_id': _event_id(line, ts)})
     return out
 
 
@@ -210,12 +218,12 @@ _last: dict = {
     'checked_at': 0, 'lines': 0, 'parsed': 0, 'filled': 0, 'error': '',
 }
 
-# 判断「回填是不是真的卡住」时回看的窗口（秒）。采集每 15 秒一轮，正常一条请求
-# 在一个窗口内就配上；超过这个时长仍空着，才值得提示用户。
+# 只诊断近期、且超过正常采集等待时间的记录。300 秒是回看范围，不是超时。
 _PENDING_WINDOW = 300
+_PENDING_GRACE = 60
 
 
-def _has_pending_accounts(since: int) -> bool:
+def _has_pending_accounts(since: int, until: int | None = None) -> bool:
     """库里是否还有「在这个时刻之后、仍未回填」的请求记录。
 
     `_last['filled']` 只是**本轮新填**的条数：`attach_request_accounts` 只匹配
@@ -228,8 +236,11 @@ def _has_pending_accounts(since: int) -> bool:
     """
     try:
         row = db.query_one(
-            'SELECT 1 FROM request_logs WHERE account IS NULL AND ts >= ? LIMIT 1',
-            (since,),
+            'SELECT 1 FROM request_logs WHERE account IS NULL '
+            'AND COALESCE(account_expected, 1) = 1 AND ts BETWEEN ? AND ? '
+            "AND (COALESCE(TRIM(mapped_model), '') <> '' OR COALESCE(TRIM(model), '') <> '') "
+            'LIMIT 1',
+            (since, until if until is not None else int(time.time()) - _PENDING_GRACE),
         )
         return row is not None
     except Exception:  # noqa: BLE001
@@ -245,18 +256,18 @@ def _collect_once() -> int:
     lines, mtime = wb2api.read_container_logs(
         _TAIL, timestamps=True, with_mtime=True, path=config.WB2API_CHAT_LOG_FILE,
     )
-    _last['checked_at'] = int(time.time())
-    _last['lines'] = len(lines)
-    if not lines:
-        _last.update(parsed=0, error='')
-        return 0
-    entries = parse_request_lines_with_mtime(lines, mtime)
-    _last['parsed'] = len(entries)
-    if not entries:
-        _last['error'] = ''
-        return 0
-    filled = db.attach_request_accounts(entries)
-    _last.update(filled=filled, error='')
+    entries = parse_request_lines_with_mtime(lines, mtime) if lines else []
+    mode = config.WB2API_MODE
+    source = (str(config.WB2API_CHAT_LOG_FILE) if mode == 'native'
+              else config.WB2API_SERVICE if mode == 'systemd'
+              else config.WB2API_CONTAINER)
+    for entry in entries:
+        entry['source'] = f'{mode}:{source}'
+    filled = db.attach_request_accounts(entries) if entries else 0
+    # 一次性发布完整快照，读侧不会看到新 parsed 配上上一轮 filled。
+    global _last
+    _last = {'checked_at': int(time.time()), 'lines': len(lines),
+             'parsed': len(entries), 'filled': filled, 'error': ''}
     return filled
 
 
@@ -302,7 +313,8 @@ def status() -> dict:
             info['hint'] = (f'journalctl 读不到 {config.WB2API_SERVICE} 的日志：确认 unit 名正确，'
                             '且面板进程能读 journal（加入 systemd-journal 组，或改用 '
                             'WB2API_MODE=native + WB2API_LOG_FILE）。')
-        return info
+        if info.get('hint'):
+            return info
     else:
         info['exists'] = updater.can_control_docker()
         if not info['exists']:
@@ -312,14 +324,17 @@ def status() -> dict:
             return info
     if not snap['checked_at']:
         info['hint'] = '采集还没跑过第一轮（启动后最多 15 秒）。稍等再看。'
+    elif snap['error']:
+        info['hint'] = f"账号采集失败：{snap['error']}。请重新检查日志读取与数据库状态。"
     elif snap['lines'] and not snap['parsed']:
         info['hint'] = ('读到了日志，但没有一行符合上游的请求格式。多半是上游版本变化改了'
                         '日志排版 —— 请把日志里一条 chat 请求的原文贴出来。')
-    elif snap['parsed'] and not snap['filled'] and _has_pending_accounts(
-            int(time.time()) - _PENDING_WINDOW):
-        info['hint'] = ('解析出了请求行，但在匹配窗口内找不到对应的本地记录'
-                        '（时间窗口 3 秒、模型名需一致）。常见于上游与面板时钟不同步，'
-                        '或日志里只有更早的请求。')
+    elif snap['parsed'] and _has_pending_accounts(
+            int(time.time()) - _PENDING_WINDOW,
+            min(int(time.time()) - _PENDING_GRACE, snap['checked_at'] - _PENDING_GRACE)):
+        info['hint'] = ('存在超过 60 秒仍未回填账号的近期请求'
+                        '（匹配时间窗口 ±3 秒、模型名需一致）。请检查日志来源、模型名与'
+                        '请求结束时间；可能是日志缺失、收尾延迟或时钟偏差。')
     else:
         info['hint'] = ''
     return info
@@ -335,7 +350,7 @@ async def _loop() -> None:
                 logger.debug('回填账号 %d 条', filled)
         except Exception as exc:  # noqa: BLE001
             # 采集失败只是这一轮没有数据，下一轮继续；不影响任何请求
-            _last['error'] = str(exc)[:200]
+            _last.update(filled=0, error=str(exc)[:200])
             logger.warning('账号回填失败（不影响请求）: %s', exc)
         await asyncio.sleep(_POLL_SECONDS)
 

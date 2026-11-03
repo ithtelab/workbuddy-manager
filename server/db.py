@@ -1,6 +1,7 @@
 """SQLite 存储层：密钥、日志、用量、IP 规则与全局设置。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -174,6 +175,15 @@ CREATE TABLE IF NOT EXISTS request_logs (
   channel           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON request_logs(ts);
+
+-- 一条上游日志只能回填一个请求；消费记录独立于日志行保留，手动清空请求日志
+-- 或重启采集器后也不能把同一事件重新分配给邻近请求。
+CREATE TABLE IF NOT EXISTS request_account_matches (
+  event_id       TEXT PRIMARY KEY,
+  request_log_id INTEGER NOT NULL UNIQUE,
+  ts             INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_account_matches_ts ON request_account_matches(ts);
 
 CREATE TABLE IF NOT EXISTS usage_daily (
   day               TEXT    NOT NULL,
@@ -678,6 +688,9 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 值形如 `昵称(uid8)`，与上游日志里的写法一致；脱敏与截断在写入侧做。
     # NULL = 未关联上（采集不可用、或该条在上游日志里已滚掉），界面显示「—」。
     ('request_logs', 'account', 'TEXT'),
+    # 0 = 本地拒绝，根本没有上游对话日志；NULL = 旧记录，保持兼容。
+    # 不能按 HTTP 状态排除：上游 400/429/503 同样可能已选账号。
+    ('request_logs', 'account_expected', 'INTEGER'),
     # 输入侧命中缓存的 token 数（上游 usage.prompt_cache_hit_tokens）。
     #
     # 为什么值得单独记：prompt_tokens 是**含**缓存的，光看它看不出这次省了
@@ -1167,6 +1180,8 @@ def _prune_side_tables() -> None:
     for sql, args in (
         ('DELETE FROM usage_hourly WHERE day < ?', (hourly_cutoff,)),
         ('DELETE FROM task_logs WHERE ts < ?', (task_cutoff,)),
+        ('DELETE FROM request_account_matches WHERE ts < ?',
+         (now - _REQUEST_LOG_RETAIN_DAYS * 86400,)),
         # 保留最新 N 行：删除 id <= 第 N+1 新那行的 id；不足 N 行时子查询为 NULL，
         # `id <= NULL` 不成立，什么都不会删。
         ('DELETE FROM audit_logs WHERE id <= (SELECT id FROM audit_logs '
@@ -1204,8 +1219,8 @@ def add_request_log(**fields: object) -> None:
         'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '
         'prompt_tokens, completion_tokens, latency_ms, first_token_ms, ua, error, '
         'stream, credit, realm, account, cache_hit_tokens, cache_miss_tokens, '
-        'cache_write_tokens, effort, channel) '
-        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'cache_write_tokens, effort, channel, account_expected) '
+        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (fields.get('ts'), fields.get('key_id'), fields.get('ip'),
          fields.get('model'), fields.get('mapped_model'), fields.get('status'),
          fields.get('prompt_tokens'), fields.get('completion_tokens'),
@@ -1213,7 +1228,7 @@ def add_request_log(**fields: object) -> None:
          fields.get('error'), fields.get('stream'), fields.get('credit'),
          fields.get('realm'), fields.get('account'), fields.get('cache_hit_tokens'),
          fields.get('cache_miss_tokens'), fields.get('cache_write_tokens'),
-         fields.get('effort'), fields.get('channel')),
+         fields.get('effort'), fields.get('channel'), fields.get('account_expected')),
     )
     _request_log_writes += 1
     if _request_log_writes >= _REQUEST_LOG_CHECK_EVERY:
@@ -1235,12 +1250,11 @@ def attach_request_accounts(entries: Iterable[dict]) -> int:
     entries 形如 `[{'ts': 结束时刻(epoch 秒), 'model': 上游侧模型名,
     'account': '昵称(uid8)'}]`。
 
-    匹配规则：**同模型 + 时间最接近 + 尚未回填**。
+    匹配规则：**同模型 + 时间最接近 + 尚未回填 + 事件尚未消费**。
 
-    为什么用「最接近」而不是相等：本端记的是 `int(time.time())`（秒级截断），
-    上游给的是纳秒 —— 两者不可能相等，只能就近匹配。实测「最近的一行」总是
-    正确的那条；但**同一秒内有多个同模型请求**时无法区分，所以只挑
-    `account IS NULL` 的行，避免把已经填对的行改错（宁可漏填，不可填错）。
+    两端时刻只有秒级精度，就近匹配仍是启发式。最近候选等距时留空，不能猜。
+    事件消费与回填在同一事务里提交：重复 tail、重启和并发采集都不能把一条日志
+    填给第二个请求。未匹配的事件不消费，下一轮仍可匹配稍晚写入的本地记录。
 
     模型名两边都取**映射后**的名字（`mapped_model`），另兼看 `model` ——
     映射表变更时两边可能只对得上一个。
@@ -1258,20 +1272,47 @@ def attach_request_accounts(entries: Iterable[dict]) -> int:
         # （历史记录里存在），等于把账号填到一条毫不相干的日志上。宁可漏填。
         if not model:
             continue
+        # 解析器提供包含原始时间戳和序号的事件标识；兼容旧调用方的三字段条目。
+        event = e.get('event_id') or json.dumps([ts, model, acct], ensure_ascii=False)
+        event_id = hashlib.sha256(
+            json.dumps([e.get('source', ''), event], ensure_ascii=False).encode('utf-8'),
+        ).hexdigest()
         try:
-            row = query_one(
-                'SELECT id FROM request_logs '
-                'WHERE account IS NULL AND ts BETWEEN ? AND ? '
-                '  AND (mapped_model = ? OR model = ?) '
-                'ORDER BY ABS(ts - ?) LIMIT 1',
-                (ts - _ACCOUNT_MATCH_WINDOW, ts + _ACCOUNT_MATCH_WINDOW,
-                 model, model, ts),
-            )
-            if row is None:
-                continue
-            execute('UPDATE request_logs SET account = ? WHERE id = ?',
-                    (acct, row['id']))
-            filled += 1
+            with _lock:
+                conn = connect()
+                try:
+                    conn.execute('BEGIN IMMEDIATE')
+                    if conn.execute('SELECT 1 FROM request_account_matches WHERE event_id = ?',
+                                    (event_id,)).fetchone():
+                        conn.rollback()
+                        continue
+                    rows = conn.execute(
+                        'SELECT id, account, ABS(ts - ?) AS distance FROM request_logs '
+                        'WHERE COALESCE(account_expected, 1) = 1 '
+                        '  AND ts BETWEEN ? AND ? AND (mapped_model = ? OR model = ?) '
+                        'ORDER BY distance, id LIMIT 2',
+                        (ts, ts - _ACCOUNT_MATCH_WINDOW, ts + _ACCOUNT_MATCH_WINDOW,
+                         model, model),
+                    ).fetchall()
+                    if not rows or (len(rows) > 1 and rows[0]['distance'] == rows[1]['distance']):
+                        conn.rollback()
+                        continue
+                    row = rows[0]
+                    # 升级前已填的最近行也要占住事件，不能因它不再为 NULL 就跳到邻行。
+                    # 账号不一致或该行已有另一事件时不猜；保留原值。
+                    if row['account'] is not None and row['account'] != acct:
+                        conn.rollback()
+                        continue
+                    if row['account'] is None:
+                        conn.execute('UPDATE request_logs SET account = ? WHERE id = ? AND account IS NULL',
+                                     (acct, row['id']))
+                    conn.execute('INSERT INTO request_account_matches(event_id, request_log_id, ts) '
+                                 'VALUES(?, ?, ?)', (event_id, row['id'], ts))
+                    conn.commit()
+                    filled += int(row['account'] is None)
+                except Exception:
+                    conn.rollback()
+                    raise
         except Exception:  # noqa: BLE001
             # 回填是旁路：任何异常都不能影响采集循环的其余部分
             continue
