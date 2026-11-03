@@ -586,6 +586,15 @@ def normalize_chat_images(body: object) -> int:
     return changed
 
 
+def _account_expected_after_error(exc: Exception) -> bool:
+    """只排除明确未发送到上游的错误；读/写超时或协议错误可能已选账号。
+
+    ConnectError 覆盖 DNS、连接拒绝和建连失败；ConnectTimeout / PoolTimeout
+    分别发生在建连与取得连接前。不能按 502 或所有 TransportError 一刀切。
+    """
+    return not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+
+
 def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, effort: str | None = None, account_expected: bool = True) -> None:
     """记录调用日志与用量。
 
@@ -1356,7 +1365,8 @@ async def _chat(request: Request, upstream_path: str):
                                 status_code=resp.status_code, headers=headers)
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                    account_expected=_account_expected_after_error(exc))
             return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     # 流式转发
@@ -1367,7 +1377,8 @@ async def _chat(request: Request, upstream_path: str):
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True, effort=effort)
+        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True, effort=effort,
+                account_expected=_account_expected_after_error(exc))
         return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     status_code = resp.status_code

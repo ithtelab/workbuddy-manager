@@ -1287,10 +1287,14 @@ def attach_request_accounts(entries: Iterable[dict]) -> int:
                         conn.rollback()
                         continue
                     rows = conn.execute(
-                        'SELECT id, account, ABS(ts - ?) AS distance FROM request_logs '
-                        'WHERE COALESCE(account_expected, 1) = 1 '
-                        '  AND ts BETWEEN ? AND ? AND (mapped_model = ? OR model = ?) '
-                        'ORDER BY distance, id LIMIT 2',
+                        'SELECT r.id, r.account, ABS(r.ts - ?) AS distance FROM request_logs r '
+                        'WHERE COALESCE(r.account_expected, 1) = 1 '
+                        '  AND r.ts BETWEEN ? AND ? AND (r.mapped_model = ? OR r.model = ?) '
+                        # 已由事件明确关联的行不再占新事件的候选；消费检查仍阻止重放。
+                        # 未建立关联的历史已填行保留，保护升级首次采集不串填。
+                        '  AND NOT EXISTS (SELECT 1 FROM request_account_matches a '
+                        '                  WHERE a.request_log_id = r.id) '
+                        'ORDER BY distance, r.id LIMIT 2',
                         (ts, ts - _ACCOUNT_MATCH_WINDOW, ts + _ACCOUNT_MATCH_WINDOW,
                          model, model),
                     ).fetchall()
@@ -1299,7 +1303,7 @@ def attach_request_accounts(entries: Iterable[dict]) -> int:
                         continue
                     row = rows[0]
                     # 升级前已填的最近行也要占住事件，不能因它不再为 NULL 就跳到邻行。
-                    # 账号不一致或该行已有另一事件时不猜；保留原值。
+                    # 未建立事件关联的历史账号不一致时不猜；保留原值。
                     if row['account'] is not None and row['account'] != acct:
                         conn.rollback()
                         continue

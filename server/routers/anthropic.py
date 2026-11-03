@@ -1063,7 +1063,8 @@ async def messages(request: Request):
                 data if isinstance(data, dict) else {}, model, thinking=want_thinking))
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                            account_expected=gateway._account_expected_after_error(exc))
             return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     # ── 流式 ────────────────────────────────────────────────
@@ -1075,7 +1076,8 @@ async def messages(request: Request):
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True,
+                        account_expected=gateway._account_expected_after_error(exc))
         return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     status_code = resp.status_code

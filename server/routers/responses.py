@@ -1770,7 +1770,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 else 'invalid_custom_tool_arguments')
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                            account_expected=gateway._account_expected_after_error(exc))
             return _failed(f'上游不可用：{exc}', 502)
 
     # ── 流式 ──
@@ -1782,7 +1783,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True,
+                        account_expected=gateway._account_expected_after_error(exc))
         return _failed(f'上游不可用：{exc}', 502)
 
     # 上游直接报错：**开流之前**用真实状态码回掉。

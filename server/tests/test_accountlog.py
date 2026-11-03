@@ -302,6 +302,18 @@ class AttachTest(unittest.TestCase):
         self.assertIsNone(self._account(rejected))
         self.assertEqual(self._account(upstream), 'A(1)')
 
+    def test_distinct_events_with_one_second_local_lag_both_match(self) -> None:
+        """合成事件：上游 100/101，本地 101/102；已关联第一条不能挡住第二条。"""
+        from server import db
+        first = self._log(TS_CN + 1)
+        second = self._log(TS_CN + 2)
+        entries = [{'ts': TS_CN + i, 'model': 'deepseek-v4.1-flash',
+                    'account': f'account-{i}', 'event_id': f'event-{i}'} for i in range(2)]
+        self.assertEqual(db.attach_request_accounts(entries), 2)
+        self.assertEqual(self._account(first), 'account-0')
+        self.assertEqual(self._account(second), 'account-1')
+        self.assertEqual(db.attach_request_accounts(entries), 0)
+
     def test_distinct_events_with_same_account_are_not_collapsed(self) -> None:
         from server import db
         self._log(TS_CN)
