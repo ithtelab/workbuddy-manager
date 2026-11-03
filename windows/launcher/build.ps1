@@ -362,26 +362,50 @@ $upstreamHashExcludeRegex = @(
 $upstreamPayloadExcludeDirs = @('.git', '__pycache__', 'auths', 'data', 'logs', 'log', 'tmp')
 $upstreamPayloadExcludeFiles = @('.env', '.env.*', 'config.json', 'users.json', '*.db', '*.db-wal', '*.db-shm', '*.log')
 if (-not $SkipUpstream) {
-    if (-not (Test-Path (Join-Path $upstreamDir 'go.mod'))) {
-        Write-Step '下载上游源码包…'
-        $tarPath = Join-Path $env:TEMP 'wb-upstream-src.tar.gz'
+    # 远端资产摘要才是「本地源码树是否最新」的依据。
+    #
+    # 只判「本地有没有 go.mod」会把旧树一直用下去：资产换了、补丁加了，而源码树哈希 /
+    # Go 版本 / 构建脚本三项缓存指纹一个都不变，于是下载与编译双双跳过，装出来的仍是
+    # 几十个补丁之前的 exe。
+    $tarPath = Join-Path $env:TEMP 'wb-upstream-src.tar.gz'
+    $assetSha = ''
+    try {
         Invoke-Curl $UpstreamSrcUrl $tarPath
+        $assetSha = Get-FileSha256 $tarPath
+    } catch {
+        # 离线/网络抖动：沿用本地源码树，不让构建整体失败；本地也没有树时下面会明确报错。
+        Write-Warn2 ('取不到上游源码包，沿用本地源码树：' + $_.Exception.Message)
+        if (Test-Path -LiteralPath $tarPath) { Remove-Item -LiteralPath $tarPath -Force }
+    }
+    $upstreamMeta = Read-CacheMeta $upstreamCacheMeta
+    $needExtract = -not (Test-Path (Join-Path $upstreamDir 'go.mod'))
+    if (-not $needExtract -and $assetSha) {
+        $needExtract = ($upstreamMeta.asset_sha256 -ne $assetSha)
+    }
+    if ($needExtract) {
+        if (-not $assetSha) { throw '上游源码树不存在，且源码包下载失败' }
+        Write-Step '解出上游源码树…'
         $extractTmp = Join-Path $env:TEMP ('wb-upstream-' + [Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory $extractTmp -Force | Out-Null
-        & $TarExe -xzf $tarPath -C $extractTmp
-        if ($LASTEXITCODE -ne 0) { throw '上游源码解压失败' }
-        New-Item -ItemType Directory $upstreamDir -Force | Out-Null
-        Move-Item (Join-Path $extractTmp 'workbuddy2api\*') $upstreamDir -Force
-        Remove-Item $extractTmp -Recurse -Force
-        Remove-Item $tarPath -Force
+        try {
+            & $TarExe -xzf $tarPath -C $extractTmp
+            if ($LASTEXITCODE -ne 0) { throw '上游源码解压失败' }
+            New-Item -ItemType Directory $upstreamDir -Force | Out-Null
+            # 只覆盖源码：auths/ 是真实账号授权，data/ 是运行状态，config.json 含 api_key。
+            # 资产里本来就没有这些，仍显式排除，免得打包口径变了把用户数据冲掉。
+            Copy-Tree (Join-Path $extractTmp 'workbuddy2api') $upstreamDir `
+                $upstreamPayloadExcludeDirs $upstreamPayloadExcludeFiles
+        } finally {
+            if (Test-Path -LiteralPath $extractTmp) { Remove-Item -LiteralPath $extractTmp -Recurse -Force }
+        }
     } else {
-        Write-Step '上游源码已存在，跳过下载'
+        Write-Step '上游源码树已与远端资产一致，跳过下载'
     }
+    if (Test-Path -LiteralPath $tarPath) { Remove-Item -LiteralPath $tarPath -Force }
 
     $upstreamExe = Join-Path $upstreamDir 'wb2api.exe'
     $upstreamSourceHash = Get-TreeHash $upstreamDir $upstreamHashExcludeRegex
     if (-not $upstreamSourceHash) { throw '上游源码指纹为空，无法判断构建输入' }
-    $upstreamMeta = Read-CacheMeta $upstreamCacheMeta
     $goForCache = Find-ExistingGoToolchain
     $goFingerprintForCache = Get-GoToolchainFingerprint $goForCache
     $goFingerprintMatches = if (-not $goForCache) {
@@ -393,9 +417,14 @@ if (-not $SkipUpstream) {
     }
     $upstreamArtifactMatches = (Test-Path $upstreamExe) -and $upstreamMeta -and
         $upstreamMeta.artifact_sha256 -eq (Get-FileSha256 $upstreamExe)
+    # 资产摘要必须进缓存键：否则远端换了源码包、本地树却没动时，其余指纹全部命中，
+    # 编译被跳过，产物仍是旧补丁的 exe。拿不到资产（离线）时不参与判定。
+    $assetMatches = (-not $assetSha) -or
+        ($upstreamMeta -and $upstreamMeta.asset_sha256 -eq $assetSha)
     $upstreamCacheValid = (Test-Path $upstreamExe) -and $upstreamMeta -and
         $upstreamMeta.source_sha256 -eq $upstreamSourceHash -and
         $upstreamMeta.source_url -eq $UpstreamSrcUrl -and
+        $assetMatches -and
         $upstreamMeta.build_script_sha256 -eq $buildScriptHash -and
         $upstreamMeta.recipe_version -eq $UpstreamBuildRecipeVersion -and
         $goFingerprintMatches -and $upstreamArtifactMatches
@@ -415,6 +444,7 @@ if (-not $SkipUpstream) {
             Write-CacheMeta $upstreamCacheMeta @{
                 source_sha256 = $upstreamSourceHash
                 source_url = $UpstreamSrcUrl
+                asset_sha256 = $assetSha
                 build_script_sha256 = $buildScriptHash
                 recipe_version = $UpstreamBuildRecipeVersion
                 go_executable_sha256 = $goFingerprint.executable_sha256
