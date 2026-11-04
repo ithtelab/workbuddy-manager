@@ -269,7 +269,12 @@ export function disabledReasonText(a: Account): string {
 /** 同一 uid 跨组只算一次；任一组可用时，其余额归入可用部分。 */
 export function partitionCredits(accounts: readonly Account[], live: Record<string, number>) {
   const unique = new Map<string, Account>();
-  const isUsable = (a: Account) => availabilityOf(a) === 'online' && a.healthy !== false;
+  const isUsable = (a: Account) => {
+    const tier = availabilityOf(a);
+    // 临时冷却不使余额失效；保护暂停、禁用等仍由分档优先排除。
+    return (tier === 'online' && a.healthy !== false)
+      || (tier === 'cooling' && a.in_pool !== false);
+  };
   for (const a of accounts) {
     if (!unique.has(a.uid) || isUsable(a)) unique.set(a.uid, a);
   }

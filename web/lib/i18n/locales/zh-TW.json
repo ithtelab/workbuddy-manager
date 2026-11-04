@@ -218,7 +218,7 @@
   "dashboard": {
     "availableCredits": "可用積分",
     "unavailableCredits": "不可用積分",
-    "creditAvailabilityHint": "可用積分僅含目前上線且可調度帳號；封禁、停用、過期、冷卻、未載入或狀態未知帳號的餘額計入不可用。模型限制不代表整個帳號不可用。",
+    "creditAvailabilityHint": "可用積分包含上線和暫時冷卻帳號的餘額；封禁、停用、保護性暫停、過期、未載入或狀態未知帳號的餘額計入不可用。模型限制不代表整個帳號不可用。",
     "creditsUnknown": "{n} 個帳號餘額未知，未計入",
     "title": "儀表板",
     "description": "{realm}帳號池健康度、反向代理閘道與今日用量總覽（每 30 秒自動重新整理）",

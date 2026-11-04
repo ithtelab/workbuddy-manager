@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import {availabilityLabelKey, disabledReasonText, isAccountBanned, needsRelogin, partitionCredits} from './account-status.ts';
+import {availabilityLabelKey, availabilityOf, disabledReasonText, isAccountBanned, needsRelogin, partitionCredits} from './account-status.ts';
+import {collectScopedExpiries} from './dashboard-credits.ts';
 
 const online = {uid: 'ok', in_pool: true, healthy: true, credits: 50};
 const banned = {uid: 'ban', disabled: true, credits: 96066,
@@ -13,7 +14,8 @@ assert.equal(isAccountBanned({...banned, disabled_reason: '11140 The model provi
 assert.equal(isAccountBanned({...banned, disabled: false}), false);
 assert.equal(isAccountBanned({...banned, disabled_reason: 'account banned by upstream (request illegal, code 11128, http 400), re-login required'}), false);
 
-const accounts = [online, banned, {uid: 'cool', cooling: true, credits: 10},
+const cooling = {uid: 'cool', in_pool: true, healthy: false, cooling: true, credits: 10};
+const accounts = [online, banned, cooling,
   {uid: 'paused', manual_disabled: true, credits: 20}, {uid: 'expired', is_expired: true, credits: 30},
   {uid: 'unknown', poolUnknown: true, credits: 40}, {uid: 'missing', in_pool: false, credits: 60},
   {uid: 'no-balance', healthy: true}, {uid: 'not-healthy', healthy: false, credits: 70},
@@ -21,8 +23,30 @@ const accounts = [online, banned, {uid: 'cool', cooling: true, credits: 10},
   {...online, uid: 'model-limited', credits: 5, rate_limited_models: [{model: 'x', until: '2099-01-01'}]}];
 let result = partitionCredits(accounts, {ok: 100});
 assert.deepEqual([result.available, result.unavailable, result.total, result.known, result.unknown],
-  [105, 96376, 96481, 10, 1]);
+  [115, 96366, 96481, 10, 1]);
 assert.equal(result.usableAccounts.some(a => a.uid === 'ban'), false);
+assert.equal(result.usableAccounts.some(a => a.uid === 'cool'), true);
+assert.equal(availabilityOf(cooling), 'cooling', 'Credit accounting must not clear the cooldown status');
+assert.deepEqual(collectScopedExpiries(result.usableAccounts, {
+  cool: {expiries: [{at: 1800000000, amount: 10}]},
+  ban: {expiries: [{at: 1800000001, amount: 96066}]},
+}), [{at: 1800000000, amount: 10}], 'Available-credit expiry includes cooling accounts only');
+for (const restriction of [
+  {disabled: true}, {manual_disabled: true}, {disabled_by_panel: true},
+  {is_expired: true}, {poolUnknown: true}, {in_pool: false},
+  {refresh_risk: {until: Date.now() / 1000 + 300, needs_review: false}},
+  {refresh_risk: {until: 0, needs_review: true}},
+]) {
+  const blocked = {...cooling, ...restriction};
+  const totals = partitionCredits([blocked], {});
+  assert.deepEqual([totals.available, totals.unavailable], [0, 10],
+    `Cooling must not override ${JSON.stringify(restriction)}`);
+}
+for (const duplicates of [[{...cooling, disabled: true}, cooling], [cooling, {...cooling, disabled: true}]]) {
+  const totals = partitionCredits(duplicates, {cool: 25});
+  assert.deepEqual([totals.available, totals.unavailable, totals.known], [25, 0, 1],
+    'A usable cooling copy in another group counts once, regardless of order');
+}
 result = partitionCredits([{...online, manual_disabled: true}, online, online], {});
 assert.equal(result.available, 50);
 assert.equal(result.unavailable, 0);
