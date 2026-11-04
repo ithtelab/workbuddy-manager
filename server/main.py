@@ -147,7 +147,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='2.11.9',
+    version='2.11.10',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
