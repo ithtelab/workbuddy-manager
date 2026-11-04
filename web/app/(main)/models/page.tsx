@@ -423,7 +423,7 @@ export default function ModelsPage() {
         ) : (
           <>
             <div className="overflow-x-auto">
-              <Table>
+              <Table className="wb-table-left">
                 <TableHeader>
                   <TableRow className="border-b border-border/60 hover:bg-transparent">
                     <TableHead className="pl-4 text-[11px] text-muted-foreground">{t('models.colModel')}</TableHead>
