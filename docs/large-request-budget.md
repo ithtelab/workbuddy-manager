@@ -2,7 +2,7 @@
 
 > 关联：`0044-large-request-rotation.patch`（引入逐请求轮换）、
 > `0046-large-request-cache-friendly.patch`（v2.11.9 改为默认关闭）、
-> 本文件对应的 `0049-large-request-budget.patch`。
+> 本文件对应的 `0048-large-request-budget.patch`。
 
 ## 为什么不再用逐请求轮换
 
