@@ -352,7 +352,16 @@
     "failedHint": "{n} failed today (not counted in the requests above)",
     "hourlyAgg": "Hourly (today)",
     "tokensPerSec": "Output tok/s",
-    "throughputHint": "Estimated from {n} successful requests (request-log retention window only)"
+    "throughputHint": "Estimated from {n} successful requests (request-log retention window only)",
+    "costTitle": "Estimated at DeepSeek list price",
+    "costPriceLink": "Prices & details →",
+    "costToday": "Today",
+    "costWeek": "Last 7 days",
+    "costTotal": "All time",
+    "costUnpriced": "{n} calls not priced",
+    "costNote": "Estimated with the list price in effect at each call (peak/off-peak, cache hit/miss). For reference only; the credits actually deducted are shown above.",
+    "colCost": "Cost",
+    "costUnavailableHint": "Model has no price entry, so it shows — rather than 0"
   },
   "accounts": {
     "badgeBanned": "● Account banned",
@@ -618,7 +627,7 @@
     "reloginQueueReloginCurrent": "Re-login current account",
     "reloginQueueReason": "Block reason: ",
     "reloginQueuePing": "Ping",
-    "reloginQueueAdvanceHint": "After a successful re-login the account leaves the queue and the next one is selected automatically.",
+    "reloginQueueAdvanceHint": "After a successful re-login the account leaves the queue and the next one is selected automatically.",
     "reloginQueueDesc": "Signing in again can repair expired credentials or sessions; it cannot lift an upstream account ban.",
     "reloginQueueEmptyTitle": "No quarantined accounts",
     "reloginQueueEmptyDesc": "Signing in again can repair expired credentials or sessions; it cannot lift an upstream account ban.",
@@ -861,7 +870,10 @@
     "notCollected": "not captured (non-streaming request)",
     "noCredit": "not returned by upstream",
     "unbilled": " (not billed)",
-    "copyField": "Copy {field}"
+    "copyField": "Copy {field}",
+    "colCost": "Cost",
+    "rowCost": "Estimated cost (list price)",
+    "costUnavailable": "No price (model not listed)"
   },
   "security": {
     "title": "Security & IP control",
@@ -1834,7 +1846,8 @@
     "proxyBindingsManagerTitle": "Account bindings",
     "proxyBindingsManagerDesc": "Each account uses at most one route; pick “Default (follow pool)” to let the pool choose.",
     "proxyAutoAssignDesc": "Assign a batch of not-yet-bound accounts to this route (the picking order is stable, so the same batch is chosen every time).",
-    "proxyGlobalSourceOff": "Global upstream proxy is off (no fallback proxy)"
+    "proxyGlobalSourceOff": "Global upstream proxy is off (no fallback proxy)",
+    "tabPricing": "Pricing"
   },
   "phrases": {
     "思考内容兜底为正文": "Use reasoning as content fallback",
@@ -1870,7 +1883,12 @@
     "需要管理员权限": "Administrator permission required",
     "用户名或密码错误": "Incorrect username or password",
     "失败次数过多，请 10 分钟后再试": "Too many failed attempts; try again in 10 minutes",
-    "密码至少 8 位": "Password must be at least 8 characters", "密码至少 12 位": "Password must be at least 12 characters", "密码过于常见，请换一个": "This password is too common; choose another", "密码不能是用户名加数字": "Password cannot be the username followed by digits", "密码不能全是数字": "Password cannot be all digits", "密码不能是重复字符": "Password cannot be a single repeated character",
+    "密码至少 8 位": "Password must be at least 8 characters",
+    "密码至少 12 位": "Password must be at least 12 characters",
+    "密码过于常见，请换一个": "This password is too common; choose another",
+    "密码不能是用户名加数字": "Password cannot be the username followed by digits",
+    "密码不能全是数字": "Password cannot be all digits",
+    "密码不能是重复字符": "Password cannot be a single repeated character",
     "用户名已存在": "That username already exists",
     "用户不存在": "User not found",
     "至少保留一个管理员": "Keep at least one administrator",
@@ -2155,5 +2173,30 @@
     "autoCopyFailed": "Auto-copy failed",
     "autoCopyFailedDetail": "Go back and copy it manually — the key is shown only once",
     "alreadyWithKey": "You've already claimed — here's yours"
+  },
+  "pricing": {
+    "title": "Pricing (DeepSeek list price)",
+    "desc": "Each call is costed with the price version and time band in effect at that moment, so changing a price never rewrites past costs.",
+    "peakNow": "Peak hours now",
+    "offPeakNow": "Off-peak now",
+    "activeVersion": "Active version",
+    "verifiedAt": "Last verified",
+    "ageDays": "{n} days ago",
+    "source": "Open the official price page",
+    "stale": "This price table has not been verified for {n} days and may be out of date. Check the link above and add a new version below if needed.",
+    "missingHolidays": "No holiday calendar for {years}: peak detection falls back to weekdays only, so holidays are billed at peak rates (overestimated).",
+    "tableTitle": "Current rates (CNY per 1M tokens, peak / off-peak)",
+    "colModel": "Model",
+    "colCacheHit": "Input · cache hit",
+    "colCacheMiss": "Input · cache miss",
+    "colOutput": "Output",
+    "rateHint": "Peak: Mon–Fri 09:00–12:00 and 14:00–18:00 Beijing time (excluding public holidays). All other hours are off-peak at half the peak rate.",
+    "overrideTitle": "Custom price table (override)",
+    "overrideDesc": "No need to wait for a release when prices change: paste a new version and set effective_from. Only models are required — peak windows and holidays are inherited. It affects calls after that date only; past costs are not recalculated. Save empty to restore the defaults.",
+    "clearOverride": "Restore default prices",
+    "saved": "Price table saved",
+    "cleared": "Default prices restored",
+    "invalidJson": "The price table is not valid JSON",
+    "overridden": "Custom"
   }
 }

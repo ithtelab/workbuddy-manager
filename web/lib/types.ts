@@ -650,6 +650,12 @@ export interface RequestLog {
   status: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或该行在功能上线前写入，
+   * 界面显示「—」——不能显示 ¥0，那会被读成「这次调用免费」。
+   */
+  cost: number | null;
   latency_ms: number;
   /**
    * 首字延迟（毫秒）：从发起上游请求到收到第一个含正文的 delta。
@@ -691,6 +697,10 @@ export interface UsagePoint {
   completion_tokens: number;
   /** 当日实际扣费合计 */
   credit: number;
+  /** 按 DeepSeek 官方价估算的费用（元）；null = 这天没有可计价的调用 */
+  cost: number | null;
+  /** 这天里没计入费用的请求数 */
+  unpriced_requests: number;
   /**
    * 当日失败请求数（4xx + 5xx 合计）。
    *
@@ -777,6 +787,14 @@ export interface UsageBreakdown {
   /** 该维度实际扣费合计 */
   credit: number;
   /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或全在该列上线前，
+   * 界面显示「—」。**不是 0**：0 会被读成「免费」。
+   */
+  cost: number | null;
+  /** 同一维度里没有计入费用的请求数（模型不在价目表 / 历史行） */
+  unpriced_requests: number;
+  /**
    * 输出速率（tokens/秒，issue #214）：按「生成耗时 = 总耗时 − 首字耗时」估算。
    * null / 缺省 = 没有可用样本（日志已清或该模型没成功请求），界面显示「—」。
    */
@@ -792,6 +810,19 @@ export interface StatsSummary {
   today_credit: number;
   week_credit: number;
   total_credit: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 该区间内没有任何可计价的调用（与「0 元」不同，界面显示「—」）。
+   */
+  today_cost: number | null;
+  week_cost: number | null;
+  total_cost: number | null;
+  /** 同一区间内**没有**计入费用的请求数——有它才能说清金额只覆盖了一部分调用 */
+  today_unpriced: number;
+  week_unpriced: number;
+  total_unpriced: number;
+  /** 费用币种（目前只有 CNY） */
+  cost_currency: string;
   week_requests: number;
   week_tokens: number;
   total_requests: number;
@@ -1776,4 +1807,47 @@ export interface WatchdogQqTest extends WatchdogQqBotsResult {
   message?: string;
   sent_at?: number;
   umo?: string;
+}
+
+/* ── 计费价目（issue #380）──────────────────────────────── */
+export interface PricingModelRate {
+  cache_hit?: {peak?: number; off_peak?: number};
+  cache_miss?: {peak?: number; off_peak?: number};
+  output?: {peak?: number; off_peak?: number};
+}
+
+export interface PricingVersion {
+  effective_from: string;
+  verified_at: string;
+  source: string;
+  source_note?: string;
+  holiday_source?: string;
+  models: Record<string, PricingModelRate & {label?: string}>;
+  peak_windows: number[][];
+  peak_days: number[];
+  holiday_years: string[];
+  /** 是否是管理员自己覆盖的版本（不是随版本分发的那份） */
+  overridden: boolean;
+  /** 距上次核对官方价目的天数；null = 没写核验日期 */
+  age_days: number | null;
+}
+
+/**
+ * 价目表状态。
+ *
+ * `missing_holiday_years` 非空表示**节假日安排缺这一年**：那段时间的高峰判定
+ * 会退化成「只看周几」，节假日里本来该按空闲价算的调用会被按高峰价计（高估一倍）。
+ */
+export interface PricingInfo {
+  currency: string;
+  money_unit: string;
+  versions: PricingVersion[];
+  active: Record<string, unknown> | null;
+  is_peak_now: boolean;
+  override: Record<string, unknown> | null;
+  has_override: boolean;
+  missing_holiday_years: number[];
+  stale_after_days: number;
+  aliases: Record<string, string>;
+  priced_models: string[];
 }

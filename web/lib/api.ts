@@ -38,6 +38,7 @@ import type {
   KeyImportStatus,
   Me,
   ModelCatalog,
+  PricingInfo,
   ModelListResponse,
   Page,
   PgSyncConfig,
@@ -737,6 +738,11 @@ export const settingsApi = {
   /** 立即重启上游（一般无需手动调用，保存配置会自动重载） */
   reloadUpstream: () =>
     post<{ok: boolean; message: string}>('/api/settings/upstash/reload'),
+  /** 计费价目表（issue #380）：版本、生效档、覆盖情况、节假日缺口 */
+  pricing: () => get<PricingInfo>('/api/settings/pricing'),
+  /** 保存覆盖价目；传 null 恢复成随版本分发的那份 */
+  savePricing: (body: Record<string, unknown> | null) =>
+    put<PricingInfo>('/api/settings/pricing', body),
   modelMap: () => get<Record<string, string>>('/api/settings/model-map'),
   saveModelMap: (body: Record<string, string>) =>
     post<Record<string, string>>('/api/settings/model-map', body),

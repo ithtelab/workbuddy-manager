@@ -7,7 +7,7 @@ import time
 from fastapi import APIRouter, Depends
 
 from .. import db, security
-from ..services import wb2api
+from ..services import pricing, wb2api
 
 router = APIRouter(prefix='/api/stats', tags=['stats'])
 
@@ -110,18 +110,26 @@ def summary(realm: str | None = None,
     rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
     rargs: tuple = (realm,) if rf else ()
 
-    def agg(where: str, args: tuple) -> tuple[int, int, float]:
+    def agg(where: str, args: tuple) -> tuple[int, int, float, float | None, int]:
+        # 费用（issue #380）：SUM(cost) 在整段都没价时是 NULL —— 不能兜成 0，
+        # 那会让「算不出」看起来像「不要钱」。同时数一遍没价的请求量，
+        # 界面才能说清「¥1.23，另有 12 次未计价」，而不是给出一个悄悄缩水的数。
         row = db.query_one(
             f'SELECT COALESCE(SUM(requests),0) AS r, '
             f'COALESCE(SUM(prompt_tokens + completion_tokens),0) AS t, '
-            f'COALESCE(SUM(credit),0) AS c FROM usage_daily WHERE {where}{rf}',
+            f'COALESCE(SUM(credit),0) AS c, '
+            f'SUM(cost) AS cost, '
+            f'COALESCE(SUM(CASE WHEN cost IS NULL THEN requests ELSE 0 END),0) AS unpriced '
+            f'FROM usage_daily WHERE {where}{rf}',
             args + rargs,
         )
-        return int(row['r']), int(row['t']), float(row['c'] or 0)
+        return (int(row['r']), int(row['t']), float(row['c'] or 0),
+                None if row['cost'] is None else float(row['cost']),
+                int(row['unpriced'] or 0))
 
-    t_req, t_tok, t_credit = agg('day = ?', (today,))
-    w_req, w_tok, w_credit = agg('day >= ?', (week,))
-    a_req, a_tok, a_credit = agg('1=1', ())
+    t_req, t_tok, t_credit, t_cost, t_unpriced = agg('day = ?', (today,))
+    w_req, w_tok, w_credit, w_cost, w_unpriced = agg('day >= ?', (week,))
+    a_req, a_tok, a_credit, a_cost, a_unpriced = agg('1=1', ())
 
     # 活跃密钥：密钥本身**不分版本**（同一把密钥可调两个版本，由模型名决定路由），
     # 所以按版本时应统计「**该版本有调用**的密钥数」，而不是「属于该版本的密钥数」
@@ -145,6 +153,17 @@ def summary(realm: str | None = None,
         'today_credit': t_credit,
         'week_credit': w_credit,
         'total_credit': a_credit,
+        # 按 DeepSeek 官方价估算的费用（元，issue #380）。
+        # None = 该区间内没有任何可计价的调用（模型没收录价目 / 全在本列上线前），
+        # 与「0 元」不同，界面显示「—」。`*_unpriced` 是同一区间内没算进费用的
+        # 请求数——有它才能说清「这个金额只覆盖了其中一部分调用」。
+        'today_cost': t_cost,
+        'week_cost': w_cost,
+        'total_cost': a_cost,
+        'today_unpriced': t_unpriced,
+        'week_unpriced': w_unpriced,
+        'total_unpriced': a_unpriced,
+        'cost_currency': pricing.currency(),
         'week_requests': w_req,
         'week_tokens': w_tok,
         'total_requests': a_req,
@@ -305,7 +324,8 @@ def daily(days: int = 30, realm: str | None = None,
     rows = db.query(
         'SELECT day, SUM(requests) AS requests, '
         'SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, '
-        'COALESCE(SUM(credit),0) AS credit '
+        'COALESCE(SUM(credit),0) AS credit, SUM(cost) AS cost, '
+        'COALESCE(SUM(CASE WHEN cost IS NULL THEN requests ELSE 0 END),0) AS unpriced '
         f'FROM usage_daily WHERE day >= ?{rf} GROUP BY day ORDER BY day ASC',
         args,
     )
@@ -318,6 +338,9 @@ def daily(days: int = 30, realm: str | None = None,
             'prompt_tokens': int(r['prompt_tokens'] or 0),
             'completion_tokens': int(r['completion_tokens'] or 0),
             'credit': float(r['credit'] or 0),
+            # 费用：None = 这天没有可计价的调用（界面画成断点，不画成 0）
+            'cost': None if r['cost'] is None else float(r['cost']),
+            'unpriced_requests': int(r['unpriced'] or 0),
             'failed': failures.get(r['day'], 0),
         }
         for r in rows
@@ -329,7 +352,8 @@ def daily(days: int = 30, realm: str | None = None,
         if day not in days_seen and n > 0:
             out.append({
                 'day': day, 'requests': 0, 'prompt_tokens': 0,
-                'completion_tokens': 0, 'credit': 0.0, 'failed': n,
+                'completion_tokens': 0, 'credit': 0.0, 'cost': None,
+                'unpriced_requests': 0, 'failed': n,
             })
     out.sort(key=lambda d: d['day'])
     return out
@@ -380,7 +404,8 @@ def hourly(day: str | None = None, realm: str | None = None,
         'SELECT hour, SUM(requests) AS requests, '
         'SUM(prompt_tokens) AS prompt_tokens, '
         'SUM(completion_tokens) AS completion_tokens, '
-        'COALESCE(SUM(credit),0) AS credit '
+        'COALESCE(SUM(credit),0) AS credit, SUM(cost) AS cost, '
+        'COALESCE(SUM(CASE WHEN cost IS NULL THEN requests ELSE 0 END),0) AS unpriced '
         f'FROM usage_hourly WHERE day = ?{rf} GROUP BY hour ORDER BY hour ASC',
         (d,) + rargs,
     )
@@ -396,6 +421,10 @@ def hourly(day: str | None = None, realm: str | None = None,
             'prompt_tokens': int(r['prompt_tokens'] or 0) if r else 0,
             'completion_tokens': int(r['completion_tokens'] or 0) if r else 0,
             'credit': float(r['credit'] or 0) if r else 0.0,
+            # 小时费用：这个桶没有可计价调用时是 None（不是 0），
+            # 图上据此画断点而不是把「没算」画成「免费」
+            'cost': (None if (not r or r['cost'] is None) else float(r['cost'])),
+            'unpriced_requests': int(r['unpriced'] or 0) if r else 0,
             'failed': failures.get(h, 0),
         })
     return out
@@ -597,7 +626,8 @@ def by_model(days: int = 30, realm: str | None = None,
     rows = db.query(
         'SELECT model AS name, SUM(requests) AS requests, '
         'SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, '
-        'COALESCE(SUM(credit),0) AS credit '
+        'COALESCE(SUM(credit),0) AS credit, SUM(cost) AS cost, '
+        'COALESCE(SUM(CASE WHEN cost IS NULL THEN requests ELSE 0 END),0) AS unpriced '
         f'FROM usage_daily WHERE day >= ?{rf} GROUP BY model ORDER BY SUM(prompt_tokens + completion_tokens) DESC',
         args,
     )
@@ -613,6 +643,9 @@ def by_model(days: int = 30, realm: str | None = None,
             'prompt_tokens': int(r['prompt_tokens'] or 0),
             'completion_tokens': int(r['completion_tokens'] or 0),
             'credit': float(r['credit'] or 0),
+            # 费用（元）；None = 这个模型没收录价目（如 glm / kimi），显示「—」
+            'cost': None if r['cost'] is None else float(r['cost']),
+            'unpriced_requests': int(r['unpriced'] or 0),
             **tmap.get(name, {'tokens_per_sec': None, 'throughput_samples': 0}),
         })
     return out
@@ -632,7 +665,8 @@ def by_key(days: int = 30, realm: str | None = None,
     rows = db.query(
         'SELECT COALESCE(k.name, u.key_id || "") AS name, SUM(u.requests) AS requests, '
         'SUM(u.prompt_tokens) AS prompt_tokens, SUM(u.completion_tokens) AS completion_tokens, '
-        'COALESCE(SUM(u.credit),0) AS credit '
+        'COALESCE(SUM(u.credit),0) AS credit, SUM(u.cost) AS cost, '
+        'COALESCE(SUM(CASE WHEN u.cost IS NULL THEN u.requests ELSE 0 END),0) AS unpriced '
         'FROM usage_daily u LEFT JOIN api_keys k ON k.id = u.key_id '
         f'WHERE u.day >= ?{rf} GROUP BY u.key_id ORDER BY SUM(u.prompt_tokens + u.completion_tokens) DESC',
         args,
@@ -644,6 +678,8 @@ def by_key(days: int = 30, realm: str | None = None,
             'prompt_tokens': int(r['prompt_tokens'] or 0),
             'completion_tokens': int(r['completion_tokens'] or 0),
             'credit': float(r['credit'] or 0),
+            'cost': None if r['cost'] is None else float(r['cost']),
+            'unpriced_requests': int(r['unpriced'] or 0),
         }
         for r in rows
     ]

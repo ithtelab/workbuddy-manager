@@ -325,7 +325,16 @@
     "failedHint": "今日失敗 {n} 次（不計入上方請求數）",
     "hourlyAgg": "按小時（當日彙總）",
     "tokensPerSec": "輸出 tok/s",
-    "throughputHint": "依 {n} 筆成功請求的生成耗時估算（僅涵蓋日誌保留期間）"
+    "throughputHint": "依 {n} 筆成功請求的生成耗時估算（僅涵蓋日誌保留期間）",
+    "costTitle": "按 DeepSeek 官方價估算",
+    "costPriceLink": "價目與說明 →",
+    "costToday": "今日",
+    "costWeek": "近 7 天",
+    "costTotal": "累計",
+    "costUnpriced": "另有 {n} 次未計價",
+    "costNote": "按每次呼叫時刻的官方價目估算（分高峰/空閒、快取命中/未命中），僅供參考。上游真實扣的積分見上面的「今日積分」。",
+    "colCost": "費用",
+    "costUnavailableHint": "該模型未收錄價目，顯示「—」而不是 0"
   },
   "accounts": {
     "badgeBanned": "● 帳號被封禁",
@@ -591,7 +600,7 @@
     "reloginQueueReloginCurrent": "重新登入目前帳號",
     "reloginQueueReason": "封控原因：",
     "reloginQueuePing": "ping 測試",
-    "reloginQueueAdvanceHint": "重新登入成功後該帳號會自動退出佇列，前進到下一位。",
+    "reloginQueueAdvanceHint": "重新登入成功後該帳號會自動退出佇列，前進到下一位。",
     "reloginQueueDesc": "重新登入僅適用於憑證或工作階段失效，不會解除上游帳號封禁。",
     "reloginQueueEmptyTitle": "目前沒有封控中的帳號",
     "reloginQueueEmptyDesc": "重新登入僅適用於憑證或工作階段失效，不會解除上游帳號封禁。",
@@ -834,7 +843,10 @@
     "notCollected": "未擷取（非串流請求）",
     "noCredit": "上游未回傳",
     "unbilled": "（未計費）",
-    "copyField": "複製{field}"
+    "copyField": "複製{field}",
+    "colCost": "費用",
+    "rowCost": "估算費用（官方價）",
+    "costUnavailable": "無價目（模型未收錄）"
   },
   "security": {
     "title": "安全與 IP 管控",
@@ -1807,7 +1819,8 @@
     "proxyBindingsManagerTitle": "綁定管理",
     "proxyBindingsManagerDesc": "每個帳號最多綁一條線路；選「預設（跟隨池策略）」就由池按策略分配。",
     "proxyAutoAssignDesc": "把一批還沒綁線路的帳號自動安排到這條線路上（挑人規則穩定，不會每次挑到不同的一批）。",
-    "proxyGlobalSourceOff": "全域上游代理已關閉（不走兜底代理）"
+    "proxyGlobalSourceOff": "全域上游代理已關閉（不走兜底代理）",
+    "tabPricing": "計費價格"
   },
   "phrases": {
     "思考内容兜底为正文": "思考內容兜底為正文",
@@ -1843,7 +1856,12 @@
     "需要管理员权限": "需要管理員權限",
     "用户名或密码错误": "使用者名稱或密碼錯誤",
     "失败次数过多，请 10 分钟后再试": "失敗次數過多，請 10 分鐘後再試",
-    "密码至少 8 位": "密碼至少 8 碼", "密码至少 12 位": "密碼至少 12 碼", "密码过于常见，请换一个": "密碼過於常見，請換一個", "密码不能是用户名加数字": "密碼不能是使用者名稱加數字", "密码不能全是数字": "密碼不能全是數字", "密码不能是重复字符": "密碼不能是重複字元",
+    "密码至少 8 位": "密碼至少 8 碼",
+    "密码至少 12 位": "密碼至少 12 碼",
+    "密码过于常见，请换一个": "密碼過於常見，請換一個",
+    "密码不能是用户名加数字": "密碼不能是使用者名稱加數字",
+    "密码不能全是数字": "密碼不能全是數字",
+    "密码不能是重复字符": "密碼不能是重複字元",
     "用户名已存在": "使用者名稱已存在",
     "用户不存在": "使用者不存在",
     "至少保留一个管理员": "至少保留一個管理員",
@@ -2128,5 +2146,30 @@
     "autoCopyFailed": "自動複製失敗",
     "autoCopyFailedDetail": "請回到上一步手動複製 —— 明文只顯示這一次",
     "alreadyWithKey": "你已經領過了，這是你的那份"
+  },
+  "pricing": {
+    "title": "計費價格（DeepSeek 官方價）",
+    "desc": "費用按每次呼叫的時刻取當時生效的價目與時段，改價不會重算歷史帳。",
+    "peakNow": "目前高峰時段",
+    "offPeakNow": "目前空閒時段",
+    "activeVersion": "生效版本",
+    "verifiedAt": "上次核對官方價",
+    "ageDays": "{n} 天前",
+    "source": "查看官方價目",
+    "stale": "價目已超過 {n} 天沒核對，可能已經調價。請點上面的連結核對，必要時在下面追加一條新版本。",
+    "missingHolidays": "缺少 {years} 年的節假日安排：這些日期的高峰判定只看週幾，節假日會被按高峰價計（偏高）。",
+    "tableTitle": "目前單價（元 / 百萬 tokens，高峰 / 空閒）",
+    "colModel": "模型",
+    "colCacheHit": "輸入·快取命中",
+    "colCacheMiss": "輸入·未命中",
+    "colOutput": "輸出",
+    "rateHint": "高峰：北京時間週一至週五 9:00-12:00、14:00-18:00（不含法定節假日）；其餘時段為空閒，單價是高峰的一半。",
+    "overrideTitle": "自訂價目（覆寫）",
+    "overrideDesc": "官方調價後不必等新版本：把新版本貼進來，effective_from 寫生效日期即可（可以只寫 models，峰谷時段與節假日會自動繼承）。只影響該日期之後的呼叫，歷史帳不重算。清空後儲存 = 恢復預設。",
+    "clearOverride": "恢復預設價目",
+    "saved": "價目已儲存",
+    "cleared": "已恢復預設價目",
+    "invalidJson": "價目不是合法的 JSON",
+    "overridden": "已自訂"
   }
 }

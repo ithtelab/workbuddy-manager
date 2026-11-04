@@ -325,7 +325,16 @@
     "failedHint": "今日失败 {n} 次（不计入上方请求数）",
     "hourlyAgg": "按小时（当日汇总）",
     "tokensPerSec": "输出 tok/s",
-    "throughputHint": "按 {n} 条成功请求的生成耗时估算（只覆盖日志保留期）"
+    "throughputHint": "按 {n} 条成功请求的生成耗时估算（只覆盖日志保留期）",
+    "costTitle": "按 DeepSeek 官方价估算",
+    "costPriceLink": "价目与说明 →",
+    "costToday": "今日",
+    "costWeek": "近 7 天",
+    "costTotal": "累计",
+    "costUnpriced": "另有 {n} 次未计价",
+    "costNote": "按每次调用时刻的官方价目估算（分高峰/空闲、缓存命中/未命中），仅供参考。上游真实扣的积分见上面的「今日积分」。",
+    "colCost": "费用",
+    "costUnavailableHint": "该模型未收录价目，显示「—」而不是 0"
   },
   "accounts": {
     "badgeBanned": "● 账号被封禁",
@@ -591,7 +600,7 @@
     "reloginQueueReloginCurrent": "重登当前账号",
     "reloginQueueReason": "封控原因：",
     "reloginQueuePing": "ping 测试",
-    "reloginQueueAdvanceHint": "重登成功后该账号会自动退出队列，前进到下一位。",
+    "reloginQueueAdvanceHint": "重登成功后该账号会自动退出队列，前进到下一位。",
     "reloginQueueDesc": "重新登录只适用于凭证或会话失效，不会解除上游账号封禁。",
     "reloginQueueEmptyTitle": "没有需要重登的账号",
     "reloginQueueEmptyDesc": "重新登录只适用于凭证或会话失效，不会解除上游账号封禁。",
@@ -834,7 +843,10 @@
     "notCollected": "未采集（非流式请求）",
     "noCredit": "上游未返回",
     "unbilled": "（未计费）",
-    "copyField": "复制{field}"
+    "copyField": "复制{field}",
+    "colCost": "费用",
+    "rowCost": "估算费用（官方价）",
+    "costUnavailable": "无价目（模型未收录）"
   },
   "security": {
     "title": "安全与 IP 管控",
@@ -1807,7 +1819,8 @@
     "proxyBindingsManagerTitle": "绑定管理",
     "proxyBindingsManagerDesc": "每个账号最多绑一条线路；选「默认（跟随池策略）」就由池按策略分配。",
     "proxyAutoAssignDesc": "把一批还没绑线路的账号自动安排到这条线路上（挑人规则稳定，不会每次挑到不同的一批）。",
-    "proxyGlobalSourceOff": "全局上游代理已关闭（不走兜底代理）"
+    "proxyGlobalSourceOff": "全局上游代理已关闭（不走兜底代理）",
+    "tabPricing": "计费价格"
   },
   "redPacket": {
     "title": "红包",
@@ -1902,5 +1915,30 @@
     "autoCopyFailed": "自动复制失败",
     "autoCopyFailedDetail": "请回到上一步手动复制 —— 明文只显示这一次",
     "alreadyWithKey": "你已经领过了，这是你的那份"
+  },
+  "pricing": {
+    "title": "计费价格（DeepSeek 官方价）",
+    "desc": "费用按每次调用的时刻取当时生效的价目与时段，改价不会重算历史账。",
+    "peakNow": "当前高峰时段",
+    "offPeakNow": "当前空闲时段",
+    "activeVersion": "生效版本",
+    "verifiedAt": "上次核对官方价",
+    "ageDays": "{n} 天前",
+    "source": "查看官方价目",
+    "stale": "价目已超过 {n} 天没核对，可能已经调价。请点上面的链接核对，必要时在下面追加一条新版本。",
+    "missingHolidays": "缺少 {years} 年的节假日安排：这些日期的高峰判定只看周几，节假日会被按高峰价计（偏高）。",
+    "tableTitle": "当前单价（元 / 百万 tokens，高峰 / 空闲）",
+    "colModel": "模型",
+    "colCacheHit": "输入·缓存命中",
+    "colCacheMiss": "输入·未命中",
+    "colOutput": "输出",
+    "rateHint": "高峰：北京时间周一至周五 9:00-12:00、14:00-18:00（不含法定节假日）；其余时段为空闲，单价是高峰的一半。",
+    "overrideTitle": "自定义价目（覆盖）",
+    "overrideDesc": "官方调价后不必等新版本：把新版本贴进来，effective_from 写生效日期即可（可以只写 models，峰谷时段与节假日会自动继承）。只影响该日期之后的调用，历史账不重算。清空后保存 = 恢复默认。",
+    "clearOverride": "恢复默认价目",
+    "saved": "价目已保存",
+    "cleared": "已恢复默认价目",
+    "invalidJson": "价目不是合法的 JSON",
+    "overridden": "已自定义"
   }
 }

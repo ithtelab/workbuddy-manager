@@ -31,9 +31,10 @@ import {
   todayKeyLocal,
   type ChartPoint,
 } from '@/lib/usage-chart';
-import {fmtCompact, fmtNumber, fmtCredit} from '@/lib/format';
+import {fmtCompact, fmtNumber, fmtCredit, fmtMoney } from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {StatCard} from '@/components/common/layout/StatCard';
+import Link from 'next/link';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
@@ -399,6 +400,49 @@ export default function StatsPage() {
         />
       </section>
 
+      {/* 按 DeepSeek 官方价估算的费用（issue #380）。
+          和上面那张「积分」卡并排看才完整：积分是上游**真实扣**的，这里回答的是
+          「同样这些 token，走官方 API 要花多少钱」。两者口径不同，所以分开放、
+          分开标注，不合成一个数字。 */}
+      <section className="rounded-[20px] bg-muted p-4">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <Coins className="h-4 w-4" />
+            {t('stats.costTitle')}
+          </div>
+          <Link
+            href="/settings/models"
+            className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+          >
+            {t('stats.costPriceLink')}
+          </Link>
+        </div>
+        <div className="grid grid-cols-3 gap-3">
+          {([
+            ['today', t('stats.costToday'), summary?.today_cost, summary?.today_unpriced],
+            ['week', t('stats.costWeek'), summary?.week_cost, summary?.week_unpriced],
+            ['total', t('stats.costTotal'), summary?.total_cost, summary?.total_unpriced],
+          ] as const).map(([key, label, value, unpriced]) => (
+            <div key={key}>
+              <div className="text-[11px] text-muted-foreground">{label}</div>
+              <div className="mt-0.5 text-lg font-semibold tabular-nums">
+                {fmtMoney(value, summary?.cost_currency)}
+              </div>
+              {!!unpriced && (
+                // 有没算进费用的调用时必须说出来：否则用户会拿一个悄悄缩水的
+                // 金额当成「全量花费」。
+                <div className="mt-0.5 text-[10px] text-amber-600 dark:text-amber-400">
+                  {t('stats.costUnpriced', {n: fmtNumber(unpriced)})}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+        <p className="mt-3 text-[11px] leading-5 text-muted-foreground">
+          {t('stats.costNote')}
+        </p>
+      </section>
+
       <section className="rounded-[20px] bg-muted p-4">
         <div className="mb-3 flex items-center justify-between">
           <div className="text-sm font-medium">{t('stats.tokenTrend')}</div>
@@ -615,6 +659,7 @@ function BreakdownPanel({
                   {t('stats.tokensPerSec')}
                 </TableHead>
               )}
+              <TableHead className="whitespace-nowrap text-[11px] text-muted-foreground">{t('stats.colCost')}</TableHead>
               <TableHead className="pr-0 text-[11px] text-muted-foreground">{t('metric.paid')}</TableHead>
             </TableRow>
           </TableHeader>
@@ -651,6 +696,11 @@ function BreakdownPanel({
                       )}
                     </TableCell>
                   )}
+                  <TableCell className="whitespace-nowrap text-xs tabular-nums">
+                    {it.cost != null ? fmtMoney(it.cost) : (
+                      <span className="text-muted-foreground/70" title={t('stats.costUnavailableHint')}>—</span>
+                    )}
+                  </TableCell>
                   <TableCell className="pr-0 text-xs tabular-nums">
                     {it.credit > 0 ? fmtCredit(it.credit) : <span className="text-muted-foreground/70">—</span>}
                   </TableCell>

@@ -122,6 +122,10 @@ def list_logs(
             # 输入侧命中缓存的 token 数。NULL 与 0 含义不同：
             # NULL = 上游没给这个字段，0 = 这次确实没命中（见 db 的列说明）。
             'cache_hit_tokens': r['cache_hit_tokens'],
+            # 按 DeepSeek 官方价估算的费用（元，issue #380）。
+            # NULL = 这个模型没收录价目（glm / kimi / minimax …）或该行在功能上线前
+            # 写入 —— 界面显示「—」。绝不能兜成 0：那会被读成「这次调用免费」。
+            'cost': r['cost'],
         }
         for r in rows
     ]
