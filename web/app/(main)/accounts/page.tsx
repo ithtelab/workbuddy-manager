@@ -20,6 +20,8 @@ import {
   ChevronRight,
   Search,
   ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
   RotateCcw,
   Snowflake,
   Sparkles,
@@ -61,6 +63,7 @@ import {
   selectAccounts,
   type GroupFilter,
   type SortKey,
+  type SortDirection,
 } from '@/lib/account-list';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
@@ -153,6 +156,7 @@ export default function AccountsPage() {
   const [q, setQ] = useState('');
   const [statusGroup, setStatusGroup] = useState<GroupFilter>('all');
   const [sort, setSort] = useState<SortKey>('default');
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
   const [page, setPage] = useState(1);
   /**
    * 账号分组（多账号池）：一个分组 = 一套上游实例（账号池）。
@@ -446,11 +450,11 @@ export default function AccountsPage() {
    */
   const filtered = useMemo(
     () =>
-      selectAccounts(visible, {q, group: statusGroup, sort}, {
+      selectAccounts(visible, {q, group: statusGroup, sort, direction: sortDirection}, {
         groupOf,
         creditOf: (a) => liveCredits[a.uid] ?? a.credits ?? null,
       }),
-    [visible, q, statusGroup, sort, liveCredits],
+    [visible, q, statusGroup, sort, sortDirection, liveCredits],
   );
 
   const paged = useMemo(() => paginate(filtered, page, PAGE_SIZE), [filtered, page]);
@@ -473,6 +477,7 @@ export default function AccountsPage() {
     setQ('');
     setStatusGroup('all');
     setSort('default');
+    setSortDirection('asc');
     setPage(1);
   }
 
@@ -1485,16 +1490,28 @@ export default function AccountsPage() {
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
               <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground" />
-              <Select value={sort} onValueChange={(v) => { setSort(v as SortKey); setPage(1); }}>
+              <Select value={sort} onValueChange={(v) => {
+                setSort(v as SortKey); setSortDirection(v === 'added' ? 'desc' : 'asc'); setPage(1);
+              }}>
                 <SelectTrigger className="h-9 w-[150px] bg-background" aria-label={t('accounts.sortLabel')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="default">{t('accounts.sortDefault')}</SelectItem>
                   <SelectItem value="remain">{t('accounts.sortRemain')}</SelectItem>
                   <SelectItem value="credits">{t('accounts.sortCredits')}</SelectItem>
+                  <SelectItem value="added">{t('accounts.sortAdded')}</SelectItem>
                 </SelectContent>
               </Select>
+              {sort !== 'default' && (
+                <Button variant="outline" size="sm" className="h-9 gap-1.5"
+                  aria-label={t('accounts.sortDirectionToggle', {direction: t(sortDirection === 'asc' ? 'accounts.sortAscending' : 'accounts.sortDescending')})}
+                  onClick={() => { setSortDirection(d => d === 'asc' ? 'desc' : 'asc'); setPage(1); }}>
+                  {sortDirection === 'asc' ? <ArrowUp className="h-3.5 w-3.5" /> : <ArrowDown className="h-3.5 w-3.5" />}
+                  {t(sortDirection === 'asc' ? 'accounts.sortAscending' : 'accounts.sortDescending')}
+                </Button>
+              )}
             </div>
           </div>
+          {sort === 'added' && <p className="mt-2 text-xs text-muted-foreground">{t('accounts.sortAddedHint')}</p>}
         </section>
       )}
 

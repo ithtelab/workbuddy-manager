@@ -127,6 +127,32 @@ check(
   ['c', 'a', 'd', 'b'],
 );
 
+check('默认顺序不受方向影响', files(selectAccounts(pool,
+  {q: '', group: 'all', sort: 'default', direction: 'desc'}, deps)), ['a', 'b', 'c', 'd']);
+check('有效期支持降序', files(selectAccounts(pool,
+  {q: '', group: 'all', sort: 'remain', direction: 'desc'}, deps)), ['c', 'a', 'd', 'b']);
+check('积分降序仍将未知余额放最后', files(selectAccounts(pool,
+  {q: '', group: 'all', sort: 'credits', direction: 'desc'}, deps)), ['d', 'a', 'c', 'b']);
+const additions = [acct('legacy'), acct('old', {added_at: 100}),
+  acct('new', {added_at: 300}), acct('same', {added_at: 300}), acct('unknown', {added_at: null})];
+check('添加时间默认最新在前，未知历史时间在后', files(selectAccounts(additions,
+  {q: '', group: 'all', sort: 'added'}, deps)), ['new', 'same', 'old', 'legacy', 'unknown']);
+check('添加时间支持升序，未知仍在后面', files(selectAccounts(additions,
+  {q: '', group: 'all', sort: 'added', direction: 'asc'}, deps)), ['old', 'new', 'same', 'legacy', 'unknown']);
+check('按添加时间排序仍与搜索结合', files(selectAccounts(additions,
+  {q: 'new', group: 'all', sort: 'added', direction: 'desc'}, deps)), ['new']);
+check('添加时间排序不改变源数组', files(additions), ['legacy', 'old', 'new', 'same', 'unknown']);
+for (const direction of ['asc', 'desc']) {
+  const invalid = [acct('nan', {credits: NaN}), acct('known', {credits: 1}), acct('inf', {credits: Infinity})];
+  check(`非有限数值在 ${direction} 下也放最后`, files(selectAccounts(invalid,
+    {q: '', group: 'all', sort: 'credits', direction}, deps)), ['known', 'nan', 'inf']);
+  const expiry = [acct('unknown', {expires_at: 0, remain_seconds: 0}),
+    acct('valid', {expires_at: 2000, remain_seconds: 20}), acct('expired', {expires_at: 1, remain_seconds: 0})];
+  check(`未知有效期在 ${direction} 下放最后，过期账号仍按 0 排序`, files(selectAccounts(expiry,
+    {q: '', group: 'all', sort: 'remain', direction}, deps)),
+    direction === 'asc' ? ['expired', 'valid', 'unknown'] : ['valid', 'expired', 'unknown']);
+}
+
 // 稳定性：键值相同的保持后端给的顺序，否则「刷新一下顺序就变了」
 const tie = [
   acct('x', {credits: 7}),
@@ -138,6 +164,8 @@ check(
   files(selectAccounts(tie, {q: '', group: 'all', sort: 'credits'}, deps)),
   ['z', 'x', 'y'],
 );
+check('降序时同值仍保持原顺序', files(selectAccounts(tie,
+  {q: '', group: 'all', sort: 'credits', direction: 'desc'}, deps)), ['x', 'y', 'z']);
 
 // 入参数组不能被改动：改了的话 React 拿到的还是同一个引用，列表不重渲染
 const before = files(pool);

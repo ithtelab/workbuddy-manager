@@ -256,6 +256,14 @@ CREATE TABLE IF NOT EXISTS account_notes (
   updated_at INTEGER NOT NULL
 );
 
+-- 本面板实际记录的添加时间；旧账号没有可靠历史时间，不用令牌文件 mtime 冒充。
+CREATE TABLE IF NOT EXISTS account_additions (
+  scope TEXT NOT NULL,
+  uid TEXT NOT NULL,
+  added_at REAL NOT NULL,
+  PRIMARY KEY (scope, uid)
+);
+
 -- 签到 / 保活结果记录。上游只在失败时打日志、成功静默，
 -- 因此本表用于留下我们自己触发的签到结果，便于事后追溯。
 CREATE TABLE IF NOT EXISTS checkin_logs (
@@ -869,6 +877,26 @@ def delete_account_note(uid: str) -> None:
 def account_notes() -> dict[str, str]:
     """全部备注 {uid: note}。账号列表一次取回，避免按账号逐条查。"""
     return {str(r['uid']): str(r['note']) for r in query('SELECT uid, note FROM account_notes')}
+
+
+def account_added_times(directory: Path | str) -> dict[str, float]:
+    return {r['uid']: r['added_at'] for r in query(
+        'SELECT uid, added_at FROM account_additions WHERE scope=?',
+        (str(Path(directory).resolve()),))}
+
+
+def record_account_added(uid: str, directory: Path | str | None) -> None:
+    execute('''INSERT INTO account_additions(scope,uid,added_at) VALUES(?,?,?)
+        ON CONFLICT(scope,uid) DO UPDATE SET added_at=excluded.added_at''',
+        (str(Path(directory or config.AUTH_DIR).resolve()), str(uid), time.time()))
+
+
+def move_account_added(uid: str, source: Path, target: Path) -> None:
+    with _lock:
+        execute('''INSERT OR IGNORE INTO account_additions(scope,uid,added_at)
+            SELECT ?,uid,added_at FROM account_additions WHERE scope=? AND uid=?''',
+            (str(target.resolve()), str(source.resolve()), uid))
+        execute('DELETE FROM account_additions WHERE scope=? AND uid=?', (str(source.resolve()), uid))
 
 
 def set_setting(key: str, value: Any) -> None:
