@@ -403,6 +403,16 @@ const POOL_FIELDS: Field[] = [
     def: 2,
   },
   {
+    key: 'credit_floor',
+    kind: 'num',
+    label: '保底积分',
+    desc: '账号可用积分低于该值时不再选它，换用其他账号；只有全部账号都低于保底时才会继续用。余额未同步的账号不参与判断，0 = 关闭',
+    unit: '积分',
+    min: 0,
+    max: 1000000,
+    def: 0,
+  },
+  {
     key: 'breaker_threshold',
     kind: 'num',
     label: '连续失败熔断阈值',

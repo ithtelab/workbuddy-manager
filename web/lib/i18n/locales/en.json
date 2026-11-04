@@ -1850,6 +1850,8 @@
     "tabPricing": "Pricing"
   },
   "phrases": {
+    "保底积分": "Credit floor",
+    "账号可用积分低于该值时不再选它，换用其他账号；只有全部账号都低于保底时才会继续用。余额未同步的账号不参与判断，0 = 关闭": "Accounts whose available credits are below this value are skipped in favour of other accounts; they are used again only when every account is below it. Accounts with an unsynced balance are ignored. 0 disables it.",
     "思考内容兜底为正文": "Use reasoning as content fallback",
     "模型在思考模式下正文为空时，把推理原文同时作为正文下发，避免只看正文的客户端显示空回复。代价：同时渲染推理与正文的客户端会把同一段话显示两遍（表现为「推理变成了正文」）。客户端能显示推理时建议关闭": "Fall back to the reasoning text as content when a thinking model returns an empty body, so clients that only read content do not see an empty reply. Cost: clients that render both reasoning and content show the same text twice (looking like the reasoning became the answer). Turn this off if your client can display reasoning.",
     "账号最短间隔": "Minimum account gap",

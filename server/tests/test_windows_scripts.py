@@ -329,6 +329,29 @@ class WindowsHostSettingsTest(unittest.TestCase):
         self.assertIn("'--host', $bindHost", src)
 
 
+class WindowsAutostartProjectTest(unittest.TestCase):
+    """issue #388：开机自启不能只驻留托盘，还要能按偏好自动启动项目。"""
+
+    def _src(self, name: str) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / name
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_preference_is_persisted_and_gated(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('autostart_project', src)
+        self.assertIn('_chkAutostartProject.Enabled = _chkAutostart.Checked', src,
+                      '「同时启动项目」必须在未勾开机自启时禁用')
+
+    def test_boot_starts_project_quietly(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('StartProject(true)', src,
+                      '开机自启没有调用静默启动')
+        self.assertIn('_openBrowserOnHealthy = !quiet', src,
+                      '静默启动不该自动打开浏览器')
+        self.assertIn('if (quiet) { AppendLog', src,
+                      '静默启动出错时不该弹模态框')
+
 class WindowsAutostartTest(unittest.TestCase):
     """issue #269：Windows 启动器开机自启（HKCU Run + 静默到托盘 + 卸载清理）。"""
 

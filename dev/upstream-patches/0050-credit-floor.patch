@@ -1,0 +1,215 @@
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -162,6 +162,7 @@ type Config struct {
+ 		LargeRequestBudget int `json:"large_request_budget"`
+ 		// LargeRequestBudgetWindow 预算的滑动窗口，默认 "120s"。
+ 		LargeRequestBudgetWindow string `json:"large_request_budget_window"`
++		CreditFloor              int64  `json:"credit_floor"`         // 保底积分（issue #364）：低于该值的账号只作最后候选，0 = 关闭
+ 		MaxInFlight              int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+ 		MaxInFlightGlobal        int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+ 		BreakerThreshold         int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+@@ -465,6 +466,9 @@ func (c *Config) normalize() error {
+ 	if c.Pool.LargeRequestBytes == 0 {
+ 		c.Pool.LargeRequestBytes = 2 << 20
+ 	}
++	if c.Pool.CreditFloor < 0 {
++		c.Pool.CreditFloor = 0
++	}
+ 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
+ 		return fmt.Errorf("session_sticky.ttl: %w", err)
+ 	}
+new file mode 100644
+index 0000000..d1590cb
+--- /dev/null
++++ b/internal/pool/credit_floor_test.go
+@@ -0,0 +1,77 @@
++package pool
++
++import (
++	"testing"
++
++	"workbuddy2api/internal/auth"
++)
++
++// issue #364：保底积分。低于阈值的账号只在没有别的候选时才被选中。
++func TestCreditFloorSkipsLowBalance(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	for uid, credits := range map[string]int64{"rich": 500, "mid": 100, "low": 50} {
++		p.Add(&auth.Auth{UID: uid})
++		p.SetCredits(uid, credits)
++	}
++	p.SetCreditFloor(200)
++	for i := 0; i < 20; i++ {
++		got := p.Pick("")
++		if got == nil {
++			t.Fatal("不应为 nil")
++		}
++		if got.UID != "rich" {
++			t.Fatalf("保底 200 时选中了 %s（credits=%d）", got.UID, p.creditOf(got.UID))
++		}
++	}
++}
++
++func (p *Pool) creditOf(uid string) int64 {
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++	if e := p.byUID[uid]; e != nil {
++		return e.credits
++	}
++	return -1
++}
++
++// 全部候选都低于保底时必须退化，而不是 503。
++func TestCreditFloorFallsBackWhenAllLow(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "a"})
++	p.Add(&auth.Auth{UID: "b"})
++	p.SetCredits("a", 10)
++	p.SetCredits("b", 20)
++	p.SetCreditFloor(1000)
++	if got := p.Pick(""); got == nil {
++		t.Fatal("全部低于保底时应回退到原候选，不能返回 nil")
++	}
++}
++
++// credits==0 表示「还没同步到余额」，不能因为保底被排除。
++func TestCreditFloorKeepsUnknownBalance(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "unknown"})
++	p.SetCreditFloor(100)
++	if got := p.Pick(""); got == nil || got.UID != "unknown" {
++		t.Fatalf("余额未知的账号不应被保底排除，got %+v", got)
++	}
++}
++
++// 粘性号跌破保底时要让位：PickByUIDForModel 返回 nil，handler 会解绑换号。
++func TestCreditFloorReleasesStickyBelowFloor(t *testing.T) {
++	p := New("")
++	defer p.Close()
++	p.Add(&auth.Auth{UID: "sticky"})
++	p.SetCredits("sticky", 50)
++	p.SetCreditFloor(100)
++	if got := p.PickByUIDForModel("sticky", ""); got != nil {
++		t.Fatalf("低于保底的粘性号不应被命中: %+v", got)
++	}
++	p.SetCredits("sticky", 150)
++	if got := p.PickByUIDForModel("sticky", ""); got == nil {
++		t.Fatal("达到保底后粘性应恢复")
++	}
++}
+--- a/internal/pool/pick.go
++++ b/internal/pool/pick.go
+@@ -63,6 +63,20 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 		}
+ 		cands = append(cands, e)
+ 	}
++	// 保底积分（issue #364）：优先从「积分不低于 floor」的账号里选。全部低于保底
++	// 时保留原候选，不让阈值把池子清空（宁可继续用，也不要 503）。
++	// credits == 0 视为「未知」，不参与判断（启动时余额还没同步）。
++	if p.creditFloor > 0 {
++		above := make([]*entry, 0, len(cands))
++		for _, e := range cands {
++			if e.credits <= 0 || e.credits >= p.creditFloor {
++				above = append(above, e)
++			}
++		}
++		if len(above) > 0 {
++			cands = above
++		}
++	}
+ 	if len(cands) == 0 {
+ 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
+ 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
+--- a/internal/pool/pool.go
++++ b/internal/pool/pool.go
+@@ -29,6 +29,10 @@ type Pool struct {
+ 	// 「硬冷却到次日 04:00，等签到恢复」）。配了就只退出这一小段，到期回到候选池
+ 	// —— 用户可能在期间充值、上游也可能刷新额度，挂一整天是浪费。
+ 	creditExhausted time.Duration
++	// creditFloor 保底积分（issue #364）：账号可用积分低于该值时不再被选中，
++	// 除非没有别的候选（否则阈值设高会直接 503）。`credits > 0` 才判断 —— 0 同时
++	// 表示「还没同步到余额」，启动时不能因此把整池排除。0 = 关闭（默认）。
++	creditFloor int64
+ 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
+ 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
+ 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
+@@ -134,6 +138,25 @@ func (p *Pool) SetCreditExhausted(d time.Duration) {
+ 	p.creditExhausted = d
+ }
+ 
++// SetCreditFloor 设置保底积分（issue #364）：低于该值的账号只作为最后候选。
++// 0 或负数 = 关闭。credits==0（未知）不受影响，避免启动时误排除整池。
++func (p *Pool) SetCreditFloor(floor int64) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if floor < 0 {
++		floor = 0
++	}
++	p.creditFloor = floor
++}
++
++// creditFloorOKLocked 该账号是否满足保底积分；调用方必须已持有 p.mu。
++func (p *Pool) creditFloorOKLocked(e *entry) bool {
++	if p.creditFloor <= 0 || e.credits <= 0 {
++		return true
++	}
++	return e.credits >= p.creditFloor
++}
++
+ // SetCostExploreInterval 注入 costTier 条件探索窗口（main 从 config 解析后调用，
+ // issue #136）。0 = 关停（完全回到现状行为）；正值覆盖默认 30m。
+ // 注意：与 SetSoftRateMax「非正值保留默认」不同，0 在这里是**合法值**（关停开关，
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -354,6 +354,11 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+ 	if p.inFlightFull(e) {
+ 		return nil
+ 	}
++	// 保底积分（issue #364）：粘性号跌破阈值时也要让位，否则「一直用同一个号」
++	// 会把保底直接吃穿。返回 nil 后 handler 会解绑并重新选号。
++	if !p.creditFloorOKLocked(e) {
++		return nil
++	}
+ 	e.lastUsed = now
+ 	// 粘性路径同样推进 usedSeq/pickSeq：粘性重度使用的账号在 LRU 兜底
+ 	// （pick 按 usedSeq 选最旧）眼中不再是"最旧"，与 pick 的严格全序语义对齐
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -39,9 +39,11 @@ type Config struct {
+ 	LargeRequestBudget int
+ 	// LargeRequestBudgetWindow 预算的滑动窗口。
+ 	LargeRequestBudgetWindow time.Duration
+-	Upstream                 *upstream.Client
+-	APIKey                   string // 空 = 不鉴权
+-	MaxRotate                int    // 单请求最多换号次数，默认 3
++	// CreditFloor 保底积分（issue #364）：低于该值的账号只作最后候选；0 = 关闭。
++	CreditFloor int64
++	Upstream    *upstream.Client
++	APIKey      string // 空 = 不鉴权
++	MaxRotate   int    // 单请求最多换号次数，默认 3
+ 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
+ 	Session *session.Router
+ 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
+@@ -182,6 +184,9 @@ func NewHandler(cfg Config) *Handler {
+ 	if cfg.LargeRequestBudget == 0 {
+ 		cfg.LargeRequestBudget = 6
+ 	}
++	if cfg.Pool != nil {
++		cfg.Pool.SetCreditFloor(cfg.CreditFloor)
++	}
+ 	if cfg.LargeRequestBytes == 0 {
+ 		cfg.LargeRequestBytes = 2 << 20 // 2 MiB ≈ 52 万 token：只切接近封号画像量级的超大上下文
+ 	}
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -250,6 +250,7 @@
+ 		LargeRequestCooldown:     cfg.LargeRequestCooldownDur,
+ 		LargeRequestBudget:       cfg.Pool.LargeRequestBudget,
+ 		LargeRequestBudgetWindow: cfg.LargeRequestBudgetWindowDur,
++		CreditFloor:              cfg.Pool.CreditFloor,
+ 		PromptMode:               cfg.Prompt.Mode,
+ 		PromptText:               cfg.PromptText,
+ 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
