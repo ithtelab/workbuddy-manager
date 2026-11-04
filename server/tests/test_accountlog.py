@@ -45,6 +45,13 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(got[0]['account'], '3a3a19b1')
         self.assertEqual(got[0]['model'], 'deepseek-v4.1-flash')
 
+    def test_event_identity_survives_tail_and_distinguishes_subseconds(self) -> None:
+        from server.services import accountlog
+        other = LINE_CN.replace('123895379Z', '223895379Z')
+        first, second = accountlog.parse_request_lines([LINE_CN, other])
+        self.assertEqual(first['event_id'], accountlog.parse_request_lines([LINE_CN])[0]['event_id'])
+        self.assertNotEqual(first['event_id'], second['event_id'])
+
     def test_timestamp_is_utc(self) -> None:
         """**核心**：docker 前缀是 UTC，解析必须按 UTC。
 
@@ -133,6 +140,7 @@ class AttachTest(unittest.TestCase):
     def setUp(self) -> None:
         from server import db
         db.execute('DELETE FROM request_logs')
+        db.execute('DELETE FROM request_account_matches')
 
     def _log(self, ts: int, model: str = 'deepseek-v4.1-flash') -> int:
         from server import db
@@ -186,6 +194,133 @@ class AttachTest(unittest.TestCase):
             [{'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'SECOND(22222222)'}])
         self.assertEqual(n, 0, '已填过的行不该被再次匹配')
         self.assertEqual(self._account(rid), 'FIRST(11111111)')
+
+    def test_event_is_not_reused_for_neighbor_on_next_poll(self) -> None:
+        from server import db
+        first = self._log(TS_CN)
+        neighbor = self._log(TS_CN + 1)
+        entry = {'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'A(1)',
+                 'event_id': 'event-1', 'source': 'docker:upstream'}
+        self.assertEqual(db.attach_request_accounts([entry, entry]), 1)
+        self.assertEqual(db.attach_request_accounts([entry]), 0)
+        self.assertEqual(self._account(first), 'A(1)')
+        self.assertIsNone(self._account(neighbor))
+
+    def test_consumption_survives_connection_restart(self) -> None:
+        from server import db
+        self._log(TS_CN)
+        neighbor = self._log(TS_CN + 1)
+        entry = {'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'A(1)'}
+        self.assertEqual(db.attach_request_accounts([entry]), 1)
+        db._conn.close()
+        db._conn = None
+        self.assertEqual(db.attach_request_accounts([entry]), 0)
+        self.assertIsNone(self._account(neighbor))
+
+    def test_first_poll_after_upgrade_does_not_steal_legacy_event(self) -> None:
+        from server import db
+        first = self._log(TS_CN)
+        db.execute('UPDATE request_logs SET account = ? WHERE id = ?', ('A(1)', first))
+        neighbor = self._log(TS_CN + 1)
+        entry = {'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'A(1)',
+                 'event_id': 'legacy-event'}
+        self.assertEqual(db.attach_request_accounts([entry]), 0)
+        self.assertEqual(db.attach_request_accounts([entry]), 0)
+        self.assertIsNone(self._account(neighbor))
+        self.assertEqual(db.query_one('SELECT count(*) n FROM request_account_matches')['n'], 1)
+
+    def test_clear_request_logs_keeps_consumed_events(self) -> None:
+        from server import db
+        self._log(TS_CN)
+        entry = {'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'A(1)'}
+        self.assertEqual(db.attach_request_accounts([entry]), 1)
+        db.execute('DELETE FROM request_logs')
+        neighbor = self._log(TS_CN + 1)
+        self.assertEqual(db.attach_request_accounts([entry]), 0)
+        self.assertIsNone(self._account(neighbor))
+
+    def test_consumption_failure_rolls_back_account_update(self) -> None:
+        from server import db
+        row = self._log(TS_CN)
+        db.execute("CREATE TRIGGER reject_account_match BEFORE INSERT ON request_account_matches "
+                   "BEGIN SELECT RAISE(ABORT, 'test failure'); END")
+        try:
+            entry = {'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'A(1)'}
+            self.assertEqual(db.attach_request_accounts([entry]), 0)
+            self.assertIsNone(self._account(row))
+            self.assertEqual(db.query_one('SELECT count(*) n FROM request_account_matches')['n'], 0)
+        finally:
+            db.execute('DROP TRIGGER reject_account_match')
+        self.assertEqual(db.attach_request_accounts([entry]), 1)
+
+    def test_different_event_does_not_skip_closer_filled_row(self) -> None:
+        from server import db
+        first = self._log(TS_CN)
+        neighbor = self._log(TS_CN + 1)
+        db.execute('UPDATE request_logs SET account = ? WHERE id = ?', ('A(1)', first))
+        entry = {'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'B(2)'}
+        self.assertEqual(db.attach_request_accounts([entry]), 0)
+        self.assertIsNone(self._account(neighbor))
+
+    def test_concurrent_polls_consume_event_once(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        from server import db
+        self._log(TS_CN)
+        neighbor = self._log(TS_CN + 1)
+        entry = {'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'A(1)',
+                 'event_id': 'shared-event'}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            counts = list(pool.map(db.attach_request_accounts, [[entry], [entry]]))
+        self.assertEqual(sum(counts), 1)
+        self.assertIsNone(self._account(neighbor))
+
+    def test_unmatched_event_can_retry_after_local_record_arrives(self) -> None:
+        from server import db
+        entry = {'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'A(1)'}
+        self.assertEqual(db.attach_request_accounts([entry]), 0)
+        row = self._log(TS_CN)
+        self.assertEqual(db.attach_request_accounts([entry]), 1)
+        self.assertEqual(self._account(row), 'A(1)')
+
+    def test_equidistant_candidates_are_not_guessed(self) -> None:
+        from server import db
+        left = self._log(TS_CN - 1)
+        right = self._log(TS_CN + 1)
+        self.assertEqual(db.attach_request_accounts(
+            [{'ts': TS_CN, 'model': 'deepseek-v4.1-flash', 'account': 'A(1)'}]), 0)
+        self.assertIsNone(self._account(left))
+        self.assertIsNone(self._account(right))
+
+    def test_local_rejection_is_not_a_candidate_but_upstream_error_is(self) -> None:
+        from server import db
+        db.add_request_log(ts=TS_CN, model='m', status=429, account_expected=0)
+        rejected = db.query_one('SELECT id FROM request_logs ORDER BY id DESC')['id']
+        db.add_request_log(ts=TS_CN + 1, model='m', status=429, account_expected=1)
+        upstream = db.query_one('SELECT id FROM request_logs ORDER BY id DESC')['id']
+        self.assertEqual(db.attach_request_accounts(
+            [{'ts': TS_CN, 'model': 'm', 'account': 'A(1)'}]), 1)
+        self.assertIsNone(self._account(rejected))
+        self.assertEqual(self._account(upstream), 'A(1)')
+
+    def test_distinct_events_with_one_second_local_lag_both_match(self) -> None:
+        """合成事件：上游 100/101，本地 101/102；已关联第一条不能挡住第二条。"""
+        from server import db
+        first = self._log(TS_CN + 1)
+        second = self._log(TS_CN + 2)
+        entries = [{'ts': TS_CN + i, 'model': 'deepseek-v4.1-flash',
+                    'account': f'account-{i}', 'event_id': f'event-{i}'} for i in range(2)]
+        self.assertEqual(db.attach_request_accounts(entries), 2)
+        self.assertEqual(self._account(first), 'account-0')
+        self.assertEqual(self._account(second), 'account-1')
+        self.assertEqual(db.attach_request_accounts(entries), 0)
+
+    def test_distinct_events_with_same_account_are_not_collapsed(self) -> None:
+        from server import db
+        self._log(TS_CN)
+        self._log(TS_CN + 1)
+        entries = [{'ts': TS_CN + i, 'model': 'deepseek-v4.1-flash',
+                    'account': 'A(1)', 'event_id': f'event-{i}'} for i in range(2)]
+        self.assertEqual(db.attach_request_accounts(entries), 2)
 
     def test_model_must_match(self) -> None:
         """模型对不上的不填：同一秒可能有别的模型的请求。"""

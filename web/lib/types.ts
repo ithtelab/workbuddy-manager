@@ -1219,9 +1219,9 @@ export interface Versions {
  * 这一列空的时候有四种完全不同的原因，后端把事实与判断依据一起返回。
  */
 export interface AccountBackfillInfo {
-  /** native = 读日志文件；docker = docker logs */
-  mode: 'native' | 'docker';
-  /** native 是文件路径，docker 是容器名 */
+  /** native = 日志文件；docker = docker logs；systemd = journal */
+  mode: 'native' | 'docker' | 'systemd';
+  /** native 是文件路径，docker 是容器名，systemd 是 unit 名 */
   source: string;
   /** 最近一次采集的时刻（epoch 秒，0 = 还没跑过） */
   checked_at: number;

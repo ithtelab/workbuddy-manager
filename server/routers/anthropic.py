@@ -225,7 +225,8 @@ def _authorize(request: Request, model: str | None, *,
         ]
         if not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist')):
             gateway._log_ip(ip, path, True, ua, 'ip_blocked')
-            gateway._record(key, ip, model or '', _mapped_for_log or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+            gateway._record(key, ip, model or '', _mapped_for_log or '', 403, 0, 0, 0, ua, 'IP 被拦截', False,
+                            account_expected=False)
             return None, ip, _err(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error')
 
     # 注意：`blocked=False` 的这一行现在默认**不写库**（审计日志只留拦截，
@@ -245,7 +246,8 @@ def _authorize(request: Request, model: str | None, *,
         # 与 gateway._authorize 同口径：状态码来自 keysvc，不再一律 403
         # （403 会被客户端显示成「API 密钥无效」，掩盖真实原因）。
         status = getattr(reason, 'status', 403)
-        gateway._record(key, ip, model or '', mapped or '', status, 0, 0, 0, ua, reason, False)
+        gateway._record(key, ip, model or '', mapped or '', status, 0, 0, 0, ua, reason, False,
+                        account_expected=False)
         # 也记进安全页的入站日志：走 /v1/messages 的客户端被拒时，此前在
         # 「IP 访问日志」里**完全看不到**（只有 gateway 那条路记），两套协议
         # 的审计口径不一致。原因码复用 gateway 的归类，避免两处写法漂移。
@@ -255,7 +257,8 @@ def _authorize(request: Request, model: str | None, *,
     limited, _count = gateway._rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{gateway.RATE_WINDOW}s 内超过 {gateway.RATE_MAX_PER_MIN} 次）'
-        gateway._record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
+        gateway._record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False,
+                        account_expected=False)
         gateway._log_ip(ip, path, True, ua, 'rate_limited')
         return None, ip, _err(msg, 429, 'rate_limit_error')
 
@@ -998,7 +1001,8 @@ async def messages(request: Request):
     try:
         payload = to_openai_request(body)
     except Exception as exc:  # noqa: BLE001
-        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
         return _err(f'请求转换失败：{exc}')
 
     # 思考档位（issue #319）：客户端选了档位，日志里却一直是「—」，因为只有
@@ -1019,7 +1023,8 @@ async def messages(request: Request):
     try:
         upstream = upstreamsvc.resolve_for_key(key)
     except upstreamsvc.UpstreamUnavailable as exc:
-        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
         # anthropic 的错误体没有 code 字段（只有 type），故第三参给 type
         return _err(str(exc), 503, 'api_error')
     url = f'{upstream["base_url"]}/v1/chat/completions'
@@ -1058,7 +1063,8 @@ async def messages(request: Request):
                 data if isinstance(data, dict) else {}, model, thinking=want_thinking))
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                            account_expected=gateway._account_expected_after_error(exc))
             return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     # ── 流式 ────────────────────────────────────────────────
@@ -1070,7 +1076,8 @@ async def messages(request: Request):
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True,
+                        account_expected=gateway._account_expected_after_error(exc))
         return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     status_code = resp.status_code

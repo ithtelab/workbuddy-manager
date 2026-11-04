@@ -1694,7 +1694,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         custom_tool_names = bridge.custom_names
         payload = to_chat_request(body, custom_tool_names, bridge)
     except Exception as exc:  # noqa: BLE001
-        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
         return _failed(f'请求转换失败：{exc}', 400)
 
     if not payload.get('messages'):
@@ -1719,7 +1720,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     try:
         upstream = upstreamsvc.resolve_for_key(key)
     except upstreamsvc.UpstreamUnavailable as exc:
-        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
         return _failed(str(exc), 503, 'api_error', 'upstream_unavailable')
     url = f'{upstream["base_url"]}/v1/chat/completions'
     started = time.time()
@@ -1768,7 +1770,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 else 'invalid_custom_tool_arguments')
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                            account_expected=gateway._account_expected_after_error(exc))
             return _failed(f'上游不可用：{exc}', 502)
 
     # ── 流式 ──
@@ -1780,7 +1783,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True,
+                        account_expected=gateway._account_expected_after_error(exc))
         return _failed(f'上游不可用：{exc}', 502)
 
     # 上游直接报错：**开流之前**用真实状态码回掉。

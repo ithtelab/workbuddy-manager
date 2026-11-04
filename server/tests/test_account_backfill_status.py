@@ -84,7 +84,8 @@ class AccountBackfillStatusTest(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         accountlog._last.update(checked_at=123, lines=40, parsed=7, filled=3)
-        self.assertEqual(accountlog.status()['hint'], '')
+        with mock.patch.object(accountlog, '_has_pending_accounts', return_value=False):
+            self.assertEqual(accountlog.status()['hint'], '')
 
     def test_no_hint_when_nothing_left_to_fill(self) -> None:
         """全部已回填时 filled 也是 0（它只统计**本轮新填**），不能据此报「对不上」。
@@ -166,6 +167,35 @@ class AccountBackfillStatusTest(unittest.TestCase):
         # _collect_once 自己抛；外层 _loop 会记录。这里直接验证字段可被写入
         accountlog._last['error'] = 'db is locked'
         self.assertIn('db is locked', accountlog._last['error'])
+
+    def test_partial_success_does_not_hide_overdue_accounts(self) -> None:
+        with mock.patch.object(accountlog.config, 'WB2API_MODE', 'docker'), \
+                mock.patch.object(accountlog.updater, 'can_control_docker', return_value=True), \
+                mock.patch.object(accountlog, '_has_pending_accounts', return_value=True):
+            accountlog._last.update(checked_at=123, lines=40, parsed=7, filled=3)
+            self.assertIn('60 秒', accountlog.status()['hint'])
+
+    def test_empty_read_clears_previous_filled_count(self) -> None:
+        accountlog._last.update(filled=7)
+        with mock.patch.object(accountlog.wb2api, 'read_container_logs', return_value=([], None)):
+            self.assertEqual(accountlog._collect_once(), 0)
+        self.assertEqual(accountlog._last['filled'], 0)
+        self.assertEqual(accountlog._last['parsed'], 0)
+
+    def test_systemd_uses_common_pending_diagnosis(self) -> None:
+        with mock.patch.object(accountlog.config, 'WB2API_MODE', 'systemd'), \
+                mock.patch.object(accountlog, '_has_pending_accounts', return_value=True):
+            accountlog._last.update(checked_at=123, lines=40, parsed=7)
+            self.assertIn('60 秒', accountlog.status()['hint'])
+
+    def test_probe_cutoff_is_anchored_to_last_collection(self) -> None:
+        with mock.patch.object(accountlog.config, 'WB2API_MODE', 'docker'), \
+                mock.patch.object(accountlog.updater, 'can_control_docker', return_value=True), \
+                mock.patch.object(accountlog.time, 'time', return_value=1000), \
+                mock.patch.object(accountlog, '_has_pending_accounts', return_value=False) as probe:
+            accountlog._last.update(checked_at=800, lines=40, parsed=7)
+            accountlog.status()
+        probe.assert_called_once_with(700, 740)
 
     def test_endpoint_requires_admin(self) -> None:
         from server.routers import logs

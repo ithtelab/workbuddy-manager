@@ -586,7 +586,16 @@ def normalize_chat_images(body: object) -> int:
     return changed
 
 
-def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, effort: str | None = None) -> None:
+def _account_expected_after_error(exc: Exception) -> bool:
+    """只排除明确未发送到上游的错误；读/写超时或协议错误可能已选账号。
+
+    ConnectError 覆盖 DNS、连接拒绝和建连失败；ConnectTimeout / PoolTimeout
+    分别发生在建连与取得连接前。不能按 502 或所有 TransportError 一刀切。
+    """
+    return not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+
+
+def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, effort: str | None = None, account_expected: bool = True) -> None:
     """记录调用日志与用量。
 
     credit 为上游返回的真实扣费（usage.credit）。None 表示上游没给，
@@ -632,6 +641,7 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             ip=db._clean(ip, 64),
             model=model_clean,
             mapped_model=db._clean(mapped, 128),
+            account_expected=int(account_expected and bool(model_clean or mapped)),
             status=status,
             prompt_tokens=pt,
             completion_tokens=ct,
@@ -719,7 +729,8 @@ def _authorize(request: Request, model: str | None,
     # 全局入站 IP 规则
     if _global_ip_blocked(ip):
         _log_ip(ip, path, True, ua, 'ip_blocked')
-        _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+        _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False,
+                account_expected=False)
         return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
     # 注意这一行**在密钥校验之前**：密钥层面的拒绝（停用 / 过期 / 配额用尽 /
@@ -733,7 +744,8 @@ def _authorize(request: Request, model: str | None,
         # 把 401/403 统一显示成「API 密钥无效」，一律 403 会把「密钥版本不匹配」
         # 这种配置问题说成密钥坏了，用户便反复重建密钥（issue #18）。
         _record(key, ip, model or '', mapped or '',
-                getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False)
+                getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False,
+                account_expected=False)
         _log_ip(ip, path, True, ua, _key_reject_code(reason, is_model_list))
         reject_status = getattr(reason, 'status', 403)
         return None, ip, _oai_error(
@@ -747,7 +759,8 @@ def _authorize(request: Request, model: str | None,
     limited, count = _rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{RATE_WINDOW}s 内超过 {RATE_MAX_PER_MIN} 次）'
-        _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
+        _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False,
+                account_expected=False)
         _log_ip(ip, path, True, ua, 'rate_limited')
         return None, ip, _oai_error(msg, 429, 'rate_limit_error', 'rate_limit_exceeded',
                                     retry_after=RATE_WINDOW)
@@ -845,7 +858,8 @@ def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
     try:
         return upstreamsvc.resolve_for_key(key), None
     except upstreamsvc.UpstreamUnavailable as exc:
-        _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False)
+        _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False,
+                account_expected=False)
         # 这里不加 _upstream_hint：本函数讲的是「密钥绑定的上游不可用」，作用域里
         # 也没有那个上游对象 —— 报出默认上游的地址只会把人带偏（异常文本已经说清
         # 是哪个分组、该启用还是改绑）。
@@ -1351,7 +1365,8 @@ async def _chat(request: Request, upstream_path: str):
                                 status_code=resp.status_code, headers=headers)
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                    account_expected=_account_expected_after_error(exc))
             return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     # 流式转发
@@ -1362,7 +1377,8 @@ async def _chat(request: Request, upstream_path: str):
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True, effort=effort)
+        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True, effort=effort,
+                account_expected=_account_expected_after_error(exc))
         return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     status_code = resp.status_code
