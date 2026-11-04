@@ -385,6 +385,76 @@ class UpdateEndToEndTest(unittest.TestCase):
         self.assertTrue(any('--user' in c for c in calls),
                         f'权限失败后没有回退到 --user：{calls}')
 
+    # ── venv 里不能退回 --user（issue #382） ──
+    #
+    # venv 的 pip 明确拒绝 `--user`（"User site-packages are not visible in
+    # this virtualenv"）；原先的可写性判定只看目录 ACL，判成不可写就加
+    # `--user`，于是本地 venv 部署的更新永远失败。
+
+    def _run_with_pip_venv(self, mod, pkg, digest, *, writable: bool,
+                           purelib: str, results: list[tuple[int, str]]):
+        pip_calls: list[list[str]] = []
+
+        def fake_run(cmd, *a, **kw):
+            if cmd[1:3] == ['-m', 'pip']:
+                pip_calls.append(cmd)
+                return results[min(len(pip_calls) - 1, len(results) - 1)]
+            return 0, ''
+
+        orig_update = mod.update_manager
+
+        def update_with_fake_pip(rep):
+            mod.run = fake_run
+            mod._in_venv = lambda: True
+            mod._venv_purelib_writable = lambda: (writable, purelib)
+            return orig_update(rep)
+
+        mod.update_manager = update_with_fake_pip
+        ok, rep = self._run_update(mod, pkg, digest)
+        return ok, rep, pip_calls
+
+    def test_venv_never_passes_user(self) -> None:
+        """venv 中即使目录被判不可写，也不能传 --user（pip 会直接拒绝）。"""
+        inst = self._make_install('venvok')
+        pkg, digest = self._make_release('venvok')
+        mod = self._load(inst)
+        ok, rep, calls = self._run_with_pip_venv(
+            mod, pkg, digest, writable=True,
+            purelib='/opt/workbuddy-manager/venv/lib/python3.14/site-packages',
+            results=[(0, '')])
+        self.assertTrue(ok, rep.text())
+        self.assertTrue(calls, '压根没调用 pip')
+        self.assertTrue(all('--user' not in c for c in calls),
+                        f'venv 里不该出现 --user：{calls}')
+        self.assertTrue(all('--break-system-packages' not in c for c in calls),
+                        f'venv 里不该传 PEP 668 的开关：{calls}')
+
+    def test_venv_unwritable_fails_before_pip_with_path(self) -> None:
+        """venv 目标不可写时提前报出具体路径，不要连着跑两次无意义的 pip。"""
+        inst = self._make_install('venvro')
+        pkg, digest = self._make_release('venvro')
+        mod = self._load(inst)
+        purelib = '/opt/workbuddy-manager/venv/lib/python3.14/site-packages'
+        ok, rep, calls = self._run_with_pip_venv(
+            mod, pkg, digest, writable=False, purelib=purelib, results=[(0, '')])
+        self.assertFalse(ok, 'venv 不可写竟然更新成功')
+        self.assertEqual(calls, [], '预检失败后仍调用了 pip')
+        self.assertIn(purelib, rep.text(), '错误里没有给出不可写的目录')
+        self.assertIn('虚拟环境', rep.text())
+
+    def test_venv_permission_error_does_not_retry_with_user(self) -> None:
+        """venv 里 pip 报权限问题时也不补 --user：那条路本来就走不通。"""
+        inst = self._make_install('venvperm')
+        pkg, digest = self._make_release('venvperm')
+        mod = self._load(inst)
+        ok, rep, calls = self._run_with_pip_venv(
+            mod, pkg, digest, writable=True, purelib='/venv/lib/python3.14/site-packages',
+            results=[(1, 'ERROR: [Errno 13] Permission denied'), (1, 'ERROR: Permission denied')])
+        self.assertFalse(ok, 'pip 失败竟然更新成功')
+        self.assertTrue(calls, '压根没调用 pip')
+        self.assertTrue(all('--user' not in c for c in calls),
+                        f'venv 的权限回退不该加 --user：{calls}')
+
     # ── 管理端没变时，上游仍要跟着包走 ──
     #
     # 上游源码只随发布包分发（原仓库已不可用），所以"管理端版本没变"不等于

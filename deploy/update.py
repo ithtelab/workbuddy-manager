@@ -1328,6 +1328,33 @@ def fetch_release_via_redirect(latest_url: str | None = None,
     }
 
 
+def _in_venv() -> bool:
+    """当前解释器是否跑在虚拟环境里（issue #382）。
+
+    venv 的 pip 明确拒绝 `--user`（"User site-packages are not visible in this
+    virtualenv"），所以这条判定必须在决定传不传 `--user` 之前做。用
+    `sys.prefix != sys.base_prefix` 而不是看路径里有没有 `venv/`：后者会被
+    任意目录名骗过。
+    """
+    return sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+
+
+def _venv_purelib_writable() -> tuple[bool, str]:
+    """venv 的 site-packages 是否可写；返回 (可写, 路径)。
+
+    venv 内不能退回 --user，只能装进自己；不可写时要在调用 pip **之前**报出
+    具体路径，而不是让 pip 连着失败两次再给一句「依赖安装失败」。
+    """
+    try:
+        purelib = sysconfig.get_path('purelib') or ''
+    except Exception:  # noqa: BLE001
+        purelib = ''
+    if not purelib:
+        return False, ''
+    p = Path(purelib)
+    return (p.is_dir() and os.access(p, os.W_OK) and os.access(p.parent, os.W_OK)), purelib
+
+
 def _system_site_writable() -> bool:
     """系统 site-packages 能不能直接写。
 
@@ -1364,13 +1391,29 @@ def install_requirements(req: Path, rep: Reporter) -> None:
     这个部署**永远升不上去**（issue #157 的另一半——#160 只做到"失败要响"）。
     """
     py = sys.executable
-    use_user = not _system_site_writable()
-    target = ['--user'] if use_user else []
+    in_venv = _in_venv()
+    if in_venv:
+        # venv 内 pip 不接受 --user（issue #382）：只能装进本环境。目标目录不可写
+        # 时提前给出路径与修复建议，别让 pip 连着失败两次再报一句笼统错误。
+        writable, purelib = _venv_purelib_writable()
+        if not writable:
+            raise RuntimeError(
+                '当前 Python 是虚拟环境（' + sys.prefix + '），但依赖目录不可写：'
+                + (purelib or '路径未知')
+                + '。请修复该目录的写权限，或重建虚拟环境后重试；'
+                  '本次更新已中止，当前版本保持不变。')
+        use_user = False
+        target: list[str] = []
+        attempts = [target]
+        rep.log(f'检测到虚拟环境（{sys.prefix}），依赖安装到该环境的 site-packages')
+    else:
+        use_user = not _system_site_writable()
+        target = ['--user'] if use_user else []
+        # 系统 Python 保留 PEP 668 的两段尝试（带 / 不带 --break-system-packages）。
+        attempts = [target + ['--break-system-packages'], target]
+        if use_user:
+            rep.log(f'系统 site-packages 不可写，依赖改装到用户站点（{site.getusersitepackages()}）')
     rep.log('检查 / 安装 Python 依赖…')
-    if use_user:
-        rep.log(f'系统 site-packages 不可写，依赖改装到用户站点（{site.getusersitepackages()}）')
-
-    attempts = [target + ['--break-system-packages'], target]
     code, out = 0, ''
     for extra in attempts:
         code, out = run([py, '-m', 'pip', 'install', '-q', *extra, '-r', str(req)],
@@ -1380,7 +1423,8 @@ def install_requirements(req: Path, rep: Reporter) -> None:
 
     # 可写性判定可能误判（ACL、只读挂载…）：只在输出看起来是权限问题时补一次 --user，
     # 免得给真正的网络/解析失败也套上 --user 掩盖原因。
-    if not use_user and any(h in (out or '').lower() for h in _PERMISSION_HINTS):
+    # venv 里没有 --user 这条退路：权限问题只能报错（上面已预检过目录）。
+    if not in_venv and not use_user and any(h in (out or '').lower() for h in _PERMISSION_HINTS):
         code, _ = run([py, '-m', 'pip', 'install', '-q', '--user',
                        '--break-system-packages', '-r', str(req)], rep=rep, check=False)
         if code == 0:
