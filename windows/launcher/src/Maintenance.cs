@@ -41,8 +41,26 @@ namespace WorkBuddyLauncher
             }
         }
 
-        /// 删除桌面 / 开始菜单快捷方式与注册表卸载项。
+        /// 删除桌面 / 开始菜单快捷方式与注册表卸载项（**卸载**用）。
         public static void RemoveShortcutsAndRegistry()
+        {
+            RemoveShortcuts();
+            RemoveRegistryEntry();
+        }
+
+        /// 只删注册表卸载项。
+        ///
+        /// **覆盖安装用**：快捷方式文件必须留着 —— 重写同名 .lnk 会让 Windows
+        /// 丢掉用户摆好的桌面图标位置，表现为「每装一次图标就跳一次」。
+        /// 指向的修正交给 PayloadInstaller.EnsureShortcut（目标变了才重建）。
+        public static void RemoveRegistryEntry()
+        {
+            try { Registry.CurrentUser.DeleteSubKeyTree(LauncherPaths.UninstallRegKey, false); }
+            catch { }
+        }
+
+        /// 删除桌面 / 开始菜单快捷方式（卸载用）。
+        public static void RemoveShortcuts()
         {
             TryDeleteFile(Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
@@ -51,8 +69,6 @@ namespace WorkBuddyLauncher
             TryDeleteFile(Path.Combine(menuDir, LauncherPaths.AppName + ".lnk"));
             TryDeleteFile(Path.Combine(menuDir, "卸载 " + LauncherPaths.AppName + ".lnk"));
             try { Directory.Delete(menuDir, false); }
-            catch { }
-            try { Registry.CurrentUser.DeleteSubKeyTree(LauncherPaths.UninstallRegKey, false); }
             catch { }
         }
 
