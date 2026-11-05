@@ -1585,7 +1585,7 @@ export default function AccountsPage() {
             固定布局把「列宽」从内容手里拿走：内容超宽就在本列内省略 / 换行，
             表格永远等于容器宽度，不再需要横向拖动。 */}
         <div className="hidden md:block">
-        <Table className="table-fixed [&_td]:overflow-hidden">
+        <Table className="table-fixed wb-first-left [&_td]:overflow-hidden">
           <TableHeader>
             <TableRow className="border-b border-border/60 hover:bg-transparent">
               <TableHead className="w-[17%] pl-4 text-[11px] text-muted-foreground">{t('accounts.colNickname')}</TableHead>

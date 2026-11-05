@@ -359,4 +359,14 @@ button {
   table.wb-table-left [data-slot='table-cell'] > div {
     justify-content: flex-start;
   }
+
+  /* 首列保持左对齐（账号页昵称列：头像 + 名字，居中后反而不好扫读） */
+  table.wb-first-left [data-slot='table-head']:first-child,
+  table.wb-first-left [data-slot='table-cell']:first-child {
+    text-align: left;
+  }
+
+  table.wb-first-left [data-slot='table-cell']:first-child > div {
+    justify-content: flex-start;
+  }
 }
