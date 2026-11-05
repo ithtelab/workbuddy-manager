@@ -71,6 +71,29 @@ _MODEL_POS = 3
 # docker --timestamps 的前缀：2026-09-23T06:58:13.123895379Z
 _TS_PREFIX = re.compile(r'^(?P<stamp>\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+')
 
+# 上游请求行尾部的 `total=20.1s`：该请求的**总耗时**（秒，可带小数）。
+#
+# 它与面板 request_logs.latency_ms 是同一个量（同一请求的总耗时），精度远高于
+# 日志行只能给出的秒级时间戳。用途见 db._pick_account_row：同秒并发时用它做
+# 平局消歧。
+#
+# 为什么不复用 tok=：`tok=` 在「200 但流被中断」「4xx/5xx」这些行里会是 `tok=-`
+# （实测 225 条 chat 行中有 3 条如此），而 `total=` 每条都有。拿不到 token 数的
+# 行在并发场景下就永远填不上，所以选覆盖面更全的耗时。
+TOTAL_FIELD = re.compile(r'total=(?P<sec>\d+(?:\.\d+)?)s')
+
+
+def _total_ms(line: str) -> int | None:
+    """从上游请求行里取出总耗时（毫秒）。取不到返回 None。"""
+    m = TOTAL_FIELD.search(line)
+    if not m:
+        return None
+    try:
+        return int(round(float(m.group('sec')) * 1000))
+    except (TypeError, ValueError):
+        return None
+
+
 # 原生写日志时上游只有时钟，没有日期：| #971 | 14:58:13 | ...
 _NATIVE_CLOCK = re.compile(r'\|\s*#\d+\s*\|\s*(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\s*\|')
 
@@ -181,8 +204,12 @@ def parse_request_lines(lines: list[str]) -> list[dict]:
         acct = _normalize_account(m.group('acct'))
         if not model or not acct or acct == '-':
             continue
-        out.append({'ts': ts, 'model': model, 'account': acct,
-                    'event_id': _event_id(line, ts)})
+        entry = {'ts': ts, 'model': model, 'account': acct,
+                 'event_id': _event_id(line, ts)}
+        total_ms = _total_ms(line)
+        if total_ms is not None:
+            entry['total_ms'] = total_ms
+        out.append(entry)
     return out
 
 
@@ -207,8 +234,12 @@ def parse_request_lines_with_mtime(lines: list[str], mtime: float | None) -> lis
         acct = _normalize_account(m.group('acct'))
         if not model or not acct or acct == '-':
             continue
-        out.append({'ts': ts, 'model': model, 'account': acct,
-                    'event_id': _event_id(line, ts)})
+        entry = {'ts': ts, 'model': model, 'account': acct,
+                 'event_id': _event_id(line, ts)}
+        total_ms = _total_ms(line)
+        if total_ms is not None:
+            entry['total_ms'] = total_ms
+        out.append(entry)
     return out
 
 
