@@ -1372,6 +1372,50 @@ def add_request_log(**fields: object) -> None:
 _ACCOUNT_MATCH_WINDOW = 3
 
 
+def _pick_account_row(rows, total_ms):
+    """从候选行里挑出唯一最可能的一条；不确定就返回 None。
+
+    原先的规则是「时间距离最近者，等距就放弃」。放弃本身是对的（v2.11.10 修
+    「相邻请求显示别人的账号」时定的安全边界），但判据只有「模型 + 秒级时间
+    戳」，而秒级时间戳在**同秒并发**时必然等距 —— 同一秒到达两条同模型请求，
+    两边距离都是 0，于是这批记录永久留在 account IS NULL，界面一直提示
+    「存在超过 60 秒仍未回填账号的近期请求」。
+
+    这里给等距分支补一个确定性判据：上游日志行的 `total=20.1s` 与本端
+    `request_logs.latency_ms` 是**同一请求的同一个量**（总耗时），精度远高于
+    秒级时间戳。于是：
+
+      · 时间距离不等距 → 仍取最近者（原语义，完全不变）；
+      · 等距且带耗时  → 取 |total_ms - latency_ms| 最小者，唯一胜出才填；
+      · 连耗时都分不开 → 返回 None，继续保持不猜。
+
+    `rows` 已按 (distance, id) 排序。并列的候选可能多于两条，因此要把整个
+    并列集合纳入比较，而不是只看前两条。
+    """
+    if not rows:
+        return None
+    best = rows[0]
+    if len(rows) == 1:
+        return best
+    tied = [r for r in rows if r['distance'] == best['distance']]
+    if len(tied) == 1:
+        return best
+    if total_ms is None:
+        return None
+    scored = []
+    for r in tied:
+        lat = r['latency_ms']
+        if lat is None:
+            continue
+        scored.append((abs(int(lat) - int(total_ms)), r))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (item[0], item[1]['id']))
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    return scored[0][1]
+
+
 def attach_request_accounts(entries: Iterable[dict]) -> int:
     """把从上游日志采集到的账号回填到对应的请求日志行（issue #69）。返回回填条数。
 
@@ -1415,21 +1459,26 @@ def attach_request_accounts(entries: Iterable[dict]) -> int:
                         conn.rollback()
                         continue
                     rows = conn.execute(
-                        'SELECT r.id, r.account, ABS(r.ts - ?) AS distance FROM request_logs r '
+                        'SELECT r.id, r.account, r.latency_ms, ABS(r.ts - ?) AS distance '
+                        'FROM request_logs r '
                         'WHERE COALESCE(r.account_expected, 1) = 1 '
                         '  AND r.ts BETWEEN ? AND ? AND (r.mapped_model = ? OR r.model = ?) '
                         # 已由事件明确关联的行不再占新事件的候选；消费检查仍阻止重放。
                         # 未建立关联的历史已填行保留，保护升级首次采集不串填。
                         '  AND NOT EXISTS (SELECT 1 FROM request_account_matches a '
                         '                  WHERE a.request_log_id = r.id) '
-                        'ORDER BY distance, r.id LIMIT 2',
+                        # 并列候选可能超过 2 条（同一秒 3 条并发），取够再消歧。
+                        'ORDER BY distance, r.id LIMIT 8',
                         (ts, ts - _ACCOUNT_MATCH_WINDOW, ts + _ACCOUNT_MATCH_WINDOW,
                          model, model),
                     ).fetchall()
-                    if not rows or (len(rows) > 1 and rows[0]['distance'] == rows[1]['distance']):
+                    if not rows:
                         conn.rollback()
                         continue
-                    row = rows[0]
+                    row = _pick_account_row(rows, e.get('total_ms'))
+                    if row is None:
+                        conn.rollback()
+                        continue
                     # 升级前已填的最近行也要占住事件，不能因它不再为 NULL 就跳到邻行。
                     # 未建立事件关联的历史账号不一致时不猜；保留原值。
                     if row['account'] is not None and row['account'] != acct:
