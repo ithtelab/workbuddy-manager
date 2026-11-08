@@ -334,3 +334,39 @@ button {
     height: 1rem;
   }
 }
+
+/**
+ * 表格对齐：默认所有列居中。
+ *
+ * `text-align: center` 只作用于行内内容；单元格里若放的是 flex 容器（状态徽章组、
+ * 头像 + 昵称组、操作按钮组），水平位置由 `justify-content` 决定，默认 flex-start
+ * 会把它们顶在左边 —— 只改 th/td 的 text-align 时，这些列看起来仍像没居中。
+ *
+ * 需要左对齐的表格（如「模型」页的名称较长、左对齐更好读）在
+ * `<Table className="wb-table-left">` 上标注：下面的选择器带元素+属性，
+ * 权重高于 Tailwind 的 `.text-center`，足以改回去而不需要 !important。
+ */
+@layer components {
+  [data-slot='table-cell'] > div {
+    justify-content: center;
+  }
+
+  table.wb-table-left [data-slot='table-head'],
+  table.wb-table-left [data-slot='table-cell'] {
+    text-align: left;
+  }
+
+  table.wb-table-left [data-slot='table-cell'] > div {
+    justify-content: flex-start;
+  }
+
+  /* 首列保持左对齐（账号页昵称列：头像 + 名字，居中后反而不好扫读） */
+  table.wb-first-left [data-slot='table-head']:first-child,
+  table.wb-first-left [data-slot='table-cell']:first-child {
+    text-align: left;
+  }
+
+  table.wb-first-left [data-slot='table-cell']:first-child > div {
+    justify-content: flex-start;
+  }
+}
