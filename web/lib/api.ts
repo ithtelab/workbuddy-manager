@@ -10,6 +10,7 @@ import type {
   DailyTask,
   CreditsFlow,
   AccountUsageResponse,
+  AccountModelUsageResponse,
   ApiKey,
   ApiToken,
   AuditLogPage,
@@ -671,6 +672,9 @@ export const statsApi = {
   /** 按「日期 × 账号」聚合（issue #402）；同一范围解析规则 */
   byAccount: (days = 30, realm?: Realm, range?: StatsRange) =>
     get<AccountUsageResponse>('/api/stats/by-account', {days, realm, ...range}),
+  /** 按「账号 × 模型」聚合（issue #369） */
+  byAccountModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountModelUsageResponse>('/api/stats/by-account-model', {days, realm, ...range}),
   /**
    * 上游自己那份统计（issue #59）。口径与本页其它数字不同：含**直连上游**的调用，
    * 且是自上游进程启动以来的累计（没有时段概念）。

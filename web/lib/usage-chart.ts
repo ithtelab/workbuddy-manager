@@ -53,6 +53,7 @@ export interface ChartPoint {
   tokens: number;
   requests: number;
   failed: number;
+  success: number;
   /** 小时粒度下：这是不是「现在」这一小时（UI 会把它标出来） */
   isNow?: boolean;
 }
@@ -76,6 +77,7 @@ export function hourlySeries(points: readonly UsageHourPoint[], nowHour?: number
       tokens: (p?.prompt_tokens ?? 0) + (p?.completion_tokens ?? 0),
       requests: p?.requests ?? 0,
       failed: p?.failed ?? 0,
+      success: p?.success ?? 0,
       isNow: nowHour === h,
     };
   });
@@ -106,6 +108,7 @@ export function dailySeries(
       tokens: (p?.prompt_tokens ?? 0) + (p?.completion_tokens ?? 0),
       requests: p?.requests ?? 0,
       failed: p?.failed ?? 0,
+      success: p?.success ?? 0,
     };
   });
 }

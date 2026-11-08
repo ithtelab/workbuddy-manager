@@ -361,6 +361,7 @@ def daily(days: int = 30, realm: str | None = None,
         args,
     )
     failures = _daily_failures(days, realm, start=start, end=end)
+    successes = _daily_success(days, realm, start=start, end=end)
     days_seen = {r['day'] for r in rows}
     out = [
         {
@@ -373,6 +374,7 @@ def daily(days: int = 30, realm: str | None = None,
             'cost': None if r['cost'] is None else float(r['cost']),
             'unpriced_requests': int(r['unpriced'] or 0),
             'failed': failures.get(r['day'], 0),
+            'success': successes.get(r['day'], 0),
         }
         for r in rows
     ]
@@ -384,7 +386,7 @@ def daily(days: int = 30, realm: str | None = None,
             out.append({
                 'day': day, 'requests': 0, 'prompt_tokens': 0,
                 'completion_tokens': 0, 'credit': 0.0, 'cost': None,
-                'unpriced_requests': 0, 'failed': n,
+                'unpriced_requests': 0, 'failed': n, 'success': 0,
             })
     out.sort(key=lambda d: d['day'])
     return out
@@ -404,6 +406,24 @@ def _daily_failures(days: int, realm: str | None = None,
             f"SELECT {db.day_sql('ts')} AS day, COUNT(*) AS n FROM request_logs "
             f"WHERE ts >= ? AND ts < ? AND status >= 400 AND key_id IS NOT NULL{rf} "
             f'GROUP BY day',
+            args,
+        )
+        return {str(r['day']): int(r['n']) for r in rows if r['day']}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _daily_success(days: int, realm: str | None = None,
+                   start: str | None = None, end: str | None = None) -> dict[str, int]:
+    """按天统计成功请求数（2xx）。与 `_daily_failures` 同源（request_logs），口径对称。"""
+    try:
+        rf = " AND COALESCE(realm, 'cn') = ?" if realm in ('cn', 'global') else ''
+        lo, hi, _span = _range_bounds(days, start, end)
+        args = (db.day_start_ts(lo), db.day_start_ts(hi) + 86400) + ((realm,) if rf else ())
+        rows = db.query(
+            f"SELECT {db.day_sql('ts')} AS day, COUNT(*) AS n FROM request_logs "
+            f"WHERE ts >= ? AND ts < ? AND status >= 200 AND status < 300 "
+            f'AND key_id IS NOT NULL{rf} GROUP BY day',
             args,
         )
         return {str(r['day']): int(r['n']) for r in rows if r['day']}
@@ -444,6 +464,7 @@ def hourly(day: str | None = None, realm: str | None = None,
     )
     by_hour = {int(r['hour']): r for r in rows}
     failures = _hourly_failures(d, realm)
+    successes = _hourly_success(d, realm)
     out: list[dict] = []
     for h in range(24):
         r = by_hour.get(h)
@@ -459,8 +480,30 @@ def hourly(day: str | None = None, realm: str | None = None,
             'cost': (None if (not r or r['cost'] is None) else float(r['cost'])),
             'unpriced_requests': int(r['unpriced'] or 0) if r else 0,
             'failed': failures.get(h, 0),
+            'success': successes.get(h, 0),
         })
     return out
+
+
+def _hourly_success(day: str, realm: str | None = None) -> dict[int, int]:
+    """某天**按小时**的成功请求数（2xx）。与 `_hourly_failures` 对称。"""
+    try:
+        rf = " AND COALESCE(realm, 'cn') = ?" if realm in ('cn', 'global') else ''
+        args = (db.day_start_ts(day), db.day_start_ts(day) + 86400) + ((realm,) if rf else ())
+        rows = db.query(
+            f"SELECT {db.hour_sql('ts')} AS bucket, COUNT(*) AS n FROM request_logs "
+            f"WHERE ts >= ? AND ts < ? AND status >= 200 AND status < 300 "
+            f'AND key_id IS NOT NULL{rf} GROUP BY bucket',
+            args,
+        )
+        out: dict[int, int] = {}
+        for r in rows:
+            bucket = str(r['bucket'] or '')
+            if len(bucket) >= 13:
+                out[int(bucket[11:13])] = int(r['n'])
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _hourly_failures(day: str, realm: str | None = None) -> dict[int, int]:
@@ -727,6 +770,51 @@ def by_account(days: int = 30, realm: str | None = None,
             'account': label,
             'nickname': (m.group(1).strip() if m else label),
             'uid8': (m.group(2) if m else ''),
+            'requests': int(r['requests'] or 0),
+            'tokens': int(r['tokens'] or 0),
+            'credit': float(r['credit'] or 0),
+            'cost': None if r['cost'] is None else float(r['cost']),
+        })
+    return {'items': items, 'total': len(rows), 'truncated': len(rows) > capped,
+            'from': lo, 'to': hi}
+
+
+@router.get('/by-account-model')
+def by_account_model(days: int = 30, realm: str | None = None,
+                     start: str | None = None, end: str | None = None,
+                     limit: int = 2000, user: dict = Depends(security.current_user)) -> dict:
+    """按「账号 × 模型」聚合（issue #369 第 2 点）。
+
+    回答「哪个号在跑哪些模型、各花了多少」——排障与成本分摊都用得上。数据源是
+    请求日志（账号是异步回填的，汇总表没有这个维度）；模型取映射后的名字，
+    映射为空时回退请求名。未回填账号的行不计。
+    """
+    import re as _re
+    lo, hi, _span = _range_bounds(days, start, end)
+    rf = " AND COALESCE(realm, 'cn') = ?" if realm in ('cn', 'global') else ''
+    capped = max(1, min(int(limit or 2000), 10000))
+    args: tuple = (db.day_start_ts(lo), db.day_start_ts(hi) + 86400)
+    if rf:
+        args += (realm,)
+    rows = db.query(
+        "SELECT account, COALESCE(NULLIF(TRIM(mapped_model), ''), model) AS model_name, "
+        'COUNT(*) AS requests, '
+        'SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) AS tokens, '
+        'COALESCE(SUM(credit),0) AS credit, SUM(cost) AS cost '
+        'FROM request_logs '
+        "WHERE ts >= ? AND ts < ? AND account IS NOT NULL AND account <> ''"
+        f'{rf} GROUP BY account, model_name ORDER BY tokens DESC LIMIT ?',
+        args + (capped + 1,),
+    )
+    items: list[dict] = []
+    for r in rows[:capped]:
+        label = str(r['account'] or '')
+        m = _re.match(r'^(.*)\(([A-Za-z0-9_-]{4,16})\)$', label)
+        items.append({
+            'account': label,
+            'nickname': (m.group(1).strip() if m else label),
+            'uid8': (m.group(2) if m else ''),
+            'model': str(r['model_name'] or '未知'),
             'requests': int(r['requests'] or 0),
             'tokens': int(r['tokens'] or 0),
             'credit': float(r['credit'] or 0),

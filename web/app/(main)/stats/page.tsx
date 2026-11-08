@@ -18,6 +18,7 @@ import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {statsApi, errText, type StatsRange} from '@/lib/api';
 import type {
+  AccountModelUsageRow,
   AccountUsageRow,
   StatsSummary,
   UpstreamStats,
@@ -162,6 +163,7 @@ export default function StatsPage() {
       byModel: () => statsApi.byModel(d, realm, range),
       byKey: () => statsApi.byKey(d, realm, range),
       byAccount: () => statsApi.byAccount(d, realm, range),
+      byAccountModel: () => statsApi.byAccountModel(d, realm, range),
     },
     [realm, days, customStart, customEnd],
   );
@@ -200,6 +202,7 @@ export default function StatsPage() {
   const byModel: UsageBreakdown[] = values.byModel ?? EMPTY_BREAKDOWN;
   const byKey: UsageBreakdown[] = values.byKey ?? EMPTY_BREAKDOWN;
   const byAccount: AccountUsageRow[] = values.byAccount?.items ?? [];
+  const byAccountModel: AccountModelUsageRow[] = values.byAccountModel?.items ?? [];
   const upstream: UpstreamStats | null = upstreamValues.upstream ?? null;
 
   const failedCount = Object.keys(errors).length;
@@ -499,7 +502,12 @@ export default function StatsPage() {
                   /* 24 个小时（或 90 天）标签全画出来会糊成一片，按 spec 抽稀。 */
                   interval={Math.max(0, spec.tickEvery - 1)}
                 />
-                <YAxis tickLine={false} axisLine={false} fontSize={11} stroke="var(--muted-foreground)" tickFormatter={(v) => fmtCompact(Number(v))} />
+                <YAxis yAxisId="tok" tickLine={false} axisLine={false} fontSize={11}
+                       stroke="var(--muted-foreground)" tickFormatter={(v) => fmtCompact(Number(v))} />
+                {/* 成功 / 失败是「次数」，与 token 差好几个数量级；放右轴才看得见。 */}
+                <YAxis yAxisId="cnt" orientation="right" tickLine={false} axisLine={false}
+                       fontSize={11} stroke="var(--muted-foreground)" allowDecimals={false}
+                       width={40} />
                 <Tooltip
                   cursor={{fill: 'var(--accent)'}}
                   contentStyle={{
@@ -514,11 +522,15 @@ export default function StatsPage() {
                     if (label === 'failed') {
                       return [fmtNumber(Number(value)), t('dashboard.failedRequests')];
                     }
+                    if (label === 'success') {
+                      return [fmtNumber(Number(value)), t('stats.successRequests')];
+                    }
                     return [fmtNumber(Number(value)), t('metric.requests')];
                   }}
                 />
                 {spec.shape === 'bar' ? (
                   <Bar
+                    yAxisId="tok"
                     dataKey="tokens"
                     name="tokens"
                     fill="var(--chart-1)"
@@ -539,6 +551,7 @@ export default function StatsPage() {
                   /* 30 / 90 天用面积：柱子细得看不清起伏，而面积图的形状对
                      「总量趋势」更直观（尖峰一眼可见）。 */
                   <Area
+                    yAxisId="tok"
                     type="monotone"
                     dataKey="tokens"
                     name="tokens"
@@ -548,10 +561,22 @@ export default function StatsPage() {
                     strokeWidth={2}
                   />
                 )}
+                {/* 成功数（issue #369 第 3 点）：与失败同一根右轴，量级可比；
+                    左轴 token 不会被次数压扁。 */}
+                <Line
+                  yAxisId="cnt"
+                  type="monotone"
+                  dataKey="success"
+                  name="success"
+                  stroke="var(--chart-2)"
+                  strokeWidth={1.5}
+                  dot={false}
+                />
                 {/* 失败数用一条线叠在同一张图上：它与 token 柱不同量级，做成柱子
                     会把柱形压扁。线只作「那天出过事」的信号，具体数值看悬停。
                     没有失败时贴着 0，不干扰读数。 */}
                 <Line
+                  yAxisId="cnt"
                   type="monotone"
                   dataKey="failed"
                   name="failed"
@@ -575,6 +600,7 @@ export default function StatsPage() {
 
       {/* 按「日期 × 账号」聚合（issue #402）：看每个号每天用了多少、扣了多少积分。 */}
       <AccountUsagePanel items={byAccount} />
+      <AccountModelUsagePanel items={byAccountModel} />
 
       {/* 上游自己那份统计（issue #59）。**单独一段、口径写明**：它含直连上游的
           调用、且自上游进程启动累计，与上面的时段选择器无关——混着看会得出
@@ -640,6 +666,51 @@ export default function StatsPage() {
         ) : null}
       </section>
     </div>
+  );
+}
+
+/** 按「账号 × 模型」的用量表（issue #369 第 2 点）。 */
+function AccountModelUsagePanel({items}: {items: AccountModelUsageRow[]}) {
+  const t = useT();
+  return (
+    <section className="rounded-[20px] bg-muted p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+        <Cpu className="h-4 w-4" />
+        {t('stats.byAccountModel')}
+      </div>
+      {items.length ? (
+        <div className="max-h-[420px] overflow-auto">
+          <Table>
+            <TableHeader>
+              <TableRow className="border-b border-border/60 hover:bg-transparent">
+                <TableHead className="text-[11px] text-muted-foreground">{t('stats.account')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('stats.model')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('metric.requestsShort')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">Token</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('metric.paid')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {items.map((row, i) => (
+                <TableRow key={`${row.account}-${row.model}-${i}`} className="border-b border-border/40">
+                  <TableCell className="max-w-[220px] truncate text-xs" title={row.account}>
+                    {row.nickname || row.uid8 || row.account}
+                  </TableCell>
+                  <TableCell className="max-w-[240px] truncate text-xs font-mono" title={row.model}>
+                    {row.model}
+                  </TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtNumber(row.requests)}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtCompact(row.tokens)}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtCredit(row.credit)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      ) : (
+        <div className="text-xs text-muted-foreground">{t('stats.noUsageData')}</div>
+      )}
+    </section>
   );
 }
 
