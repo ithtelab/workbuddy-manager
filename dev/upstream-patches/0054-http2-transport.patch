@@ -1,0 +1,190 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index 80d5fe1..d92ca1f 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -116,6 +116,9 @@ type Config struct {
+ 		// 缺省 true：服务器出口带宽窄时（实测 1Mbps）3MB 上下文可省 20s+ 首字节；
+ 		// 小于阈值（64KB）的请求不压缩，短对话零开销。排障可显式配 false。
+ 		GzipBody bool `json:"gzip_body"`
++		// HTTP2 出站启用 HTTP/2（issue #392）。默认 false：现行 HTTP/1.1 路径经过
++		// 长流/代理/WAF 验证；开启前请确认 SSE 长流与线路代理在目标网络可用。
++		HTTP2 bool `json:"http2"`
+ 	} `json:"upstream"`
+ 
+ 	Features struct {
+@@ -357,6 +360,11 @@ func applyEnv(c *Config) {
+ 			c.Upstream.GzipBody = b
+ 		}
+ 	}
++	if v := os.Getenv("WB2A_HTTP2"); v != "" {
++		if b, err := strconv.ParseBool(v); err == nil {
++			c.Upstream.HTTP2 = b
++		}
++	}
+ 	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
+ 		if b, err := strconv.ParseBool(v); err == nil {
+ 			c.Features.SanitizeBlacklistFingerprints = b
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index 5eb5038..f26c648 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -86,6 +86,11 @@ func main() {
+ 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+ 	// 账号级出口线路（issue #210）：面板绑在线路名上，这里把名字解析成地址。
+ 	upstream.ConfigureProxies(cfg.Proxies)
++	// 出站 HTTP/2（issue #392）：默认关闭，开启后由标准库按 ALPN 协商。
++	upstream.ConfigureHTTP2(cfg.Upstream.HTTP2)
++	if cfg.Upstream.HTTP2 {
++		log.Printf("出站 HTTP/2 已启用（upstream.http2=true）——请确认 SSE 长流与代理线路可用")
++	}
+ 	// 思考通道兜底（issue #135）：默认开启；显式关掉时打一行日志，免得"为什么
+ 	// 只看 content 的客户端又空了"变成悬案。
+ 	upstream.ConfigureReasoningFallback(cfg.ReasoningAsContent == nil || *cfg.ReasoningAsContent)
+diff --git a/config.example.json b/config.example.json
+index 5daa5fa..bbb9a35 100644
+--- a/config.example.json
++++ b/config.example.json
+@@ -53,7 +53,9 @@
+     "device_token": "",
+     "device_token_file": "",
+     "client_name": "WorkBuddy",
+-    "passthrough_ip": false
++    "passthrough_ip": false,
++    "gzip_body": true,
++    "http2": false
+   },
+   "features": {
+     "sanitize_blacklist_fingerprints": true,
+diff --git a/internal/upstream/transport.go b/internal/upstream/transport.go
+index dcb3bd0..1315c1d 100644
+--- a/internal/upstream/transport.go
++++ b/internal/upstream/transport.go
+@@ -14,6 +14,7 @@ import (
+ 	"sort"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ )
+ 
+@@ -76,9 +77,22 @@ func newDialer() *net.Dialer {
+ //     完成后无 h2 协议可用，连接退回 HTTP/1.1）。
+ //   - TCP 层：DialContext 10s 建连上限 + 15s keepalive 探测，半开连接在建立期
+ //     和复用期都能被快速识别（见 dialTimeout/dialKeepAlive 注释）。
++//
++// http2Enabled 出站是否允许 HTTP/2（issue #392）。默认关闭：现有部署按 HTTP/1.1
++// 长期验证过，h2 的 SSE 长流、代理线路与 WAF 行为需要现场单独验证后再开。
++var http2Enabled atomic.Bool
++
++// ConfigureHTTP2 设置出站是否启用 HTTP/2（main 启动时调用一次；默认 false）。
++//
++// 开启后不再注入空 TLSNextProto，并打开 ForceAttemptHTTP2，让标准库按 ALPN 协商
++// h2；关闭时保持原来的「空映射真禁 h2」路径，行为与旧版逐字一致。
++func ConfigureHTTP2(on bool) {
++	http2Enabled.Store(on)
++}
++
+ func newTransport() *http.Transport {
+ 	dialer := newDialer()
+-	return &http.Transport{
++	tr := &http.Transport{
+ 		DialContext: dialer.DialContext,
+ 		// 出口代理：走标准环境变量（HTTP_PROXY / HTTPS_PROXY / NO_PROXY，大小写都认）。
+ 		//
+@@ -86,17 +100,24 @@ func newTransport() *http.Transport {
+ 		// 默认读环境变量不同 —— 于是「容器里配好代理、curl 能通、网关却仍走直连」
+ 		// 成了一种没有任何日志的静默失败（issue #136，群晖 + 代理出网的部署）。
+ 		// ProxyFromEnvironment 同时负责 NO_PROXY：内网/回环地址按环境变量绕过。
+-		Proxy: http.ProxyFromEnvironment,
+-		// 空 TLSNextProto（非 nil）真正禁 h2：见函数注释。必须 make 而非 nil——
+-		// nil 表示「让标准库注入默认 h2 映射」（kongjianguan 实测：设
+-		// ForceAttemptHTTP2=false 后日志仍报 h2 timeout，正是这个陷阱）。
+-		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
++		Proxy:                 http.ProxyFromEnvironment,
+ 		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+ 		MaxIdleConns:          maxIdleConns,
+ 		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+ 		IdleConnTimeout:       idleConnTimeout,
+ 		ResponseHeaderTimeout: responseHeaderTimeout,
+ 	}
++	if http2Enabled.Load() {
++		// 标准库在 ForceAttemptHTTP2=true 且 TLSNextProto 为 nil 时按 ALPN 协商 h2。
++		// 注意不能同时留空映射：空映射会覆盖 ALPN 结果，h2 永远协商不出来。
++		tr.ForceAttemptHTTP2 = true
++	} else {
++		// 空 TLSNextProto（非 nil）真正禁 h2：见函数注释。必须 make 而非 nil——
++		// nil 表示「让标准库注入默认 h2 映射」（kongjianguan 实测：设
++		// ForceAttemptHTTP2=false 后日志仍报 h2 timeout，正是这个陷阱）。
++		tr.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
++	}
++	return tr
+ }
+ 
+ // DirectRouteName 是账号级「强制直连」的保留线路名（issue #223）。
+diff --git a/internal/upstream/transport_test.go b/internal/upstream/transport_test.go
+index 12d04ed..071c4eb 100644
+--- a/internal/upstream/transport_test.go
++++ b/internal/upstream/transport_test.go
+@@ -1,6 +1,7 @@
+ package upstream
+ 
+ import (
++	"crypto/tls"
+ 	"fmt"
+ 	"io"
+ 	"net"
+@@ -28,6 +29,54 @@ func TestNewDialerParams(t *testing.T) {
+ 	}
+ }
+ 
++// TestHTTP2Switch：默认关闭 h2（空 TLSNextProto），显式开启后交给标准库 ALPN。
++func TestHTTP2Switch(t *testing.T) {
++	t.Cleanup(func() { ConfigureHTTP2(false) })
++
++	ConfigureHTTP2(false)
++	off := newTransport()
++	if off.ForceAttemptHTTP2 {
++		t.Error("HTTP/2 默认必须关闭（ForceAttemptHTTP2=false）")
++	}
++	if off.TLSNextProto == nil || len(off.TLSNextProto) != 0 {
++		t.Errorf("关闭时必须用非 nil 空映射禁 h2，得到 %#v", off.TLSNextProto)
++	}
++
++	ConfigureHTTP2(true)
++	on := newTransport()
++	if !on.ForceAttemptHTTP2 {
++		t.Error("开启后 ForceAttemptHTTP2 必须为 true")
++	}
++	if on.TLSNextProto != nil {
++		t.Errorf("开启后必须让标准库注入 h2（TLSNextProto=nil），得到 %d 项", len(on.TLSNextProto))
++	}
++}
++
++// TestHTTP2Negotiation 开启后用真实 TLS 服务确认 ALPN 协商到 h2（不是只看字段）。
++func TestHTTP2Negotiation(t *testing.T) {
++	ConfigureHTTP2(true)
++	t.Cleanup(func() { ConfigureHTTP2(false) })
++
++	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	srv.EnableHTTP2 = true
++	srv.StartTLS()
++	t.Cleanup(srv.Close)
++
++	tr := newTransport()
++	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} // 测试自签证书
++	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
++	resp, err := client.Get(srv.URL)
++	if err != nil {
++		t.Fatalf("h2 请求失败：%v", err)
++	}
++	defer resp.Body.Close()
++	if resp.ProtoMajor != 2 {
++		t.Errorf("协商结果 ProtoMajor=%d，期望 2（HTTP/2）", resp.ProtoMajor)
++	}
++}
++
+ // TestTransportDisableKeepAlivesStaysFalse 显式锁定「DisableKeepAlives 不吸收」
+ // 决策：保持 false（连接复用是本网关连接池的既有意图，MaxIdleConnsPerHost=20）。
+ // 若未来有人误开此开关，此断言强制其先读到报告里的 trade-off 分析。

@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from server import config, db  # noqa: E402
+from server import upstreamsvc  # noqa: E402
 from server.services import tasklog, wb2api  # noqa: E402
 
 SAMPLE = [
@@ -93,6 +94,66 @@ class CollectPipeline(unittest.TestCase):
         asyncio.run(tasklog._collect_once())
         db.clear_task_logs()
         self.assertEqual(db.task_log_stats()['total'], 0)
+
+
+class GroupContainerCollection(unittest.TestCase):
+    """多分组部署：每个分组的上游容器都要采集（issue #389）。"""
+
+    GROUP_LINES = [
+        '2026-09-12T09:00:01.111111111Z 2026/09/12 09:00:01 checkin 分组号01(abc12345): ok credits=100',
+        '2026-09-12T09:00:02.222222222Z 2026/09/12 09:00:02 checkin 分组号01(abc12345): 已签到',
+    ]
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_db = config.DB_PATH
+        config.DB_PATH = Path(self._tmp.name) / 'groups.db'
+        db._conn = None
+        db.connect()
+        self._orig_reader = wb2api.read_container_logs
+        self.calls: list[str | None] = []
+
+        def reader(limit=200, timestamps=True, container=None):
+            self.calls.append(container)
+            return self.GROUP_LINES if container else SAMPLE
+
+        wb2api.read_container_logs = reader
+
+    def tearDown(self) -> None:
+        wb2api.read_container_logs = self._orig_reader
+        try:
+            if db._conn is not None:
+                db._conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        db._conn = None
+        config.DB_PATH = self._orig_db
+        self._tmp.cleanup()
+
+    def test_reads_default_and_group_containers(self) -> None:
+        upstreamsvc.create_upstream('分组', 'http://127.0.0.1:7863',
+                                    container='wb-group')
+        parsed, added = asyncio.run(tasklog._collect_once())
+        self.assertEqual(parsed, 9, '默认容器 7 条 + 分组容器 2 条')
+        self.assertEqual(added, 9)
+        self.assertEqual(self.calls, [None, 'wb-group'])
+        messages = [l['message'] for l in db.list_task_logs(limit=50)]
+        self.assertIn('ok credits=100', messages)
+        self.assertIn('已签到', messages)
+
+    def test_same_container_as_default_is_read_once(self) -> None:
+        upstreamsvc.create_upstream('重复', 'http://127.0.0.1:7863',
+                                    container=config.WB2API_CONTAINER)
+        asyncio.run(tasklog._collect_once())
+        self.assertEqual(self.calls, [None], '默认容器与分组同名时不应读两遍')
+
+    def test_disabled_group_container_still_read(self) -> None:
+        # 分组被停用只影响新请求的受理；已经产生的任务日志仍应保留，
+        # 否则用户停用分组后历史签到记录会突然停止采集。
+        upstreamsvc.create_upstream('停用组', 'http://127.0.0.1:7863',
+                                    enabled=False, container='wb-group')
+        asyncio.run(tasklog._collect_once())
+        self.assertIn('wb-group', self.calls)
 
 
 class NicknameResolution(unittest.TestCase):

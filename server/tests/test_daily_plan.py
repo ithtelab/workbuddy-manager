@@ -241,3 +241,109 @@ class RunNowEndpointTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SchedulerOwnershipTest(unittest.TestCase):
+    """两套调度重叠时只保留一套（issue #375）。"""
+
+    def test_overlap_toggle_only_touches_checkin_and_compensation(self) -> None:
+        patcher, _ = _patch_db()
+        with patcher:
+            dailyplan.set_plan(_body(checkin=(False, 9), claim=(True, 11),
+                                     full=(False, 12), compensation=(False, 15)))
+            plan = dailyplan.set_overlap_enabled(True)
+            self.assertTrue(plan['checkin']['enabled'])
+            self.assertTrue(plan['compensation']['enabled'])
+            self.assertTrue(plan['claim']['enabled'], '领奖是面板独占，不能被统一开关带走')
+            self.assertFalse(plan['full']['enabled'])
+            self.assertEqual(plan['claim']['hour'], 11, '时刻不应被改写')
+            self.assertEqual(plan['compensation']['hour'], 15)
+
+            plan = dailyplan.set_overlap_enabled(False)
+            self.assertFalse(plan['checkin']['enabled'])
+            self.assertFalse(plan['compensation']['enabled'])
+            self.assertTrue(plan['claim']['enabled'])
+
+    def test_overlap_toggle_rejects_non_bool(self) -> None:
+        patcher, _ = _patch_db()
+        with patcher, self.assertRaises(TypeError):
+            dailyplan.set_overlap_enabled('false')  # type: ignore[arg-type]
+
+    def test_conflicts_are_reported(self) -> None:
+        patcher, _ = _patch_db({'daily_tasks_plan': _body(
+            checkin=(True, 9), compensation=(True, 10))})
+        with patcher, mock.patch.object(
+                accounts_router.wb2api, 'load_upstream_config',
+                return_value={'available': True,
+                              'schedule': {'checkin_enabled': True,
+                                           'activity_enabled': True}}):
+            status = accounts_router._task_scheduler_status()
+        self.assertEqual(status['conflicts'], ['checkin', 'compensation'])
+        self.assertTrue(status['upstream']['available'])
+
+    def test_upstream_unavailable_is_not_a_crash(self) -> None:
+        patcher, _ = _patch_db({'daily_tasks_plan': _body(checkin=(True, 9))})
+        with patcher, mock.patch.object(
+                accounts_router.wb2api, 'load_upstream_config',
+                side_effect=RuntimeError('docker down')):
+            status = accounts_router._task_scheduler_status()
+        self.assertFalse(status['upstream']['available'])
+        self.assertEqual(status['conflicts'], ['checkin'],
+                         '上游状态未知时按默认开启 conservatively 提示冲突')
+
+
+class KeepSchedulerEndpointTest(unittest.TestCase):
+    """一键统一两套调度：只改重叠任务，并写上游配置（issue #375）。"""
+
+    def test_keep_upstream_disables_only_overlap(self) -> None:
+        patcher, _ = _patch_db({'daily_tasks_plan': _body(
+            checkin=(True, 9), compensation=(True, 10), claim=(True, 11))})
+        with patcher,                 mock.patch.object(accounts_router.security, 'audit'),                 mock.patch.object(accounts_router.wb2api, 'save_upstream_config',
+                                  return_value={'available': True}) as save,                 mock.patch.object(accounts_router.wb2api, 'load_upstream_config',
+                                  return_value={'available': True, 'schedule': {
+                                      'checkin_enabled': False, 'activity_enabled': False}}),                 mock.patch.object(accounts_router.reload, 'request_restart',
+                                  return_value=True):
+            out = accounts_router.keep_task_scheduler({'keep': 'upstream'},
+                                                      user={'role': 'admin'})
+        save.assert_called_once_with({'schedule': {
+            'checkin_enabled': True, 'activity_enabled': True}})
+        self.assertFalse(out['plan']['checkin']['enabled'])
+        self.assertFalse(out['plan']['compensation']['enabled'])
+        self.assertTrue(out['plan']['claim']['enabled'])
+
+    def test_keep_panel_writes_upstream_and_enables_overlap(self) -> None:
+        patcher, _ = _patch_db({'daily_tasks_plan': _body(checkin=(False, 9))})
+        with patcher, \
+                mock.patch.object(accounts_router.security, 'audit'), \
+                mock.patch.object(accounts_router.wb2api, 'save_upstream_config',
+                                  return_value={'available': True}) as save, \
+                mock.patch.object(accounts_router.wb2api, 'load_upstream_config',
+                                  return_value={'available': True, 'schedule': {}}), \
+                mock.patch.object(accounts_router.reload, 'request_restart',
+                                  return_value=True):
+            out = accounts_router.keep_task_scheduler({'keep': 'panel'},
+                                                      user={'role': 'admin'})
+        save.assert_called_once_with({'schedule': {
+            'checkin_enabled': False, 'activity_enabled': False}})
+        self.assertTrue(out['plan']['checkin']['enabled'])
+        self.assertTrue(out['plan']['compensation']['enabled'])
+        self.assertTrue(out['reload_scheduled'])
+
+    def test_keep_upstream_already_on_does_not_restart(self) -> None:
+        patcher, _ = _patch_db({'daily_tasks_plan': _body(checkin=(True, 9))})
+        with patcher,                 mock.patch.object(accounts_router.security, 'audit'),                 mock.patch.object(accounts_router.wb2api, 'save_upstream_config') as save,                 mock.patch.object(accounts_router.wb2api, 'load_upstream_config',
+                                  return_value={'available': True, 'schedule': {
+                                      'checkin_enabled': True, 'activity_enabled': True}}),                 mock.patch.object(accounts_router.reload, 'request_restart') as restart:
+            out = accounts_router.keep_task_scheduler({'keep': 'upstream'},
+                                                      user={'role': 'admin'})
+        save.assert_not_called()
+        restart.assert_not_called()
+        self.assertIsNone(out['reload_scheduled'])
+        self.assertNotIn('reload_hint', out)
+
+    def test_bad_keep_value_is_400(self) -> None:
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException) as ctx:
+            accounts_router.keep_task_scheduler({'keep': 'both'},
+                                                user={'role': 'admin'})
+        self.assertEqual(ctx.exception.status_code, 400)

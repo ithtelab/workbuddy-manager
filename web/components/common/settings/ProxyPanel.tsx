@@ -150,7 +150,7 @@ export function ProxyPanel() {
         notify.ok(t('settings.proxyTestOk', {ms: String(result.ms)}),
                   result.exit_info || result.exit_ip || '');
       } else {
-        notify.err(t('settings.proxyTestFail'), result.error || '');
+        notify.err(t('settings.proxyTestFail'), result.hint || result.error || '');
       }
       await load();
     } catch (e) {
@@ -304,9 +304,22 @@ export function ProxyPanel() {
     : settings?.source === 'panel' ? 'settings.proxyGlobalSourcePanel'
       : settings?.source === 'env' ? 'settings.proxyGlobalSourceEnv'
         : 'settings.proxyGlobalSourceNone';
+  // 聊天请求由上游发出；全局代理只覆盖面板自己的请求。没有账号绑定线路时，
+  // 这里配得再好聊天也不会走代理（issue #379 的误解来源）。
+  const boundTotal = routes.reduce((n, r) => n + (r.bound || 0), 0);
+  const showChatScopeWarn = !!settings?.http_configured && boundTotal === 0;
 
   return (
     <div className="space-y-4">
+      {showChatScopeWarn && (
+        <div className="rounded-[20px] border border-amber-500/30 bg-amber-500/10 p-4 text-xs leading-5 text-amber-700 dark:text-amber-300">
+          <div className="mb-1 flex items-center gap-1.5 font-medium">
+            <Globe className="h-3.5 w-3.5" />
+            {t('settings.proxyChatScopeTitle')}
+          </div>
+          <div>{t('settings.proxyChatScopeWarn')}</div>
+        </div>
+      )}
       {/* ── 池配置 + 线路表 ── */}
       <div className="rounded-[20px] bg-muted p-4">
         <div className="mb-3 flex flex-wrap items-center gap-3">
@@ -570,7 +583,7 @@ export function ProxyPanel() {
                       notify[result.ok ? 'ok' : 'err'](
                         result.ok ? t('settings.proxyTestOk', {ms: String(result.ms)})
                           : t('settings.proxyTestFail'),
-                        result.exit_info || result.error || '');
+                        result.exit_info || result.hint || result.error || '');
                     } catch (e) {
                       notify.err(errText(e));
                     } finally {

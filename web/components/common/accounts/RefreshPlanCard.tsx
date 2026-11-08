@@ -3,7 +3,7 @@
 import {useCallback, useEffect, useState} from 'react';
 import {CalendarClock, Loader2, Play, Save, TriangleAlert} from 'lucide-react';
 import {accountApi, errText} from '@/lib/api';
-import type {DailyPlan, DailyTask, DailyTaskConfig, RefreshPlan} from '@/lib/types';
+import type {DailyPlan, DailyTask, DailyTaskConfig, RefreshPlan, TaskSchedulerStatus} from '@/lib/types';
 import {fmtDateTime} from '@/lib/format';
 import {notify} from '@/lib/toast';
 import {useT} from '@/lib/i18n/provider';
@@ -230,13 +230,20 @@ function DailyTasksSection({onRan}: {onRan?: () => void}) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState<DailyTask | null>(null);
+  const [sched, setSched] = useState<TaskSchedulerStatus | null>(null);
+  const [applying, setApplying] = useState<'upstream' | 'panel' | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const p = await accountApi.dailyPlan();
+      const [p, s] = await Promise.all([
+        accountApi.dailyPlan(),
+        // 调度冲突是辅助信息；取不到时不能让整个每日计划面板变成错误态。
+        accountApi.taskScheduler().catch(() => null),
+      ]);
       setPlan(p);
       setDraft(draftOf(p));
+      setSched(s);
     } catch (e) {
       notify.err(errText(e));
     } finally {
@@ -264,6 +271,7 @@ function DailyTasksSection({onRan}: {onRan?: () => void}) {
       const p = await accountApi.saveDailyPlan(draft);
       setPlan(p);
       setDraft(draftOf(p));
+      setSched(await accountApi.taskScheduler().catch(() => null));
       notify.ok(t('tasks.dailySaved'));
     } catch (e) {
       notify.err(errText(e));
@@ -271,6 +279,24 @@ function DailyTasksSection({onRan}: {onRan?: () => void}) {
       setSaving(false);
     }
   }, [draft, t]);
+
+  const applyKeep = useCallback(async (keep: 'upstream' | 'panel') => {
+    setApplying(keep);
+    try {
+      const r = await accountApi.keepTaskScheduler(keep);
+      setPlan(r.plan);
+      setDraft(draftOf(r.plan));
+      setSched(r.scheduler);
+      notify.ok(t(keep === 'upstream'
+        ? 'tasks.schedulerKeptUpstream'
+        : 'tasks.schedulerKeptPanel'));
+      if (r.reload_hint) notify.warn(t('tasks.schedulerReloadPending'), r.reload_hint);
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setApplying(null);
+    }
+  }, [t]);
 
   const runNow = useCallback(async (task: DailyTask) => {
     setRunning(task);
@@ -308,6 +334,36 @@ function DailyTasksSection({onRan}: {onRan?: () => void}) {
         <div className="text-xs font-medium">{t('tasks.dailyTitle')}</div>
         <div className="text-[11px] text-muted-foreground">{t('tasks.dailyHint')}</div>
       </div>
+
+      {sched && sched.conflicts.length > 0 && (
+        <div className="mt-2 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-[11px] leading-5 text-amber-700 dark:text-amber-300">
+          <div className="flex items-center gap-1.5 font-medium">
+            <TriangleAlert className="h-3.5 w-3.5" />
+            {t('tasks.schedulerConflictTitle')}
+          </div>
+          <div className="mt-1">
+            {t('tasks.schedulerConflictDesc', {
+              tasks: sched.conflicts
+                .map((k) => t(k === 'checkin' ? 'accounts.dailyCheckin' : 'accounts.dailyCompensation'))
+                .join(' / '),
+            })}
+          </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <Button size="sm" variant="outline" className="rounded-full"
+                    disabled={applying !== null}
+                    onClick={() => void applyKeep('upstream')}>
+              {applying === 'upstream' ? <Loader2 className="animate-spin" /> : null}
+              {t('tasks.schedulerKeepUpstream')}
+            </Button>
+            <Button size="sm" variant="outline" className="rounded-full"
+                    disabled={applying !== null}
+                    onClick={() => void applyKeep('panel')}>
+              {applying === 'panel' ? <Loader2 className="animate-spin" /> : null}
+              {t('tasks.schedulerKeepPanel')}
+            </Button>
+          </div>
+        </div>
+      )}
 
       <div className="mt-2 space-y-2">
         {DAILY_TASKS.map(({key, labelKey, noteKey, warn}) => {

@@ -1527,8 +1527,13 @@ async def _docker_restart(name: str) -> tuple[bool, str]:
 
 def read_container_logs(limit: int = 200, timestamps: bool = True,
                         with_mtime: bool = False,
-                        path: Path | None = None) -> list[str] | tuple[list[str], float | None]:
+                        path: Path | None = None,
+                        container: str | None = None) -> list[str] | tuple[list[str], float | None]:
     """读取上游日志（原生日志文件或 Docker，失败返回空列表）。
+
+    `container` 指定要读的容器名（issue #389：多分组部署里每组一个上游容器）。
+    显式传入时**总是走 `docker logs`**，即使面板自身是 native/systemd 模式——
+    分组容器是独立的 Docker 实例，日志不在本机文件里。
 
     默认带 `--timestamps`：docker 会在每行前面加上精确到纳秒的 RFC3339 时间，
     自动任务日志据此获得准确时间并据此去重（上游自己的 log 前缀精度只到秒）。
@@ -1540,7 +1545,7 @@ def read_container_logs(limit: int = 200, timestamps: bool = True,
     `WB2API_CHAT_LOG_FILE`：上游把对话行写 stdout、业务行写 stderr，原生模式两者
     是两个文件。Docker 模式忽略它 —— `docker logs` 本来就把两路合并在一起。
     """
-    if config.WB2API_MODE == 'native':
+    if container is None and config.WB2API_MODE == 'native':
         source = path or config.WB2API_LOG_FILE
         try:
             count = max(1, min(5000, limit))
@@ -1553,14 +1558,14 @@ def read_container_logs(limit: int = 200, timestamps: bool = True,
 
     import subprocess
 
-    if config.WB2API_MODE == 'systemd':
+    if container is None and config.WB2API_MODE == 'systemd':
         lines = _journal_lines(max(1, min(5000, limit)), timestamps)
         return (lines, None) if with_mtime else lines
 
     cmd = ['docker', 'logs', '--tail', str(max(1, min(5000, limit)))]
     if timestamps:
         cmd.append('--timestamps')
-    cmd.append(config.WB2API_CONTAINER)
+    cmd.append(container or config.WB2API_CONTAINER)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
         # docker logs 把应用日志写到 stderr

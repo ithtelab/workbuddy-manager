@@ -195,6 +195,27 @@ export interface DailyPlan {
   full: DailyTaskConfig;
 }
 
+/** 上游与面板两套调度的重叠状态（issue #375）。 */
+export interface TaskSchedulerStatus {
+  upstream: {
+    available: boolean;
+    /** 上游 config.json 的 schedule.checkin_enabled */
+    checkin: boolean;
+    /** 上游 schedule.activity_enabled（内部含领取补偿） */
+    activity: boolean;
+  };
+  panel: Record<DailyTask, boolean>;
+  /** 两套都开的重叠任务：checkin / compensation */
+  conflicts: string[];
+}
+
+export interface TaskSchedulerApply {
+  plan: DailyPlan;
+  scheduler: TaskSchedulerStatus;
+  reload_scheduled: boolean | null;
+  reload_hint?: string;
+}
+
 /** 上游为一组账号给出的计数（`/status` 的顶层汇总与 realm_totals 同构） */
 export interface PoolCounts {
   total: number;
@@ -284,6 +305,8 @@ export interface ProxyProbe {
   exit_ip?: string;
   exit_info?: string;
   error?: string;
+  /** 失败时的可行动提示（协议/端口/认证/规则），原始 error 仍保留 */
+  hint?: string;
 }
 
 export interface ProxySettings {

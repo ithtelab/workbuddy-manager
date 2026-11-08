@@ -22,7 +22,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from .. import db
+from .. import config, db, upstreamsvc
 from . import wb2api
 
 # docker --timestamps 前缀
@@ -554,10 +554,38 @@ def state() -> dict:
 TAIL_LINES = 3000
 
 
+def _log_containers() -> list[str | None]:
+    """本次要读日志的容器：默认上游 + 各分组登记的上游容器（issue #389）。
+
+    默认上游用 `None` 表示「按当前部署模式读取」（原生文件 / systemd / 默认容器）；
+    分组容器必须显式给名字，走 `docker logs`。同一容器只读一次——默认容器与某个
+    分组填了同一个名字时，否则会把同一批日志解析两遍（dedup 虽然会挡住入库，但
+    浪费一次 `docker logs`，而且 `parsed` 统计会翻倍）。
+    """
+    out: list[str | None] = [None]
+    default = str(config.WB2API_CONTAINER or '').strip()
+    seen = {default} if default else set()
+    for upstream in upstreamsvc.list_upstreams(include_default=False):
+        name = str(upstream.get('container') or '').strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+async def _read_logs(name: str | None, limit: int) -> list[str]:
+    if name is None:
+        return await asyncio.to_thread(wb2api.read_container_logs, limit, True)
+    return await asyncio.to_thread(
+        wb2api.read_container_logs, limit, True, container=name)
+
+
 async def _collect_once(limit: int = TAIL_LINES) -> tuple[int, int]:
-    """读一次容器日志并入库，返回 (解析到的任务行数, 新增条数)。"""
-    lines = await asyncio.to_thread(wb2api.read_container_logs, limit, True)
-    events = parse_lines(lines)
+    """读一次所有上游容器的日志并入库，返回 (解析到的任务行数, 新增条数)。"""
+    events: list[dict] = []
+    for name in _log_containers():
+        lines = await _read_logs(name, limit)
+        events.extend(parse_lines(lines))
     if not events:
         return 0, 0
     added = await asyncio.to_thread(db.add_task_logs, events)

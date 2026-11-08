@@ -2278,6 +2278,102 @@ def save_daily_plan(body: dict,
     return plan
 
 
+def _task_scheduler_status() -> dict:
+    """上游调度器与面板每日计划的重叠状态（issue #375）。"""
+    plan = dailyplan.get_plan()
+    try:
+        cfg = wb2api.load_upstream_config()
+        available = cfg.get('available') is not False
+        sched = cfg.get('schedule') if isinstance(cfg.get('schedule'), dict) else {}
+    except Exception:  # noqa: BLE001 —— 配置读不到就按「不可用」展示，不阻断面板
+        available, sched = False, {}
+    upstream = {
+        'available': bool(available),
+        'checkin': bool(sched.get('checkin_enabled', True)),
+        'activity': bool(sched.get('activity_enabled', True)),
+    }
+    panel = {t: bool(plan[t]['enabled']) for t in dailyplan.TASKS}
+    conflicts: list[str] = []
+    if panel['checkin'] and upstream['checkin']:
+        conflicts.append('checkin')
+    if panel['compensation'] and upstream['activity']:
+        conflicts.append('compensation')
+    return {'upstream': upstream, 'panel': panel, 'conflicts': conflicts}
+
+
+def _set_upstream_overlap(enabled: bool) -> bool:
+    """把上游 checkin/activity 设成指定状态；返回是否真的改了配置。
+
+    只在状态不一致时写文件 + 触发重载：点「只保留上游」时上游通常本来就开着，
+    没必要为一次无变化的保存重启容器（会打断正在跑的请求）。
+    """
+    cfg = wb2api.load_upstream_config()
+    if cfg.get('available') is False:
+        raise HTTPException(status_code=409, detail=str(cfg.get('error') or '上游配置不可用'))
+    sched = cfg.get('schedule') if isinstance(cfg.get('schedule'), dict) else {}
+    keys = ('checkin_enabled', 'activity_enabled')
+    if all(bool(sched.get(k, True)) == enabled for k in keys):
+        return False
+    wb2api.save_upstream_config({'schedule': {k: enabled for k in keys}})
+    return True
+
+
+@router.get('/accounts/task-scheduler')
+def get_task_scheduler(user: dict = Depends(security.current_user)) -> dict:
+    """两套调度的重叠状态；账号页据此提示「谁在跑」（issue #375）。"""
+    return _task_scheduler_status()
+
+
+@router.put('/accounts/task-scheduler')
+def keep_task_scheduler(body: dict, user: dict = Depends(security.require_admin)) -> dict:
+    """只保留一套调度（issue #375）。
+
+    - `upstream`：关闭面板的签到 / 领取补偿；领奖与做任务仍留在面板（上游没有）。
+    - `panel`：开启面板的签到 / 领取补偿，并关闭上游的 checkin / activity，
+      避免两套同时跑。会写上游 config 并触发热重载；改完需等容器重启生效。
+    """
+    keep = str((body or {}).get('keep') or '').strip()
+    if keep not in ('upstream', 'panel'):
+        raise HTTPException(status_code=400, detail="keep 只能是 upstream 或 panel")
+    if keep == 'upstream':
+        # 对称：若之前选过「只保留面板」，上游的 checkin/activity 已被关掉；
+        # 现在切回上游必须把它们重新打开，否则会变成「两边都没跑」。
+        try:
+            changed = _set_upstream_overlap(True)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        plan = dailyplan.set_overlap_enabled(False)
+        reloaded = reload.request_restart() if changed else None
+        security.audit(user, 'keep_task_scheduler', 'upstream',
+                       '关闭面板签到/领取补偿，恢复上游 checkin/activity')
+        result = {'plan': plan, 'scheduler': _task_scheduler_status(),
+                  'reload_scheduled': None if not changed else bool(reloaded)}
+        if changed and not reloaded:
+            result['reload_hint'] = ('配置已写入，但当前环境无法自动重启上游容器；'
+                                     '请手动重启后生效')
+        return result
+
+    # panel：先确认上游配置可写，避免「面板开了、上游没关」的半套状态。
+    try:
+        changed = _set_upstream_overlap(False)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    plan = dailyplan.set_overlap_enabled(True)
+    reloaded = reload.request_restart() if changed else None
+    security.audit(user, 'keep_task_scheduler', 'panel',
+                   '关闭上游 checkin/activity，改由面板签到/领取补偿')
+    result = {'plan': plan, 'scheduler': _task_scheduler_status(),
+              'reload_scheduled': None if not changed else bool(reloaded)}
+    if changed and not reloaded:
+        result['reload_hint'] = ('配置已写入，但当前环境无法自动重启上游容器；'
+                                 '请手动重启后生效')
+    return result
+
+
 @router.post('/accounts/daily-plan/run')
 async def run_daily_task_now(body: dict = Body(...),
                              user: dict = Depends(security.require_admin)) -> dict:

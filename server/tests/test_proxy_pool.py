@@ -349,3 +349,27 @@ class LegacyTemplateTest(_Base):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ProxyErrorHintTest(unittest.TestCase):
+    """代理测活失败时给可行动提示（issue #379）。"""
+
+    def test_protocol_mismatch(self) -> None:
+        hint = pr._proxy_error_hint(ConnectionError('Malformed reply from SOCKS server'))
+        self.assertIn('协议不匹配', hint)
+
+    def test_wrong_version_number(self) -> None:
+        hint = pr._proxy_error_hint(ssl_error('SSL: WRONG_VERSION_NUMBER'))
+        self.assertIn('TLS 握手失败', hint)
+
+    def test_socks_ruleset(self) -> None:
+        hint = pr._proxy_error_hint(ConnectionError(
+            'Proxy Server could not connect: Connection not allowed by ruleset'))
+        self.assertIn('白名单', hint)
+
+    def test_unknown_error_has_no_hint(self) -> None:
+        self.assertEqual(pr._proxy_error_hint(RuntimeError('boom')), '')
+
+
+class ssl_error(Exception):
+    """测试用异常：类名里带 SSL，模拟 ssl.SSLError 的文案。"""

@@ -110,7 +110,7 @@ export default function LoginPage() {
                 autoComplete="username"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="admin"
+                placeholder={t('login.usernamePlaceholder')}
                 className="bg-background"
               />
             </div>

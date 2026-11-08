@@ -570,6 +570,32 @@ def health() -> dict[str, dict]:
     return table if isinstance(table, dict) else {}
 
 
+def _proxy_error_hint(exc: Exception) -> str:
+    """把常见代理错误翻译成可行动的提示（issue #379）。
+
+    用户看到的原始错误是 `ProxyError: ... Malformed reply` / `SSL:
+    WRONG_VERSION_NUMBER`，很难从中判断「是协议填错、端口填错，还是代理拒绝」。
+    这里只做**归类提示**，原始错误仍原样返回，排障时两者都要看。
+    """
+    text = f'{type(exc).__name__}: {exc}'
+    low = text.lower()
+    if 'malformed reply' in low:
+        return '代理协议不匹配：地址可能不是 SOCKS5，或端口不是代理端口。确认服务商给的是 http:// 还是 socks5://'
+    if 'wrong_version_number' in low or ('ssl' in low and 'wrong version' in low):
+        return 'TLS 握手失败：多半是协议/端口填错（HTTP 代理却填了 https://，或把网页端口当代理端口）'
+    if 'connection not allowed by ruleset' in low:
+        return '代理服务器拒绝了这个目标：检查代理的白名单/规则、账号密码，或该代理是否允许访问外网'
+    if '407' in low or 'proxy authentication' in low or 'authentication required' in low:
+        return '代理认证失败：检查地址里的用户名和密码（特殊字符需要 URL 编码）'
+    if 'connection refused' in low:
+        return '代理端口拒绝连接：确认地址、端口和代理进程是否在运行'
+    if 'timeout' in low or 'timed out' in low:
+        return '连接代理超时：检查网络可达性与代理地址'
+    if 'name or service not known' in low or 'no such host' in low:
+        return '代理域名解析失败：检查地址拼写与 DNS'
+    return ''
+
+
 async def probe_url(proxy: str, *, timeout: float = 8.0,
                     check_url: str | None = None) -> dict:
     """经这个代理地址发一次轻请求（默认查出口 IP 与归属地）。
@@ -596,8 +622,12 @@ async def probe_url(proxy: str, *, timeout: float = 8.0,
                                                      data.get('org')) if x),
         }
     except Exception as exc:  # noqa: BLE001 —— 探测失败原因原样回给界面
-        return {'ok': False, 'ms': int((time.monotonic() - started) * 1000),
-                'error': f'{type(exc).__name__}: {exc}'}
+        result = {'ok': False, 'ms': int((time.monotonic() - started) * 1000),
+                  'error': f'{type(exc).__name__}: {exc}'}
+        hint = _proxy_error_hint(exc)
+        if hint:
+            result['hint'] = hint
+        return result
 
 
 async def probe_route(name: str, *, timeout: float = 8.0,

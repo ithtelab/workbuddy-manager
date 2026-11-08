@@ -112,6 +112,26 @@ def set_plan(body: object) -> dict:
     return plan
 
 
+# 与上游调度器**重叠**的任务：签到（上游 checkin）与领取补偿（上游 activity
+# 内部会领）。领奖 / 做任务上游没有，属于面板独占，不参与「只保留一套」。
+OVERLAP_TASKS = ('checkin', 'compensation')
+
+
+def set_overlap_enabled(enabled: bool) -> dict:
+    """统一开关重叠任务（issue #375：上游与面板两套调度二选一）。
+
+    只动 checkin / compensation，保留时刻与 last_run；claim / full 不受影响。
+    非布尔值直接拒绝，避免把 'false' 写进库后 is_due 按真值判断。
+    """
+    if not isinstance(enabled, bool):
+        raise TypeError('enabled 必须是布尔值')
+    plan = get_plan()
+    for task in OVERLAP_TASKS:
+        plan[task]['enabled'] = enabled
+    db.set_setting(_KEY, plan)
+    return plan
+
+
 def _stamp(now: int) -> str:
     """「哪一天的哪个整点」——同一天同一小时只跑一次的去重键。"""
     lt = time.localtime(now)

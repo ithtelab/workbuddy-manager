@@ -7,6 +7,8 @@ import type {
   AccountsResponse,
   RefreshPlan,
   DailyPlan,
+  TaskSchedulerStatus,
+  TaskSchedulerApply,
   DailyTask,
   CreditsFlow,
   AccountUsageResponse,
@@ -379,6 +381,11 @@ export const accountApi = {
   dailyPlan: () => get<DailyPlan>('/api/accounts/daily-plan'),
   saveDailyPlan: (plan: DailyPlan) =>
     put<DailyPlan>('/api/accounts/daily-plan', plan),
+  /** 上游与面板两套调度的重叠状态（issue #375） */
+  taskScheduler: () => get<TaskSchedulerStatus>('/api/accounts/task-scheduler'),
+  /** 只保留一套调度；panel 会写上游 config 并触发重载 */
+  keepTaskScheduler: (keep: 'upstream' | 'panel') =>
+    put<TaskSchedulerApply>('/api/accounts/task-scheduler', {keep}),
   /** 立即执行一次某个每日任务（不等定时） */
   runDailyTask: (task: DailyTask) =>
     post<{ok: boolean; message: string; task: string; plan: DailyPlan}>(
