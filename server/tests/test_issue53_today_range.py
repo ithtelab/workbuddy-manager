@@ -57,13 +57,14 @@ class TodayOptionTest(unittest.TestCase):
         opts = re.findall(r'<SelectItem value="(\d+)">', self.src)
         self.assertEqual(opts, ['1', '7', '30', '90'])
         # 一个 d 同时喂给 daily / byModel / byKey（三处跟随）
-        for call in ('statsApi.daily(d, realm)', 'statsApi.byModel(d, realm)',
-                     'statsApi.byKey(d, realm)'):
+        # 自定义日期（issue #257）通过第三个参数传范围；三处仍共用同一个 d。
+        for call in ('statsApi.daily(d, realm, range)', 'statsApi.byModel(d, realm, range)',
+                     'statsApi.byKey(d, realm, range)'):
             self.assertIn(call, self.src, f'{call} 没有跟随时段')
 
     def test_fallback_matches_default(self) -> None:
         """`Number(days) || X` 的兜底值要与默认值一致，否则非法值时口径会跳变。"""
-        m = re.search(r'const d = Number\(days\) \|\| (\d+);', self.src)
+        m = re.search(r'return Number\(days\) \|\| (\d+);', self.src)
         self.assertIsNotNone(m)
         self.assertEqual(m.group(1), '1')
 

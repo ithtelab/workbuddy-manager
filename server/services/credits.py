@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
 import time
 
@@ -72,8 +73,31 @@ def _save_snapshot(snap: dict) -> None:
         pass
 
 
-def record_balance(uid: str, nickname: str, credits: int | float | None) -> int | None:
-    """记录一次余额；较上次增加时写一条积分流水并返回增加量。
+def _package_keys(expiries: list[dict] | None) -> list[list[int]] | None:
+    """把到期积分包列表转成可持久化的 `[到期时刻, 额度]` 键；拿不到返回 None。"""
+    if not isinstance(expiries, list):
+        return None
+    out: list[list[int]] = []
+    for e in expiries:
+        if not isinstance(e, dict):
+            continue
+        try:
+            at = int(e.get('at'))
+            amount = int(e.get('amount'))
+        except (TypeError, ValueError):
+            continue
+        out.append([at, amount])
+    return sorted(out)
+
+
+def record_balance(uid: str, nickname: str, credits: int | float | None,
+                   expiries: list[dict] | None = None) -> int | None:
+    """记录一次余额；写一条积分获取流水并返回本次入账额度。
+
+    收入判据（issue #393）优先用**积分包出现**而不是余额净增：签到发 100、同一天
+    有 100 的旧包到期时，余额净增为 0，只按净增记账会把这次签到收入完全吞掉。
+    到期包列表（`expiries`）里新出现的 `[到期时刻, 额度]` 就是真实入账；余额净增
+    仍作为回退（老上游/到期列表拿不到时行为不变）。
 
     首次见到的账号只建立基线、不记流水，否则会把历史余额误报成「刚获得」。
     """
@@ -84,31 +108,69 @@ def record_balance(uid: str, nickname: str, credits: int | float | None) -> int 
     except (TypeError, ValueError):
         return None
 
+    now = int(time.time())
     snap = _load_snapshot()
     prev_raw = snap.get(uid)
     prev = _snapshot_value(prev_raw)
-    snap[uid] = {'credits': value, 'at': int(time.time())}
+    prev_packages = None
+    if isinstance(prev_raw, dict):
+        raw_packages = prev_raw.get('packages')
+        if isinstance(raw_packages, list):
+            prev_packages = []
+            for item in raw_packages:
+                if isinstance(item, list) and len(item) == 2:
+                    try:
+                        prev_packages.append([int(item[0]), int(item[1])])
+                    except (TypeError, ValueError):
+                        continue
+    packages = _package_keys(expiries)
+    entry = {'credits': value, 'at': now}
+    if packages is not None:
+        entry['packages'] = packages
+    snap[uid] = entry
     _save_snapshot(snap)
 
     if prev is None:
         return None
 
-    delta = value - prev
-    if delta <= 0 or delta > _MAX_DELTA:
-        return None
-
-    db.add_task_logs([{
-        'ts': int(time.time()),
-        'uid': uid,
-        'kind': 'credit',
-        'level': 'credit',
-        'credits': delta,
-        'message': f'余额 +{delta}（{prev} → {value}）'
-                   + (f' · {nickname}' if nickname else ''),
-        # 用余额值做去重键：同一余额只会留下一条流水
-        'dedup_key': f'credit|{uid}|{value}',
-    }])
-    return delta
+    # 1) 新出现的积分包 = 真实收入（不受同日到期抵消影响）。
+    income = 0
+    logs: list[dict] = []
+    if packages is not None and prev_packages is not None:
+        before = {(a, n) for a, n in prev_packages}
+        for at, amount in packages:
+            if (at, amount) in before or amount <= 0:
+                continue
+            income += amount
+            logs.append({
+                'ts': now,
+                'uid': uid,
+                'kind': 'credit',
+                'level': 'credit',
+                'credits': amount,
+                'message': f'积分包 +{amount}（{datetime.datetime.fromtimestamp(at).strftime("%m-%d %H:%M")} 到期）'
+                           + (f' · {nickname}' if nickname else ''),
+                'dedup_key': f'credit|{uid}|pkg|{at}|{amount}',
+            })
+    # 2) 到期列表拿不到/没有新包时，退回余额净增（存量行为）。
+    if not logs:
+        delta = value - prev
+        if delta <= 0 or delta > _MAX_DELTA:
+            return None
+        income = delta
+        logs.append({
+            'ts': now,
+            'uid': uid,
+            'kind': 'credit',
+            'level': 'credit',
+            'credits': delta,
+            'message': f'余额 +{delta}（{prev} → {value}）'
+                       + (f' · {nickname}' if nickname else ''),
+            # 用余额值做去重键：同一余额只会留下一条流水
+            'dedup_key': f'credit|{uid}|{value}',
+        })
+    db.add_task_logs(logs)
+    return income or None
 
 
 async def get_credits(
@@ -141,7 +203,7 @@ async def get_credits(
 
     if ok and record:
         try:
-            record_balance(uid, nickname, credits)
+            record_balance(uid, nickname, credits, expiries)
         except Exception:  # noqa: BLE001
             pass
 

@@ -43,7 +43,34 @@ def _epoch_since(days: int) -> int:
     return int(time.mktime(time.strptime(_since(days), '%Y-%m-%d')))
 
 
-def _throughput_by_model(days: int, realm: str | None) -> dict[str, dict]:
+def _range_bounds(days: int | None, start: str | None = None,
+                  end: str | None = None) -> tuple[str, str, int]:
+    """把「近 N 天」或「start~end」统一成 (起日, 止日, 跨度天数)。
+
+    自定义范围（issue #257）两端都含；span 上限沿用 _DAYS_MAX，防止误填 100 年
+    导致全表扫描。日期格式非法时静默退回 days 口径（界面上仍能出数）。
+    """
+    if start and end:
+        try:
+            s = datetime.date.fromisoformat(str(start).strip())
+            e = datetime.date.fromisoformat(str(end).strip())
+        except ValueError:
+            pass
+        else:
+            if s > e:
+                s, e = e, s
+            span = (e - s).days + 1
+            if span > _DAYS_MAX:
+                s = e - datetime.timedelta(days=_DAYS_MAX - 1)
+                span = _DAYS_MAX
+            return s.isoformat(), e.isoformat(), span
+    d = _clamp_days(days, 30)
+    return _since(d), time.strftime('%Y-%m-%d'), d
+
+
+def _throughput_by_model(days: int, realm: str | None,
+                         start: str | None = None,
+                         end: str | None = None) -> dict[str, dict]:
     """按模型算**输出速率**（tokens/秒，issue #214）。
 
     数据源必须是 `request_logs`：`usage_daily` 只累计请求数与 token 数，没有耗时。
@@ -58,16 +85,18 @@ def _throughput_by_model(days: int, realm: str | None) -> dict[str, dict]:
       · 只覆盖**请求日志保留期**内的数据，返回 `throughput_samples` 让界面如实
         标注样本量（统计页的时间范围可能比日志保留期长）。
     """
-    since = _epoch_since(days)
+    lo, hi, _span = _range_bounds(days, start, end)
+    since = int(time.mktime(time.strptime(lo, '%Y-%m-%d')))
+    until = int(time.mktime(time.strptime(hi, '%Y-%m-%d'))) + 86400
     rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
-    args: tuple = (since,) + ((realm,) if rf else ())
+    args: tuple = (since, until) + ((realm,) if rf else ())
     rows = db.query(
         'SELECT model AS name, COUNT(*) AS samples, '
         'SUM(completion_tokens) AS ct, '
         'SUM(CASE WHEN latency_ms > COALESCE(first_token_ms, 0) '
         '         THEN latency_ms - COALESCE(first_token_ms, 0) ELSE 0 END) AS gen_ms '
         'FROM request_logs '
-        'WHERE ts >= ? AND status >= 200 AND status < 300 AND completion_tokens > 0 '
+        'WHERE ts >= ? AND ts < ? AND status >= 200 AND status < 300 AND completion_tokens > 0 '
         # 生成耗时必须为正：latency=0 或 latency<=first_token 的记录算不出速率，
         # 留在分母外也不该把它们的 token 计进分子（否则速率会虚高一倍）。
         'AND latency_ms > COALESCE(first_token_ms, 0)'
@@ -311,6 +340,7 @@ def rebuild_usage(user: dict = Depends(security.require_admin)) -> dict:
 
 @router.get('/daily')
 def daily(days: int = 30, realm: str | None = None,
+          start: str | None = None, end: str | None = None,
           user: dict = Depends(security.current_user)) -> list[dict]:
     """按天聚合。realm 非空时只统计该版本。
 
@@ -319,17 +349,18 @@ def daily(days: int = 30, realm: str | None = None,
     （详见 `_failures`）。趋势图用它把「失败」画出来——否则全池中断那天的
     曲线是空的，看不出出过事。
     """
+    lo, hi, _span = _range_bounds(days, start, end)
     rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
-    args = (_since(max(1, days)),) + ((realm,) if rf else ())
+    args = (lo, hi) + ((realm,) if rf else ())
     rows = db.query(
         'SELECT day, SUM(requests) AS requests, '
         'SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, '
         'COALESCE(SUM(credit),0) AS credit, SUM(cost) AS cost, '
         'COALESCE(SUM(CASE WHEN cost IS NULL THEN requests ELSE 0 END),0) AS unpriced '
-        f'FROM usage_daily WHERE day >= ?{rf} GROUP BY day ORDER BY day ASC',
+        f'FROM usage_daily WHERE day BETWEEN ? AND ?{rf} GROUP BY day ORDER BY day ASC',
         args,
     )
-    failures = _daily_failures(days, realm)
+    failures = _daily_failures(days, realm, start=start, end=end)
     days_seen = {r['day'] for r in rows}
     out = [
         {
@@ -359,17 +390,19 @@ def daily(days: int = 30, realm: str | None = None,
     return out
 
 
-def _daily_failures(days: int, realm: str | None = None) -> dict[str, int]:
+def _daily_failures(days: int, realm: str | None = None,
+                    start: str | None = None, end: str | None = None) -> dict[str, int]:
     """按天统计失败请求数（4xx + 5xx）。口径与 `_failures` 一致。"""
     try:
         # 同 `_failures`：NULL 固定归 cn，不能把 NULL 兜成查询目标版本
         rf = " AND COALESCE(realm, 'cn') = ?" if realm in ('cn', 'global') else ''
         # 过滤用 ts 范围（走索引），**分组**仍必须用日期表达式（要按天聚合，
         # 这个没法避免）。两者分开：过滤是热路径上的大头，分组只作用于过滤后的行。
-        args = (db.day_start_ts(_since(max(1, days))),) + ((realm,) if rf else ())
+        lo, hi, _span = _range_bounds(days, start, end)
+        args = (db.day_start_ts(lo), db.day_start_ts(hi) + 86400) + ((realm,) if rf else ())
         rows = db.query(
             f"SELECT {db.day_sql('ts')} AS day, COUNT(*) AS n FROM request_logs "
-            f"WHERE ts >= ? AND status >= 400 AND key_id IS NOT NULL{rf} "
+            f"WHERE ts >= ? AND ts < ? AND status >= 400 AND key_id IS NOT NULL{rf} "
             f'GROUP BY day',
             args,
         )
@@ -547,6 +580,7 @@ def _credit_income_by_day(since: str, realm: str | None) -> dict[str, float]:
 
 @router.get('/credits')
 def credits_flow(days: int = 30, realm: str | None = None,
+                 start: str | None = None, end: str | None = None,
                  user: dict = Depends(security.current_user)) -> dict:
     """积分收支：按天给出收入与支出，并给出今日 / 近 7 天 / 区间合计。
 
@@ -566,8 +600,8 @@ def credits_flow(days: int = 30, realm: str | None = None,
     精确到每次请求。两个口径精度不同，所以不把「净额」当作唯一结论，而是收入 /
     支出 / 净额三项都列。
     """
-    d = _clamp_days(days, 30)
-    since = _since(d)
+    lo, hi, d = _range_bounds(days, start, end)
+    since = lo
     today = time.strftime('%Y-%m-%d')
 
     # 支出：usage_daily 带 realm 列，可直接筛
@@ -577,17 +611,17 @@ def credits_flow(days: int = 30, realm: str | None = None,
         str(r['day']): float(r['credit'] or 0)
         for r in db.query(
             'SELECT day, COALESCE(SUM(credit),0) AS credit FROM usage_daily '
-            f'WHERE day >= ?{rf} GROUP BY day',
-            (since,) + rargs,
+            f'WHERE day BETWEEN ? AND ?{rf} GROUP BY day',
+            (lo, hi) + rargs,
         )
     }
     income = _credit_income_by_day(since, realm)
 
     # 补齐每一天（含无数据的日子），折线才不会断成两截
-    start = datetime.date(*time.localtime(db.day_start_ts(since))[:3])
+    first = datetime.date.fromisoformat(lo)
     daily: list[dict] = []
     for i in range(d):
-        day = (start + datetime.timedelta(days=i)).isoformat()
+        day = (first + datetime.timedelta(days=i)).isoformat()
         inc = income.get(day, 0.0)
         exp = expense.get(day, 0.0)
         daily.append({'day': day, 'income': inc, 'expense': exp, 'net': inc - exp})
@@ -603,11 +637,12 @@ def credits_flow(days: int = 30, realm: str | None = None,
     # 剩一个孤点，看不出「今天什么时候进、什么时候花」。沿用用量趋势图已确立的
     # 粒度规则（days=1 → hour，固定 24 桶补零，见 /stats/hourly）。
     # 多日范围不返回 hourly —— 响应形态与升级前逐字段一致。
-    hourly = _credits_hourly(today, realm) if d == 1 else None
+    hourly = (_credits_hourly(today, realm)
+              if d == 1 and lo == hi == today else None)
     return {
         'days': d,
-        'from': daily[0]['day'] if daily else since,
-        'to': today,
+        'from': daily[0]['day'] if daily else lo,
+        'to': hi,
         'today': _sum([r for r in daily if r['day'] == today]),
         'week': _sum([r for r in daily if r['day'] >= week_from]),
         'total': _sum(daily),
@@ -619,21 +654,24 @@ def credits_flow(days: int = 30, realm: str | None = None,
 
 @router.get('/by-model')
 def by_model(days: int = 30, realm: str | None = None,
+             start: str | None = None, end: str | None = None,
              user: dict = Depends(security.current_user)) -> list[dict]:
     """按模型聚合。realm 非空时只统计该版本。"""
+    lo, hi, _span = _range_bounds(days, start, end)
     rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
-    args = (_since(max(1, days)),) + ((realm,) if rf else ())
+    args = (lo, hi) + ((realm,) if rf else ())
     rows = db.query(
         'SELECT model AS name, SUM(requests) AS requests, '
         'SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, '
         'COALESCE(SUM(credit),0) AS credit, SUM(cost) AS cost, '
         'COALESCE(SUM(CASE WHEN cost IS NULL THEN requests ELSE 0 END),0) AS unpriced '
-        f'FROM usage_daily WHERE day >= ?{rf} GROUP BY model ORDER BY SUM(prompt_tokens + completion_tokens) DESC',
+        f'FROM usage_daily WHERE day BETWEEN ? AND ?{rf} GROUP BY model '
+        'ORDER BY SUM(prompt_tokens + completion_tokens) DESC',
         args,
     )
     # 输出速率来自请求日志（issue #214）：与上面的用量表**同区间不同源**，
     # 所以只给「两边都有」的模型补字段；日志里完全没有的模型给 null（显示 —）。
-    tmap = _throughput_by_model(days, realm)
+    tmap = _throughput_by_model(days, realm, start, end)
     out = []
     for r in rows:
         name = r['name'] or '未知'
@@ -651,8 +689,56 @@ def by_model(days: int = 30, realm: str | None = None,
     return out
 
 
+@router.get('/by-account')
+def by_account(days: int = 30, realm: str | None = None,
+               start: str | None = None, end: str | None = None,
+               limit: int = 1000, user: dict = Depends(security.current_user)) -> dict:
+    """按「日期 × 账号」聚合请求数、token 与积分（issue #402）。
+
+    数据源是请求日志：`usage_daily` 没有账号维度，补也不该在汇总表里做（账号可由
+    回填晚到）。账号列形如 `昵称(uid8)`，这里拆出 `nickname` / `uid8` 方便外部消费；
+    未回填的行（account 为空）不计入——宁可少一行，也不把「不知道是谁」摊到某个号上。
+
+    自定义日期与 `days` 同一套范围解析（issue #257）；`limit` 默认 1000 行，
+    超出时 `truncated=true`，按日期倒序、当天积分从高到低取。
+    """
+    import re as _re
+    lo, hi, _span = _range_bounds(days, start, end)
+    rf = " AND COALESCE(realm, 'cn') = ?" if realm in ('cn', 'global') else ''
+    capped = max(1, min(int(limit or 1000), 5000))
+    args: tuple = (db.day_start_ts(lo), db.day_start_ts(hi) + 86400)
+    if rf:
+        args += (realm,)
+    rows = db.query(
+        f"SELECT {db.day_sql('ts')} AS day, account, COUNT(*) AS requests, "
+        'SUM(COALESCE(prompt_tokens,0) + COALESCE(completion_tokens,0)) AS tokens, '
+        'COALESCE(SUM(credit),0) AS credit, SUM(cost) AS cost '
+        'FROM request_logs '
+        "WHERE ts >= ? AND ts < ? AND account IS NOT NULL AND account <> ''"
+        f'{rf} GROUP BY day, account ORDER BY day DESC, credit DESC LIMIT ?',
+        args + (capped + 1,),
+    )
+    items: list[dict] = []
+    for r in rows[:capped]:
+        label = str(r['account'] or '')
+        m = _re.match(r'^(.*)\(([A-Za-z0-9_-]{4,16})\)$', label)
+        items.append({
+            'day': str(r['day'] or ''),
+            'account': label,
+            'nickname': (m.group(1).strip() if m else label),
+            'uid8': (m.group(2) if m else ''),
+            'requests': int(r['requests'] or 0),
+            'tokens': int(r['tokens'] or 0),
+            'credit': float(r['credit'] or 0),
+            'cost': None if r['cost'] is None else float(r['cost']),
+        })
+    return {'items': items, 'total': len(rows), 'truncated': len(rows) > capped,
+            'from': lo, 'to': hi}
+
+
 @router.get('/by-key')
 def by_key(days: int = 30, realm: str | None = None,
+           start: str | None = None, end: str | None = None,
            user: dict = Depends(security.current_user)) -> list[dict]:
     """按密钥聚合。realm 非空时只统计该版本。
 
@@ -660,15 +746,17 @@ def by_key(days: int = 30, realm: str | None = None,
     的调用量」——所以同一把密钥在两个版本下都会出现，数字各是各的。这是如实
     反映架构，不是重复计数。
     """
+    lo, hi, _span = _range_bounds(days, start, end)
     rf = ' AND u.realm = ?' if realm in ('cn', 'global') else ''
-    args = (_since(max(1, days)),) + ((realm,) if rf else ())
+    args = (lo, hi) + ((realm,) if rf else ())
     rows = db.query(
         'SELECT COALESCE(k.name, u.key_id || "") AS name, SUM(u.requests) AS requests, '
         'SUM(u.prompt_tokens) AS prompt_tokens, SUM(u.completion_tokens) AS completion_tokens, '
         'COALESCE(SUM(u.credit),0) AS credit, SUM(u.cost) AS cost, '
         'COALESCE(SUM(CASE WHEN u.cost IS NULL THEN u.requests ELSE 0 END),0) AS unpriced '
         'FROM usage_daily u LEFT JOIN api_keys k ON k.id = u.key_id '
-        f'WHERE u.day >= ?{rf} GROUP BY u.key_id ORDER BY SUM(u.prompt_tokens + u.completion_tokens) DESC',
+        f'WHERE u.day BETWEEN ? AND ?{rf} GROUP BY u.key_id '
+        'ORDER BY SUM(u.prompt_tokens + u.completion_tokens) DESC',
         args,
     )
     return [

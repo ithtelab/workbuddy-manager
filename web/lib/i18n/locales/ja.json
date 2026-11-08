@@ -275,6 +275,12 @@
     "creditsExpiryDaily": "直近の期限日（{time}）に {amount} ポイントが失効"
   },
   "stats": {
+    "customRange": "カスタム",
+    "startDate": "開始日",
+    "endDate": "終了日",
+    "byAccount": "アカウント別",
+    "date": "日付",
+    "account": "アカウント",
     "title": "使用量",
     "description": "期間・モデル・キー別に Token 消費量とリクエスト数を集計（60 秒ごとに自動更新。現在は{realm}のみ）",
     "today": "今日",

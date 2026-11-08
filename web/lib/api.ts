@@ -9,6 +9,7 @@ import type {
   DailyPlan,
   DailyTask,
   CreditsFlow,
+  AccountUsageResponse,
   ApiKey,
   ApiToken,
   AuditLogPage,
@@ -642,10 +643,17 @@ export const logApi = {
 };
 
 /* ── 用量统计 ───────────────────────────────────────── */
+/** 自定义日期范围（issue #257）：两端都含；与 days 同时传时后端优先用日期。 */
+export interface StatsRange {
+  start?: string;
+  end?: string;
+}
+
 export const statsApi = {
   /** realm 非空时只统计该版本（界面按版本切换时传） */
   summary: (realm?: Realm) => get<StatsSummary>('/api/stats/summary', {realm}),
-  daily: (days = 30, realm?: Realm) => get<UsagePoint[]>('/api/stats/daily', {days, realm}),
+  daily: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsagePoint[]>('/api/stats/daily', {days, realm, ...range}),
   /**
    * 某天**按小时**的用量（默认今天）。「今日」趋势图用它 —— 范围只有一天时
    * 按天聚合只有一根柱子。后端固定返回 24 个桶（补零），前端不必再补。
@@ -654,12 +662,15 @@ export const statsApi = {
     get<UsageHourPoint[]>('/api/stats/hourly', {day, realm}),
 
   /** 积分收支（收入 / 支出）按天聚合 + 今日 / 近 7 天合计 */
-  creditsFlow: (days = 30, realm?: Realm) =>
-    get<CreditsFlow>('/api/stats/credits', {days, realm}),
-  byModel: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
-  byKey: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm}),
+  creditsFlow: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<CreditsFlow>('/api/stats/credits', {days, realm, ...range}),
+  byModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm, ...range}),
+  byKey: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm, ...range}),
+  /** 按「日期 × 账号」聚合（issue #402）；同一范围解析规则 */
+  byAccount: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountUsageResponse>('/api/stats/by-account', {days, realm, ...range}),
   /**
    * 上游自己那份统计（issue #59）。口径与本页其它数字不同：含**直连上游**的调用，
    * 且是自上游进程启动以来的累计（没有时段概念）。

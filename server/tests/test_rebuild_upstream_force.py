@@ -49,7 +49,7 @@ class ForceRecreateTest(unittest.TestCase):
         self.rep = _Rep()
         self.run_calls: list[list[str]] = []
 
-    def _patch(self, ids=('old-container-id', 'new-container-id')):
+    def _patch(self, ids=('old-container-id', 'new-container-id'), *, persisted=True):
         seq = list(ids)
 
         def fake_run(cmd, **kw):
@@ -64,7 +64,29 @@ class ForceRecreateTest(unittest.TestCase):
             mock.patch.object(self.mod, 'wait_upstream_ready'),
             mock.patch.object(self.mod, '_container_id',
                               side_effect=lambda name: seq.pop(0) if seq else ''),
+            mock.patch.object(self.mod, '_auths_persisted', return_value=persisted),
         ]
+
+    def test_skips_rebuild_when_auths_not_persisted(self) -> None:
+        """auths 没有挂载/卷时跳过重建（issue #400）：force-recreate 会删掉容器层里
+        的账号文件，而面板 data 还在——用户会看到「能登录但没有号」。"""
+        patches = self._patch(persisted=False)
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.mod.rebuild_upstream(self.rep)
+        up = [c for c in self.run_calls if 'up' in c]
+        self.assertEqual(up, [], f'没有持久化 auths 时仍执行了重建：{up}')
+        self.assertIn('auths', self.rep.text())
+
+    def test_unknown_auths_state_does_not_block(self) -> None:
+        """容器还不存在/读不到挂载信息时不拦（首次创建依赖 compose 配置）。"""
+        patches = self._patch(persisted=None)
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.mod.rebuild_upstream(self.rep)
+        self.assertTrue(any('up' in c for c in self.run_calls))
 
     def test_rebuild_uses_force_recreate(self) -> None:
         patches = self._patch()

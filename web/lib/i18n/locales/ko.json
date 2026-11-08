@@ -275,6 +275,12 @@
     "creditsExpiryDaily": "가장 가까운 만료일({time})에 {amount} 포인트 만료"
   },
   "stats": {
+    "customRange": "사용자 지정",
+    "startDate": "시작일",
+    "endDate": "종료일",
+    "byAccount": "계정별",
+    "date": "날짜",
+    "account": "계정",
     "title": "사용량",
     "description": "기간, 모델, 키별로 Token 소비와 요청량을 집계합니다 (60초마다 자동 새로고침, 현재 {realm}만 집계)",
     "today": "오늘",

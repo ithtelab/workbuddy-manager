@@ -302,6 +302,12 @@
     "creditsExpiryDaily": "{amount} credits expire on the nearest day ({time})"
   },
   "stats": {
+    "customRange": "Custom",
+    "startDate": "Start date",
+    "endDate": "End date",
+    "byAccount": "By account",
+    "date": "Date",
+    "account": "Account",
     "title": "Usage",
     "description": "Token consumption and request volume by time, model and key (auto-refresh every 60s; currently {realm} only)",
     "today": "Today",

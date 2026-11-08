@@ -779,6 +779,25 @@ export interface CreditsFlow {
   hourly?: CreditsFlowHourPoint[];
 }
 
+export interface AccountUsageRow {
+  day: string;
+  account: string;
+  nickname: string;
+  uid8: string;
+  requests: number;
+  tokens: number;
+  credit: number;
+  cost: number | null;
+}
+
+export interface AccountUsageResponse {
+  items: AccountUsageRow[];
+  total: number;
+  truncated: boolean;
+  from: string;
+  to: string;
+}
+
 export interface UsageBreakdown {
   name: string;
   requests: number;

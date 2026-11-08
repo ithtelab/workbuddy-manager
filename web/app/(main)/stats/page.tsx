@@ -1,7 +1,7 @@
 'use client';
 
 import {useCallback, useState} from 'react';
-import {Activity, TrendingUp, KeyRound, Cpu, Wrench, RotateCcw, Coins, AlertTriangle, Server} from 'lucide-react';
+import {Activity, TrendingUp, KeyRound, Cpu, Wrench, RotateCcw, Coins, AlertTriangle, Server, CalendarDays, UserRound} from 'lucide-react';
 import {
   Area,
   Bar,
@@ -16,8 +16,9 @@ import {
 } from 'recharts';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
-import {statsApi, errText} from '@/lib/api';
+import {statsApi, errText, type StatsRange} from '@/lib/api';
 import type {
+  AccountUsageRow,
   StatsSummary,
   UpstreamStats,
   UsageBreakdown,
@@ -42,6 +43,7 @@ import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {useAuth} from '@/lib/auth-context';
 import {useRealm} from '@/lib/realm-context';
 import {Button} from '@/components/ui/button';
+import {Input} from '@/components/ui/input';
 import {
   Select,
   SelectContent,
@@ -121,7 +123,19 @@ export default function StatsPage() {
    * 与选择器天然同一口径，不需要各自翻译一遍。
    */
   const [days, setDays] = useState('1');
-  const d = Number(days) || 1;
+  /** 自定义日期（issue #257）：两端都含；只有选「自定义」且两格都填了才生效。 */
+  const [customStart, setCustomStart] = useState('');
+  const [customEnd, setCustomEnd] = useState('');
+  const isCustom = days === 'custom';
+  const range: StatsRange | undefined =
+    isCustom && customStart && customEnd ? {start: customStart, end: customEnd} : undefined;
+  const spanDays = (() => {
+    if (!isCustom || !customStart || !customEnd) return Number(days) || 1;
+    const a = Date.parse(customStart), b = Date.parse(customEnd);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return 30;
+    return Math.min(3650, Math.max(1, Math.round(Math.abs(b - a) / 86400000) + 1));
+  })();
+  const d = spanDays;
 
   /**
    * 本页四份统计。
@@ -140,15 +154,16 @@ export default function StatsPage() {
   } = useAsyncAll(
     {
       summary: () => statsApi.summary(realm),
-      daily: () => statsApi.daily(d, realm),
+      daily: () => statsApi.daily(d, realm, range),
       // 「今日」的图按小时画（见 lib/usage-chart.ts 的说明）：只有这个范围需要
       // 小时数据，其它范围直接给空数组，省一次请求。
       hourly: () => (days === '1' ? statsApi.hourly(undefined, realm)
                                   : Promise.resolve([] as UsageHourPoint[])),
-      byModel: () => statsApi.byModel(d, realm),
-      byKey: () => statsApi.byKey(d, realm),
+      byModel: () => statsApi.byModel(d, realm, range),
+      byKey: () => statsApi.byKey(d, realm, range),
+      byAccount: () => statsApi.byAccount(d, realm, range),
     },
-    [realm, days],
+    [realm, days, customStart, customEnd],
   );
 
   /**
@@ -184,6 +199,7 @@ export default function StatsPage() {
   const daily: UsagePoint[] = values.daily ?? EMPTY_POINTS;
   const byModel: UsageBreakdown[] = values.byModel ?? EMPTY_BREAKDOWN;
   const byKey: UsageBreakdown[] = values.byKey ?? EMPTY_BREAKDOWN;
+  const byAccount: AccountUsageRow[] = values.byAccount?.items ?? [];
   const upstream: UpstreamStats | null = upstreamValues.upstream ?? null;
 
   const failedCount = Object.keys(errors).length;
@@ -230,8 +246,23 @@ export default function StatsPage() {
               <SelectItem value="7">{t('stats.last7')}</SelectItem>
               <SelectItem value="30">{t('stats.last30')}</SelectItem>
               <SelectItem value="90">{t('stats.last90')}</SelectItem>
+              <SelectItem value="custom">{t('stats.customRange')}</SelectItem>
             </SelectContent>
           </Select>
+          {isCustom && (
+            <div className="flex items-center gap-1.5">
+              <CalendarDays className="h-3.5 w-3.5 text-muted-foreground" />
+              <Input type="date" value={customStart} max={customEnd || undefined}
+                     aria-label={t('stats.startDate')}
+                     onChange={(e) => setCustomStart(e.target.value)}
+                     className="h-8 w-[140px] rounded-full text-xs" />
+              <span className="text-xs text-muted-foreground">–</span>
+              <Input type="date" value={customEnd} min={customStart || undefined}
+                     aria-label={t('stats.endDate')}
+                     onChange={(e) => setCustomEnd(e.target.value)}
+                     className="h-8 w-[140px] rounded-full text-xs" />
+            </div>
+          )}
           {isAdmin && (
             <ConfirmDialog
               title={t('stats.repairTitle')}
@@ -542,6 +573,9 @@ export default function StatsPage() {
         <BreakdownPanel title={t('stats.byKey')} icon={KeyRound} items={byKey} />
       </section>
 
+      {/* 按「日期 × 账号」聚合（issue #402）：看每个号每天用了多少、扣了多少积分。 */}
+      <AccountUsagePanel items={byAccount} />
+
       {/* 上游自己那份统计（issue #59）。**单独一段、口径写明**：它含直连上游的
           调用、且自上游进程启动累计，与上面的时段选择器无关——混着看会得出
           「今日请求包含了直连流量」这种错误结论。取不到时只写原因，不弹提示。 */}
@@ -606,6 +640,49 @@ export default function StatsPage() {
         ) : null}
       </section>
     </div>
+  );
+}
+
+/** 按「日期 × 账号」的用量表（issue #402）。 */
+function AccountUsagePanel({items}: {items: AccountUsageRow[]}) {
+  const t = useT();
+  return (
+    <section className="rounded-[20px] bg-muted p-4">
+      <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+        <UserRound className="h-4 w-4" />
+        {t('stats.byAccount')}
+      </div>
+      {items.length ? (
+        <div className="max-h-[420px] overflow-auto">
+          <Table>
+            <TableHeader>
+              <TableRow className="border-b border-border/60 hover:bg-transparent">
+                <TableHead className="text-[11px] text-muted-foreground">{t('stats.date')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('stats.account')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('metric.requestsShort')}</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">Token</TableHead>
+                <TableHead className="text-[11px] text-muted-foreground">{t('metric.paid')}</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {items.map((row, i) => (
+                <TableRow key={`${row.day}-${row.account}-${i}`} className="border-b border-border/40">
+                  <TableCell className="whitespace-nowrap text-xs tabular-nums">{row.day}</TableCell>
+                  <TableCell className="max-w-[240px] truncate text-xs" title={row.account}>
+                    {row.nickname || row.uid8 || row.account}
+                  </TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtNumber(row.requests)}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtCompact(row.tokens)}</TableCell>
+                  <TableCell className="text-xs tabular-nums">{fmtCredit(row.credit)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      ) : (
+        <div className="text-xs text-muted-foreground">{t('stats.noUsageData')}</div>
+      )}
+    </section>
   );
 }
 
