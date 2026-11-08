@@ -1,0 +1,96 @@
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -640,6 +640,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 
+ 	tried := map[string]bool{}
+ 	var lastErr error
++	// 多号同时限流时，整池恢复时刻是**最早**那个重置墙钟（issue #403）。记录
++	// 最早的一条 6004 原文，末端若整体仍以限流收场就用它，而不是最后轮到的号
++	// 的（会更晚，让客户端白等一整个周期）。
++	var earliestRateBody string
++	var earliestRateAt time.Time
+ 
+ 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
+ 	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
+@@ -1071,6 +1076,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				st.status = http.StatusBadRequest
+ 				return
+ 			}
++			if kind == upstream.ErrSoftRate {
++				if at, ok := upstream.ParseRateReset(string(respBody)); ok &&
++					(earliestRateAt.IsZero() || at.Before(earliestRateAt)) {
++					earliestRateAt = at
++					earliestRateBody = string(respBody)
++				}
++			}
+ 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
+ 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
+ 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+@@ -1215,6 +1227,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
+ 			msg = s
+ 		}
++		// 限流收场：用**最早**恢复的那个号的上游原文（issue #403）。「更晚」的
++		// 那条会让客户端按错误的时间等待，而池子在更早就已能服务。
++		if ue.Kind == upstream.ErrSoftRate && strings.TrimSpace(earliestRateBody) != "" {
++			msg = strings.TrimSpace(earliestRateBody)
++			hint = h.hintOf(ue.Kind, earliestRateBody, bareModel, reqHasImage, ue)
++		}
+ 	}
+ 	writeOpenAIErrorHint(w, status, code, msg, hint)
+ 	st.status = status
+--- a/internal/server/handler_test.go
++++ b/internal/server/handler_test.go
+@@ -1023,6 +1023,43 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
+ 	}
+ }
+ 
++// TestChat429ReportsEarliestReset 多号同时限流时返回**最早**恢复的那条原文（issue #403）。
++//
++// 整池在最早那个号重置时就能服务；用最后轮到的号的时间会让客户端白等一整个周期。
++func TestChat429ReportsEarliestReset(t *testing.T) {
++	early := time.Now().Add(5 * time.Minute)
++	late := time.Now().Add(2 * time.Hour)
++	fmtTS := func(at time.Time) string {
++		return at.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
++	}
++	earlyTS, lateTS := fmtTS(early), fmtTS(late)
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		if authz == "Bearer at-a" {
++			return 429, `{"code":6004,"msg":"将在 ` + earlyTS + ` UTC+8 重置","requestId":"a"}`, false
++		}
++		return 429, `{"code":6004,"msg":"将在 ` + lateTS + ` UTC+8 重置","requestId":"b"}`, false
++	})
++	p := testPoolWith(
++		&auth.Auth{UID: "a", AccessToken: "at-a", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "b", AccessToken: "at-b", ExpiresAt: 9999999999},
++	)
++	h := NewHandler(Config{Pool: p, Upstream: up})
++	req := httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.3","messages":[]}`))
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, req)
++	if rec.Code != http.StatusTooManyRequests {
++		t.Fatalf("code=%d body=%s (want 429)", rec.Code, rec.Body)
++	}
++	body := rec.Body.String()
++	if !strings.Contains(body, earlyTS) {
++		t.Errorf("429 文案应给最早恢复时间 %s，got %s", earlyTS, body)
++	}
++	if strings.Contains(body, lateTS) {
++		t.Errorf("429 文案不该给更晚的重置时间 %s，got %s", lateTS, body)
++	}
++}
++
+ // TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
+ // （现状不变）。
+ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
+@@ -2460,7 +2497,7 @@ func TestContentBlockedCustomIgnoresActiveDegrade(t *testing.T) {
+ }
+ 
+ // TestStaleSnapshotBoundedByPickGate 粘性快照陈旧被 Pick 闸兜底的契约锚
+-//（pr134-watchlist-analysis.md #10）：
++// （pr134-watchlist-analysis.md #10）：
+ // session.ResolveForModel 在取任何锁之前拿 pool 可用性快照——若快照后、Pick 前
+ // 粘性号 A 被冷却（快照陈旧判 available），Session 层仍会返回 A 作为建议 uid；
+ // 但真正的可用性权威闸是 handler 的 Pool.PickByUIDForModel（锁内新鲜判定

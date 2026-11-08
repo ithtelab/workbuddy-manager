@@ -1,0 +1,117 @@
+--- a/internal/upstream/payload.go
++++ b/internal/upstream/payload.go
+@@ -93,6 +93,11 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
+ 		if msgs, ok := obj["messages"].([]any); ok {
+ 			sanitizeMessages(msgs)
+ 		}
++		// tools[].function.description 与 system prompt 同源，同样要过一遍净化
++		// （issue #395）；name 不动，避免破坏工具匹配。
++		if tools, ok := obj["tools"].([]any); ok {
++			sanitizeTools(tools)
++		}
+ 	}
+ 	out, err := json.Marshal(obj)
+ 	if err != nil {
+--- a/internal/upstream/sanitize.go
++++ b/internal/upstream/sanitize.go
+@@ -294,6 +294,42 @@ func sanitizeToolCalls(v any) bool {
+ 	return changed
+ }
+ 
++// sanitizeTools 净化 tools[].function.description（issue #395）。
++//
++// 为什么需要：`sanitizeMessages` 只覆盖 messages，tools 数组原样出站；而
++// Claude Code / Codex 这类客户端的 tool description 与 system prompt 同源，
++// 都是固定模板句 —— 上游按逐字黑名单拦截，模板句正是高发区（#321/#308 的
++// 同类指纹）。这里对 description 做与正文相同的最小改写；**不改 name**：
++// 名字参与客户端/上游的工具匹配，改一个字符就会让调用对不上。
++//
++// 预检在 sanitizeText 内部（hasFingerprint），没命中时零分配返回原串。
++func sanitizeTools(v any) bool {
++	list, ok := v.([]any)
++	if !ok {
++		return false
++	}
++	changed := false
++	for _, item := range list {
++		tool, ok := item.(map[string]any)
++		if !ok {
++			continue
++		}
++		fn, ok := tool["function"].(map[string]any)
++		if !ok {
++			continue
++		}
++		desc, ok := fn["description"].(string)
++		if !ok {
++			continue
++		}
++		if s := sanitizeText(desc); s != desc {
++			fn["description"] = s
++			changed = true
++		}
++	}
++	return changed
++}
++
+ // sanitizeMessages 净化 messages 中的 content、reasoning_content 与 tool_calls；任一命中返回 true。
+ func sanitizeMessages(messages []any) bool {
+ 	changed := false
+new file mode 100644
+index 0000000..28330b7
+--- /dev/null
++++ b/internal/upstream/sanitize_tools_test.go
+@@ -0,0 +1,53 @@
++package upstream
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++// issue #395：tools[].function.description 与 system prompt 同源，同样要净化。
++func TestSanitizeToolsRewritesDescription(t *testing.T) {
++	tools := []any{
++		map[string]any{"type": "function", "function": map[string]any{
++			"name":        "read_file",
++			"description": ccIdentity + " " + ccBranch,
++			"parameters":  map[string]any{"type": "object"},
++		}},
++	}
++	if !sanitizeTools(tools) {
++		t.Fatal("sanitizeTools 没有报告改动")
++	}
++	fn := tools[0].(map[string]any)["function"].(map[string]any)
++	desc, _ := fn["description"].(string)
++	if strings.Contains(desc, ccIdentity) {
++		t.Errorf("description 仍含指纹：%q", desc)
++	}
++	if fn["name"] != "read_file" {
++		t.Errorf("工具名不该被改写：%v", fn["name"])
++	}
++}
++
++func TestPrepareBodySanitizesTools(t *testing.T) {
++	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],` +
++		`"tools":[{"type":"function","function":{"name":"read_file","description":"` + ccIdentity + `","parameters":{"type":"object"}}}]}`)
++	out := PrepareBodyOptWithEffortsAndDefault(body, true, nil, nil)
++	var obj map[string]any
++	if err := json.Unmarshal(out, &obj); err != nil {
++		t.Fatalf("not json: %v", err)
++	}
++	tools, _ := obj["tools"].([]any)
++	desc := tools[0].(map[string]any)["function"].(map[string]any)["description"].(string)
++	if strings.Contains(desc, ccIdentity) {
++		t.Errorf("出站 tools.description 仍含指纹：%q", desc)
++	}
++}
++
++func TestPrepareBodyLeavesToolsWhenSanitizeOff(t *testing.T) {
++	body := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],` +
++		`"tools":[{"type":"function","function":{"name":"read_file","description":"` + ccIdentity + `"}}]}`)
++	out := PrepareBodyOptWithEffortsAndDefault(body, false, nil, nil)
++	if !strings.Contains(string(out), ccIdentity) {
++		t.Error("sanitize=false 时不应改写 tools.description")
++	}
++}
