@@ -266,14 +266,18 @@ class RateLimitedModelsTest(unittest.TestCase):
         已经恢复的模型一直标成「受限」（与 isDegraded 同一口径的坑）。
         """
         body = self._helper_body()
-        self.assertIn('Date.parse', body, '没用时间解析 —— 过期的条目也会被算成受限')
+        self.assertIn('modelLimitEnd', body, '没有取统一的恢复时刻')
         self.assertIn('> now', body, '没有「截止在未来」的比较')
+        # 时间解析在 modelLimitEnd 里（issue #409：until 与 reset_at 取较晚者）。
+        module = self._src()
+        self.assertIn('Date.parse', module, '没用时间解析 —— 过期的条目也会被算成受限')
+        self.assertIn('reset_at', module, '没有认上游真实 reset_at')
 
-    def test_requires_until_string(self) -> None:
-        """缺 until / 非字符串 → 不算（保守：宁可不报，也别报个说不清时间的）。"""
-        body = self._helper_body()
-        self.assertIn("typeof until !== 'string'", body)
-        self.assertIn('return false', body)
+    def test_requires_parseable_time(self) -> None:
+        """缺时间 / 非字符串 / 解析不出来 → 不算（宁可不报，也别报个说不清时间的）。"""
+        module = self._src()
+        self.assertIn("typeof v !== 'string'", module)
+        self.assertIn('return at === -Infinity ? null : at', module)
 
     def test_reads_upstream_ledger_not_account_cooling(self) -> None:
         """读的是上游那本台账字段（rate_limited_models），不是账号级 cooling。

@@ -522,6 +522,16 @@ async def upstream_status(upstream_id: int | None = Query(None),
                                    api_key=upstreamsvc.forward_api_key(group))
 
 
+def _bare_model_id(raw: object) -> str:
+    """模型 id 的跨源比对键：去掉 `cn:` / `global:` 前缀（只用于比对，不改返回值）。"""
+    name = str(raw or '')
+    low = name.lower()
+    for pref in ('cn:', 'global:'):
+        if low.startswith(pref):
+            return name[len(pref):]
+    return name
+
+
 def _strip_cn_prefix(m: dict) -> dict:
     """去掉模型 id 的 `cn:` 前缀，**保留 `global:`**（见调用处注释）。"""
     mid = str(m.get('id') or '')
@@ -568,6 +578,25 @@ async def models(
     # 曾用过 modelcatalog._strip_realm_prefix()，它把两种前缀都去掉了——那会让
     # 界面上的国际版模型名变成「不可用」，实测发现后改为只去 cn:。
     items = [_strip_cn_prefix(m) for m in items]
+    # 按模型中心目录裁掉已下架模型（issue #407）：上游 /v1/models 的静态表里
+    # 还留着 lkeap / v3-0324 这类早就不能用的名字，界面和客户端都会当成可选。
+    # 两个版本都取到腾讯直连目录时才裁；任一版本取不到就原样返回，不清空列表。
+    catalog_realms = ['global' if str(realm).strip().lower() == 'global' else 'cn'] if realm else ['cn', 'global']
+    known: set[str] | None = set()
+    for r in catalog_realms:
+        try:
+            cat = await modelcatalog.catalog(r)
+        except Exception:  # noqa: BLE001
+            known = None
+            break
+        if cat.get('source') != 'tencent':
+            known = None
+            break
+        known |= {_bare_model_id(m.get('id'))
+                  for m in (cat.get('models') or [])
+                  if isinstance(m, dict) and m.get('id')}
+    if known:
+        items = [m for m in items if _bare_model_id(m.get('id')) in known]
     return {
         'models': items,
         'source': wb2api.models_source(source_items),
@@ -1101,22 +1130,27 @@ async def account_credits(
     }
 
 
-def _local_uids() -> set[str]:
-    """本机**所有分组**当前存在的账号 uid（含被临时禁用的）。
+def _local_accounts() -> dict[str, dict]:
+    """本机**所有分组**当前存在的账号 uid 及其调度状态（不查上游）。
 
     快照按 uid 登记、不分分组，所以判断「这个 uid 还在不在」也要跨分组找。
-    被禁用的账号算存在：那只是把文件改名为 `.disabled`，随时可以再启用
-    （与 `wb2api.list_auth_accounts` 的口径一致）。
+    `active` 只依赖本地就能判的信号：账号文件存在、没有 `.disabled` 后缀、
+    令牌没有过期。上游的 `disabled`/`manual_disabled` 要问 /status，这个只读
+    接口刻意不发请求；跨分组同名 uid 只要有一组可用就算可用。
     """
-    found: set[str] = set()
+    found: dict[str, dict] = {}
     for group in upstreamsvc.list_upstreams():
         directory = _group_dir(group)
         if directory is None:
             continue
         for account in wb2api.list_auth_accounts(directory):
             uid = str(account.get('uid') or '').strip()
-            if uid:
-                found.add(uid)
+            if not uid:
+                continue
+            active = (not str(account.get('file') or '').endswith('.disabled')
+                      and not account.get('is_expired'))
+            prev = found.get(uid)
+            found[uid] = {'active': active or bool(prev and prev['active'])}
     return found
 
 
@@ -1146,23 +1180,40 @@ def account_admin_api_status(upstream_id: int | None = Query(None),
 
 
 @router.get('/accounts/credits-snapshot')
-def credits_snapshot(user: dict = Depends(security.current_user)) -> dict:
-    """已登记的积分快照（只读）。
+def credits_snapshot(include_inactive: bool = Query(False),
+                     user: dict = Depends(security.current_user)) -> dict:
+    """已登记的积分快照（只读，**不触发任何上游查询**）。
 
-    给外部工具/对账用：**不触发任何上游查询**，只回面板已经记录下来的余额与登记
-    时刻。读接口，只读令牌也能调；请把数字按「已登记」使用，不要当实时余额。
+    给外部工具/对账用：默认只返回**当前还在、且还能被调度**的账号的登记值，
+    这样按 uid / 按域汇总出来的余额就是实际可花的量（issue #404）。已删除账号
+    的登记在删号时清掉，读取时也不会再返回；停用（`.disabled`）、令牌过期的
+    账号默认排除，传 `include_inactive=true` 可以连它们一起看，每行带
+    `active=false`。
 
-    快照**跨全部分组**（它按 uid 登记，不分组的），每行因此带一个 `known`：
-    该 uid 现在是否还对应一个本机账号。账号删掉之后，快照里那份历史记录不会
-    跟着消失 —— 对账脚本可以据 `known=false` 把它排除，或反过来当作
-    「这个账号曾经存在」的凭据。
+    `known` 仍保留：返回的每一行都是 known=true（历史记录/已删号不再下发）。
+    数字是「已登记」而非实时余额，请配合 `registered_at` 展示。
     """
     payload = creditsvc.snapshot_entries()
-    known = _local_uids()
+    local = _local_accounts()
+    rows: list[dict] = []
     for row in payload['accounts']:
-        row['known'] = row['uid'] in known
-    payload['known_count'] = sum(1 for row in payload['accounts'] if row['known'])
-    return payload
+        info = local.get(row['uid'])
+        if info is None:
+            # 已删账号：登记值不该再参与汇总（删号路径已清理，这里兜住升级前的残留）。
+            continue
+        row['known'] = True
+        row['active'] = bool(info['active'])
+        if row['active'] or include_inactive:
+            rows.append(row)
+    rows.sort(key=lambda r: r['uid'])
+    return {
+        'snapshot_at': max((r['registered_at'] or 0 for r in rows), default=0),
+        'count': len(rows),
+        'known_count': len(rows),
+        'active_count': sum(1 for r in rows if r['active']),
+        'total_registered': len(payload['accounts']),
+        'accounts': rows,
+    }
 
 
 @router.post('/accounts/refresh-credits')
@@ -2402,12 +2453,22 @@ async def account_set_note(
 async def account_delete(filename: str, upstream_id: int | None = Query(None),
                          user: dict = Depends(security.require_session_admin)) -> dict:
     group = _group(upstream_id)
+    base_dir = _require_dir(group)
+    # 删之前先取 uid：快照按 uid 登记，文件没了就查不到是哪条要清（issue #404）。
+    uid = ''
     try:
-        removed = wb2api.delete_auth_account(filename, _require_dir(group))
+        raw = _load(filename, base_dir)
+        uid = str((raw.get('account') or {}).get('uid') or '')
+    except HTTPException:
+        uid = ''
+    try:
+        removed = wb2api.delete_auth_account(filename, base_dir)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:
         raise HTTPException(status_code=404, detail='账号文件不存在')
+    if uid:
+        creditsvc.forget(uid)
     reload.request_restart(upstream=_reload_target(group))
     return {'success': True}
 

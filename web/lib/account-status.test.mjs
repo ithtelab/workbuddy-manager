@@ -32,7 +32,9 @@ import {
   degradedCount,
   interleave,
   mergePoolStatus,
+  modelLimitEnd,
   poolTotals,
+  rateLimitedModels,
   tagGroup,
 } from './account-status.ts';
 
@@ -316,6 +318,31 @@ check(
     'accounts.groupStopped',
   ],
 );
+
+// issue #409：上游 /status 的 reset_at 是真实重置时刻，until 只是被
+// soft_rate_max 截断的本地冷却。过滤与展示都必须认 reset_at。
+const iso = (ms) => new Date(ms).toISOString();
+const now = Date.now();
+check(
+  '本地 until 已过但上游 reset_at 未到 → 仍算模型受限',
+  rateLimitedModels({uid: 'u', rate_limited_models: [
+    {model: 'm', until: iso(now - 60_000), reset_at: iso(now + 3_600_000), reason: '6004'},
+  ]}).map((x) => x.model),
+  ['m'],
+);
+check(
+  '两个时间都过了 → 不再显示受限',
+  rateLimitedModels({uid: 'u', rate_limited_models: [
+    {model: 'm', until: iso(now - 60_000), reset_at: iso(now - 30_000), reason: '6004'},
+  ]}),
+  [],
+);
+check(
+  '恢复时刻取二者较晚者',
+  modelLimitEnd({until: iso(now + 1_000), reset_at: iso(now + 9_000)}),
+  now + 9_000,
+);
+check('没有可解析时间时返回 null', modelLimitEnd({}), null);
 
 console.log(failed ? `\n${failed} failed` : '\nall passed');
 process.exit(failed ? 1 : 0);

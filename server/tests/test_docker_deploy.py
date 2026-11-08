@@ -162,11 +162,31 @@ class RestartBehaviorTest(unittest.TestCase):
             def log(self, m, level='info'): self.lines.append((level, m))
 
         with mock.patch.object(mod.os, 'kill',
-                               side_effect=lambda pid, sig: killed.append((pid, sig))), \
-                mock.patch.object(mod.time, 'sleep'):
+                               side_effect=lambda pid, sig: killed.append((pid, sig))),                 mock.patch.object(mod, '_pid1_alive', return_value=False),                 mock.patch.object(mod.time, 'sleep'):
             mod._exit_for_restart(Rep())
         self.assertEqual(killed, [(1, _signal.SIGTERM)],
                          f'应向 PID 1 发 SIGTERM，实际：{killed}')
+
+    def test_exit_for_restart_waits_for_pid1(self) -> None:
+        """发完 SIGTERM 要确认 PID 1 真的退出，不能固定睡 2 秒就走（issue #398）。
+
+        旧实现的固定 sleep 在 uvicorn 卡住优雅关闭时会让容器既不退也不重启，
+        用户看到更新后 502；这里钉住「等」和「超时强杀」两个行为。
+        """
+        import signal as _signal
+        mod = _load_update_mod(WB_RUN_MODE='docker')
+        killed: list[tuple[int, int]] = []
+
+        class Rep:
+            def __init__(self): self.lines = []
+            def log(self, m, level='info'): self.lines.append((level, m))
+
+        with mock.patch.object(mod.os, 'kill',
+                               side_effect=lambda pid, sig: killed.append((pid, sig))),                 mock.patch.object(mod, '_pid1_alive', return_value=True),                 mock.patch.object(mod.time, 'time', side_effect=[0, 1, 999]),                 mock.patch.object(mod.time, 'sleep'):
+            mod._exit_for_restart(Rep())
+        kill_sig = getattr(_signal, 'SIGKILL', _signal.SIGTERM)  # Windows 没有 SIGKILL
+        self.assertEqual([s for _, s in killed], [_signal.SIGTERM, kill_sig],
+                         f'超时后应强杀，实际：{killed}')
 
 
 class UpstreamUpdateGuardTest(unittest.TestCase):

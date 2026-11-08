@@ -66,6 +66,16 @@ class CreditsSnapshotShapeTest(unittest.TestCase):
         self.assertEqual([r['uid'] for r in rows['accounts']], ['u4'])
 
 
+    def test_forget_removes_registration(self) -> None:
+        """删号路径调用 forget：登记与缓存一起清掉（issue #404）。"""
+        creditsvc._cache.clear()
+        creditsvc.record_balance('bye', '再见', 42)
+        creditsvc._cache['bye'] = (0, True, 42, '', [])
+        creditsvc.forget('bye')
+        self.assertNotIn('bye', creditsvc._load_snapshot())
+        self.assertNotIn('bye', creditsvc._cache)
+
+
 class CreditsSnapshotEndpointTest(unittest.TestCase):
     """端到端：读这个接口不能碰上游。"""
 
@@ -101,23 +111,22 @@ class CreditsSnapshotEndpointTest(unittest.TestCase):
                                                           'expiresAt': int(time.time()) + 3600}}),
             encoding='utf-8')
 
-    def test_known_flag_marks_deleted_accounts(self) -> None:
-        """账号删掉后快照仍留着它的历史记录：对账脚本要能一眼分辨
-        「还在的账号」和「只剩记录的 uid」，因此每行必须带 `known`。"""
+    def test_deleted_account_is_dropped_from_snapshot(self) -> None:
+        """已删账号不再出现在快照里（issue #404）：快照不是审计日志，
+        留着历史登记会让按 uid/按域汇总的余额虚高。"""
         config.AUTH_DIR = Path(self._tmp.name) / 'auths'
         creditsvc.record_balance('still-here', '还在', 100)
         creditsvc.record_balance('deleted', '已删', 200)
         self._write_account('still-here')
 
         body = self._client().get('/api/accounts/credits-snapshot').json()
-        by_uid = {row['uid']: row for row in body['accounts']}
-        self.assertTrue(by_uid['still-here']['known'], '在池账号被判成已删除')
-        self.assertFalse(by_uid['deleted']['known'], '已删账号没被标出来')
-        self.assertEqual(body['known_count'], 1)
+        self.assertEqual([row['uid'] for row in body['accounts']], ['still-here'])
+        self.assertEqual(body['count'], 1)
+        self.assertEqual(body['total_registered'], 2, '总量仍应能看出库里有两条登记')
 
-    def test_disabled_account_still_counts_as_known(self) -> None:
-        """「临时禁用」只是改名 `.disabled`，账号还在、随时能启用 ——
-        把它算成已删除会让对账脚本误删一条本该保留的记录。"""
+    def test_disabled_account_hidden_by_default(self) -> None:
+        """停用账号不再被调度，默认不该计入「还能花多少」；
+        `include_inactive=true` 仍能查到它，且标成 active=false。"""
         config.AUTH_DIR = Path(self._tmp.name) / 'auths'
         creditsvc.record_balance('off-line', '被禁用', 300)
         self._write_account('off-line')
@@ -125,11 +134,18 @@ class CreditsSnapshotEndpointTest(unittest.TestCase):
             config.AUTH_DIR / 'workbuddy-off-line.json.disabled')
 
         body = self._client().get('/api/accounts/credits-snapshot').json()
-        self.assertTrue(body['accounts'][0]['known'])
-        self.assertEqual(body['known_count'], 1)
+        self.assertEqual(body['accounts'], [])
+        self.assertEqual(body['active_count'], 0)
+
+        all_rows = self._client().get(
+            '/api/accounts/credits-snapshot?include_inactive=true').json()
+        self.assertEqual(len(all_rows['accounts']), 1)
+        self.assertTrue(all_rows['accounts'][0]['known'])
+        self.assertFalse(all_rows['accounts'][0]['active'])
 
     def test_endpoint_reads_without_asking_upstream(self) -> None:
         creditsvc.record_balance('u9', '九号', 777)
+        self._write_account('u9')
 
         async def boom(*a, **k):  # pragma: no cover - 调用即失败
             raise AssertionError('只读查询不该触发上游')
@@ -142,4 +158,5 @@ class CreditsSnapshotEndpointTest(unittest.TestCase):
         self.assertEqual(row['credits'], 777)
         self.assertIsInstance(body['snapshot_at'], int)
         self.assertIsInstance(row['registered_at'], int)
-        self.assertFalse(row['known'], '临时库里没有这个账号，应标为已不存在')
+        self.assertTrue(row['known'])
+        self.assertTrue(row['active'])

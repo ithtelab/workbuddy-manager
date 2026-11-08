@@ -33,7 +33,9 @@ export function AccountModelLimitsDialog({account, open, onOpenChange}: {
         </DialogHeader>
         <ul className="min-h-0 space-y-3 overflow-y-auto px-6 pb-2 text-xs">
           {limited.map((m) => {
-            const until = account?.rate_limited_models?.find((x) => x.model === m.model)?.until;
+            const row = account?.rate_limited_models?.find((x) => x.model === m.model);
+            // 展示上游真实重置时刻，而不是被 soft_rate_max 截断的本地 until（issue #409）。
+            const until = row?.reset_at || row?.until;
             const missing = m.reason.startsWith('11102');
             return (
               <li key={m.model} className="space-y-1 rounded-xl border p-3">

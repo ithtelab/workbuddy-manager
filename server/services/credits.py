@@ -148,6 +148,23 @@ async def get_credits(
     return ok, credits, message, False, None, expiries
 
 
+def forget(uid: str) -> None:
+    """账号删除后把它的余额登记一并清掉（issue #404）。
+
+    快照不是审计日志：它回答的是「这些账号现在还有多少积分」。账号都删了，
+    留着这条登记只会让按 uid/按域汇总的外部调用方算出虚高的余额。历史留痕
+    由 task_logs 负责，不靠这张设置表。
+    """
+    if not uid:
+        return
+    uid = str(uid)
+    snap = _load_snapshot()
+    if uid in snap:
+        snap.pop(uid, None)
+        _save_snapshot(snap)
+    _cache.pop(uid, None)
+
+
 def invalidate(uid: str | None = None) -> None:
     """清除缓存（uid 为空则全清）。签到等会改变余额的操作后调用。"""
     if uid:

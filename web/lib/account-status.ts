@@ -141,12 +141,26 @@ export function rateLimitedModels(a: Account): {model: string; reason: string}[]
   const now = Date.now();
   return rows
     .filter((m) => {
-      const until = m.until;
-      if (typeof until !== 'string' || !until) return false;
-      const at = Date.parse(until);
-      return Number.isFinite(at) && at > now;
+      // 上游 /status 同时给两个时间（issue #409）：
+      //   · until    —— 网关本地冷却截止，会被 soft_rate_max 截断；
+      //   · reset_at —— 上游真实额度重置（未截断，通常远晚于 until）。
+      // 模型要真正可用，必须**两个都过去**，所以判活跃取较晚者；只看到期时间
+      // 会在本地冷却一到期就把「模型受限」藏起来，而实际上游还要几小时。
+      const at = modelLimitEnd(m);
+      return at !== null && at > now;
     })
     .map((m) => ({model: m.model, reason: String(m.reason ?? '')}));
+}
+
+/** 该模型恢复可用的时刻（毫秒）：取 `until` 与 `reset_at` 的较晚者；都不可解析返回 null。 */
+export function modelLimitEnd(m: {until?: string; reset_at?: string}): number | null {
+  const parse = (v?: string) => {
+    if (typeof v !== 'string' || !v) return -Infinity;
+    const at = Date.parse(v);
+    return Number.isFinite(at) ? at : -Infinity;
+  };
+  const at = Math.max(parse(m.until), parse(m.reset_at));
+  return at === -Infinity ? null : at;
 }
 
 /**

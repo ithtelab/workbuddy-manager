@@ -375,3 +375,13 @@ class DockGroupsInvariantTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class DockDialogVisibilityTest(unittest.TestCase):
+    """issue #406：弹窗打开时底栏跟随动画仍在跑。"""
+
+    def test_dock_hidden_while_dialogs_open(self) -> None:
+        src = (_ROOT / 'web' / 'components' / 'common' / 'layout' / 'ManagementBar.tsx'
+               ).read_text(encoding='utf-8')
+        self.assertIn('profileOpen || addOpen', src,
+                      '个人信息/快速添加弹窗打开时没有隐藏底栏')
+        self.assertIn("{visibility: 'hidden'}", src)

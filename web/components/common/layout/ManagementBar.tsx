@@ -904,9 +904,15 @@ export function ManagementBar() {
         onPointerCancel={handleDockPointerEnd}
         onClickCapture={handleDockClickCapture}
         style={
-          dockPosition ?
-            {left: dockPosition.x, top: dockPosition.y, transform: 'translateX(-50%)'} :
-            {visibility: 'hidden'}
+          // 个人信息 / 快速添加弹窗打开时把底栏整个藏起来（issue #406）：遮罩是
+          // 半透明的，底栏会留在下面，而鼠标跟随的放大动画不会自己复位，看起来
+          // 像「弹窗开着底栏还在动」。快速添加原本就因焦点转移而停住，这里把两个
+          // 弹窗统一处理，避免两处行为不一致。
+          profileOpen || addOpen ?
+            {visibility: 'hidden'} :
+            dockPosition ?
+              {left: dockPosition.x, top: dockPosition.y, transform: 'translateX(-50%)'} :
+              {visibility: 'hidden'}
         }
       >
         {showDockTip && (

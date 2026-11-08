@@ -1852,6 +1852,11 @@ def restart_service(rep: Reporter) -> None:
     rep.log('服务已重启')
 
 
+# 等待 PID 1 退出的上限。uvicorn 的 --timeout-graceful-shutdown 设为 20 秒，
+# 比它再留一点余量；超时后强杀并提示手动重启。
+_GRACEFUL_EXIT_SECONDS = 30
+
+
 def _exit_for_restart(rep: Reporter) -> None:
     """容器形态下：结束**整个容器**使新代码生效。
 
@@ -1865,13 +1870,40 @@ def _exit_for_restart(rep: Reporter) -> None:
     """
     try:
         os.kill(1, signal.SIGTERM)
-        rep.log('已向主进程发送终止信号，容器即将在新代码下重启')
+        rep.log('已向主进程发送终止信号，等待容器用新代码重启')
     except Exception as exc:  # noqa: BLE001
         rep.log(f'发送终止信号失败（{exc}）—— 请手动重启容器：'
                 'docker compose restart workbuddy-manager', 'warn')
         return
-    # 给接收方一点时间优雅退出；随后本进程也退出（容器本该随之结束）
-    time.sleep(2)
+    # 必须**等 PID 1 真的退出**再结束本进程（issue #398）。旧实现固定 sleep 2 秒就
+    # 走人：uvicorn 没有优雅退出超时（Dockerfile 的 --timeout-graceful-shutdown）时
+    # 会一直等连接关闭，容器既不退出也不重启 —— 用户看到的就是更新后卡死 502。
+    deadline = time.time() + _GRACEFUL_EXIT_SECONDS
+    while time.time() < deadline:
+        if not _pid1_alive():
+            rep.log('主进程已退出，容器将按 restart 策略用新代码拉起')
+            return
+        time.sleep(0.5)
+    rep.log(f'主进程在 {_GRACEFUL_EXIT_SECONDS} 秒内未退出，发送 SIGKILL；'
+            '若容器仍未重启，请手动执行 docker compose restart workbuddy-manager', 'warn')
+    try:
+        # Windows 没有 SIGKILL（容器场景不会走到这里，但导入/测试要能跑）。
+        os.kill(1, getattr(signal, 'SIGKILL', signal.SIGTERM))
+    except Exception as exc:  # noqa: BLE001
+        rep.log(f'强制结束主进程失败（{exc}）', 'warn')
+
+
+def _pid1_alive() -> bool:
+    """容器主进程是否还活着；没有权限探测时按「活着」处理（宁可等/强杀，不误判）。"""
+    try:
+        os.kill(1, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def read_local_version() -> str:
