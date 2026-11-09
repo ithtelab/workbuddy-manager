@@ -90,14 +90,22 @@ def _package_keys(expiries: list[dict] | None) -> list[list[int]] | None:
     return sorted(out)
 
 
+def _package_balances(packages: list[list[int]]) -> dict[int, int]:
+    balances: dict[int, int] = {}
+    for at, amount in packages:
+        balances[at] = balances.get(at, 0) + amount
+    return balances
+
+
 def record_balance(uid: str, nickname: str, credits: int | float | None,
                    expiries: list[dict] | None = None) -> int | None:
     """记录一次余额；写一条积分获取流水并返回本次入账额度。
 
     收入判据（issue #393）优先用**积分包出现**而不是余额净增：签到发 100、同一天
     有 100 的旧包到期时，余额净增为 0，只按净增记账会把这次签到收入完全吞掉。
-    到期包列表（`expiries`）里新出现的 `[到期时刻, 额度]` 就是真实入账；余额净增
-    仍作为回退（老上游/到期列表拿不到时行为不变）。
+    `expiries.amount` 是套餐剩余额度，会随消费减少。按到期时间汇总后，只记
+    剩余额度的正向差额。新增到期桶仍能识别同日旧包到期抵消的签到收入。
+    到期列表不可用时回退余额净增。
 
     首次见到的账号只建立基线、不记流水，否则会把历史余额误报成「刚获得」。
     """
@@ -124,7 +132,13 @@ def record_balance(uid: str, nickname: str, credits: int | float | None,
                     except (TypeError, ValueError):
                         continue
     packages = _package_keys(expiries)
-    entry = {'credits': value, 'at': now}
+    # 正余额却没有到期数据，不代表已知的空包基线。
+    if packages == [] and value > 0:
+        packages = None
+    if prev_packages == [] and prev is not None and prev > 0:
+        prev_packages = None
+    previous_observation = prev_raw.get('observation_id', prev_raw.get('at', 0)) if isinstance(prev_raw, dict) else 0
+    entry = {'credits': value, 'at': now, 'observation_id': time.time_ns()}
     if packages is not None:
         entry['packages'] = packages
     snap[uid] = entry
@@ -133,24 +147,26 @@ def record_balance(uid: str, nickname: str, credits: int | float | None,
     if prev is None:
         return None
 
-    # 1) 新出现的积分包 = 真实收入（不受同日到期抵消影响）。
+    # 1) 同一到期桶的余额下降是消费。补充额度只计增加的部分。
     income = 0
     logs: list[dict] = []
     if packages is not None and prev_packages is not None:
-        before = {(a, n) for a, n in prev_packages}
-        for at, amount in packages:
-            if (at, amount) in before or amount <= 0:
+        before = _package_balances(prev_packages)
+        for at, amount in _package_balances(packages).items():
+            increase = amount - before.get(at, 0)
+            if increase <= 0 or increase > _MAX_DELTA:
                 continue
-            income += amount
+            income += increase
             logs.append({
                 'ts': now,
                 'uid': uid,
                 'kind': 'credit',
                 'level': 'credit',
-                'credits': amount,
-                'message': f'积分包 +{amount}（{datetime.datetime.fromtimestamp(at).strftime("%m-%d %H:%M")} 到期）'
+                'credits': increase,
+                'message': f'积分包 +{increase}（{datetime.datetime.fromtimestamp(at).strftime("%m-%d %H:%M")} 到期）'
                            + (f' · {nickname}' if nickname else ''),
-                'dedup_key': f'credit|{uid}|pkg|{at}|{amount}',
+                # 同一快照的并发观察去重，消费后再次补充相同额度可再次入账。
+                'dedup_key': f'credit|{uid}|pkg-delta|{previous_observation}|{at}|{amount}',
             })
     # 2) 到期列表拿不到/没有新包时，退回余额净增（存量行为）。
     if not logs:
