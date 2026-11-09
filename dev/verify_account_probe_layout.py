@@ -85,7 +85,7 @@ def main() -> None:
                 data = dict(username='ui-test', role='admin')
             elif path == '/api/accounts':
                 data = dict(total=len(ACCOUNTS), accounts=ACCOUNTS, manageable=True)
-            elif path == '/api/status':
+            elif path == '/api/upstream/status':
                 data = dict(connected=True, accounts=ACCOUNTS, total=43, healthy=41, cooling=2)
             elif path == '/api/upstreams':
                 data = dict(items=[])

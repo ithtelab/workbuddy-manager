@@ -179,7 +179,7 @@ WebUI 的后端需要向 `workbuddy2api`（`127.0.0.1:7863`）拉取运行时状
 | GET | `/api/auth/poll?state=` | 轮询扫码结果，成功即自动签到+落盘 |
 | DELETE | `/api/accounts/{filename}` | 删除指定账号 |
 | POST | `/api/accounts/{filename}/checkin` | 单账号手动签到 |
-| GET | `/api/status` | 代理透传 workbuddy2api 的 `/status`（可选） |
+| GET | `/api/upstream/status` | 代理透传 workbuddy2api 的 `/status`（可选） |
 
 ---
 

@@ -514,9 +514,15 @@ async def list_accounts(upstream_id: int | None = Query(None),
     }
 
 
-@router.get('/status')
+@router.get('/upstream/status')
 async def upstream_status(upstream_id: int | None = Query(None),
                           user: dict = Depends(security.current_user)) -> dict:
+    """上游运行状态。
+
+    路径从 `/api/status` 迁到这里：那个地址要让给客户端余额协议的公开元数据
+    端点（见 routers/balance），而它必须无鉴权可达。本接口要登录，改用与
+    `/upstream/logs` 同族的命名。
+    """
     group = _group(upstream_id)
     return await wb2api.get_status(base_url=group['base_url'],
                                    api_key=upstreamsvc.forward_api_key(group))

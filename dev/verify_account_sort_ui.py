@@ -42,7 +42,7 @@ try:
             if path == '/api/me': data = dict(username='fixture', role='admin')
             elif path == '/api/upstreams': data = dict(items=[dict(id=1,name='测试分组',auth_dir='/auths',enabled=True,is_default=True)])
             elif path == '/api/accounts': data = dict(total=len(accounts),accounts=accounts,manageable=True)
-            elif path == '/api/status': data = dict(connected=True,accounts=accounts,total=len(accounts),healthy=len(accounts),disabled=0)
+            elif path == '/api/upstream/status': data = dict(connected=True,accounts=accounts,total=len(accounts),healthy=len(accounts),disabled=0)
             elif path == '/api/accounts/refresh-credits': data = dict(total=len(accounts),succeeded=len(accounts),failed=[],credits={a['uid']:a['credits'] for a in accounts},meta={})
             elif path == '/api/account-risk': data = dict(items=[],failed_groups=[],total=0)
             elif path.endswith('/note'):

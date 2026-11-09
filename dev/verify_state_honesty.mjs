@@ -207,9 +207,9 @@ await page.route('**/api/**', async (route) => {
   // 设置页：主数据是配置（那张表单就是它的副本）；用户列表是另一个 Tab 的配件
   if (MODE.value === 8 && /\/api\/settings\/upstream/.test(url)) return fail();
   if (MODE.value === 9 && /\/api\/users/.test(url)) return fail();
-  // 账号页：主数据是账号池（`/api/accounts`）；上游状态是另一个 hook（`/api/status`）
+  // 账号页：主数据是账号池（`/api/accounts`）；上游状态是另一个 hook（`/api/upstream/status`）
   if (MODE.value === 10 && is('accounts')) return fail();
-  if (MODE.value === 11 && is('status')) return fail();
+  if (MODE.value === 11 && is('upstream/status')) return fail();
   if (MODE.value === 12 && is('model-catalog')) return fail();
   if (MODE.value === 13 && is('red-packets')) return fail();
   if (MODE.value === 14 && (is('accounts') || is('model-catalog') || is('red-packets'))) {

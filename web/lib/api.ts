@@ -450,7 +450,7 @@ export const accountApi = {
 export const upstreamApi = {
   /** 上游运行状态。upstreamId 非空时查**该分组**的实例（多账号池）。 */
   status: (upstreamId?: number | null) =>
-    get<UpstreamStatus>('/api/status',
+    get<UpstreamStatus>('/api/upstream/status',
                         upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 上游模型简表；realm 非空时只返回该版本的条目 */
   models: (realm?: Realm) => get<ModelListResponse>('/api/models', {realm}),

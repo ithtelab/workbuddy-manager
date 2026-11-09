@@ -130,7 +130,7 @@ step(slowDone.skeletons === 0 && !slowDone.noAccounts && slowDone.hasNumber,
 await intercept(async (route) => {
   const u = route.request().url();
   if (passAuth(route)) { await route.continue(); return; }
-  if (u.includes('/api/stats/daily') || u.includes('/api/status')) {
+  if (u.includes('/api/stats/daily') || u.includes('/api/upstream/status')) {
     await route.fulfill({status: 500, contentType: 'application/json',
                          body: JSON.stringify({detail: '注入的失败'})});
     return;
