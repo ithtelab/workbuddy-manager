@@ -1220,6 +1220,7 @@
     "planCardTitle": "Scheduled tasks",
     "planDays": "days",
     "planDesc": "Refresh every account's token every N days, regardless of remaining validity",
+    "keepaliveHint": "The upstream scheduler also refreshes tokens at its keep-alive hours (default 22:00 daily). To stop it, turn off “Auto keep-alive” or change the hours under Settings → Upstream → Scheduled tasks. Refreshing too often can trigger HTTP 429.",
     "planDisabled": "Not enabled",
     "planHour": "Run at",
     "planInterval": "Interval",

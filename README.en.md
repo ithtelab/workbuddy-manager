@@ -186,6 +186,9 @@ in [the usage guide](docs/usage.md).
 | `POST` | `/v1/messages/count_tokens` | gateway key | Rough input-token estimate (by character count) |
 | `GET` | `/v1/models` | gateway key | Model list |
 | `GET` | `/v1/usage` | gateway key | Self-check for one key: used / remaining quota, expiry, model scope (reads panel records; makes no call) |
+| `GET` | `/api/usage/token/` | gateway key | Balance protocol: remaining quota for the current key (new-api balance panels) |
+| `GET` | `/api/status` | none | Public balance metadata: declares the unit only, never the amount |
+| `GET` | `/api/upstream/status` | session | Upstream runtime status (moved from `/api/status`) |
 | `GET` | `/healthz` | none | Liveness probe (includes upstream connectivity) |
 | `GET` | `/api/me` | session | Current user |
 | `POST` | `/api/login` `/api/logout` | none | Sign in / out |
@@ -220,9 +223,13 @@ Threat model and hardening notes: [security notes](docs/security-notes.md) and t
 
 ## Known limitations
 
-- **No outbound IP pool**: only **inbound** IP control is implemented. Binding a dedicated
-  egress IP / proxy per Tencent account would require proxy-pool support in the upstream Go
-  service and is out of scope here.
+- **Per-account egress routes**: the panel can bind a named HTTP/HTTPS proxy per account.
+  Chat and upstream background tasks also require matching support in workbuddy2api;
+  configuration and compatibility are covered in [account proxy routes](docs/account-proxy-routes.md).
+- **Image generation is not supported**: the gateway only bridges chat / Responses / Messages
+  and does not expose `/v1/images/generations`. A model's `supports_images` flag means **image
+  input**, not image generation; the official app's canvas/image flow is a separate path with
+  no proxy equivalent.
 - Request and response **bodies are not stored** — only metadata (model, status, tokens,
   latency, source), to protect privacy.
 - Usage is aggregated per day × key × model; hourly granularity would require extending the

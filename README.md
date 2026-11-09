@@ -199,6 +199,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 | `POST` | `/v1/messages/count_tokens` | 网关密钥 | 按字符数粗估输入 token |
 | `GET` | `/v1/models` | 网关密钥 | 模型列表 |
 | `GET` | `/v1/usage` | 网关密钥 | 密钥自查：已用 / 剩余额度、有效期与模型范围（只读面板记录，不产生调用） |
+| `GET` | `/api/usage/token/` | 网关密钥 | 余额协议：当前密钥的剩余额度（供 new-api 客户端余额面板） |
+| `GET` | `/api/status` | 无 | 余额协议公开元数据：只声明数值单位，不含额度 |
+| `GET` | `/api/upstream/status` | 会话 | 上游运行状态（由原 `/api/status` 迁来；旧路径已让给余额协议） |
 | `GET` | `/healthz` | 无 | 存活探测（含上游连通性） |
 | `GET` | `/api/me` | 会话 | 当前登录用户 |
 | `POST` | `/api/login` `/api/logout` | 无 | 登录 / 登出 |
@@ -234,6 +237,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 ## 已知限制
 
 - **账号出口线路**：管理端支持按账号绑定命名 HTTP/HTTPS 代理。聊天和上游后台任务还需 workbuddy2api 配套支持，配置与兼容条件见 [账号出口线路](docs/account-proxy-routes.md)。
+- **不支持图片生成**：网关只桥接对话 / Responses / Messages 接口，不提供 `/v1/images/generations`；模型目录里的 `supports_images` 表示「可以看图」（图片输入），不是「可以生图」。官方 App 的画布 / 生图走独立链路，反代没有对应入口。
 - 请求的**请求体 / 响应体内容不做留存**，仅记录元数据（模型、状态、Token、延迟、来源），以保护隐私。
 - 用量统计按「天 × 密钥 × 模型」聚合；如需小时粒度可扩展 `usage_daily` 表。
 

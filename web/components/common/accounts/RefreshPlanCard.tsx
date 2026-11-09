@@ -172,6 +172,9 @@ function TokenPlanSection({onRan}: {onRan?: () => void}) {
           </div>
         </div>
       </div>
+      <div className="mt-1.5 text-[11px] leading-4 text-muted-foreground">
+        {t('tasks.keepaliveHint')}
+      </div>
 
       <div className="mt-2.5 flex flex-wrap items-end gap-3">
         <div className="space-y-1">
