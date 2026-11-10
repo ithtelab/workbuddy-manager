@@ -243,6 +243,29 @@ class PureTest(unittest.TestCase):
         # 空 UA 才记 unknown
         self.assertEqual(tap._client_family(''), 'unknown')
 
+    def test_client_family_agrees_with_the_logs_channel(self) -> None:
+        """轨迹页与日志页对同一批 UA 必须给出一致的结论。
+
+        这两处各有一份 UA 归类（日志页要 `codex / vscode / api…` 这套词表，
+        轨迹页要 `claude / dsh / cli…`），但**认不认得出同一个客户端**必须一致 ——
+        实测就是这样翻车的：日志页早已认识 `deepseek-harness`（记成 dsh），
+        轨迹页那张表没有它，同一批请求在日志页显示 dsh、在轨迹页显示「其它」。
+        这条守卫专门抓这种「两套词表各长一半」的分叉。
+        """
+        from server.routers import gateway
+
+        samples = [
+            'deepseek-harness/0.2.2-rc.1 (+https://github.com/deepseek-ai/deepseek-harness)',
+            'claude-cli/2.0.1 (external, cli)',
+            'codex_cli_rs/0.9.0',
+            'curl/8.4.0',
+        ]
+        for ua in samples:
+            tap_family = tap._client_family(ua)
+            logs_channel = gateway.client_channel(ua)
+            self.assertNotIn(tap_family, ('other', 'unknown'), f'轨迹页认不出：{ua}')
+            self.assertNotIn(logs_channel, ('other', 'unknown'), f'日志页认不出：{ua}')
+
     def test_client_family(self) -> None:
         self.assertEqual(tap._client_family('claude-code/1.0'), 'claude')
         self.assertEqual(tap._client_family('codex_cli_rs/0.9'), 'codex')
