@@ -41,6 +41,31 @@
 
 </details>
 
+<details>
+<summary><b>腾讯视角 / 长字符串浮窗 / 定位 / 自动刷新</b>（点击展开）</summary>
+
+<img src="images/traces-tencent.png" alt="腾讯视角" width="100%" />
+
+腾讯视角：上游 workbuddy2api **真正发往腾讯**的那一跳 —— 剥前缀、改模型名、提示词重写、会话头族与风控头都在这里发生（需上游开 `outbound_trace`）
+
+<img src="images/traces-string-hover.png" alt="长字符串悬停浮窗" width="100%" />
+
+长字符串悬停浮窗：system prompt、工具描述这类几千字的内容，悬停即看全文。Preview 按**真实换行**渲染，Raw 是转义原文
+
+<img src="images/traces-locate.png" alt="差异定位到 JSON 路径" width="100%" />
+
+差异「定位」：点一下直接跳到请求页，展开沿途节点并滚到差异所在的那一行（橙色高亮）
+
+<img src="images/traces-refresh-settings.png" alt="刷新间隔设置" width="100%" />
+
+齿轮里调自动刷新的间隔（默认 20 秒，存在浏览器本地）；关掉自动刷新后新轮次到达时只给一条提示，不抢当前正在看的那一轮
+
+<img src="images/traces-aux.png" alt="辅助调用挂回主会话" width="100%" />
+
+辅助调用（会话标题生成 / 上下文压缩）挂回主会话：列表里是「+1 辅助」，详情里能点进去看
+
+</details>
+
 ### 账号管理
 > Token 有效期按剩余时间分档着色（已过期 / 即将过期 / 偏紧 / 健康）
 
