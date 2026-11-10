@@ -20,7 +20,8 @@ from .routers import (
     accounts, accountrisk as accountrisk_router, anthropic, auth, balance, gateway, keys, logs, models,
     playground,
     pgsync as pgsync_router, redpackets, responses, security as security_router,
-    proxies, settings, stats, system, tokens, upstreams, watchdog as watchdog_router,
+    proxies, settings, stats, system, tap as tap_router, tokens, upstreams,
+    watchdog as watchdog_router,
 )
 from .services import (
     accountlog, accountrisk, autoupdate, cooling, dailyplan, modelrecovery, pgsync, renew, tasklog,
@@ -295,6 +296,9 @@ app.include_router(redpackets.router)
 # 抽奖：**公开端点**（收到链接的人不需要账号），单独挂便于区分边界
 app.include_router(redpackets.claim_router)
 app.include_router(logs.router)
+# 调用抓包（Trace Tap）：把每次调用的完整上下文留在面板里回放与对比，
+# 与请求日志是两套数据（见 services/tap.py 的模块注释）
+app.include_router(tap_router.router)
 app.include_router(stats.router)
 app.include_router(security_router.router)
 # 管理面作用域化 API Token（见 docs/api-tokens.md）；接口本身只接受会话鉴权
