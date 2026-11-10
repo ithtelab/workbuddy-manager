@@ -93,9 +93,13 @@ def scan(root: Path) -> int:
         except (UnicodeDecodeError, OSError):
             continue
         for i, line in enumerate(text.split('\n'), 1):
+            # 测试文件里的假密钥（占位符、请求追踪号）不该当成泄露 ——
+            # 但仍要报出来让人看一眼，所以降级成「需人工确认」。
+            in_test = '_test.' in f.name or f.name.endswith('.test.mjs') or '/tests/' in str(f)
             for pat, label in HARD_PATTERNS:
                 if _hit(pat, line):
-                    hard_hits.append((str(f.relative_to(root)), label, i))
+                    (soft_hits if in_test else hard_hits).append(
+                        (str(f.relative_to(root)), label + ('（测试文件）' if in_test else ''), i))
             for pat, label in SOFT_PATTERNS:
                 if _hit(pat, line):
                     soft_hits.append((str(f.relative_to(root)), label, i))
