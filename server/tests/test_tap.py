@@ -484,6 +484,143 @@ class DbTest(unittest.TestCase):
         fixed = tap.list_sessions()['items'][0]
         self.assertEqual(fixed['client'], 'dsh')
 
+    def test_title_call_is_aux_and_linked_to_its_session(self) -> None:
+        """会话标题生成是**辅助调用**，必须挂回主会话，而不是单列成第二条记录。
+
+        实测现场：dsh 每轮开始时发一次标题请求（system 是 "Create a concise title…"、
+        无工具、237 token），它的 system 与主循环完全不同 → 指纹不同 → 早先被记成
+        独立会话，看起来像「一次对话记了两条」。
+        """
+        tap.save_settings({'enabled': True})
+        main_turn = self._capture()  # 主会话首轮（首条 user = "fix the bug in foo.py"）
+        assert main_turn is not None
+        main_session = tap.turn_view(main_turn)['session_id']
+
+        title_body = {
+            'model': 'deepseek-v4.1-flash',
+            'messages': [
+                {'role': 'system',
+                 'content': 'Create a concise title for an AI coding-assistant session '
+                            'from the supplied human messages.'},
+                {'role': 'user',
+                 'content': 'Generate the session title from this JSON array of human '
+                            'messages: [{"seq":1,"text":"fix the bug in foo.py"}]'},
+            ],
+            'stream': True,
+        }
+        self.assertEqual(tap._aux_kind(title_body), 'title')
+        self._capture(body=title_body)
+
+        # 默认列表只显示主会话（辅助调用不单列）
+        self.assertEqual(tap.list_sessions()['total'], 1)
+        # 打开 include_aux 才看得到，并且它挂回了主会话
+        items = tap.list_sessions(include_aux=True)['items']
+        self.assertEqual(len(items), 2)
+        aux = next(s for s in items if s['kind'] != 'main')
+        self.assertEqual(aux['kind'], 'title')
+        self.assertEqual(aux['parent_id'], main_session, '辅助调用没有挂回主会话')
+
+        # 主会话要能看到「我名下挂了 1 次辅助调用」，详情里也能直接列出来
+        listed = next(s for s in items if s['kind'] == 'main')
+        self.assertEqual(listed['aux_count'], 1)
+        detail = tap.session(main_session)
+        assert detail is not None
+        self.assertEqual(len(detail['aux']), 1)
+        self.assertEqual(detail['aux'][0]['id'], aux['id'])
+        self.assertEqual(detail['aux'][0]['kind'], 'title')
+
+    def test_aux_link_survives_escaped_newlines(self) -> None:
+        """标题请求里的文本是 JSON 序列化过的（字面量 \\n），主会话存的是真换行。
+
+        不归一化就永远对不上：实测那条 `session-15fbe…` 的标题请求正是这种形态，
+        结果辅助调用挂不上父会话，在列表里看起来又像"两条记录"。
+        """
+        tap.save_settings({'enabled': True})
+        main_turn = self._capture()  # 首条 user = "fix the bug in foo.py"
+        assert main_turn is not None
+        main_session = tap.turn_view(main_turn)['session_id']
+
+        title_body = {
+            'messages': [
+                {'role': 'system',
+                 'content': 'Create a concise title for an AI coding-assistant session '
+                            'from the supplied human messages.'},
+                # 注意是字面量 \\n，不是真换行
+                {'role': 'user',
+                 'content': 'Generate the session title from this JSON array of human '
+                            'messages:\\n[{"seq":1,"text":"fix the bug\\nin foo.py"}]'},
+            ],
+        }
+        self._capture(body=title_body)
+        aux = next(s for s in tap.list_sessions(include_aux=True)['items']
+                   if s['kind'] != 'main')
+        self.assertEqual(aux['parent_id'], main_session)
+
+    def test_short_first_message_still_links(self) -> None:
+        """首条消息很短（15 字以内的中文）也必须能挂上 —— 早期下限卡在 16 字时漏了。"""
+        tap.save_settings({'enabled': True})
+        short = '验证辅助调用归属：这条是主会话'
+        main_turn = self._capture(body=_body(messages=[
+            BODY['messages'][0], {'role': 'user', 'content': short}]))
+        assert main_turn is not None
+        main_session = tap.turn_view(main_turn)['session_id']
+        self._capture(body={'messages': [
+            {'role': 'system',
+             'content': 'Create a concise title for an AI coding-assistant session.'},
+            {'role': 'user',
+             'content': f'Generate the session title from this JSON array: [{{"text":"{short}"}}]'},
+        ]})
+        aux = next(s for s in tap.list_sessions(include_aux=True)['items']
+                   if s['kind'] != 'main')
+        self.assertEqual(aux['parent_id'], main_session)
+
+    def test_aux_link_matches_truncated_human_message(self) -> None:
+        """标题请求里的人类消息可能被客户端**截断**（只保留首句）。
+
+        只比「整条前缀」会落空：主会话的首条 user 是长段落，标题请求里只带了开头
+        一句话。所以归属要由长到短试若干前缀（下限见 `_link_parent`，短消息也覆盖）。
+        """
+        tap.save_settings({'enabled': True})
+        long_text = ('http://127.0.0.1:7864/settings/backup/ 帮我看下如何备份和还原 '
+                     'workbuddy-manager 的数据，以及账号数据是否已经持久化在容器外。'
+                     '如果持久化了，重建容器能不能恢复已经添加的账户。')
+        main_body = _body(messages=[BODY['messages'][0],
+                                    {'role': 'user', 'content': long_text}])
+        main_turn = self._capture(body=main_body)
+        assert main_turn is not None
+        main_session = tap.turn_view(main_turn)['session_id']
+
+        truncated = long_text[:40]  # 客户端只带了开头一句
+        title_body = {
+            'messages': [
+                {'role': 'system',
+                 'content': 'Create a concise title for an AI coding-assistant session '
+                            'from the supplied human messages.'},
+                {'role': 'user',
+                 'content': 'Generate the session title from this JSON array of human '
+                            'messages: [{"seq":1,"text":"' + truncated + '"}]'},
+            ],
+        }
+        self._capture(body=title_body)
+        aux = next(s for s in tap.list_sessions(include_aux=True)['items']
+                   if s['kind'] != 'main')
+        self.assertEqual(aux['parent_id'], main_session, '截断的人类消息也要能挂回主会话')
+
+    def test_compaction_is_aux_but_normal_summary_is_not(self) -> None:
+        # 压缩（compaction）同样是客户端在会话中途发的独立请求；而「帮我总结这篇
+        # 文章」是正常对话，不能因为出现 summar* 就被当成辅助调用。
+        compact = {'messages': [
+            {'role': 'system',
+             'content': 'You are performing a compaction of the conversation so far.'},
+            {'role': 'user', 'content': 'Summarize the conversation so far.'},
+        ]}
+        self.assertEqual(tap._aux_kind(compact), 'compact')
+        normal = {'messages': [
+            {'role': 'system', 'content': 'You are a helpful assistant.'},
+            {'role': 'user', 'content': '帮我总结这篇关于猫的文章'},
+        ]}
+        self.assertEqual(tap._aux_kind(normal), 'main')
+
     def test_prune_respects_max_sessions(self) -> None:
         tap.save_settings({'enabled': True, 'max_sessions': 10})
         for i in range(14):

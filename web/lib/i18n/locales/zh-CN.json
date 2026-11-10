@@ -2047,6 +2047,18 @@
     "headers": "请求头（客户端）",
     "upstreamHeaders": "请求头（网关发往上游）",
     "headersHint": "密钥类字段已打码（保留前 6 位，足以认出是哪一把）",
-    "noHeaders": "未采集到请求头（该记录写入时还没有这一项）"
+    "noHeaders": "未采集到请求头（该记录写入时还没有这一项）",
+    "auxBadge": "辅助",
+    "showAux": "显示辅助调用",
+    "auxOf": "这是辅助调用（会话标题生成），属于会话 #{id}",
+    "auxUnlinked": "这是辅助调用（会话标题生成），未能对上是哪条会话",
+    "auxJump": "跳到该会话",
+    "noTurnsTitle": "这条会话没有明细",
+    "noTurnsDesc": "只剩会话汇总，逐轮的请求与响应已不在库里（通常是数据库损坏后只恢复了汇总）。可以删掉这条记录，或直接发一次请求产生新记录。",
+    "turnLoadFailed": "这一轮取不到了（可能已被清理）。",
+    "hasAux": "+{n} 辅助",
+    "auxInline": "含 {n} 次辅助调用：",
+    "kindTitle": "标题",
+    "kindCompact": "压缩"
   }
 }

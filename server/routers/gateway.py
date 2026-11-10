@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 import logging
 import threading
 import time
+import uuid
 
 import httpx
 from fastapi import APIRouter, Request
@@ -1352,6 +1353,10 @@ async def _chat(request: Request, upstream_path: str):
     # 转发头只构造一次：既给 httpx，也给抓包（「网关发了什么请求头」是双视角的
     # 一半，另一处再造一份就可能与真正发出去的不一致）。
     up_headers = _upstream_headers(upstream)
+    # 关联键：上游开启出站转储后，会把「它发往腾讯」的请求 / 响应按这个头落两行，
+    # 管理端的「腾讯视角」据此精确对回这一轮（不靠时间窗猜）。
+    trace_id = uuid.uuid4().hex[:16]
+    up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:
@@ -1386,6 +1391,7 @@ async def _chat(request: Request, upstream_path: str):
                 path=upstream_path, protocol='chat', status=rec_status,
                 latency_ms=latency, stream=False, payload=data, usage=usage,
                 error=error, upstream_body=body, upstream_headers=up_headers,
+                trace_id=trace_id,
             )
             if missing is not None:
                 return JSONResponse(missing, status_code=404)
@@ -1405,7 +1411,7 @@ async def _chat(request: Request, upstream_path: str):
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,
                 path=upstream_path, protocol='chat', status=502, latency_ms=latency,
                 stream=False, error=str(exc), upstream_body=body,
-                upstream_headers=up_headers,
+                upstream_headers=up_headers, trace_id=trace_id,
             )
             return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
@@ -1496,7 +1502,7 @@ async def _chat(request: Request, upstream_path: str):
                 path=upstream_path, protocol='chat', status=status_code,
                 latency_ms=latency, first_token_ms=first_token_ms, stream=True,
                 text=raw_stream.text(), usage=usage, error=error_text,
-                upstream_body=body, upstream_headers=up_headers,
+                upstream_body=body, upstream_headers=up_headers, trace_id=trace_id,
             )
 
     return StreamingResponse(generator(), status_code=status_code, media_type=content_type)

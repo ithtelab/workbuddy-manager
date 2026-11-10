@@ -34,8 +34,10 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Iterable
 
 from .. import config, db
@@ -602,10 +604,100 @@ def client_reconstruct(client_text: str | None, protocol: str) -> dict | None:
     return out
 
 
+# 辅助调用的 system 特征。目前只收「会话标题生成」——它是 dsh / Codex 这类客户端
+# 在每轮开始时都会发的独立请求，system prompt 与主循环完全不同。
+#
+# 为什么值得单独认：它有自己的 system，指纹必然与主会话不同，于是**一次对话在
+# 列表里显示成两条**（一条 1 轮的"标题"、一条 N 轮的主会话）。用户看到的就是
+# 「为什么有两条记录」——实测反馈。
+_AUX_PATTERNS = (
+    ('title', (re.compile(r'create a concise title', re.I),
+               re.compile(r'generate the session title', re.I),
+               re.compile(r'\bsession title\b', re.I))),
+    # 上下文压缩（compaction）：同样是客户端在会话中途发的**独立请求**，
+    # system 换成压缩专用提示词、通常不带工具。判据刻意收紧到
+    # 「compaction / 对这段对话做摘要」这类明确措辞：泛化的 summar* 会把
+    # 「帮我总结这篇文章」这种正常请求也吞进来，那是误伤。
+    ('compact', (re.compile(r'\bcompaction\b', re.I),
+                 re.compile(r'compact (the|this) conversation', re.I),
+                 re.compile(r'summar(?:y|ize) (of )?(the )?conversation so far', re.I),
+                 re.compile(r'conversation summary', re.I))),
+)
+
+
+def _aux_kind(body: object) -> str:
+    """这条请求是不是辅助调用（标题生成等）。返回 kind，普通请求返回 'main'。
+
+    判据用「system 特征 + 没有工具」双保险：只匹配文案，客户端换个说法就漏；
+    只看"没工具"，普通的纯聊天请求也会被误判成辅助调用。
+    """
+    system = _system_text(body)
+    if not system:
+        return 'main'
+    if _tool_names(body):
+        return 'main'
+    for kind, patterns in _AUX_PATTERNS:
+        if any(p.search(system) for p in patterns):
+            return kind
+    return 'main'
+
+
+def _norm_text(text: str) -> str:
+    """把两段文本归一成「可以直接比」的形态。
+
+    现场细节（不改就会对不上）：客户端的标题请求是把人类消息**序列化进 JSON
+    字符串**的，所以我方看到的是字面量 `\\n\\n`；而主会话的首条消息在入库时
+    （`_clean`）已经把换行压成了空格。同一段话在两边长得完全不同，直接 `in`
+    必然失败 —— 归一化要同时处理「字面量转义」与「空白折叠」。
+    """
+    flat = (text or '').replace('\\n', ' ').replace('\\r', ' ').replace('\\t', ' ')
+    return re.sub(r'\s+', ' ', flat).strip()
+
+
+def _link_parent(first_user: str, protocol: str, key_id: int | None,
+                 now: int, exclude_id: int) -> int | None:
+    """把辅助调用挂回它所属的主会话。
+
+    判据是**内容包含**，不是时间窗：标题请求会把人类消息原文塞进自己的 user
+    内容里（实测 `Generate the session title from this JSON array … [{"seq":13,
+    "text":"…"}]`），所以主会话的「首条 user 消息」必然是这段文本的子串。
+    时间窗（10 分钟）只是把扫描范围收窄，不作为判据本身 —— 并发跑多个会话时
+    时间窗会同时命中多条，包含匹配不会。
+    """
+    if not first_user:
+        return None
+    rows = db.query(
+        'SELECT id, first_user FROM tap_sessions '
+        "WHERE COALESCE(kind, 'main') = 'main' AND id != ? AND protocol = ? "
+        'AND COALESCE(key_id, 0) = COALESCE(?, 0) AND updated_at >= ? '
+        'ORDER BY updated_at DESC LIMIT 50',
+        (exclude_id, protocol, key_id, now - 600),
+    )
+    needle = _norm_text(first_user)
+    if len(needle) < 8:
+        return None
+    for row in rows:
+        candidate = _norm_text(row['first_user'] or '')
+        if not candidate:
+            continue
+        # 由长到短试几种前缀：客户端可能把人类消息**截断**后再塞进标题请求
+        # （实测遇到过只保留首句的情况），所以只比整条必然对不上。短到 16 个字
+        # 仍然足够具体（中文 16 字基本不会撞车），再短就不可靠了。
+        # 下限放到 6 个字：真实的首条消息经常很短（「继续」「hi」「看下这个」），
+        # 卡在 16 字会让这些会话永远挂不上辅助调用（实测：15 字的中文标题就漏了）。
+        # 6 字以上 + 同密钥 + 同协议 + 10 分钟窗，误挂的概率已经很低。
+        for size in (120, 60, 30, 16, 8, 6):
+            sig = candidate[:size]
+            if len(sig) >= 6 and sig in needle:
+                return int(row['id'])
+    return None
+
+
 # ── 写入 ─────────────────────────────────────────────────
 def _session_id(fingerprint: str, key_id: int | None, client: str,
                 protocol: str, model: str | None, now: int,
-                ua: str | None = None) -> int:
+                ua: str | None = None, first_user: str = '',
+                kind: str = 'main') -> int:
     row = db.query_one(
         'SELECT id FROM tap_sessions WHERE fingerprint = ? '
         'AND COALESCE(key_id, 0) = COALESCE(?, 0) AND protocol = ? '
@@ -616,17 +708,24 @@ def _session_id(fingerprint: str, key_id: int | None, client: str,
         # 首轮没有 UA（或旧记录还没有这一列）时，用后续轮补齐 —— UA 是事实，
         # client 只是从它派生的分类，能补就补。
         db.execute(
-            'UPDATE tap_sessions SET client_ua = COALESCE(client_ua, ?) WHERE id = ?',
-            (_clean(ua, 200), row['id']),
+            'UPDATE tap_sessions SET client_ua = COALESCE(client_ua, ?), '
+            'first_user = COALESCE(first_user, ?) WHERE id = ?',
+            (_clean(ua, 200), _clean(first_user, 4000), row['id']),
         )
         return int(row['id'])
-    return db.execute(
+    session_id = db.execute(
         'INSERT INTO tap_sessions(fingerprint, key_id, client, client_ua, protocol, '
-        'model, started_at, updated_at, turns, prompt_tokens, completion_tokens) '
-        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0)',
+        'model, started_at, updated_at, turns, prompt_tokens, completion_tokens, '
+        'first_user, kind) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)',
         (fingerprint, key_id, client, _clean(ua, 200), protocol,
-         _clean(model, 128), now, now),
+         _clean(model, 128), now, now, _clean(first_user, 4000), kind),
     )
+    if kind != 'main':
+        parent = _link_parent(first_user, protocol, key_id, now, session_id)
+        if parent:
+            db.execute('UPDATE tap_sessions SET parent_id = ? WHERE id = ?',
+                       (parent, session_id))
+    return session_id
 
 
 def _clean(value: object, limit: int) -> str | None:
@@ -651,6 +750,7 @@ def capture(*, body: object, headers: Iterable[tuple[str, str]] | None,
             usage: dict | None = None, error: str | None = None,
             upstream_body: object | None = None,
             upstream_headers: object | None = None,
+            trace_id: str | None = None,
             client_response: object | None = None) -> int | None:
     """记录一轮调用。返回 turn id，未抓包时返回 None。
 
@@ -679,8 +779,10 @@ def capture(*, body: object, headers: Iterable[tuple[str, str]] | None,
         model = None
         if isinstance(body, dict) and isinstance(body.get('model'), str):
             model = body['model']
+        kind = _aux_kind(view_body)
         session_id = _session_id(fingerprint, key['id'] if key else None,
-                                 client, protocol, model, now, ua)
+                                 client, protocol, model, now, ua,
+                                 _first_user_text(view_body), kind)
         row = db.query_one('SELECT turns FROM tap_sessions WHERE id = ?', (session_id,))
         seq = int(row['turns']) + 1 if row else 1
 
@@ -741,13 +843,14 @@ def capture(*, body: object, headers: Iterable[tuple[str, str]] | None,
             'mapped_model, status, stream, latency_ms, first_token_ms, '
             'prompt_tokens, completion_tokens, cache_hit_tokens, cache_miss_tokens, '
             'cost, request_json, response_text, client_response_text, recon_json, '
-            'usage_json, error, truncated) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'usage_json, error, truncated, trace_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (session_id, seq, now, _clean(path, 128), protocol, _clean(model, 128),
              _clean(model, 128), status, 1 if stream else 0, latency_ms,
              first_token_ms, pt, ct, _as_int(hit), _as_int(miss), cost,
              request_text, response_text, client_text or None, recon_text,
              json.dumps(usage_obj, ensure_ascii=False, default=str)[:8192],
-             _clean(error, 500), 1 if (cut_request or cut_response or cut_recon) else 0),
+             _clean(error, 500), 1 if (cut_request or cut_response or cut_recon) else 0,
+             _clean(trace_id, 64)),
         )
         db.execute(
             'UPDATE tap_sessions SET updated_at = ?, turns = ?, '
@@ -791,6 +894,65 @@ def prune() -> dict[str, int]:
 
 
 # ── 查询 ─────────────────────────────────────────────────
+def backfill_aux() -> int:
+    """按已入库的请求体重新判定会话类型并补上归属（旧数据一次性修正）。
+
+    两遍：先把每条会话的 `first_user` 补齐（这一列是后加的，存量记录为空），
+    再判定类型并做包含匹配 —— 否则归属查询永远拿 NULL 去比，必然对不上。
+    """
+    changed = 0
+    rows = db.query('SELECT id, kind, parent_id, protocol, key_id, first_user '
+                    'FROM tap_sessions')
+    filled: dict[int, str] = {}
+    for row in rows:
+        first_user = row['first_user'] or ''
+        if not first_user:
+            turn_row = db.query_one(
+                'SELECT request_json FROM tap_turns WHERE session_id = ? '
+                'ORDER BY seq ASC LIMIT 1', (row['id'],))
+            if turn_row:
+                doc, ok = _loads(turn_row['request_json'])
+                if ok and isinstance(doc, dict):
+                    first_user = _first_user_text(doc.get('upstream_body') or doc.get('body'))
+                    if first_user:
+                        db.execute('UPDATE tap_sessions SET first_user = ? WHERE id = ?',
+                                   (_clean(first_user, 4000), row['id']))
+        filled[int(row['id'])] = first_user
+
+    # 第二遍：判定类型 + 归属。先把所有主会话定下来（它们可能是辅助调用的父），
+    # 再处理辅助调用。
+    pending: list[tuple[int, str, str, str | None, int | None, int]] = []
+    for row in rows:
+        stored = row['kind'] or 'main'
+        # 已经是辅助调用、但还没挂上父的（上一版回填留下的），也要补一次归属；
+        # 挂上了的就不重复算。
+        if stored != 'main' and row['parent_id'] is not None:
+            continue
+        turn_row = db.query_one(
+            'SELECT request_json, ts FROM tap_turns WHERE session_id = ? '
+            'ORDER BY seq ASC LIMIT 1', (row['id'],))
+        if not turn_row:
+            continue
+        doc, ok = _loads(turn_row['request_json'])
+        if not ok or not isinstance(doc, dict):
+            continue
+        body = doc.get('upstream_body') or doc.get('body')
+        kind = stored if stored != 'main' else _aux_kind(body)
+        if kind == 'main':
+            continue
+        pending.append((int(row['id']), kind, str(filled.get(int(row['id'])) or ''),
+                        row['protocol'], row['key_id'], int(turn_row['ts'])))
+    for session_id, kind, first_user, protocol, key_id, ts in pending:
+        # key_id 必须一起传：归属查询按「同一把密钥」过滤，传 None 会退化成
+        # 「key_id 为 0 的那些会话」，一条都对不上。
+        parent = _link_parent(first_user, str(protocol or 'chat'), key_id, ts + 1,
+                              session_id)
+        db.execute('UPDATE tap_sessions SET kind = ?, parent_id = ? WHERE id = ?',
+                   (kind, parent, session_id))
+        changed += 1
+    return changed
+
+
 def backfill_clients() -> int:
     """按入库的 UA 重新归类旧会话。返回改动条数。
 
@@ -847,9 +1009,14 @@ def stats() -> dict:
 
 
 def list_sessions(page: int = 1, size: int = 20, days: int | None = None,
-                  client: str | None = None, q: str | None = None) -> dict:
+                  client: str | None = None, q: str | None = None,
+                  include_aux: bool = False) -> dict:
     where: list[str] = []
     args: list[Any] = []
+    # 辅助调用（会话标题生成等）默认不单列：它们属于某条主会话，混在列表里
+    # 会让人以为「一次对话被记了两条」（实测反馈）。要看就显式打开。
+    if not include_aux:
+        where.append("COALESCE(s.kind, 'main') = 'main'")
     if days:
         where.append('updated_at >= ?')
         args.append(int(time.time()) - max(1, min(int(days), 90)) * 86400)
@@ -859,13 +1026,19 @@ def list_sessions(page: int = 1, size: int = 20, days: int | None = None,
     if q:
         where.append('(model LIKE ? OR fingerprint LIKE ?)')
         args.extend([f'%{q}%', f'%{q}%'])
-    clause = ('WHERE ' + ' AND '.join(where)) if where else ''
-    total = int(db.query_one(
-        f'SELECT COUNT(*) AS c FROM tap_sessions {clause}', args)['c'] or 0)
     page = max(1, min(int(page), 100_000))
     size = max(1, min(int(size), 200))
+    clause = ('WHERE ' + ' AND '.join(where)) if where else ''
+    total = int(db.query_one(
+        f'SELECT COUNT(*) AS c FROM tap_sessions s {clause}', args)['c'] or 0)
+    # `turns` 一律从 tap_turns **实算**，不用会话表里的汇总列。
+    # 教训（2026-11-08）：库损坏后恢复出的汇总列还在、明细行全丢，列表于是显示
+    # 「33 轮」而每一轮都点不开 —— 界面上看起来像功能坏了，其实是数字在撒谎。
     rows = db.query(
-        f'SELECT s.*, k.name AS key_name FROM tap_sessions s '
+        f'SELECT s.*, k.name AS key_name, '
+        f'(SELECT COUNT(*) FROM tap_turns t WHERE t.session_id = s.id) AS actual_turns, '
+        f'(SELECT COUNT(*) FROM tap_sessions a WHERE a.parent_id = s.id) AS aux_count '
+        f'FROM tap_sessions s '
         f'LEFT JOIN api_keys k ON k.id = s.key_id {clause} '
         f'ORDER BY s.updated_at DESC LIMIT ? OFFSET ?',
         (*args, size, (page - 1) * size),
@@ -880,11 +1053,16 @@ def list_sessions(page: int = 1, size: int = 20, days: int | None = None,
                 'key_name': r['key_name'],
                 'client': r['client'],
                 'client_ua': r['client_ua'],
+                'kind': r['kind'],
+                'parent_id': r['parent_id'],
                 'protocol': r['protocol'],
                 'model': r['model'],
                 'started_at': r['started_at'],
                 'updated_at': r['updated_at'],
-                'turns': r['turns'],
+                'turns': r['actual_turns'],
+                # 挂在这条会话底下的辅助调用（标题 / 压缩）次数。辅助调用默认
+                # 不单列，但完全看不见也不行 —— 用户会以为「标题没被记下来」。
+                'aux_count': r['aux_count'] or 0,
                 'prompt_tokens': r['prompt_tokens'],
                 'completion_tokens': r['completion_tokens'],
             }
@@ -914,11 +1092,22 @@ def session(session_id: int) -> dict | None:
         'key_name': row['key_name'],
         'client': row['client'],
         'client_ua': row['client_ua'],
+        'kind': row['kind'],
+        'parent_id': row['parent_id'],
         'protocol': row['protocol'],
         'model': row['model'],
         'started_at': row['started_at'],
         'updated_at': row['updated_at'],
-        'turns': row['turns'],
+        'turns': len(turns),
+        # 名下挂着的辅助调用：界面上可以直接跳过去，不必先去列表打开「显示辅助调用」。
+        'aux': [
+            {'id': c['id'], 'kind': c['kind'], 'ts': c['ts'], 'model': c['model']}
+            for c in db.query(
+                # 会话表没有 `ts` 列（只有 started_at / updated_at）：辅助调用
+                # 按创建时刻排序，用 started_at 即可。
+                'SELECT id, kind, started_at AS ts, model FROM tap_sessions '
+                'WHERE parent_id = ? ORDER BY started_at ASC LIMIT 50', (session_id,))
+        ],
         'prompt_tokens': row['prompt_tokens'],
         'completion_tokens': row['completion_tokens'],
         'items': [
@@ -1010,6 +1199,7 @@ def turn(turn_id: int) -> dict | None:
         'response_raw': row['response_text'] if (not response_ok or row['stream']) else None,
         'recon': recon or {'text': '', 'reasoning': '', 'tool_calls': []},
         'usage': usage or {},
+        'trace_id': row['trace_id'] if 'trace_id' in row.keys() else None,
         # ── 两端视角 ──────────────────────────────────────────
         # `upstream_*` 是网关与上游之间那一跳，`client_*` 是客户端手里那份。
         # 对 Chat 两者相同（透传），对 Anthropic / Responses 是两份不同报文。
@@ -1056,6 +1246,80 @@ def turn_view(turn_id: int) -> dict | None:
         body = data['request'].get('upstream_body') or data['request'].get('body')
     data['summary'] = _summary(body)
     return data
+
+
+# ── 上游出站转储（腾讯视角）─────────────────────────────
+# workbuddy2api 开启 outbound_trace 后，会把「它真正发往腾讯」的请求 / 响应写成
+# JSONL。该文件就落在面板已挂载的上游目录里，所以直接读，不新增接口、不复制数据。
+def _outbound_path() -> Path:
+    return Path(os.environ.get('WB_TAP_OUTBOUND_FILE',
+                               '/opt/workbuddy2api/data/outbound-trace.jsonl'))
+
+
+def outbound(trace_id: str | None, *, max_scan: int = 16 * 1024 * 1024) -> dict:
+    """按 trace_id 取上游出站记录（腾讯视角）。
+
+    **从文件尾部倒着扫**而不是整份读入：这个文件随调用线性增长，而查的永远是
+    最近那一轮。窗口给 16 MB：实测**单行**可达 260 KB（64 KB 请求 + SSE 响应全文
+    各一行），一个 42 轮的长会话几小时内就能写出几十 MB（minimax 那次 64 MB，
+    要查的轮落在 53 MB 处）—— 4 MB / 8 MB 都会「翻完就查不到」。16 MB 覆盖
+    「最近一小时左右的调用」；再往前属于历史，如实提示「已滑出窗口」。仍不
+    整份读入 ——「一次查看拖垮内存」这条路不能开。
+    """
+    path = _outbound_path()
+    if not trace_id:
+        return {'available': False, 'reason': 'no-trace', 'entries': [], 'path': str(path)}
+    if not path.is_file():
+        return {'available': False, 'reason': 'no-file', 'entries': [], 'path': str(path)}
+
+    wanted = trace_id.strip()
+    marker = f'"{wanted}"'.encode()
+    found: list[dict] = []
+    try:
+        with path.open('rb') as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            read = 0
+            carry = b''
+            while read < min(size, max_scan):
+                step = min(65536, size - read)
+                if step <= 0:
+                    break
+                read += step
+                fh.seek(size - read)
+                chunk = fh.read(step) + carry
+                lines = chunk.split(b'\n')
+                # 第一行可能被截断（除非已经读到文件开头），留给下一轮拼接。
+                carry = b'' if read >= size else lines[0]
+                for raw in reversed(lines[1:] if read < size else lines):
+                    if wanted.encode() not in raw or marker not in raw:
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if entry.get('trace_id') != wanted:
+                        continue
+                    found.append(entry)
+                # 上游每个路径尝试各写一对（换路径重试是常态）：取**最后一对**——
+                # 它是真正成功（或最终失败）的那次。第一对是失败尝试，正文可能
+                # 只有几十字节，用户会以为「响应怎么这么短」。
+                if len(found) >= 2:
+                    break
+    except OSError as exc:
+        return {'available': False, 'reason': f'io: {exc}', 'entries': [], 'path': str(path)}
+
+    found.sort(key=lambda e: (e.get('kind') != 'request', e.get('ts', 0)))
+    # 多对时只留**最新**的一对（换路径重试会写多对；按 ts 各取最大）。
+    latest: dict[str, dict] = {}
+    for entry in found:
+        kind = entry.get('kind')
+        if kind not in ('request', 'response'):
+            continue
+        if kind not in latest or entry.get('ts', 0) >= latest[kind].get('ts', 0):
+            latest[kind] = entry
+    entries = [latest[k] for k in ('request', 'response') if k in latest]
+    return {'available': True, 'reason': '', 'entries': entries, 'path': str(path)}
 
 
 def delete_session(session_id: int) -> bool:

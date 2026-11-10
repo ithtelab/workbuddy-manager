@@ -52,7 +52,8 @@ def post_backfill(user: dict = Depends(security.require_session_admin)) -> dict:
     是谁做的。UA 原文一直在 `tap_turns` 里，重算不需要重新抓包。
     """
     changed = tap.backfill_clients()
-    return {'changed': changed, 'stats': tap.stats()}
+    aux = tap.backfill_aux()
+    return {'changed': changed, 'aux': aux, 'stats': tap.stats()}
 
 
 @router.post('/prune')
@@ -65,8 +66,10 @@ def post_prune(user: dict = Depends(security.require_session_admin)) -> dict:
 @router.get('/sessions')
 def list_sessions(page: int = 1, size: int = 20, days: int | None = None,
                   client: str | None = None, q: str | None = None,
+                  include_aux: bool = False,
                   user: dict = Depends(security.require_admin)) -> dict:
-    return tap.list_sessions(page=page, size=size, days=days, client=client, q=q)
+    return tap.list_sessions(page=page, size=size, days=days, client=client, q=q,
+                             include_aux=include_aux)
 
 
 @router.get('/sessions/{session_id}')
@@ -94,6 +97,23 @@ def get_turn(turn_id: int, user: dict = Depends(security.require_admin)) -> dict
     if not data:
         raise HTTPException(status_code=404, detail='该轮记录不存在（可能已按保留策略清理）')
     return data
+
+
+@router.get('/turns/{turn_id}/outbound')
+def get_outbound(turn_id: int,
+                 user: dict = Depends(security.require_admin)) -> dict:
+    """腾讯视角：上游（workbuddy2api）真正发往腾讯的那一跳。
+
+    数据来自**上游进程自己写的** JSONL（`outbound_trace`，默认关闭），本接口只按
+    trace id 去文件里取那两行。因此三种「看不到」要分开讲清楚，别让用户对着空白
+    猜：上游没开转储 / 文件还没生成 / 这一轮没有 id（功能上线前的老记录）。
+    """
+    data = tap.turn(turn_id)
+    if not data:
+        raise HTTPException(status_code=404, detail='该轮记录不存在（可能已按保留策略清理）')
+    result = tap.outbound(data.get('trace_id'))
+    result['trace_id'] = data.get('trace_id')
+    return result
 
 
 @router.get('/diff')

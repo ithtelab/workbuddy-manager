@@ -1035,6 +1035,9 @@ async def messages(request: Request):
     url = f'{upstream["base_url"]}/v1/chat/completions'
     # 转发头只构造一次：既给 httpx，也给抓包（双视角的一半）
     up_headers = gateway._upstream_headers(upstream)
+    # 关联键：让上游的出站转储能精确对回这一轮（见 gateway 同名注释）
+    trace_id = uuid.uuid4().hex[:16]
+    up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:
@@ -1076,7 +1079,7 @@ async def messages(request: Request):
                 payload=data, usage=usage,
                 error=None if resp.status_code < 400 else str(data)[:500],
                 upstream_body=payload, upstream_headers=up_headers,
-                client_response=client_doc,
+                trace_id=trace_id, client_response=client_doc,
             )
             if resp.status_code >= 400:
                 msg = ''
@@ -1101,7 +1104,7 @@ async def messages(request: Request):
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,
                 path='/v1/messages', protocol='anthropic', status=502,
                 latency_ms=latency, stream=False, error=str(exc),
-                upstream_body=payload, upstream_headers=up_headers,
+                upstream_body=payload, upstream_headers=up_headers, trace_id=trace_id,
             )
             return _err(f'上游不可用：{exc}', 502, 'api_error')
 
@@ -1248,7 +1251,7 @@ async def messages(request: Request):
                 latency_ms=latency, first_token_ms=first_token_ms, stream=True,
                 text=raw_stream.text(), usage=usage, error=error_text,
                 upstream_body=payload, upstream_headers=up_headers,
-                client_response=client_stream.text() or None,
+                trace_id=trace_id, client_response=client_stream.text() or None,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

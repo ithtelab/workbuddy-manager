@@ -143,3 +143,6 @@ start-all.cmd
 stop-all.cmd
 dev/.weight-task
 dev/.shots-weight-task
+
+# worktree 里为了复用依赖做的符号链接（不是仓库内容）
+/web/node_modules

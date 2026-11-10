@@ -1957,6 +1957,12 @@ export interface TapSession {
   client: string | null;
   /** 原始 UA。`client` 是从它派生的分类，版本号也从这里取。 */
   client_ua?: string | null;
+  /** `main` = 一轮对话；`title` 等 = 辅助调用（会话标题生成），属于某条主会话。 */
+  kind: string;
+  /** 辅助调用所属的主会话 id。 */
+  parent_id: number | null;
+  /** 这条主会话底下挂了几次辅助调用（标题 / 压缩）。 */
+  aux_count?: number;
   /** 客户端说的协议：chat / anthropic / responses。 */
   protocol: string;
   model: string | null;
@@ -1992,6 +1998,8 @@ export interface TapTurnBrief {
 
 export interface TapSessionDetail extends TapSession {
   items: TapTurnBrief[];
+  /** 挂在它名下的辅助调用（点一下可跳转）。 */
+  aux?: {id: number; kind: string; ts: number; model: string | null}[];
 }
 
 /** 请求体的结构摘要（后端现算，不落库）。 */
@@ -2054,6 +2062,34 @@ export interface TapTurn extends Omit<TapTurnBrief, 'request_bytes' | 'response_
   client_recon: TapRecon | null;
   passthrough: boolean;
   client_protocol: string;
+  /** 关联键：上游出站转储按它回查（腾讯视角）。NULL = 老记录 / 上游没开转储。 */
+  trace_id?: string | null;
+}
+
+/* ── 腾讯视角：上游（workbuddy2api）真正发往腾讯的那一跳 ─────────────── */
+
+export interface TapOutboundEntry {
+  kind: 'request' | 'response';
+  trace_id: string;
+  uid?: string;
+  ts?: number;
+  ms?: number;
+  method?: string;
+  url?: string;
+  status?: number;
+  headers?: Record<string, string>;
+  body?: string;
+  truncated?: boolean;
+  error?: string;
+}
+
+export interface TapOutbound {
+  available: boolean;
+  /** no-trace（老记录）/ no-file（上游没开或还没写）/ io:… */
+  reason: string;
+  entries: TapOutboundEntry[];
+  path: string;
+  trace_id?: string | null;
 }
 
 /** 两轮请求的结构化差异（claude-tap 的 diff 视图）。 */

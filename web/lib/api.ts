@@ -63,6 +63,7 @@ import type {
   TapDiff,
   TapSession,
   TapSessionDetail,
+  TapOutbound,
   TapTurn,
   TaskLogResponse,
   TaskRunStatus,
@@ -664,9 +665,13 @@ export const tapApi = {
   prune: () => post<{turns: number; stats: TapConfigResponse['stats']}>('/api/tap/prune'),
   sessions: (params: Record<string, unknown>) =>
     get<{total: number; items: TapSession[]}>('/api/tap/sessions', params),
+  /** 触发一次历史重算：按库里已有的 UA 重新归类、并把辅助调用挂回主会话。 */
+  backfill: () => post<{changed: number; aux: number}>('/api/tap/backfill'),
   session: (id: number) => get<TapSessionDetail>(`/api/tap/sessions/${id}`),
   remove: (id: number) => del<{ok: boolean}>(`/api/tap/sessions/${id}`),
   turn: (id: number) => get<TapTurn>(`/api/tap/turns/${id}`),
+  /** 腾讯视角：上游（workbuddy2api）发往腾讯的那一跳（读它写的 JSONL） */
+  outbound: (id: number) => get<TapOutbound>(`/api/tap/turns/${id}/outbound`),
   diff: (before: number, after: number) =>
     get<TapDiff>('/api/tap/diff', {before, after}),
   clear: () => post<{ok: boolean; turns: number}>('/api/tap/clear'),
