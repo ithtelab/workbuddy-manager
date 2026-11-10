@@ -34,7 +34,7 @@ class PackageIncomeTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _logs(self) -> list[dict]:
-        return db.query('SELECT credits, message, dedup_key FROM task_logs ORDER BY id')
+        return db.query('SELECT ts, credits, message, dedup_key FROM task_logs ORDER BY id')
 
     def test_new_package_counts_even_when_balance_flat(self) -> None:
         # 基线：3910，包 A 到期
@@ -105,6 +105,32 @@ class PackageIncomeTest(unittest.TestCase):
     def test_zero_balance_empty_packages_can_receive_real_income(self) -> None:
         credits.record_balance('empty', '', 0, [])
         self.assertEqual(credits.record_balance('empty', '', 20, [{'at': 3000, 'amount': 20}]), 20)
+
+    def test_package_income_uses_created_timestamp(self) -> None:
+        credits.record_balance('u10', '', 100, [{'at': 3000, 'amount': 100,
+                                                  'created': 1000}])
+        with mock.patch.object(credits.time, 'time', return_value=5000):
+            income = credits.record_balance(
+                'u10', '', 200,
+                [{'at': 3000, 'amount': 100, 'created': 1000},
+                 {'at': 4000, 'amount': 100, 'created': 2000}])
+        self.assertEqual(income, 100)
+        self.assertEqual(self._logs()[0]['ts'], 2000,
+                         '流水时间用上游 CreateTime，而不是采集时刻')
+
+    def test_missing_created_falls_back_to_collection_time(self) -> None:
+        credits.record_balance('u11', '', 100, [{'at': 3000, 'amount': 100}])
+        with mock.patch.object(credits.time, 'time', return_value=5000):
+            credits.record_balance('u11', '', 200,
+                                   [{'at': 4000, 'amount': 100}])
+        self.assertEqual(self._logs()[0]['ts'], 5000)
+
+    def test_legacy_two_tuple_snapshot_is_readable(self) -> None:
+        db.set_setting(credits._SNAP_KEY, {'old2': {
+            'credits': 100, 'at': 123, 'packages': [[3000, 100]]}})
+        self.assertIsNone(credits.record_balance(
+            'old2', '', 100, [{'at': 3000, 'amount': 100, 'created': 1000}]))
+        self.assertEqual(self._logs(), [])
 
     def test_repeat_topups_in_same_second_are_not_lost(self) -> None:
         with mock.patch.object(credits.time, 'time', return_value=123):

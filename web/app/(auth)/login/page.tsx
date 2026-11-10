@@ -24,6 +24,12 @@ export default function LoginPage() {
   // `window.location.search` 而不是 `useSearchParams`：静态导出下后者必须包一层
   // Suspense，为一行提示不值得改整页结构。
   const [expired, setExpired] = useState(false);
+  // 静态导出的页在 JS 到位前是原生表单；此时提交会走浏览器默认 GET，把
+  // ?username=…&password=… 写进地址栏（浏览记录 / 反代日志 / Referer）。
+  // 挂载前禁用提交按钮，并给 form 加 method="post" 作为第二道保险。
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => setReady(true), []);
 
   useEffect(() => {
     if (!loading && me) router.replace('/dashboard');
@@ -98,7 +104,7 @@ export default function LoginPage() {
           </div>
         </div>
 
-        <form onSubmit={submit} className="rounded-[24px] bg-muted p-5">
+        <form onSubmit={submit} method="post" className="rounded-[24px] bg-muted p-5">
           <div className="space-y-4">
             <div className="space-y-1.5">
               <Label htmlFor="username" className="text-[11px] text-muted-foreground">
@@ -144,7 +150,7 @@ export default function LoginPage() {
               <p className="text-xs text-muted-foreground">{t('login.initialPwdHint')}</p>
             )}
 
-            <Button type="submit" disabled={busy} className="w-full rounded-full">
+            <Button type="submit" disabled={busy || !ready} className="w-full rounded-full">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
               {t('login.submit')}
             </Button>

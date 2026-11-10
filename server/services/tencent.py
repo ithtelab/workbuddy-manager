@@ -880,7 +880,8 @@ async def fetch_credits(auth: dict) -> tuple[bool, int | float | None, str, list
             total += remain
             at = _package_expiry(item) if remain > 0 else None
             if at is not None:
-                expiries.append({'at': at, 'amount': _round_credits(remain)})
+                expiries.append({'at': at, 'amount': _round_credits(remain),
+                                'created': _package_created(item)})
         expiries.sort(key=lambda e: e['at'])
         return True, _round_credits(total), '查询成功', expiries
     except Exception as exc:  # noqa: BLE001
@@ -1239,6 +1240,21 @@ def _package_remain(item: dict) -> float:
 # 这里等价。
 _PACKAGE_END_LAYOUT = '%Y-%m-%d %H:%M:%S'
 _PACKAGE_END_TZ = timezone(timedelta(hours=8))
+
+
+def _package_created(item: dict) -> int:
+    """套餐到账时刻（epoch 秒）。上游 CreateTime 是毫秒时间戳。
+
+    缺失/非法/非正数返回 0，调用方据此回退「采集时刻」——不能拿 0 当 1970 年。
+    """
+    raw = item.get('CreateTime')
+    if raw is None:
+        return 0
+    try:
+        ms = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return ms // 1000 if ms > 0 else 0
 
 
 def _package_expiry(item: dict) -> int | None:

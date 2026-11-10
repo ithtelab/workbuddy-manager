@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime
 import json
 import time
+import uuid
 
 from .. import db
 from . import tencent
@@ -74,7 +75,11 @@ def _save_snapshot(snap: dict) -> None:
 
 
 def _package_keys(expiries: list[dict] | None) -> list[list[int]] | None:
-    """把到期积分包列表转成可持久化的 `[到期时刻, 额度]` 键；拿不到返回 None。"""
+    """把到期积分包列表转成可持久化的 `[到期时刻, 额度, 到账时刻]` 键。
+
+    第三个字段是上游 CreateTime（epoch 秒）；缺失/旧补丁给 0，记账时回退采集
+    时刻。拿不到到期列表返回 None（与「空列表」区分）。
+    """
     if not isinstance(expiries, list):
         return None
     out: list[list[int]] = []
@@ -86,13 +91,19 @@ def _package_keys(expiries: list[dict] | None) -> list[list[int]] | None:
             amount = int(e.get('amount'))
         except (TypeError, ValueError):
             continue
-        out.append([at, amount])
-    return sorted(out)
+        try:
+            created = int(e.get('created') or 0)
+        except (TypeError, ValueError):
+            created = 0
+        out.append([at, amount, created])
+    return sorted(out, key=lambda item: (item[0], item[2]))
 
 
 def _package_balances(packages: list[list[int]]) -> dict[int, int]:
+    """按到期时刻汇总剩余额度；兼容旧快照的两元组。"""
     balances: dict[int, int] = {}
-    for at, amount in packages:
+    for item in packages:
+        at, amount = int(item[0]), int(item[1])
         balances[at] = balances.get(at, 0) + amount
     return balances
 
@@ -126,9 +137,10 @@ def record_balance(uid: str, nickname: str, credits: int | float | None,
         if isinstance(raw_packages, list):
             prev_packages = []
             for item in raw_packages:
-                if isinstance(item, list) and len(item) == 2:
+                if isinstance(item, list) and len(item) >= 2:
                     try:
-                        prev_packages.append([int(item[0]), int(item[1])])
+                        prev_packages.append([int(item[0]), int(item[1]),
+                                              int(item[2]) if len(item) >= 3 else 0])
                     except (TypeError, ValueError):
                         continue
     packages = _package_keys(expiries)
@@ -138,7 +150,7 @@ def record_balance(uid: str, nickname: str, credits: int | float | None,
     if prev_packages == [] and prev is not None and prev > 0:
         prev_packages = None
     previous_observation = prev_raw.get('observation_id', prev_raw.get('at', 0)) if isinstance(prev_raw, dict) else 0
-    entry = {'credits': value, 'at': now, 'observation_id': time.time_ns()}
+    entry = {'credits': value, 'at': now, 'observation_id': uuid.uuid4().hex}
     if packages is not None:
         entry['packages'] = packages
     snap[uid] = entry
@@ -152,13 +164,20 @@ def record_balance(uid: str, nickname: str, credits: int | float | None,
     logs: list[dict] = []
     if packages is not None and prev_packages is not None:
         before = _package_balances(prev_packages)
+        # 同一到期桶可能有多条包，额度先汇总；到账时刻取该桶里最晚的 CreateTime。
+        created_by_at: dict[int, int] = {}
+        for at, _amount, created in packages:
+            created_by_at[at] = max(created_by_at.get(at, 0), created)
         for at, amount in _package_balances(packages).items():
             increase = amount - before.get(at, 0)
             if increase <= 0 or increase > _MAX_DELTA:
                 continue
             income += increase
+            created = created_by_at.get(at, 0)
+            # 用上游到账时刻，而不是采集时刻（issue #414）；异常/未来值回退 now。
+            deliver_at = created if 0 < created <= now else now
             logs.append({
-                'ts': now,
+                'ts': deliver_at,
                 'uid': uid,
                 'kind': 'credit',
                 'level': 'credit',

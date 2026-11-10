@@ -48,7 +48,16 @@ _lock = asyncio.Lock()
 
 
 def state() -> dict:
-    """当前重载状态，供前端展示。"""
+    """当前重载状态，供前端展示。
+
+    `pending=True` 但 worker 已经不在（线程池里误调用留下的脏状态、worker 异常
+    退出等）时，在读侧自愈：这种「排队中但没人执行」会让前端永远转圈，
+    等到下一次保存才复位（issue #419）。
+    """
+    global _pending
+    if _state['pending'] and (_worker is None or _worker.done()):
+        _pending = False
+        _state['pending'] = False
     return dict(_state)
 
 
@@ -97,13 +106,16 @@ def request_restart(upstream: dict | None = None) -> bool:
         loop.create_task(_restart_container_bg(container))
         return True
     global _pending, _worker
-    _pending = True
-    _state['pending'] = True
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # 没有运行中的事件循环：无法后台调度，交由调用方决定是否同步执行
+        # 没有运行中的事件循环：无法后台调度，交由调用方决定是否同步执行。
+        # **不能先置 pending**：线程池里调用时会留下 pending=True 而没有任何
+        # worker 的脏状态，前端会永远停在「正在应用配置…」（issue #419）。
         return False
+    # 拿到 loop 之后再置位：此时 worker 一定能被创建，状态不会悬空。
+    _pending = True
+    _state['pending'] = True
     if _worker is None or _worker.done():
         _worker = loop.create_task(_worker_loop())
     return True

@@ -376,5 +376,17 @@ class CreditsCacheCarriesExpiriesTest(unittest.TestCase):
         self.assertEqual(got[5], [{'at': 2, 'amount': 2}], '失效后必须重新查')
 
 
+class PackageCreatedTest(unittest.TestCase):
+    """上游 CreateTime（毫秒）→ 到账秒；缺失/非法返回 0，交给调用方回退。"""
+
+    def test_milliseconds_to_seconds(self) -> None:
+        self.assertEqual(tencent._package_created({'CreateTime': 1762710000123}), 1762710000)
+
+    def test_missing_or_invalid_is_zero(self) -> None:
+        for item in ({}, {'CreateTime': None}, {'CreateTime': 'x'},
+                     {'CreateTime': 0}, {'CreateTime': -1}):
+            self.assertEqual(tencent._package_created(item), 0)
+
+
 if __name__ == '__main__':
     unittest.main()

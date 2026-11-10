@@ -2331,7 +2331,7 @@ def get_task_scheduler(user: dict = Depends(security.current_user)) -> dict:
 
 
 @router.put('/accounts/task-scheduler')
-def keep_task_scheduler(body: dict, user: dict = Depends(security.require_admin)) -> dict:
+async def keep_task_scheduler(body: dict, user: dict = Depends(security.require_admin)) -> dict:
     """只保留一套调度（issue #375）。
 
     - `upstream`：关闭面板的签到 / 领取补偿；领奖与做任务仍留在面板（上游没有）。
