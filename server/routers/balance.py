@@ -228,3 +228,28 @@ def status() -> dict:
             'custom_currency_exchange_rate': 1,
         },
     }
+
+@router.get('/v1/credits')
+async def client_credits(request: Request):
+    """客户端默认余额路径。
+
+    RikkaHub 的 OpenAI 兼容服务商默认配置是 `{{baseUrl}}/credits`（即这里），
+    并把 `data.total_usage` 当作「余额」显示；new-api 的写法是
+    `data.total_available`。同一份数值给两个键，客户端不必改配置。
+    """
+    result = await token_usage(request)
+    if isinstance(result, JSONResponse):
+        return result
+    data = result.get('data') or {}
+    return {
+        'code': True,
+        'data': {
+            'object': 'credits',
+            'total_credits': data.get('total_granted'),
+            'total_used': data.get('total_used'),
+            'total_available': data.get('total_available'),
+            # RikkaHub 读这个当余额；与 total_available 同值
+            'total_usage': data.get('total_available'),
+            'scope': data.get('scope'),
+        },
+    }
