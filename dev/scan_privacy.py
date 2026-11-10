@@ -28,11 +28,15 @@ HARD_PATTERNS = [
     (r'github_pat_[A-Za-z0-9_]{20,}', 'GitHub fine-grained token'),
     (r'-----BEGIN [A-Z ]*PRIVATE KEY-----', '私钥块'),
     (r'\bwbk_[A-Za-z0-9]{30,}\b', '面板 API key（完整）'),
-    (r'\b4da5e8d53eccee9', '网关 API key（完整）'),
-    (r'8750806ac05175fabf3cc8930d7775bd', '面板管理员口令'),
+    (r'\b[0-9a-f]{32}\b', '32 位十六进制串（疑似口令/密钥）'),
     (r'Bearer\s+[A-Za-z0-9]{32,}', 'Bearer 长令牌'),
     (r'"api_key"\s*:\s*"[A-Za-z0-9]{24,}"', '正文的 api_key'),
+    (r'(?i)\b(admin[_-]?password|api[_-]?key|secret|token)\s*[=:]\s*["\']?[A-Za-z0-9]{24,}',
+     '配置里写死的凭证'),
 ]
+
+# 扫描器自己会命中上面这些模式（它把模式写在源码里）。跳过自己。
+SELF = Path(__file__).name
 
 # 需人工确认：本机路径 / 私人邮箱
 SOFT_PATTERNS = [
@@ -77,6 +81,9 @@ def scan(root: Path) -> int:
     soft_hits: list[tuple[str, str, int]] = []
     for f in files:
         if not f.is_file():
+            continue
+        # 扫描器自己：模式就写在它的源码里，必然命中自己
+        if f.name == SELF:
             continue
         if f.suffix.lower() not in TEXT_SUFFIX and f.name not in {
                 'Dockerfile', 'Makefile', '.env.example', '.gitignore'}:
