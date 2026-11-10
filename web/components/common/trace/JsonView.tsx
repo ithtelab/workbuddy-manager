@@ -432,6 +432,32 @@ export function JsonPreview({value, expandAll, focusPath, maxHeight = 'max-h-[60
   }, []);
 
   /**
+   * 点击浮窗**外面** → 立即关闭。
+   *
+   * 为什么不能只靠「延迟关闭」：鼠标移出文本行后，浮窗会挂在那儿 1 秒。
+   * 这 1 秒里用户点了别处（比如想点页面上的另一个控件），浮窗却还杵在屏幕
+   * 中间挡着 —— 该关的时候没关。
+   *
+   * 为什么用 `pointerdown` 而不是 `click`：`pointerdown` 在按下瞬间就触发，
+   * 用户点别的控件时，浮窗会在**那个控件收到点击之前**消失，不会出现
+   * 「浮窗先抢走焦点、按钮点不动」。
+   *
+   * 捕获阶段监听 + 不阻止传播：只监听，不干预别人的点击。
+   */
+  useEffect(() => {
+    if (!hovered) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const t = e.target as Node | null;
+      // 点在浮窗里 → 不关（还要让人点 Preview/Raw、复制）
+      if (t && panelRef.current?.contains(t)) return;
+      cancelClose();
+      setHovered(null);
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => document.removeEventListener('pointerdown', onPointerDown, true);
+  }, [hovered, cancelClose]);
+
+  /**
    * 悬停到字符串上 → 弹出带 Preview/Raw 切换的浮窗。
    *
    * 取原文靠**路径**而不是内容匹配：内容匹配有歧义（悬停 `role: "system"` 会
@@ -561,6 +587,12 @@ export function JsonPreview({value, expandAll, focusPath, maxHeight = 'max-h-[60
         // expandLevel：默认展开 2 层（与「默认前 10 项」的直觉一致）；
         // expandAll 信号切换全展开/全收起；定位模式下临时全展开（见上方注释）
         expandLevel={focusMode ? 100 : expandAll === undefined ? 2 : expandAll ? 100 : false}
+        // 关掉「数据更新时闪红」：库比较的是**对象引用**，我们每次重拉数据都是
+        // 新的对象 → 每次刷新 ROOT 都闪一下红，看着像在报错（实测：自动刷新
+        // 一开，ROOT 每 20 秒红一次）。
+        // 这个闪烁本来是给「同一棵树内某个值真的变了」的提示用的，但抓包页
+        // 每次刷新整棵树都是新的，区分不出「哪一行变了」，只会一直闪。
+        highlightUpdate={false}
         showLineNumbers={false}
         lineHeight={18}
         overscan={40}

@@ -1,6 +1,6 @@
 'use client';
 
-import {useCallback, useEffect, useMemo, useState} from 'react';
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ArrowLeft,
   ChevronLeft,
@@ -8,6 +8,7 @@ import {
   Download,
   Radar,
   RefreshCw,
+  Settings2,
   Trash2,
 } from 'lucide-react';
 import {useAuth} from '@/lib/auth-context';
@@ -15,6 +16,14 @@ import {errText, tapApi} from '@/lib/api';
 import {fmtDateTime, fmtMoney, fmtNumber} from '@/lib/format';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {useDebounced} from '@/lib/use-debounce';
+import {useHeartbeat} from '@/lib/use-heartbeat';
+import {
+  DEFAULT_REFRESH_INTERVAL,
+  getRefreshInterval,
+  REFRESH_INTERVAL_CHOICES,
+  setRefreshInterval,
+  type RefreshInterval,
+} from '@/lib/display-prefs';
 import {notify} from '@/lib/toast';
 import {useT} from '@/lib/i18n/provider';
 import {
@@ -55,6 +64,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import {Popover, PopoverContent, PopoverTrigger} from '@/components/ui/popover';
 import {cn} from '@/lib/utils';
 
 const PAGE_SIZE = 20;
@@ -74,6 +84,16 @@ const BLOCK_SCROLL = 'max-h-96 overflow-auto';
 
 /** 稳定空数组：每次渲染现写 `[]` 会让下游依赖它的 memo 每帧重算（同日志页）。 */
 const EMPTY_TURNS: TapTurnBrief[] = [];
+
+/**
+ * 距上次更新过了多少秒（用于「上次更新 N 秒前」）。
+ *
+ * `now` 是**每秒走一格**的显示时钟，不是 Date.now() —— 直接用 Date.now()
+ * 的话，这行小字只在刷新那一刻重渲染，那个数字永远停在 0 秒。
+ */
+function agoSeconds(ts: number, now: number): number {
+  return Math.max(0, Math.round((now - ts) / 1000));
+}
 
 /**
  * 抓包回放页（Trace Tap）。
@@ -171,6 +191,139 @@ export default function TracesPage() {
     [sessionId],
   );
   const session = detail.values.session ?? null;
+
+  /* ── 自动刷新 ───────────────────────────────────────────────
+   *
+   * 抓包是「别人（客户端）在写、我在读」的场景：新请求完成后，页面必须自己
+   * 跟上，否则用户盯着一个静止的界面，还得手动点刷新才知道刚才发生了什么。
+   *
+   * 刷新分两层，各自的代价不同：
+   *  · **列表层**（会话列表 + 统计）：便宜。用户最关心的是「有没有新会话 /
+   *    轮数涨了没」。
+   *  · **详情层**（当前会话的轮次）：贵一点（一次会话几百轮）。
+   *
+   * 两层用**同一个**间隔，由用户在齿轮里设置（默认 20 秒）。
+   * 两层都**不打断**用户正在看的东西：刷新详情时，正在看的那一轮（turnId）
+   * 保持不变，不会被「跳到最新一轮」抢走 —— 那是自动刷新最招人烦的行为。
+   * 只有当用户**没在看任何一轮**时，才跟着新数据走到最后一轮。
+   */
+
+  /**
+   * 自动刷新间隔（秒）：**用户可调**，默认 20 秒（见 lib/display-prefs.ts）。
+   *
+   * 存在浏览器本地，不落后端 —— 这是「我这块屏幕怎么看」的偏好，不是系统行为。
+   */
+  const [intervalSec, setIntervalSec] = useState<RefreshInterval>(DEFAULT_REFRESH_INTERVAL);
+  /**
+   * 首屏读一次本地偏好。
+   *
+   * 为什么不在 useState 的初值里直接读：那是**服务端渲染**时执行的，
+   * localStorage 只在浏览器里有 —— 首屏会拿到默认值，与客户端不一致
+   * （同 lib/realm-context.tsx 的处理：挂载后再读）。
+   */
+  useEffect(() => {
+    setIntervalSec(getRefreshInterval());
+  }, []);
+
+  /**
+   * 两层心跳用**同一个**间隔。
+   *
+   * 之前分成两层（列表 10 秒 / 详情 20 秒），是为了「详情更贵、少拉点」——
+   * 但用户要的是一个能调的间隔，两个数字反而让人困惑：调了到底哪个生效？
+   * 现在统一成一个值，齿轮里改一次两边都跟着变。
+   *
+   * 代价：间隔调小时，列表层也跟着变快 —— 但列表层本来就便宜（一次会话列表
+   * + 统计），真正贵的是详情层，而详情层的轮次条只在选中会话时才拉。
+   */
+  const tickMs = intervalSec * 1000;
+
+  /** 最近一次成功刷新列表的时间 —— 界面上显示「上次更新 xx 秒前」。 */
+  const [lastUpdate, setLastUpdate] = useState<number | null>(null);
+  /**
+   * 每秒走一格的「显示用」时钟。
+   *
+   * 为什么需要它：「N 秒前更新」这个数字要**自己往上跳**，否则它只在刷新那一刻
+   * 重渲染一次 —— 而刷新本身每 10 秒一次，于是那个数字永远停在「0 秒前」
+   * （刷新完立刻算就是 0 秒），看着像坏了。
+   *
+   * 这个时钟只驱动那行小字的重渲染，**不触发任何请求**。
+   */
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  /** 自动刷新开关：用户可能正在盯着一个值，不希望它被刷掉。 */
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  /** 「有新轮次了」的提示条：只在用户**停在中间某轮**时出现。 */
+  const [pendingTurns, setPendingTurns] = useState(0);
+
+  /**
+   * 详情刷新时的「当前会话已有多少轮」快照。
+   *
+   * 用它算新增了多少轮：只比**条数**不够（同一条被重写时条数不变），
+   * 比最大 seq 更准 —— seq 单调递增，新增轮次必然带来更大的 seq。
+   */
+  const knownMaxSeq = useRef(0);
+
+  /** 刷新列表 + 详情。 */
+  const refreshAll = useCallback(async () => {
+    await list.reload();
+    await detail.reload();
+    setLastUpdate(Date.now());
+  }, [list, detail]);
+
+  /**
+   * 心跳：定时重拉。
+   *
+   * 分两层定时器而不是一个：详情层（一次会话几百轮）比列表层贵得多，
+   * 合成一个 10 秒会把后端压得慌。
+   */
+  useHeartbeat(() => {
+    if (!autoRefresh) return;
+    void list.reload().then(() => setLastUpdate(Date.now()));
+  }, tickMs);
+
+  useHeartbeat(() => {
+    if (!autoRefresh) return;
+    void detail.reload();
+  }, tickMs);
+
+  /**
+   * 详情刷新后：算出新增了几轮。
+   *
+   * **只提示，绝不自动跳转。**
+   *
+   * 轮次列表是「随时在长」的（客户端还在跑，轮次就一条条冒出来）—— 列表自己
+   * 更新就够了，但**当前看的那一轮不能被抢走**：用户正在读第 30 轮的内容，
+   * 页面却自己跳到第 31 轮，读到一半的东西就没了。
+   *
+   * 所以不管用户停在哪一轮，都一律给一个「有 N 轮新的，点击查看最新」的入口，
+   * 跳不跳由用户自己决定。
+   */
+  useEffect(() => {
+    const items = session?.items ?? EMPTY_TURNS;
+    if (!items.length) {
+      knownMaxSeq.current = 0;
+      setPendingTurns(0);
+      return;
+    }
+    const maxSeq = items.reduce((m, x) => Math.max(m, x.seq), 0);
+    const prevSeq = knownMaxSeq.current;
+    knownMaxSeq.current = maxSeq;
+    // 首屏（prevSeq=0）不算「新增」，那是初次加载。
+    if (prevSeq === 0 || maxSeq <= prevSeq) {
+      setPendingTurns(0);
+      return;
+    }
+    setPendingTurns(maxSeq - prevSeq);
+  }, [session]);
+
+  /** 切到会话时重置「已知最大 seq」，避免把上一个会话的轮数算成新增。 */
+  useEffect(() => {
+    knownMaxSeq.current = 0;
+    setPendingTurns(0);
+  }, [sessionId]);
 
   /** 列表刷新后把选中会话修正到一个仍然存在的条目上。 */
   useEffect(() => {
@@ -300,12 +453,82 @@ export default function TracesPage() {
               </Label>
             </div>
             <Button variant="outline" size="sm" className="rounded-full"
-                    onClick={() => void list.reload()}>
+                    onClick={() => void refreshAll()}>
               <RefreshCw
                 className={cn('h-3.5 w-3.5', list.isRefreshing && 'animate-spin')}
               />
               {t('common.refresh')}
             </Button>
+            {/* 自动刷新开关：抓包是「别人在写、我在读」，页面得自己跟上。
+                开着时右上角显示「上次更新 N 秒前」，让人知道这不是卡住了。 */}
+            <div className="flex items-center gap-2 rounded-full border px-3 py-1">
+              <Switch
+                id="tap-auto-refresh"
+                checked={autoRefresh}
+                onCheckedChange={setAutoRefresh}
+              />
+              <Label htmlFor="tap-auto-refresh" className="text-xs">
+                {t('trace.autoRefresh')}
+              </Label>
+              {autoRefresh && (
+                <span className="text-[11px] text-muted-foreground">
+                  {lastUpdate
+                    ? t('trace.updatedAgo', {s: agoSeconds(lastUpdate, now)})
+                    : t('trace.updating')}
+                </span>
+              )}
+            </div>
+            {/* 齿轮：配置刷新间隔。
+                单独一个按钮而不是把选择器直接摊在工具栏上 —— 间隔是偶尔才调的
+                参数，常驻一排选项会挤掉「刷新 / 清空」这些更常用的按钮。 */}
+            <Popover>
+              <PopoverTrigger asChild>
+                <Button variant="outline" size="icon"
+                        className="h-8 w-8 rounded-full"
+                        aria-label={t('trace.refreshSettings')}>
+                  <Settings2 className="h-3.5 w-3.5" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-72 space-y-3">
+                <div className="space-y-1">
+                  <p className="text-sm font-medium">{t('trace.refreshSettings')}</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    {t('trace.refreshIntervalHint')}
+                  </p>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="tap-refresh-interval" className="text-xs">
+                    {t('trace.refreshInterval')}
+                  </Label>
+                  <Select
+                    value={String(intervalSec)}
+                    onValueChange={(v) => {
+                      const n = Number(v) as RefreshInterval;
+                      setIntervalSec(n);
+                      setRefreshInterval(n);
+                    }}
+                  >
+                    <SelectTrigger
+                      id="tap-refresh-interval"
+                      size="sm"
+                      className="w-full rounded-xl"
+                      // 无障碍：下拉本身要有可读名称（Label 的 htmlFor 不算数，
+                      // 读屏软件读到的是触发按钮）
+                      aria-label={t('trace.refreshInterval')}
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {REFRESH_INTERVAL_CHOICES.map((c) => (
+                        <SelectItem key={c} value={String(c)}>
+                          {t('trace.refreshIntervalValue', {s: c})}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </PopoverContent>
+            </Popover>
             {enabled && cfg && (
               <ConfirmDialog
                 title={t('trace.clearTitle')}
@@ -616,6 +839,26 @@ export default function TracesPage() {
                     </button>
                   ))}
                 </div>
+
+                {/* 「有 N 轮新的」提示：只在用户停在**中间某轮**时出现。
+                    自动刷新不能把正在读的内容顶掉 —— 所以这里给一个入口，
+                    让用户自己决定要不要跳到最新。 */}
+                {pendingTurns > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const last = items[items.length - 1];
+                      if (!last) return;
+                      setTurnId(last.id);
+                      setTab('overview');
+                      setPendingTurns(0);
+                    }}
+                    className="flex w-fit items-center gap-1.5 rounded-full border border-primary/40 bg-primary/10 px-2.5 py-1 text-[11px] text-primary transition-colors hover:bg-primary/20"
+                  >
+                    <Radar className="h-3 w-3" />
+                    {t('trace.newTurns', {n: pendingTurns})}
+                  </button>
+                )}
 
                 <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2">
                   <div className="flex flex-wrap gap-1">
