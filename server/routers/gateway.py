@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, db, iputil, keysvc, upstreamsvc
-from ..services import modelcatalog, modelmap, proxyroutes
+from ..services import modelcatalog, modelmap, proxyroutes, tap as tap_svc
 from ..config import _env_int
 from ..routers.security import get_config as get_security_config
 
@@ -1294,6 +1295,11 @@ async def _chat(request: Request, upstream_path: str):
     body, err = await _read_json_body(request)
     if err:
         return err
+    # 客户端原样发出的那份请求体：**在任何改写之前**深拷贝。
+    # 后面的模型映射、max_tokens 钳制、图片归一、stream_options 注入都会就地
+    # 改动 `body`，改完就再也拿不到「客户端到底发了什么」——而抓包页的
+    # 「客户端视角」正是要看这一份，和网关改写后的那份对着看。
+    client_body = copy.deepcopy(body)
 
     requested_model = body.get('model') if isinstance(body, dict) else None
     # model 必须是字符串：非字符串（对象/数组/数字）会让后面的 _map_model 与
@@ -1367,6 +1373,14 @@ async def _chat(request: Request, upstream_path: str):
                 key, ip, requested_model or '', mapped or '', rec_status, pt, ct,
                 latency, ua, error, False, usage=usage, effort=effort,
             )
+            # 抓包（Trace Tap）：在记账之后、响应返回之前落库。放在这里而不是
+            # 转发之前，是因为非流式要拿到完整响应体才算「这一轮到底回了什么」。
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path=upstream_path, protocol='chat', status=rec_status,
+                latency_ms=latency, stream=False, payload=data, usage=usage,
+                error=error, upstream_body=body,
+            )
             if missing is not None:
                 return JSONResponse(missing, status_code=404)
             retry_after = None
@@ -1381,6 +1395,11 @@ async def _chat(request: Request, upstream_path: str):
             latency = int((time.time() - started) * 1000)
             _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False,
                     account_expected=_account_expected_after_error(exc))
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path=upstream_path, protocol='chat', status=502, latency_ms=latency,
+                stream=False, error=str(exc), upstream_body=body,
+            )
             return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     # 流式转发
@@ -1424,6 +1443,10 @@ async def _chat(request: Request, upstream_path: str):
         return JSONResponse({'error': {'message': text[:1000], 'type': 'api_error'}},
                             status_code=status_code, headers=headers)
 
+    # 抓包用的原始流缓冲。与 `pending` 分开：`pending` 会被 _scan_sse 消费掉
+    # （它只保留残缺的最后一行），照它入库会丢掉前面所有数据帧。
+    raw_stream = tap_svc.RawStream()
+
     async def generator():
         usage: dict = {}
         pending = ''
@@ -1433,8 +1456,10 @@ async def _chat(request: Request, upstream_path: str):
         first_token_ms: int | None = None
         try:
             async for chunk in resp.aiter_bytes():
+                piece = chunk.decode('utf-8', errors='ignore')
+                raw_stream.feed(piece)
                 if status_code >= 400:
-                    pending += chunk.decode('utf-8', errors='ignore')
+                    pending += piece
                     # 有数据就留一份：早先要等到 4000 字节才取，而上游的错误体
                     # 通常只有几百字节 → error_text 恒为空，**错误被静默丢弃**：
                     # 客户端看得到（原样透传），管理端日志却什么都不记，用户来问
@@ -1443,7 +1468,7 @@ async def _chat(request: Request, upstream_path: str):
                         error_text = pending[:500]
                     yield chunk
                     continue
-                pending += chunk.decode('utf-8', errors='ignore')
+                pending += piece
                 pending, saw_content = _scan_sse(pending, usage)
                 if saw_content and first_token_ms is None:
                     first_token_ms = int((time.time() - started) * 1000)
@@ -1458,6 +1483,13 @@ async def _chat(request: Request, upstream_path: str):
                 key, ip, requested_model or '', mapped or '', status_code, pt, ct,
                 latency, ua, error_text, True, usage=usage,
                 first_token=first_token_ms, effort=effort,
+            )
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path=upstream_path, protocol='chat', status=status_code,
+                latency_ms=latency, first_token_ms=first_token_ms, stream=True,
+                text=raw_stream.text(), usage=usage, error=error_text,
+                upstream_body=body,
             )
 
     return StreamingResponse(generator(), status_code=status_code, media_type=content_type)

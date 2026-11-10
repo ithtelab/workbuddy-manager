@@ -27,6 +27,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import time
@@ -37,6 +38,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, db, iputil, keysvc, upstreamsvc
 from ..routers.security import get_config as get_security_config
+from ..services import tap as tap_svc
 # responses 只为复用推理凭据的编解码（`_encode_credential` / `_decode_credential`）：
 # Anthropic 的 `signature` 与 Responses 的 `encrypted_content` 语义完全相同——
 # 都是「客户端原样搬来搬去的不透明串」，两边编解码必须一致，否则同一轮对话在
@@ -977,6 +979,9 @@ async def messages(request: Request):
     model = body.get('model')
     if not isinstance(model, str) or not model.strip():
         return _err('model 必须是字符串')
+    # 客户端原样的 Anthropic 请求体（快照要在 clamp_max_tokens 之前：那一步会
+    # 就地改 `max_tokens`，之后就看不出客户端原本要了多少）。
+    client_body = copy.deepcopy(body)
     # max_tokens 在 Anthropic 协议里是**必填项**，缺失即 400（与 OpenAI 不同）
     if body.get('max_tokens') is None:
         return _err('缺少必填字段 max_tokens')
@@ -1050,6 +1055,26 @@ async def messages(request: Request):
                 latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
                 usage=usage, effort=effort,
             )
+            # 抓包：body 是 Anthropic 原形（客户端意图），payload 是转换后真正
+            # 发往上游的 OpenAI 体 —— 排查「转换层吃了什么字段」要靠后者。
+            # 客户端视角：Anthropic 客户端实际收到的报文（翻译后的形态）。
+            # 与 `payload`（上游原文）是两份东西，抓包页要能对着看。
+            client_doc = None
+            if resp.status_code < 400:
+                try:
+                    client_doc = to_anthropic_response(
+                        data if isinstance(data, dict) else {}, model,
+                        thinking=want_thinking)
+                except Exception:  # noqa: BLE001 - 翻译失败不该影响抓包
+                    client_doc = None
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/messages', protocol='anthropic',
+                status=resp.status_code, latency_ms=latency, stream=False,
+                payload=data, usage=usage,
+                error=None if resp.status_code < 400 else str(data)[:500],
+                upstream_body=payload, client_response=client_doc,
+            )
             if resp.status_code >= 400:
                 msg = ''
                 if isinstance(data, dict):
@@ -1059,12 +1084,22 @@ async def messages(request: Request):
                     msg = resp.text[:300]
                 return _err(msg, resp.status_code, 'api_error',
                             hint=gateway._error_hint(data))
-            return JSONResponse(to_anthropic_response(
-                data if isinstance(data, dict) else {}, model, thinking=want_thinking))
+            # 复用上面为抓包算好的那份：翻译一次就够，重复翻译既慢又可能
+            # 因为两次取值不同（例如时间戳字段）而在界面上与实际的响应对不上。
+            return JSONResponse(client_doc if client_doc is not None else
+                                to_anthropic_response(
+                                    data if isinstance(data, dict) else {},
+                                    model, thinking=want_thinking))
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
             gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False,
                             account_expected=gateway._account_expected_after_error(exc))
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/messages', protocol='anthropic', status=502,
+                latency_ms=latency, stream=False, error=str(exc),
+                upstream_body=payload,
+            )
             return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     # ── 流式 ────────────────────────────────────────────────
@@ -1082,6 +1117,12 @@ async def messages(request: Request):
 
     status_code = resp.status_code
 
+    # 抓包用的原始流缓冲（`pending` 会被逐行消费，存不出完整响应，同 gateway）
+    raw_stream = tap_svc.RawStream()
+    # 回给客户端的那条流（Anthropic 事件）。与 `raw_stream` 分开：那份是上游的
+    # OpenAI 形态，这份才是客户端手里拿到的报文 —— 抓包页的「客户端视角」用它。
+    client_stream = tap_svc.RawStream()
+
     async def gen():
         usage: dict = {}
         pending = ''
@@ -1092,7 +1133,9 @@ async def messages(request: Request):
 
         try:
             async for chunk in resp.aiter_bytes():
-                pending += chunk.decode('utf-8', errors='ignore')
+                piece = chunk.decode('utf-8', errors='ignore')
+                raw_stream.feed(piece)
+                pending += piece
 
                 if status_code >= 400:
                     # 有数据就留一份：早先要等到 4000 字节才取，而常见的上游错误体
@@ -1152,6 +1195,7 @@ async def messages(request: Request):
                         usage.update(frame_usage)
 
                     for event in translator.feed(obj):
+                        client_stream.feed(event.decode('utf-8', 'ignore'))
                         yield event
 
                     if translator.saw_content and first_token_ms is None:
@@ -1173,14 +1217,17 @@ async def messages(request: Request):
             #     残缺」的回答：不重试、不报错，排障时毫无线索；截断点若落在
             #     input_json_delta 中间，还会拿半截 JSON 去执行工具调用。
             if error_text:
-                yield _event('error', {
+                err_event = _event('error', {
                     'type': 'error',
                     'error': {'type': 'api_error', 'message': error_text},
                 })
+                client_stream.feed(err_event.decode('utf-8', 'ignore'))
+                yield err_event
             # 仍补一套收尾事件（含 message_start，若流尚未开始）：部分客户端期
             # 待流以 message_stop 结束，缺了会一直等（挂住）。error 已先发出，
             # 不会再被吞掉。
             for event in translator.finish(None, force=True):
+                client_stream.feed(event.decode('utf-8', 'ignore'))
                 yield event
         finally:
             await resp.aclose()
@@ -1191,6 +1238,13 @@ async def messages(request: Request):
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
                 usage=usage, first_token=first_token_ms, effort=effort,
+            )
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/messages', protocol='anthropic', status=status_code,
+                latency_ms=latency, first_token_ms=first_token_ms, stream=True,
+                text=raw_stream.text(), usage=usage, error=error_text,
+                upstream_body=payload, client_response=client_stream.text() or None,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

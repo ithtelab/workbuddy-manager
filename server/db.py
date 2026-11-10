@@ -444,6 +444,74 @@ CREATE TABLE IF NOT EXISTS upstreams (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- ── 调用抓包（Trace Tap，见 services/tap.py）──────────────────────────────
+--
+-- 为什么单独两张表、而不是给 request_logs 加列：两者的取舍正好相反。
+-- request_logs 是**计量**数据（谁、何时、多少 token），字段少、行数多、长期聚合；
+-- 抓包是**排障证据**（这一轮到底发了什么），单行可到几百 KB，只能按保留期滚动删。
+-- 混在一张表里的后果是双向的：抓包开关会拖慢每一次日志查询，清日志也会把证据
+-- 一起清掉 —— 而「清完日志还想看当时发了什么」正是排障里最常见的一步。
+CREATE TABLE IF NOT EXISTS tap_sessions (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- 会话指纹：system + 首条 user 消息 + 协议 的哈希（见 tap._fingerprint）。
+  -- 同一轮 agent 任务的每次请求都带着同样的 system 与同一条开头的 user 消息，
+  -- 因此能把「一次任务」里的多轮请求归成一组，不需要客户端配合上报 run id。
+  fingerprint       TEXT    NOT NULL,
+  key_id            INTEGER,
+  -- 客户端家族（claude / codex / cursor / cli / other）：由 UA 归类。
+  client            TEXT,
+  -- 客户端说的协议（chat / anthropic / responses）。上游一律是 OpenAI 形态，
+  -- 这个字段记的是**进来时**的协议 —— 它决定请求体怎么解读。
+  protocol          TEXT    NOT NULL DEFAULT 'chat',
+  model             TEXT,
+  started_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL,
+  turns             INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tap_sessions_updated ON tap_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_tap_sessions_fp ON tap_sessions(fingerprint, key_id, protocol);
+
+CREATE TABLE IF NOT EXISTS tap_turns (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id        INTEGER NOT NULL,
+  -- 会话内序号，从 1 开始。用序号而不是时间戳：并发的两轮请求秒级时间戳会
+  -- 并列，而界面的「和上一轮比」依赖一个确定的先后。
+  seq               INTEGER NOT NULL,
+  ts                INTEGER NOT NULL,
+  path              TEXT,
+  protocol          TEXT,
+  model             TEXT,
+  mapped_model      TEXT,
+  status            INTEGER,
+  stream            INTEGER NOT NULL DEFAULT 0,
+  latency_ms        INTEGER,
+  first_token_ms    INTEGER,
+  prompt_tokens     INTEGER,
+  completion_tokens INTEGER,
+  cache_hit_tokens  INTEGER,
+  cache_miss_tokens INTEGER,
+  cost              REAL,
+  -- 请求体（已脱敏、已按 max_body 截断）的 JSON 文本。truncated=1 时界面按
+  -- 原文展示，而不是假装还能解析成结构。
+  request_json      TEXT,
+  -- 上游原始响应：流式是 SSE 原文，非流式是 JSON 文本，同样脱敏并截断。
+  response_text     TEXT,
+  -- **回给客户端的**响应。chat 是透传（与 response_text 相同），Anthropic /
+  -- Responses 两条协议是**翻译后**的形态 —— 同一个请求，「上游说了什么」与
+  -- 「客户端收到了什么」是两份不同的报文，排查协议转换只能两边对着看。
+  client_response_text TEXT,
+  -- 从上面那段响应里重建出的「模型到底说了什么」：正文、思考、工具调用。
+  -- 流式响应没法直接读；不重建，用户在界面上只能看到一堆 `data:` 行。
+  recon_json        TEXT,
+  usage_json        TEXT,
+  error             TEXT,
+  truncated         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tap_turns_session ON tap_turns(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_tap_turns_ts ON tap_turns(ts);
 """
 
 
@@ -650,6 +718,9 @@ def replace_database(staging: Path) -> None:
 # 因此新增字段必须显式 ALTER。每条用 PRAGMA 检测后再加，可重复执行。
 _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # (表名, 列名, 列定义)
+    # 抓包要能对着看「上游说的」与「客户端收到的」：存量库缺这一列时，
+    # 界面按「未采集」处理，而不是把上游原文冒充成客户端视角。
+    ('tap_turns', 'client_response_text', 'TEXT'),
     ('request_logs', 'credit', 'REAL'),
     ('usage_daily', 'credit', 'REAL NOT NULL DEFAULT 0'),
     # 首字延迟：可空（历史记录与非流式请求为 NULL）

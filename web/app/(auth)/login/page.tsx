@@ -34,6 +34,21 @@ export default function LoginPage() {
     setExpired(new URLSearchParams(window.location.search).get('expired') === '1');
   }, []);
 
+  /**
+   * 是否已挂载（= React 已经接管了这个表单）。
+   *
+   * 静态导出的页面在 JS 到位之前是一个**原生表单**：此时点「登录」不会走下面的
+   * `submit`，浏览器会按默认的 GET 提交把 `?username=…&password=…` 拼到地址栏上
+   * —— 密码随即进入浏览记录、反向代理访问日志与任何 Referer。实测复现：在
+   * hydrate 完成前点提交，地址栏出现明文密码。
+   *
+   * 所以按钮在挂载前保持 disabled（点不动，也就不会原生提交），并给 form 加上
+   * `method="post"` 作为第二道保险：即使某天有人把 disabled 去掉，最坏也只是
+   * 一次 405，而不是把密码写进 URL。
+   */
+  const [ready, setReady] = useState(false);
+  useEffect(() => setReady(true), []);
+
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     if (busy) return;
@@ -98,7 +113,7 @@ export default function LoginPage() {
           </div>
         </div>
 
-        <form onSubmit={submit} className="rounded-[24px] bg-muted p-5">
+        <form onSubmit={submit} method="post" className="rounded-[24px] bg-muted p-5">
           <div className="space-y-4">
             <div className="space-y-1.5">
               <Label htmlFor="username" className="text-[11px] text-muted-foreground">
@@ -144,7 +159,7 @@ export default function LoginPage() {
               <p className="text-xs text-muted-foreground">{t('login.initialPwdHint')}</p>
             )}
 
-            <Button type="submit" disabled={busy} className="w-full rounded-full">
+            <Button type="submit" disabled={busy || !ready} className="w-full rounded-full">
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
               {t('login.submit')}
             </Button>
