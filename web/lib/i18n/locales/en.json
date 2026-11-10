@@ -2276,7 +2276,7 @@
     "noRecon": "Nothing to reconstruct for this turn (error response or empty reply)",
     "rawTruncated": "Request body (truncated, shown as raw text)",
     "truncatedHint": "This record exceeded the size limit; the request body was truncated",
-    "requestBody": "Client request body",
+    "requestBody": "Request body",
     "upstreamBody": "Request body sent upstream",
     "rawStream": "Raw upstream stream",
     "diffFirst": "This is the first turn, nothing to compare against",
@@ -2344,6 +2344,22 @@
     "outboundPath": "Dump file: {path}",
     "outboundTruncated": "Content exceeded the per-record limit and was truncated",
     "clientResponse": "Response received by the client (translated)",
-    "outboundOutOfWindow": "This turn has scrolled out of the scan window (the file is large): only recent outbound records are kept, check newer calls"
+    "outboundOutOfWindow": "This turn has scrolled out of the scan window (the file is large): only recent outbound records are kept, check newer calls",
+    "expandAll": "Expand all",
+    "collapseAll": "Collapse all",
+    "salvageTail": "Truncated remainder (raw)",
+    "upstreamRequestBody": "Gateway request body (rewritten)",
+    "diffDigestNote": "Both request bodies were truncated, so this compares **digests** (per-message role + content hash) — the raw bodies are cut at the same offset, so comparing them would always report \"identical\".",
+    "outboundNotFound": "No record for this turn in the dump file (it may have been written in an earlier batch, or that turn went to a different upstream).",
+    "outboundDecompressed": "decompressed (upstream sent gzip)",
+    "stringDetail": "String detail",
+    "stringMode": {
+      "preview": "Preview",
+      "raw": "Raw"
+    },
+    "stringStats": "{chars} chars · {lines} lines",
+    "copyValue": "Copy value",
+    "longStrings": "Long strings worth reading ({n}):",
+    "loadMore": "Load more ({n} more)"
   }
 }

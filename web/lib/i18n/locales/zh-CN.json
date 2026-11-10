@@ -2014,7 +2014,7 @@
     "noRecon": "这一轮没有可重建的输出（可能是错误响应或空回复）",
     "rawTruncated": "请求体（已截断，按原文展示）",
     "truncatedHint": "这条记录超过单条上限，请求体已被截断",
-    "requestBody": "客户端请求体",
+    "requestBody": "请求体",
     "upstreamBody": "发往上游的请求体",
     "rawStream": "上游原始流",
     "diffFirst": "这是第一轮，没有可对比的上一轮",
@@ -2082,6 +2082,22 @@
     "outboundPath": "转储文件：{path}",
     "outboundTruncated": "内容超过单条上限，已截断",
     "clientResponse": "客户端收到的响应（翻译后）",
-    "outboundOutOfWindow": "这一轮已滑出扫描窗口（文件太大）：只保留最近一段时间的出站记录，请查看更新的调用"
+    "outboundOutOfWindow": "这一轮已滑出扫描窗口（文件太大）：只保留最近一段时间的出站记录，请查看更新的调用",
+    "expandAll": "展开全部",
+    "collapseAll": "收起全部",
+    "salvageTail": "截断剩余部分（原文）",
+    "upstreamRequestBody": "网关请求体（改写后）",
+    "diffDigestNote": "这两轮的请求体都被截断了，比较的是**摘要**（逐条消息的角色与内容哈希）—— 请求体原文切在同一位置，比全文必然「完全一致」。",
+    "outboundNotFound": "转储文件里没有这一轮的记录（可能写在了更早的批次，或那一轮走了别的上游）。",
+    "outboundDecompressed": "已解压（上游发的是 gzip 压缩体）",
+    "stringDetail": "字符串详情",
+    "stringMode": {
+      "preview": "Preview",
+      "raw": "Raw"
+    },
+    "stringStats": "{chars} 字符 · {lines} 行",
+    "copyValue": "复制内容",
+    "longStrings": "值得细看的长字符串（{n} 个）：",
+    "loadMore": "加载更多（还有 {n} 条）"
   }
 }

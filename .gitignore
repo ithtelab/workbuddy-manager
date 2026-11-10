@@ -146,3 +146,6 @@ dev/.shots-weight-task
 
 # worktree 里为了复用依赖做的符号链接（不是仓库内容）
 /web/node_modules
+
+# 本地备份（数据库快照等），不入库
+.local-backups/

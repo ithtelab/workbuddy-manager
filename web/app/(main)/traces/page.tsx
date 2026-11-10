@@ -36,7 +36,8 @@ import type {
   TapTurnBrief,
 } from '@/lib/types';
 import {PageHeader} from '@/components/common/layout/PageHeader';
-import {JsonPreview, jsonAnchor, type JsonPath} from '@/components/common/trace/JsonView';
+import {JsonPreview, salvageJson} from '@/components/common/trace/JsonView';
+import type {JsonPath} from '@/lib/json-path';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
@@ -133,6 +134,12 @@ export default function TracesPage() {
    * 逐层展开并高亮，用户不用自己去树上找。
    */
   const [focusPath, setFocusPath] = useState<JsonPath | null>(null);
+  /**
+   * Preview 树的展开/收起信号。大报文默认**全收起**（展开两层在 500 KB 的
+   * 截断体上等于整页树），用户点「展开全部」再摊开 —— 这是可逆操作，
+   * 手动展开过的节点在收起信号撤销后保留原状。
+   */
+  const [expandAll, setExpandAll] = useState<boolean | undefined>(undefined);
   const [turn, setTurn] = useState<TapTurn | null>(null);
   /** 单轮正文取不到（404 / 网络错误）：要明确说，而不是让骨架屏一直转。 */
   const [turnFailed, setTurnFailed] = useState(false);
@@ -714,27 +721,32 @@ export default function TracesPage() {
                   {turn && tab === 'request' && (
                     <div className="min-w-0">
                       <RequestTab turn={turn} view={view} outbound={outbound}
-                                  format={format} highlight={focusPath} />
+                                  format={format} highlight={focusPath}
+                                  expandAll={expandAll} focusPath={focusPath}
+                                  onToggleExpand={() => setExpandAll((v) => !(v ?? false))} />
                     </div>
                   )}
                   {turn && tab === 'response' && (
                     <div className="min-w-0">
-                      <ResponseTab turn={turn} view={view} outbound={outbound} format={format} />
+                      <ResponseTab turn={turn} view={view} outbound={outbound} format={format}
+                              expandAll={expandAll}
+                              onToggleExpand={() => setExpandAll((v) => !(v ?? false))} />
                     </div>
                   )}
                   {turn && tab === 'diff' && (
                     <DiffTab diff={diff} hasPrev={Boolean(before)} onLocate={(path) => {
+                        // 路径前缀取决于树顶层的形状：
+                        //   · 截断体：根是 {headers, upstream_headers, body}，消息在
+                        //     body.messages 下 → 要补 'body'；
+                        //   · 完整体：根**就是** body 本身（键是 model/messages/…）
+                        //     → 不能补，否则多一层找不到（实测定位停在半路）。
                         setFocusPath(path);
                         setTab('request');
                         setView('gateway');
                         setFormat('preview');
-                        // 滚动放在页面层做：树是切页签后**新挂载**的，节点出现的
-                        // 时机取决于展开层级与容器高度，交给 JsonView 内部去滚实测
-                        // 不可靠（目标停在视口外）。这里等两帧再按 id 找。
-                        window.setTimeout(() => {
-                          document.getElementById(jsonAnchor(path))
-                            ?.scrollIntoView({block: 'nearest'});
-                        }, 180);
+                        // 滚动由树自己做（JsonView 的 focusPath）：它需要先**展开**
+                        // 目标行所在的那几层 —— 折叠状态下目标行不在 DOM 里，
+                        // 页面层 scrollIntoView 只会滚到空白处。
                       }} />
                   )}
                 </div>
@@ -813,24 +825,69 @@ function Overview({turn}: {turn: TapTurn}) {
  * tencent 视角的报文不在库里，而在上游写的转储文件里 —— 取不到时给出
  * **指向原因**的提示（没开启 / 没有该轮 / 文件不存在），而不是一片空白。
  */
-function RequestTab({turn, view, outbound, format, highlight}: {
+function RequestTab({turn, view, outbound, format, highlight, expandAll, focusPath,
+                     onToggleExpand}: {
   turn: TapTurn;
   view: 'client' | 'gateway' | 'tencent';
   outbound: TapOutbound | null;
   format: 'preview' | 'raw';
   highlight: JsonPath | null;
+  expandAll?: boolean;
+  /** diff「定位」的目标路径：树会展开到那一行。 */
+  focusPath?: JsonPath | null;
+  /** 「展开全部 / 收起全部」—— 放在报文标题行里。 */
+  onToggleExpand?: () => void;
 }) {
   const t = useT();
   const req = turn.request && typeof turn.request === 'object'
     ? (turn.request as Record<string, unknown>)
     : null;
 
+  // 截断的请求体：JSON 已经解析不了，但**能切出前缀树** —— 从原文里截到哪一层
+  // 就展示到哪一层，比甩一坨 500 KB 的 <pre> 有用得多（实测反馈：滚动半分钟
+  // 找不到重点）。解析不出来的剩余尾巴单独给一段原文。
+  // useMemo 必须在所有 early return 之前（React Hooks 规则），tencent 分支
+  // 的早退挪到 salvage 计算之后。
+  const salvage = useMemo(() => {
+    if (turn.request_ok) return null;
+    const raw = turn.request_raw || '';
+    // 截断发生在 body 中段，而 headers 排在最前面 —— 几乎总是完整的。
+    // 先切「body 之前」的部分（headers 等完整字段），能整体解析就直接用；
+    // body 本身再单独切前缀树，两块拼起来展示。
+    // `"body"` 可能出现在 headers 的**值**里（UA/cookie 都可能含这个词），
+    // 所以必须找 `"body": {` 这种带值的形态，并且取最后一次出现 —— 入库结构
+    // 固定是 {headers, body}，body 一定在最后。
+    let bodyStart = -1;
+    const needle = '"body": {';
+    let scan = 0;
+    while (true) {
+      const at = raw.indexOf(needle, scan);
+      if (at < 0) break;
+      bodyStart = at;
+      scan = at + 1;
+    }
+    const headPart = bodyStart > 0 ? raw.slice(0, bodyStart - 1) : '';
+    let headersDoc: unknown = null;
+    if (headPart) {
+      // headPart 以逗号结尾（body 是最后一个键），补 `}` 前先去掉
+      try {
+        const headFixed = `${headPart.replace(/[\s,]+$/, '')}}`;
+        headersDoc = JSON.parse(headFixed) as Record<string, unknown>;
+      } catch { /* headers 段不完整（极少见），退回不展示 */ }
+    }
+    const bodyRaw = bodyStart > 0 ? raw.slice(bodyStart + '"body": '.length) : raw;
+    const prefix = salvageJson(bodyRaw);
+    if (prefix === null && headersDoc === null) return null;
+    return {headers: headersDoc, prefix, tail: '', ok: false};
+  }, [turn.request_ok, turn.request_raw]);
+
   // 腾讯视角：整页换成出站转储里那一跳（请求侧），不走库里的两份。
   if (view === 'tencent') {
-    return <OutboundSide outbound={outbound} side="request" />;
+    return <OutboundSide outbound={outbound} side="request" format={format}
+                       expandAll={expandAll} onToggleExpand={onToggleExpand} />;
   }
 
-  if (!turn.request_ok) {
+  if (!turn.request_ok && !salvage) {
     return <Block title={t('trace.rawTruncated')} body={turn.request_raw || ''} />;
   }
 
@@ -844,8 +901,15 @@ function RequestTab({turn, view, outbound, format, highlight}: {
   // 请求头也是两份：客户端发来的（含它自己的网关密钥）与网关发给上游的
   // （含上游密钥）。两边 Authorization 是**不同的凭证**，只看 body 永远看不出
   // 「凭证换了没换」——而这是排查 401 / 打错账号池的第一现场。
-  const clientHeaders = asHeaders(req ? req.headers : null);
-  const upstreamHeaders = asHeaders(req ? req.upstream_headers : null);
+  // 截断体：headers 从抢救结果里来（入库的 request_json 解析不了，但 headers
+  // 段几乎总是完整的 —— 它在截断点之前）。不救的话界面上会显示「未采集到」，
+  // 而下面树里明明有 headers，自相矛盾（实测反馈）。
+  const clientHeaders = salvage && salvage.headers
+    ? asHeaders((salvage.headers as Record<string, unknown>).headers ?? salvage.headers)
+    : asHeaders(req ? req.headers : null);
+  const upstreamHeaders = salvage && salvage.headers
+    ? asHeaders((salvage.headers as Record<string, unknown>).upstream_headers ?? null)
+    : asHeaders(req ? req.upstream_headers : null);
   const headers = view === 'client' ? clientHeaders : upstreamHeaders;
 
   return (
@@ -873,15 +937,67 @@ function RequestTab({turn, view, outbound, format, highlight}: {
         items={headers}
       />
       <section>
-        <h4 className="mb-1 text-xs font-medium">
-          {view === 'client' ? t('trace.clientRequest') : t('trace.upstreamRequest')}
-        </h4>
-        {format === 'preview'
-          ? <JsonPreview value={shown} highlight={highlight} />
-          : <pre className={BLOCK_SCROLL + " rounded-md bg-muted/40 p-2 font-mono text-[11px]"}>
-              {pretty(shown)}
-            </pre>}
+        <BodyHeader
+          title={view === 'client' ? t('trace.requestBody') : t('trace.upstreamRequestBody')}
+          format={format}
+          expandAll={expandAll}
+          onToggleExpand={onToggleExpand}
+        />
+        {!turn.request_ok && salvage ? (
+          // 截断体：headers（完整）+ body 前缀树拼成一棵展示；默认全收起。
+          format === 'preview' ? (
+            <JsonPreview
+              value={{...(salvage.headers as object), body: salvage.prefix}}
+              expandAll={expandAll}
+              focusPath={focusPath}
+              maxHeight="max-h-[60vh]" />
+          ) : (
+            <pre className={BLOCK_SCROLL + " rounded-md bg-muted/40 p-2 font-mono text-[11px]"}>
+              {turn.request_raw}
+            </pre>
+          )
+        ) : format === 'preview' ? (
+          <JsonPreview value={shown} highlight={highlight} expandAll={expandAll}
+                       focusPath={focusPath} />
+        ) : (
+          <pre className={BLOCK_SCROLL + " rounded-md bg-muted/40 p-2 font-mono text-[11px]"}>
+            {pretty(shown)}
+          </pre>
+        )}
       </section>
+    </div>
+  );
+}
+
+/**
+ * 报文区的标题行：标题 + 格式相关的操作。
+ *
+ * 「展开全部 / 收起全部」放在**标题后面**而不是页面顶部：它只对下面这一段
+ * JSON 生效，放在顶部工具条里离作用对象太远，用户点了不知道作用在哪
+ * （实测反馈：点 Preview 后下面又冒出一个「展开全部」，位置突兀）。
+ */
+function BodyHeader({title, format, expandAll, onToggleExpand, extra}: {
+  title: string;
+  format: 'preview' | 'raw';
+  expandAll?: boolean;
+  onToggleExpand?: () => void;
+  /** 标题右侧的附加内容（如「已解压」标记）。 */
+  extra?: React.ReactNode;
+}) {
+  const t = useT();
+  return (
+    <div className="mb-1 flex flex-wrap items-center gap-2">
+      <h4 className="text-xs font-medium">{title}</h4>
+      {format === 'preview' && onToggleExpand && (
+        <button
+          type="button"
+          onClick={onToggleExpand}
+          className="rounded-full border px-2 py-0.5 text-[10px] text-muted-foreground hover:bg-muted"
+        >
+          {expandAll ? t('trace.collapseAll') : t('trace.expandAll')}
+        </button>
+      )}
+      {extra}
     </div>
   );
 }
@@ -963,17 +1079,20 @@ function ToolCalls({calls}: {calls: {id: string; name: string; arguments: string
  *     翻译后的报文，字段名与上游完全不同）；
  *   · 网关视角 —— 上游原文（SSE 帧 / JSON），用于取证与对照。
  */
-function ResponseTab({turn, view, outbound, format}: {
+function ResponseTab({turn, view, outbound, format, expandAll, onToggleExpand}: {
   turn: TapTurn;
   view: 'client' | 'gateway' | 'tencent';
   outbound: TapOutbound | null;
   format: 'preview' | 'raw';
+  expandAll?: boolean;
+  onToggleExpand?: () => void;
 }) {
   const t = useT();
 
   // 腾讯视角：整页换成出站转储里那一跳（响应侧：状态码、耗时、SSE 原文）。
   if (view === 'tencent') {
-    return <OutboundSide outbound={outbound} side="response" />;
+    return <OutboundSide outbound={outbound} side="response" format={format}
+                       expandAll={expandAll} onToggleExpand={onToggleExpand} />;
   }
 
   const recon = (view === 'client' ? turn.client_recon : turn.upstream_recon) ?? turn.recon;
@@ -1004,8 +1123,9 @@ function ResponseTab({turn, view, outbound, format}: {
       <p className="text-[11px] text-muted-foreground">{note}</p>
       {structured ? (
         <section>
-          <h4 className="mb-1 text-xs font-medium">{t('trace.clientResponse')}</h4>
-          <JsonPreview value={structured} />
+          <BodyHeader title={t('trace.clientResponse')} format={format}
+                     expandAll={expandAll} onToggleExpand={onToggleExpand} />
+          <JsonPreview value={structured} expandAll={expandAll} />
         </section>
       ) : !recon && view === 'client' && !turn.passthrough ? (
         <p className="text-xs text-muted-foreground">{t('trace.notCaptured')}</p>
@@ -1074,10 +1194,22 @@ function DiffTab({diff, hasPrev, onLocate}: {
   }
   if (!diff) return <SkeletonBar className="h-32 w-full" />;
   if (diffIsEmpty(diff)) {
-    return <p className="text-xs text-muted-foreground">{t('trace.diffEmpty')}</p>;
+    return (
+      <div className="space-y-1">
+        <p className="text-xs text-muted-foreground">{t('trace.diffEmpty')}</p>
+        {diff.from_digest && (
+          <p className="text-[11px] text-muted-foreground">{t('trace.diffDigestNote')}</p>
+        )}
+      </div>
+    );
   }
   return (
     <div className="space-y-4 text-xs">
+      {diff.from_digest && (
+        <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+          {t('trace.diffDigestNote')}
+        </p>
+      )}
       {diff.params.length > 0 && (
         <section>
           <h4 className="mb-1 font-medium">{t('trace.diffParams')}</h4>
@@ -1331,9 +1463,12 @@ function Timeline({
  * 三种「看不到」各有提示，别让人对着空白猜：上游没开转储（含开启方式）、
  * 这一轮没有 trace id（功能上线前的老记录）、文件在但没匹配到该轮。
  */
-function OutboundSide({outbound, side}: {
+function OutboundSide({outbound, side, format, expandAll, onToggleExpand}: {
   outbound: TapOutbound | null;
   side: 'request' | 'response';
+  format: 'preview' | 'raw';
+  expandAll?: boolean;
+  onToggleExpand?: () => void;
 }) {
   const t = useT();
   if (!outbound) return <SkeletonBar className="h-32 w-full" />;
@@ -1344,7 +1479,31 @@ function OutboundSide({outbound, side}: {
       : outbound.reason === 'no-file'
         ? t('trace.outboundUnavailable')
         : t('trace.outboundError', {reason: outbound.reason});
-  } else if (outbound.reason === 'out-of-window') {
+    return (
+      <div className="space-y-2 text-xs">
+        <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-amber-700 dark:text-amber-300">
+          {hint}
+        </p>
+        <p className="text-[11px] text-muted-foreground">
+          {t('trace.outboundPath', {path: outbound.path})}
+        </p>
+      </div>
+    );
+  }
+  if (outbound.reason === 'not-found') {
+    // 文件在、也扫完了整个文件，确实没有这一轮的记录 —— 与「没开转储」是两回事
+    return (
+      <div className="space-y-2 text-xs">
+        <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-amber-700 dark:text-amber-300">
+          {t('trace.outboundNotFound')}
+        </p>
+        <p className="text-[11px] text-muted-foreground">
+          {t('trace.outboundPath', {path: outbound.path})}
+        </p>
+      </div>
+    );
+  }
+  if (outbound.reason === 'out-of-window') {
     // 有文件但这一轮已经滑出扫描窗口（活跃池子几小时就写出上百 MB）：
     // 不是错误，也不是"还没有"，如实说清楚原因。
     return (
@@ -1389,16 +1548,53 @@ function OutboundSide({outbound, side}: {
         items={headerPairs(entry.headers)}
       />
       <div className="min-w-0">
-        <Block
+        <BodyHeader
           title={isReq ? t('trace.outboundReqBody') : t('trace.outboundRespBody')}
-          body={entry.body || '—'}
+          format={format}
+          expandAll={expandAll}
+          onToggleExpand={onToggleExpand}
+          extra={entry.decompressed ? (
+            <Badge variant="outline" className="text-[10px]">
+              {t('trace.outboundDecompressed')}
+            </Badge>
+          ) : null}
         />
+        {format === 'preview' && isReq ? (
+          // 腾讯视角的请求体是**JSON**（上游发往腾讯的那一份），要能像其它
+          // 报文一样折叠浏览 —— 之前只有一块纯文本，几百 KB 根本没法读。
+          <JsonPreview value={parseMaybeJson(entry.body || '')} expandAll={expandAll} />
+        ) : format === 'preview' ? (
+          // 响应是 SSE 帧流，不是单个 JSON —— 按行展示（保留 data: 前缀）
+          <pre className={BLOCK_SCROLL + " rounded-md bg-muted/40 p-2 font-mono text-[11px]"}>
+            {entry.body || '—'}
+          </pre>
+        ) : (
+          <pre className={BLOCK_SCROLL + " rounded-md bg-muted/40 p-2 font-mono text-[11px]"}>
+            {entry.body || '—'}
+          </pre>
+        )}
       </div>
       {entry.truncated && (
         <p className="text-[11px] text-amber-600">{t('trace.outboundTruncated')}</p>
       )}
     </div>
   );
+}
+
+/**
+ * 尽量把一段文本解析成 JSON；不是 JSON 就原样返回字符串（交给树按标量渲染）。
+ *
+ * 腾讯视角的请求体是上游发出去的 JSON 原文；偶尔（比如上游改了格式）不是，
+ * 那时也要能显示 —— 所以失败时返回原字符串而不是报错。
+ */
+function parseMaybeJson(text: string): unknown {
+  const trimmed = (text || '').trim();
+  if (!trimmed || (trimmed[0] !== '{' && trimmed[0] !== '[')) return text;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return text;
+  }
 }
 
 /** 上游转储里的 headers 已是打码后的平铺对象，这里只排序展示。 */

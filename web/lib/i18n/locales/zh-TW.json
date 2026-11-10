@@ -2249,7 +2249,7 @@
     "noRecon": "這一輪沒有可重建的輸出（可能是錯誤回應或空回覆）",
     "rawTruncated": "請求內容（已截斷，按原文展示）",
     "truncatedHint": "這條記錄超過單條上限，請求內容已被截斷",
-    "requestBody": "用戶端請求內容",
+    "requestBody": "請求內容",
     "upstreamBody": "發往上遊的請求內容",
     "rawStream": "上遊原始串流",
     "diffFirst": "這是第一輪，沒有可對比的上一輪",
@@ -2317,6 +2317,22 @@
     "outboundPath": "轉儲檔案：{path}",
     "outboundTruncated": "內容超過單條上限，已截斷",
     "clientResponse": "用戶端收到的回應（翻譯後）",
-    "outboundOutOfWindow": "這一輪已滑出掃描視窗（檔案太大）：只保留最近一段時間的出站記錄，請查看更新的呼叫"
+    "outboundOutOfWindow": "這一輪已滑出掃描視窗（檔案太大）：只保留最近一段時間的出站記錄，請查看更新的呼叫",
+    "expandAll": "展開全部",
+    "collapseAll": "收起全部",
+    "salvageTail": "截斷剩餘部分（原文）",
+    "upstreamRequestBody": "閘道請求內容（改寫後）",
+    "diffDigestNote": "這兩輪的請求內容都被截斷了，比較的是**摘要**（逐條訊息的角色與內容雜湊）—— 請求內容原文切在同一位置，比全文必然「完全一致」。",
+    "outboundNotFound": "轉儲檔案裡沒有這一輪的記錄（可能寫在了更早的批次，或那一輪走了別的上游）。",
+    "outboundDecompressed": "已解壓（上游發的是 gzip 壓縮體）",
+    "stringDetail": "字串詳情",
+    "stringMode": {
+      "preview": "Preview",
+      "raw": "Raw"
+    },
+    "stringStats": "{chars} 字元 · {lines} 行",
+    "copyValue": "複製內容",
+    "longStrings": "值得細看的長字串（{n} 個）：",
+    "loadMore": "載入更多（還有 {n} 條）"
   }
 }

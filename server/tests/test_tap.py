@@ -621,6 +621,103 @@ class DbTest(unittest.TestCase):
         ]}
         self.assertEqual(tap._aux_kind(normal), 'main')
 
+    def test_truncated_turns_diff_uses_digest(self) -> None:
+        """截断的两轮也必须能比出差异（不能永远是「完全一致」）。
+
+        实测现场：请求体 2 MB、单条上限 512 KB → 两轮都切在**同一字节位置**，
+        抢救出的前缀逐字相同，比前缀必然说「一致」——那是假信息。摘要在截断
+        **之前**算（逐条消息的角色 + 内容哈希 + 工具名），与截断无关。
+        """
+        tap.save_settings({'enabled': True, 'max_body': 4096})
+        big = 'x' * 20000
+        body_a = _body(messages=[BODY['messages'][0],
+                                   {'role': 'user', 'content': big}])
+        body_b = _body(messages=[BODY['messages'][0],
+                                   {'role': 'user', 'content': big},
+                                   {'role': 'assistant', 'content': 'done'}])
+        a = self._capture(body=body_a, stream=False)
+        b = self._capture(body=body_b, stream=False)
+        assert a is not None and b is not None
+        self.assertTrue(tap.turn(a)['truncated'], '这一轮应当被截断（测试前提）')
+        d = tap.diff(a, b)
+        assert d is not None
+        self.assertTrue(d.get('from_digest'), '截断场景应当走摘要比较')
+        self.assertGreaterEqual(d['summary']['added'], 1,
+                                '摘要比较应发现新增的那条消息')
+
+    def test_outbound_falls_back_to_previous_generation(self) -> None:
+        """轮转后当前文件可能还不存在（要等下一次调用），上一代要兜底。
+
+        实测：转储文件超过上限被改名成 .1（116 MB），而新文件要等下一次调用
+        才被上游创建 —— 这段空窗期里只查当前文件会得到「文件不存在」。
+        """
+        import os
+        import tempfile
+
+        tap.save_settings({'enabled': True})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'outbound-trace.jsonl'
+            prev = Path(str(path) + '.1')
+            prev.write_text(
+                '{"kind":"request","trace_id":"abc","ts":1}\n'
+                '{"kind":"response","trace_id":"abc","ts":2}\n', encoding='utf-8')
+            old_env = os.environ.get('WB_TAP_OUTBOUND_FILE')
+            os.environ['WB_TAP_OUTBOUND_FILE'] = str(path)
+            try:
+                res = tap.outbound('abc')
+            finally:
+                if old_env is None:
+                    os.environ.pop('WB_TAP_OUTBOUND_FILE', None)
+                else:
+                    os.environ['WB_TAP_OUTBOUND_FILE'] = old_env
+        self.assertTrue(res['available'])
+        self.assertEqual(len(res['entries']), 2, '上一代里的记录应当能查到')
+
+    def test_outbound_gunzips_compressed_request_body(self) -> None:
+        """上游在请求体 > 64 KB 时会 gzip 压缩再发往腾讯，转储记的是**压缩字节**。
+
+        不解压的话界面就是乱码（body 开头 `\x1f\x8b`）—— 实测反馈。
+        """
+        import gzip as _gzip
+        import json as _json
+
+        payload = _json.dumps({'model': 'x', 'messages': [
+            {'role': 'user', 'content': '你好' * 500}]}, ensure_ascii=False).encode('utf-8')
+        # 新上游：base64+gzip（压缩字节不是合法 UTF-8，必须 base64 才不丢字节）
+        import base64 as _b64
+        b64 = _b64.b64encode(_gzip.compress(payload)).decode('ascii')
+        text, done = tap._maybe_gunzip(b64, {'Content-Encoding': 'gzip'}, 'base64+gzip')
+        self.assertTrue(done, '应当识别出 base64+gzip 并解压')
+        self.assertIn('你好', text)
+        # 旧上游：Go 把压缩字节当 UTF-8 字符串写进 JSON，非法字节在**写入时**
+        # 就被替换成 U+FFFD —— 管理端拿到的已经是坏数据，无法还原，如实返回。
+        legacy = _gzip.compress(payload).decode('utf-8', 'replace')
+        self.assertIn('\ufffd', legacy, '前提：旧上游的形态确实含替换字符')
+        text2, done2 = tap._maybe_gunzip(legacy, {'Content-Encoding': 'gzip'})
+        self.assertFalse(done2, '字节已损坏时不应声称解压成功')
+        self.assertIn('\ufffd', text2)
+        # 非 gzip 的原样返回
+        same, changed = tap._maybe_gunzip('{"a":1}', {'Content-Type': 'application/json'})
+        self.assertFalse(changed)
+        self.assertEqual(same, '{"a":1}')
+
+    def test_salvage_prefix_cuts_outside_strings(self) -> None:
+        """截断发生在**字符串中间**时也要能抢救出可解析的前缀。
+
+        实测：minimax 那条 512 KB 记录，截断点落在 `"name": "bas` 里 ——
+        旧实现按「最后一个逗号」切，切出来的前缀里有个未闭合的字符串，
+        JSON.parse 必然失败 → 界面上请求体**整个空白**。
+        """
+        raw = ('{"headers": {"a": "b"}, "body": {"model": "m", "messages": ['
+               '{"role": "user", "content": "hi"}, {"name": "bas')
+        got = tap.salvage_json_prefix(raw)
+        assert got is not None, '应当抢救出前缀'
+        # 返回的是 **body 段**的内容（不是含 body 键的外层）
+        assert isinstance(got, dict)
+        assert got.get('model') == 'm'
+        # 截断前完整的那个元素应当在里面（截断点在它之后）
+        assert len(got.get('messages') or []) >= 1
+
     def test_prune_respects_max_sessions(self) -> None:
         tap.save_settings({'enabled': True, 'max_sessions': 10})
         for i in range(14):

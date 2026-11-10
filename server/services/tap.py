@@ -31,6 +31,8 @@ Cursor、各类 SDK）把**完整的上下文**（system prompt、全部历史�
 """
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 import html
 import json
@@ -317,6 +319,73 @@ def _client_version(ua: str | None) -> str:
     if '/' not in first:
         return ''
     return re.sub(r'[^0-9A-Za-z.\-]', '', first.split('/', 1)[1])[:24]
+
+
+def request_digest(body: object) -> dict:
+    """请求体的**可比摘要**（在截断前算）。
+
+    为什么不直接比 body：请求体常有两三 MB，而单条存储上限默认 512 KB ——
+    截断把两轮都切在**同一个字节位置**，抢救出的前缀逐字相同，「与上一轮对比」
+    于是永远说「完全一致」，那是假信息（实测：325 条消息的会话，真实差异全在
+    末尾几十条里）。
+
+    摘要只保留「结构」不保留「全文」：消息逐条记 role + 内容哈希（16 位），
+    工具记名字，参数记键值。它与截断无关，因此永远可比；体积只有几 KB。
+
+    哈希用 sha1 而非全文：全文会让摘要本身变成另一份「截断体」，就白做了。
+    """
+    if not isinstance(body, dict):
+        return {'kind': 'other'}
+    digest: dict[str, Any] = {'kind': 'object'}
+    msgs = body.get('messages')
+    if isinstance(msgs, list):
+        digest['messages'] = [
+            {
+                'role': str(m.get('role')) if isinstance(m, dict) else '?',
+                'h': _short_hash(m.get('content') if isinstance(m, dict) else m),
+                # 工具调用也算进去：agent 的每一轮差异往往就在这里
+                'tc': _tool_call_names(m) if isinstance(m, dict) else [],
+            }
+            for m in msgs
+        ]
+    tools = body.get('tools')
+    if isinstance(tools, list):
+        digest['tools'] = sorted(
+            str((t.get('function') or t).get('name'))
+            for t in tools if isinstance(t, dict))
+    params = _param_view(body)
+    digest['params'] = {k: _short_hash(v) for k, v in params.items()}
+    digest['model'] = body.get('model') if isinstance(body.get('model'), str) else ''
+    digest['n'] = len(msgs) if isinstance(msgs, list) else 0
+    return digest
+
+
+def _short_hash(value: object) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, str):
+        raw = value
+    else:
+        try:
+            raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:  # noqa: BLE001
+            raw = str(value)
+    return hashlib.sha1(raw.encode('utf-8', 'replace')).hexdigest()[:16]
+
+
+def _tool_call_names(msg: dict) -> list[str]:
+    calls = msg.get('tool_calls')
+    if not isinstance(calls, list):
+        return []
+    out: list[str] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get('function') if isinstance(call.get('function'), dict) else {}
+        name = fn.get('name') or call.get('name')
+        if isinstance(name, str):
+            out.append(name)
+    return out
 
 
 def _clip(text: str, limit: int) -> tuple[str, bool]:
@@ -789,6 +858,9 @@ def capture(*, body: object, headers: Iterable[tuple[str, str]] | None,
         recon = reconstruct(text=text, payload=payload)
         usage_obj = usage if isinstance(usage, dict) else {}
 
+        # 摘要要在**截断前**算：截断后的 body 已经不是全量，摘要就失去意义。
+        digest = request_digest(view_body)
+
         request_doc = {
             'headers': redact_headers(headers),
             # 网关发给上游的那套头（Content-Type、Authorization…）。**必须一起留**：
@@ -838,16 +910,25 @@ def capture(*, body: object, headers: Iterable[tuple[str, str]] | None,
         except Exception:  # noqa: BLE001 - 价目表缺失不该影响抓包
             cost = None
 
+        # 顺带轮转上游的转储文件：上游只追加、不轮转，写满会吃磁盘，而旧记录
+        # 也永远查不到（扫描只看尾部）。管理端是唯一会持续跑着的进程，由它兜底。
+        try:
+            _rotate_outbound(_outbound_path(), OUTBOUND_MAX_BYTES)
+        except Exception:  # noqa: BLE001 - 轮转失败不该影响抓包
+            pass
+
         turn_id = db.execute(
             'INSERT INTO tap_turns(session_id, seq, ts, path, protocol, model, '
             'mapped_model, status, stream, latency_ms, first_token_ms, '
             'prompt_tokens, completion_tokens, cache_hit_tokens, cache_miss_tokens, '
-            'cost, request_json, response_text, client_response_text, recon_json, '
-            'usage_json, error, truncated, trace_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            'cost, request_json, request_digest, response_text, client_response_text, '
+            'recon_json, usage_json, error, truncated, trace_id) '
+            'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
             (session_id, seq, now, _clean(path, 128), protocol, _clean(model, 128),
              _clean(model, 128), status, 1 if stream else 0, latency_ms,
              first_token_ms, pt, ct, _as_int(hit), _as_int(miss), cost,
-             request_text, response_text, client_text or None, recon_text,
+             request_text, json.dumps(digest, ensure_ascii=False, default=str),
+             response_text, client_text or None, recon_text,
              json.dumps(usage_obj, ensure_ascii=False, default=str)[:8192],
              _clean(error, 500), 1 if (cut_request or cut_response or cut_recon) else 0,
              _clean(trace_id, 64)),
@@ -1193,7 +1274,13 @@ def turn(turn_id: int) -> dict | None:
         'truncated': bool(row['truncated']),
         'request': request,
         'request_ok': request_ok,
+        # 截断时 request_json 本身就是原文（diff 的兜底路径要用它）；
+        # 未截断时 request_raw 为 None，界面直接用解析好的 request。
         'request_raw': None if request_ok else row['request_json'],
+        'request_text': row['request_json'],
+        # 摘要（截断前算的）：diff 在截断场景改用它
+        'request_digest': _loads(row['request_digest'])[0]
+        if 'request_digest' in row.keys() else None,
         'response': response,
         'response_ok': response_ok,
         'response_raw': row['response_text'] if (not response_ok or row['stream']) else None,
@@ -1256,6 +1343,134 @@ def _outbound_path() -> Path:
                                '/opt/workbuddy2api/data/outbound-trace.jsonl'))
 
 
+def _outbound_candidates() -> list[Path]:
+    # 转储文件的候选路径：当前文件 + 上一代（.1）。
+    #
+    # 为什么要有上一代：轮转发生在「当前文件超过上限」的那一刻，此时新文件要等
+    # **下一次调用**才被上游创建 —— 这中间窗口里当前文件根本不存在，而上一代里
+    # 还留着最近的历史（实测：轮转后立刻查，.1 有 116 MB 数据、当前文件不存在）。
+    # 只查当前文件会把这段窗口整个变成「查不到」。
+    path = _outbound_path()
+    out = [path]
+    prev = path.with_suffix(path.suffix + '.1')
+    if prev != path:
+        out.append(prev)
+    return out
+
+
+# 出站转储文件的大小上限（字节）：超过就**按时间轮转**。
+#
+# 为什么必须有：上游（workbuddy2api）的 outbound_trace 只追加、不轮转 ——
+# 每次调用两行、每行可达 260 KB（64 KB 请求 + SSE 响应全文各一行）。一个活跃
+# 的池子几小时就能写出上百 MB（实测本机 12 小时到 112 MB）。文件无界增长会
+# 吃满磁盘，而且**查历史时永远查不到**（旧数据在文件头部，尾部扫描够不着）。
+#
+# 轮转策略：超过上限就把当前文件改名成 .1（只保留一代），新调用写新文件。
+# 代价是「上一代之前」的记录消失 —— 但那本来也查不到（扫描窗口只覆盖尾部），
+# 而磁盘有界是硬要求。上限可用环境变量调大。
+OUTBOUND_MAX_BYTES = max(4 * 1024 * 1024, int(
+    os.environ.get('WB_TAP_OUTBOUND_MAX_BYTES', 64 * 1024 * 1024)))
+
+
+def _rotate_outbound(path: Path, limit: int) -> None:
+    """转储文件超过上限时轮转一代（.1）。写失败静默忽略。
+
+    只留一代：留多代要处理「新一代写满了再转」的多文件查找，而查历史本来就
+    做不到（扫描窗口只看尾部）。一代足够覆盖「最近若干小时」。
+    """
+    try:
+        if not path.is_file() or path.stat().st_size < limit:
+            return
+        old = path.with_suffix(path.suffix + '.1')
+        if old.exists():
+            old.unlink()
+        path.rename(old)
+    except OSError:
+        # 轮转失败不该影响调用（写文件的下一行会继续追加到原文件）
+        pass
+
+
+def _maybe_gunzip(body: str, headers: dict, encoding: str = '') -> tuple[str, bool]:
+    """把转储里的请求体还原成**可读文本**。
+
+    上游（workbuddy2api）在请求体超过 64 KB 时会 gzip 压缩再发往腾讯
+    （`internal/upstream/client.go` 的 `outboundBody`），而压缩字节**不是合法
+    UTF-8** —— 直接当文本渲染就是乱码（实测：开头 `\x1f\x8b`）。
+
+    两种情况：
+    · `body_encoding == "base64+gzip"`（新上游）：body 是 base64 编码的压缩字节，
+      先 base64 解码再 gunzip；
+    · 没有该标记（旧上游）：body 是被当字符串塞进 JSON 的**原始字节**，非法字节
+      在写入时就已被替换成 U+FFFD，**无法还原** —— 这时如实返回原样并标出
+      「已损坏」，不假装成功。
+
+    返回 (可读文本, 是否成功还原)。
+    """
+    if encoding == 'base64+gzip':
+        try:
+            raw = base64.b64decode(body, validate=False)
+            return gzip.decompress(raw).decode('utf-8', 'replace'), True
+        except Exception:  # noqa: BLE001 - 解码失败：原样返回
+            return body, False
+
+    enc = ''
+    for key, value in (headers or {}).items():
+        if str(key).lower() == 'content-encoding':
+            enc = str(value).lower()
+            break
+    if 'gzip' not in enc:
+        return body, False
+    # 旧上游的形态：字节被当 UTF-8 字符串存，非法处已变成 U+FFFD，无法还原。
+    # 只有当整个 body 恰好没有替换字符时才可能用 latin-1 还原。
+    if '\ufffd' in body:
+        return body, False
+    try:
+        compressed = body.encode('latin-1')
+        return gzip.decompress(compressed).decode('utf-8', 'replace'), True
+    except Exception:  # noqa: BLE001 - 不是 gzip / 解压失败：原样返回
+        return body, False
+
+
+def _scan_outbound_file(path: Path, wanted: str, max_scan: int) -> tuple[list[dict], bool]:
+    """在一个文件里从尾部倒扫，找 wanted 的记录。
+
+    返回 (找到的记录, 是否扫完了整个文件)。第二个值用来区分「整个文件都没有」
+    与「只看了尾部、这条在更早」—— 这两种在界面上要给出不同的提示。
+    """
+    found: list[dict] = []
+    with path.open('rb') as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        read = 0
+        carry = b''
+        while read < min(size, max_scan):
+            step = min(65536, size - read)
+            if step <= 0:
+                break
+            read += step
+            fh.seek(size - read)
+            chunk = fh.read(step) + carry
+            lines = chunk.split(b'\n')
+            # 第一行可能被截断（除非已经读到文件开头），留给下一轮拼接。
+            carry = b'' if read >= size else lines[0]
+            for raw in reversed(lines[1:] if read < size else lines):
+                if wanted.encode() not in raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except ValueError:
+                    continue
+                if entry.get('trace_id') != wanted:
+                    continue
+                found.append(entry)
+            # 上游每个路径尝试各写一对（换路径重试是常态）：取**最后一对**——
+            # 它是真正成功（或最终失败）的那次。第一对是失败尝试，正文可能
+            # 只有几十字节，用户会以为「响应怎么这么短」。
+            if len(found) >= 2:
+                break
+        return found, read >= size
+
+
 def outbound(trace_id: str | None, *, max_scan: int = 16 * 1024 * 1024) -> dict:
     """按 trace_id 取上游出站记录（腾讯视角）。
 
@@ -1265,53 +1480,39 @@ def outbound(trace_id: str | None, *, max_scan: int = 16 * 1024 * 1024) -> dict:
     要查的轮落在 53 MB 处）—— 4 MB / 8 MB 都会「翻完就查不到」。16 MB 覆盖
     「最近一小时左右的调用」；再往前属于历史，如实提示「已滑出窗口」。仍不
     整份读入 ——「一次查看拖垮内存」这条路不能开。
+
+    候选文件按顺序查：当前文件优先，**上一代（.1）兜底** —— 轮转后新文件要等
+    下一次调用才出现，这段空窗期里上一代里还留着最近的历史。
     """
-    path = _outbound_path()
+    candidates = _outbound_candidates()
+    path = candidates[0]
     if not trace_id:
         return {'available': False, 'reason': 'no-trace', 'entries': [], 'path': str(path)}
-    if not path.is_file():
+    if not any(p.is_file() for p in candidates):
         return {'available': False, 'reason': 'no-file', 'entries': [], 'path': str(path)}
 
     wanted = trace_id.strip()
     found: list[dict] = []
+    scanned_all = False
     try:
-        with path.open('rb') as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            read = 0
-            carry = b''
-            while read < min(size, max_scan):
-                step = min(65536, size - read)
-                if step <= 0:
-                    break
-                read += step
-                fh.seek(size - read)
-                chunk = fh.read(step) + carry
-                lines = chunk.split(b'\n')
-                # 第一行可能被截断（除非已经读到文件开头），留给下一轮拼接。
-                carry = b'' if read >= size else lines[0]
-                for raw in reversed(lines[1:] if read < size else lines):
-                    if wanted.encode() not in raw:
-                        continue
-                    try:
-                        entry = json.loads(raw)
-                    except ValueError:
-                        continue
-                    if entry.get('trace_id') != wanted:
-                        continue
-                    found.append(entry)
-                # 上游每个路径尝试各写一对（换路径重试是常态）：取**最后一对**——
-                # 它是真正成功（或最终失败）的那次。第一对是失败尝试，正文可能
-                # 只有几十字节，用户会以为「响应怎么这么短」。
-                if len(found) >= 2:
-                    break
+        for cand in candidates:
+            if not cand.is_file():
+                continue
+            entries, complete = _scan_outbound_file(cand, wanted, max_scan)
+            found.extend(entries)
+            if entries:
+                scanned_all = complete
+                break
+            scanned_all = scanned_all and complete
     except OSError as exc:
         return {'available': False, 'reason': f'io: {exc}', 'entries': [], 'path': str(path)}
 
-    # 没扫到且还有更多文件没看：如实区分「窗口内没有」与「滑出窗口」。
-    # 实测：一个活跃的池子几小时就能写出上百 MB，16 MB 窗口外属于常态，
-    # 界面给「已滑出窗口，请查看更新的调用」而不是假装不存在。
-    if not found and size > max_scan:
+    # 没扫到：把「看遍了所有候选文件也没有」与「只看了尾部、这条在更早」分开说。
+    # 前者是「这一轮确实没被转储」；后者是「文件太大、这条已被挤出扫描窗口」。
+    if not found:
+        if scanned_all:
+            return {'available': True, 'reason': 'not-found',
+                    'entries': [], 'path': str(path)}
         return {'available': True, 'reason': 'out-of-window',
                 'entries': [], 'path': str(path)}
 
@@ -1325,6 +1526,25 @@ def outbound(trace_id: str | None, *, max_scan: int = 16 * 1024 * 1024) -> dict:
         if kind not in latest or entry.get('ts', 0) >= latest[kind].get('ts', 0):
             latest[kind] = entry
     entries = [latest[k] for k in ('request', 'response') if k in latest]
+    # 请求体可能是 gzip 压缩字节 → 解压成可读文本（否则界面是乱码）
+    for entry in entries:
+        if entry.get('kind') != 'request':
+            continue
+        headers = entry.get('headers')
+        headers = headers if isinstance(headers, dict) else {}
+        text, decompressed = _maybe_gunzip(
+            str(entry.get('body') or ''), headers,
+            str(entry.get('body_encoding') or ''))
+        if decompressed:
+            entry['body'] = text
+            entry['body_encoding'] = ''
+            # 解压后可能超过上游的 max_body 截断上限 —— 重新按同样上限截一次，
+            # 并如实标记（否则界面显示的是不完整的正文却没说）。
+            limit = int(os.environ.get('WB_TAP_OUTBOUND_MAX_BODY', 262144))
+            if len(text) > limit:
+                entry['body'] = text[:limit]
+                entry['truncated'] = True
+            entry['decompressed'] = True
     return {'available': True, 'reason': '', 'entries': entries, 'path': str(path)}
 
 
@@ -1376,11 +1596,217 @@ def _param_view(body: object) -> dict[str, str]:
     }
 
 
+def _diff_from_digest(digest_a: dict, digest_b: dict,
+                      turn_a: dict, turn_b: dict) -> dict:
+    """用摘要比两轮（截断场景）。
+
+    摘要的 messages 是逐条 `{role, h(内容哈希), tc(工具调用名)}`，因此能精确
+    指出「新增了哪几条、改了哪几条」——这正是截断丢掉的部分。
+    """
+    msgs_a = digest_a.get('messages') or []
+    msgs_b = digest_b.get('messages') or []
+    common = min(len(msgs_a), len(msgs_b))
+    changed = [
+        {'index': i, 'role': str(msgs_b[i].get('role')),
+         'before': _digest_preview(msgs_a[i]), 'after': _digest_preview(msgs_b[i])}
+        for i in range(common)
+        if msgs_a[i].get('h') != msgs_b[i].get('h')
+        or msgs_a[i].get('role') != msgs_b[i].get('role')
+    ]
+    added = [
+        {'index': i, 'role': str(msgs_b[i].get('role')),
+         'preview': _digest_preview(msgs_b[i]), 'chars': 0}
+        for i in range(common, len(msgs_b))
+    ]
+    removed = [
+        {'index': i, 'role': str(msgs_a[i].get('role')),
+         'preview': _digest_preview(msgs_a[i])}
+        for i in range(common, len(msgs_a))
+    ]
+    params_a = digest_a.get('params') or {}
+    params_b = digest_b.get('params') or {}
+    params = [
+        {'key': k, 'before': params_a.get(k), 'after': params_b.get(k)}
+        for k in sorted(set(params_a) | set(params_b))
+        if params_a.get(k) != params_b.get(k)
+    ]
+    tools_a = digest_a.get('tools') or []
+    tools_b = digest_b.get('tools') or []
+    return {
+        'before': {'id': turn_a['id'], 'seq': turn_a['seq'], 'ts': turn_a['ts'],
+                   'model': turn_a.get('model')},
+        'after': {'id': turn_b['id'], 'seq': turn_b['seq'], 'ts': turn_b['ts'],
+                  'model': turn_b.get('model')},
+        'params': params,
+        'system': {
+            'changed': False,
+            'before_chars': 0, 'after_chars': 0, 'before': '', 'after': '',
+        },
+        'messages': {
+            'before_total': len(msgs_a), 'after_total': len(msgs_b),
+            'common': common, 'added': added[:50], 'removed': removed[:50],
+            'changed': changed[:50],
+        },
+        'tools': {
+            'added': sorted(set(tools_b) - set(tools_a))[:50],
+            'removed': sorted(set(tools_a) - set(tools_b))[:50],
+            'changed': [],
+        },
+        'summary': {
+            'params': len(params), 'system': 0, 'added': len(added),
+            'removed': len(removed), 'changed': len(changed),
+            'tools': len(set(tools_b) - set(tools_a)) + len(set(tools_a) - set(tools_b)),
+        },
+        # 截断下用的是摘要：界面要说明「比的是摘要」，否则用户会以为看到的是全文
+        'from_digest': True,
+    }
+
+
+def _digest_preview(msg: dict) -> str:
+    """摘要里一条消息的可读摘要：角色 + 工具调用名 + 哈希前缀。"""
+    role = str(msg.get('role') or '?')
+    tools = msg.get('tc') or []
+    h = str(msg.get('h') or '')[:8]
+    if tools:
+        return f'{role} · {", ".join(str(t) for t in tools[:3])} · {h}'
+    return f'{role} · {h}'
+
+
 def _body_of(turn_row: dict) -> object:
+    """取这一轮的请求体（用于 diff）。
+
+    **截断的轮次必须也能比**：请求体超过 `max_body` 时 `request_json` 解析不了，
+    `request` 是 None —— 两个 None 相比会「完全一致」，那是**假信息**（实测
+    用户看到的正是这个）。所以这里退一步：从 `request_raw` 里切出能解析的
+    body 前缀（`salvage_json_prefix`），至少能比出「多了哪些消息」。
+    """
     req = turn_row.get('request')
     if isinstance(req, dict):
-        return req.get('upstream_body') or req.get('body')
+        body = req.get('upstream_body') or req.get('body')
+        if body is not None:
+            return body
+    raw = turn_row.get('request_raw') or turn_row.get('request_text')
+    if raw:
+        return salvage_json_prefix(raw)
     return None
+
+
+def salvage_json_prefix(raw: str) -> object | None:
+    """从（可能被截断的）入库原文里切出能解析的请求体前缀。
+
+    入库结构是 `{headers, body, upstream_body}`，截断发生在 body 中段。做法：
+    找最后一个 `"body": {`（**取最后一次** —— headers 的值里也可能出现
+    "body" 字样），把 body 之前那段补齐解析得到 headers；body 本身逐字符扫描，
+    记录字符串边界与括号栈，切到最后一个完整闭合点并补齐右括号。
+    """
+    if not raw:
+        return None
+    needle = '"body": {'
+    at = -1
+    scan = 0
+    while True:
+        pos = raw.find(needle, scan)
+        if pos < 0:
+            break
+        at = pos
+        scan = pos + 1
+    if at < 0:
+        return _json_prefix(raw)
+    body_raw = raw[at + len(needle) - 1:]
+    return _json_prefix(body_raw)
+
+
+def _json_prefix(text: str) -> object | None:
+    """切出 JSON 文本里可解析的最长前缀（补齐未闭合的括号）。
+
+    **切点必须落在「字符串之外」**：截断常发生在某个字符串中间（例如
+    `"name": "bas`），此时切出来的前缀里有一个**未闭合的字符串**，
+    `JSON.parse` 必然失败 —— 整个抢救作废，界面上请求体就是空的（实测：
+    minimax 那条 512 KB 截断记录，body 完全显示不出来）。
+
+    所以：先扫出「不在字符串里」的逗号/括号位置，只在这些位置切；再把
+    切点回退到**最近一个完整闭合的容器**上 —— 宁可少给几 KB，也不能给出一段
+    解析不了的文本。
+    """
+    trimmed = text.strip()
+    if not trimmed or trimmed[0] not in '{[':
+        return None
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    # 安全切点：每个元素结束时（对象/数组的闭合处），且不在字符串里
+    safe_ends: list[int] = []
+    last_comma = -1
+    for i, ch in enumerate(trimmed):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in '{[':
+            stack.append(ch)
+            continue
+        if ch in '}]':
+            if stack:
+                stack.pop()
+            safe_ends.append(i + 1)
+            if not stack:
+                break
+            continue
+        if ch == ',' and stack:
+            last_comma = i
+    # 兜底切点：最后一个「在字符串外的逗号」——它前面是一个完整元素
+    if last_comma > 0:
+        safe_ends.append(last_comma)
+    if not safe_ends:
+        return None
+    # 从后往前试：越靠后给的内容越全，但必须是能解析的
+    for end in sorted(set(safe_ends), reverse=True):
+        if end <= 0:
+            continue
+        prefix = trimmed[:end]
+        # 补齐未闭合的括号（按扫描到的栈）
+        depth = _bracket_depth(trimmed, end)
+        for ch in reversed(depth):
+            prefix += '}' if ch == '{' else ']'
+        prefix = prefix.rstrip().rstrip(',').rstrip()
+        if not prefix:
+            continue
+        try:
+            return json.loads(prefix)
+        except ValueError:
+            continue
+    return None
+
+
+def _bracket_depth(text: str, upto: int) -> list[str]:
+    """文本前 ``upto`` 个字符处仍未闭合的括号（栈）。"""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for ch in text[:upto]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in '{[':
+            stack.append(ch)
+        elif ch in '}]' and stack:
+            stack.pop()
+    return stack
 
 
 def diff(before_turn_id: int, after_turn_id: int) -> dict | None:
@@ -1395,6 +1821,14 @@ def diff(before_turn_id: int, after_turn_id: int) -> dict | None:
     if not a or not b:
         return None
     body_a, body_b = _body_of(a), _body_of(b)
+
+    # 截断的两轮：body 前缀逐字相同（切在同一字节位置），必须改用**摘要**比。
+    # 摘要在截断前算好（request_digest），与截断无关。
+    digest_a = a.get('request_digest')
+    digest_b = b.get('request_digest')
+    if a.get('truncated') or b.get('truncated'):
+        if isinstance(digest_a, dict) and isinstance(digest_b, dict):
+            return _diff_from_digest(digest_a, digest_b, a, b)
 
     params_a, params_b = _param_view(body_a), _param_view(body_b)
     params = [
