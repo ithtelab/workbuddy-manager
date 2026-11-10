@@ -589,7 +589,7 @@ class DbTest(unittest.TestCase):
         一句话。所以归属要由长到短试若干前缀（下限见 `_link_parent`，短消息也覆盖）。
         """
         tap.save_settings({'enabled': True})
-        long_text = ('http://127.0.0.1:7864/settings/backup/ 帮我看下如何备份和还原 '
+        long_text = ('http://<面板地址>/settings/backup/ 帮我看下如何备份和还原 '
                      'workbuddy-manager 的数据，以及账号数据是否已经持久化在容器外。'
                      '如果持久化了，重建容器能不能恢复已经添加的账户。')
         main_body = _body(messages=[BODY['messages'][0],
