@@ -2125,4 +2125,9 @@ export interface TapDiff {
     changed: number;
     tools: number;
   };
+  /**
+   * true = 两轮请求体都被截断，这次比的是**摘要**（逐条消息的角色 + 内容哈希），
+   * 而不是请求体全文 —— 截断会把两轮切在同一位置，比前缀必然「完全一致」。
+   */
+  from_digest?: boolean;
 }

@@ -2249,7 +2249,7 @@
     "noRecon": "這一輪沒有可重建的輸出（可能是錯誤回應或空回覆）",
     "rawTruncated": "請求內容（已截斷，按原文展示）",
     "truncatedHint": "這條記錄超過單條上限，請求內容已被截斷",
-    "requestBody": "用戶端請求內容",
+    "requestBody": "請求內容",
     "upstreamBody": "發往上遊的請求內容",
     "rawStream": "上遊原始串流",
     "diffFirst": "這是第一輪，沒有可對比的上一輪",
@@ -2265,7 +2265,8 @@
     "viewLabel": "視角",
     "view": {
       "client": "用戶端",
-      "gateway": "閘道"
+      "gateway": "閘道",
+      "tencent": "騰訊"
     },
     "clientRequest": "用戶端請求內容（原樣）",
     "clientRequestHint": "用戶端（下游）原樣送出的請求 —— 閘道還沒動它",
@@ -2294,6 +2295,34 @@
     "hasAux": "+{n} 輔助",
     "auxInline": "含 {n} 次輔助呼叫：",
     "kindTitle": "標題",
-    "kindCompact": "壓縮"
+    "kindCompact": "壓縮",
+    "formatLabel": "格式",
+    "format": {
+      "preview": "Preview",
+      "raw": "Raw"
+    },
+    "diffBefore": "改前",
+    "diffAfter": "改後",
+    "locate": "定位",
+    "outboundHint": "上遊（workbuddy2api）真正發往騰訊的那一跳 —— 這一跳的剝前綴、改模型名、提示詞重寫、會話頭族與風控頭都在這裡發生",
+    "outboundReqHeaders": "發往騰訊的請求標頭",
+    "outboundReqBody": "發往騰訊的請求內容",
+    "outboundRespHeaders": "騰訊回傳的回應標頭",
+    "outboundRespBody": "騰訊回傳的回應內容",
+    "outboundDuration": "耗時 {ms} ms",
+    "outboundUnavailable": "上遊沒有開啟出站轉儲，看不到這一段。請在 workbuddy2api 的 config.json 裡把 outbound_trace.enabled 設為 true（預設關閉）",
+    "outboundNoTrace": "這一輪沒有關聯鍵（開啟出站轉儲之前的記錄），無法回查上遊那一跳",
+    "outboundEmpty": "上遊已開啟轉儲，但這一輪不在最近的記錄裡（轉儲按時間滾動，只保留最近約 16 MB——大約最近一小時的呼叫；更早的輪次查不到了）",
+    "outboundError": "讀取上遊轉儲失敗：{reason}",
+    "outboundPath": "轉儲檔案：{path}",
+    "outboundTruncated": "內容超過單條上限，已截斷",
+    "clientResponse": "用戶端收到的回應（翻譯後）",
+    "outboundOutOfWindow": "這一輪已滑出掃描視窗（檔案太大）：只保留最近一段時間的出站記錄，請查看更新的呼叫",
+    "expandAll": "展開全部",
+    "collapseAll": "收起全部",
+    "salvageTail": "截斷剩餘部分（原文）",
+    "upstreamRequestBody": "閘道請求內容（改寫後）",
+    "diffDigestNote": "這兩輪的請求內容都被截斷了，比較的是**摘要**（逐條訊息的角色與內容雜湊）—— 請求內容原文切在同一位置，比全文必然「完全一致」。",
+    "outboundNotFound": "轉儲檔案裡沒有這一輪的記錄（可能寫在了更早的批次，或那一輪走了別的上游）。"
   }
 }

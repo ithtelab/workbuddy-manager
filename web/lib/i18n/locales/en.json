@@ -2276,7 +2276,7 @@
     "noRecon": "Nothing to reconstruct for this turn (error response or empty reply)",
     "rawTruncated": "Request body (truncated, shown as raw text)",
     "truncatedHint": "This record exceeded the size limit; the request body was truncated",
-    "requestBody": "Client request body",
+    "requestBody": "Request body",
     "upstreamBody": "Request body sent upstream",
     "rawStream": "Raw upstream stream",
     "diffFirst": "This is the first turn, nothing to compare against",
@@ -2292,7 +2292,8 @@
     "viewLabel": "Perspective",
     "view": {
       "client": "Client",
-      "gateway": "Gateway"
+      "gateway": "Gateway",
+      "tencent": "Tencent"
     },
     "clientRequest": "Client request body (as sent)",
     "clientRequestHint": "What the client sent, before the gateway touched it",
@@ -2321,6 +2322,34 @@
     "hasAux": "+{n} aux",
     "auxInline": "{n} auxiliary calls:",
     "kindTitle": "title",
-    "kindCompact": "compact"
+    "kindCompact": "compact",
+    "formatLabel": "Format",
+    "format": {
+      "preview": "Preview",
+      "raw": "Raw"
+    },
+    "diffBefore": "Before",
+    "diffAfter": "After",
+    "locate": "Locate",
+    "outboundHint": "The hop the upstream (workbuddy2api) really makes to Tencent — realm-prefix stripping, model renaming, prompt rewriting and conversation/risk headers all happen here",
+    "outboundReqHeaders": "Headers sent to Tencent",
+    "outboundReqBody": "Body sent to Tencent",
+    "outboundRespHeaders": "Headers returned by Tencent",
+    "outboundRespBody": "Body returned by Tencent",
+    "outboundDuration": "{ms} ms",
+    "outboundUnavailable": "Outbound tracing is off in the upstream, so this hop is not visible. Set outbound_trace.enabled to true in workbuddy2api config.json (off by default)",
+    "outboundNoTrace": "This turn has no correlation id (recorded before outbound tracing was enabled), so the upstream hop cannot be looked up",
+    "outboundEmpty": "The upstream dump is enabled, but this turn is not among the recent records (the dump keeps roughly the last 16 MB — about the past hour; older turns are no longer reachable)",
+    "outboundError": "Could not read the upstream dump: {reason}",
+    "outboundPath": "Dump file: {path}",
+    "outboundTruncated": "Content exceeded the per-record limit and was truncated",
+    "clientResponse": "Response received by the client (translated)",
+    "outboundOutOfWindow": "This turn has scrolled out of the scan window (the file is large): only recent outbound records are kept, check newer calls",
+    "expandAll": "Expand all",
+    "collapseAll": "Collapse all",
+    "salvageTail": "Truncated remainder (raw)",
+    "upstreamRequestBody": "Gateway request body (rewritten)",
+    "diffDigestNote": "Both request bodies were truncated, so this compares **digests** (per-message role + content hash) — the raw bodies are cut at the same offset, so comparing them would always report \"identical\".",
+    "outboundNotFound": "No record for this turn in the dump file (it may have been written in an earlier batch, or that turn went to a different upstream)."
   }
 }

@@ -2249,7 +2249,7 @@
     "noRecon": "이 턴에는 재구성할 출력이 없습니다(오류 응답 또는 빈 응답)",
     "rawTruncated": "요청 본문(잘림, 원문 표시)",
     "truncatedHint": "이 기록이 건당 상한을 넘어 요청 본문이 잘렸습니다",
-    "requestBody": "클라이언트 요청 본문",
+    "requestBody": "요청 본문",
     "upstreamBody": "업스트림으로 보낸 요청 본문",
     "rawStream": "업스트림 원본 스트림",
     "diffFirst": "첫 턴이라 비교할 대상이 없습니다",
@@ -2265,7 +2265,8 @@
     "viewLabel": "관점",
     "view": {
       "client": "클라이언트",
-      "gateway": "게이트웨이"
+      "gateway": "게이트웨이",
+      "tencent": "텐센트"
     },
     "clientRequest": "클라이언트 요청 본문(원본)",
     "clientRequestHint": "게이트웨이가 손대기 전, 클라이언트가 보낸 그대로의 내용",
@@ -2294,6 +2295,34 @@
     "hasAux": "+{n} 보조",
     "auxInline": "보조 호출 {n}건:",
     "kindTitle": "제목",
-    "kindCompact": "압축"
+    "kindCompact": "압축",
+    "formatLabel": "형식",
+    "format": {
+      "preview": "미리보기",
+      "raw": "원본"
+    },
+    "diffBefore": "변경 전",
+    "diffAfter": "변경 후",
+    "locate": "위치로",
+    "outboundHint": "업스트림(workbuddy2api)이 텐센트로 실제 보내는 구간입니다. realm 접두사 제거, 모델명 변경, 프롬프트 재작성, 대화/리스크 헤더가 모두 여기서 일어납니다",
+    "outboundReqHeaders": "텐센트로 보낸 헤더",
+    "outboundReqBody": "텐센트로 보낸 본문",
+    "outboundRespHeaders": "텐센트가 반환한 헤더",
+    "outboundRespBody": "텐센트가 반환한 본문",
+    "outboundDuration": "{ms} ms",
+    "outboundUnavailable": "업스트림에서 출站 추적이 꺼져 있어 이 구간을 볼 수 없습니다. workbuddy2api 의 config.json 에서 outbound_trace.enabled 를 true 로 설정하세요(기본 꺼짐)",
+    "outboundNoTrace": "이 턴에는 연관 키가 없습니다(출站 추적 활성화 이전 기록)",
+    "outboundEmpty": "업스트림 덤프가 켜져 있지만 이 턴은 최근 기록에 없습니다(덤프는 최근 약 16 MB — 대략 최근 1시간치만 보관하며, 그보다 오래된 턴은 조회할 수 없습니다)",
+    "outboundError": "업스트림 덤프를 읽지 못했습니다: {reason}",
+    "outboundPath": "덤프 파일: {path}",
+    "outboundTruncated": "건당 상한을 넘어 잘렸습니다",
+    "clientResponse": "클라이언트가 받은 응답(번역됨)",
+    "outboundOutOfWindow": "이 턴은 스캔 윈도우를 벗어났습니다(파일이 큼): 최근 호출 기록만 유지됩니다. 더 최근 호출을 확인하세요",
+    "expandAll": "모두 펼치기",
+    "collapseAll": "모두 접기",
+    "salvageTail": "잘린 나머지(원문)",
+    "upstreamRequestBody": "게이트웨이 요청 본문(변환 후)",
+    "diffDigestNote": "두 요청 본문이 모두 잘려 있어 **요약**(메시지별 역할과 내용 해시)으로 비교합니다. 본문은 같은 위치에서 잘려 전체 비교는 항상 \"동일\"이 됩니다.",
+    "outboundNotFound": "덤프 파일에 이 턴의 기록이 없습니다(이전 배치에 기록되었거나 다른 업스트림으로 갔을 수 있습니다)."
   }
 }

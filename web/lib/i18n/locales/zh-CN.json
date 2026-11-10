@@ -2014,7 +2014,7 @@
     "noRecon": "这一轮没有可重建的输出（可能是错误响应或空回复）",
     "rawTruncated": "请求体（已截断，按原文展示）",
     "truncatedHint": "这条记录超过单条上限，请求体已被截断",
-    "requestBody": "客户端请求体",
+    "requestBody": "请求体",
     "upstreamBody": "发往上游的请求体",
     "rawStream": "上游原始流",
     "diffFirst": "这是第一轮，没有可对比的上一轮",
@@ -2030,7 +2030,8 @@
     "viewLabel": "视角",
     "view": {
       "client": "客户端",
-      "gateway": "网关"
+      "gateway": "网关",
+      "tencent": "腾讯"
     },
     "clientRequest": "客户端请求体（原样）",
     "clientRequestHint": "客户端（下游）原样发出的请求 —— 网关还没碰它",
@@ -2059,6 +2060,34 @@
     "hasAux": "+{n} 辅助",
     "auxInline": "含 {n} 次辅助调用：",
     "kindTitle": "标题",
-    "kindCompact": "压缩"
+    "kindCompact": "压缩",
+    "formatLabel": "格式",
+    "format": {
+      "preview": "Preview",
+      "raw": "Raw"
+    },
+    "diffBefore": "改前",
+    "diffAfter": "改后",
+    "locate": "定位",
+    "outboundHint": "上游（workbuddy2api）真正发往腾讯的那一跳 —— 这一段的剥前缀、改模型名、提示词重写、会话头族与风控头都在这里发生",
+    "outboundReqHeaders": "发往腾讯的请求头",
+    "outboundReqBody": "发往腾讯的请求体",
+    "outboundRespHeaders": "腾讯返回的响应头",
+    "outboundRespBody": "腾讯返回的响应体",
+    "outboundDuration": "耗时 {ms} ms",
+    "outboundUnavailable": "上游没有开启出站转储，看不到这一段。请在 workbuddy2api 的 config.json 里把 outbound_trace.enabled 设为 true（默认关闭）",
+    "outboundNoTrace": "这一轮没有关联键（开启出站转储之前的记录），无法回查上游那一跳",
+    "outboundEmpty": "上游已开启转储，但这一轮不在最近的记录里（转储按时间滚动，只保留最近约 16 MB——大约最近一小时的调用；更早的轮次查不到了）",
+    "outboundError": "读取上游转储失败：{reason}",
+    "outboundPath": "转储文件：{path}",
+    "outboundTruncated": "内容超过单条上限，已截断",
+    "clientResponse": "客户端收到的响应（翻译后）",
+    "outboundOutOfWindow": "这一轮已滑出扫描窗口（文件太大）：只保留最近一段时间的出站记录，请查看更新的调用",
+    "expandAll": "展开全部",
+    "collapseAll": "收起全部",
+    "salvageTail": "截断剩余部分（原文）",
+    "upstreamRequestBody": "网关请求体（改写后）",
+    "diffDigestNote": "这两轮的请求体都被截断了，比较的是**摘要**（逐条消息的角色与内容哈希）—— 请求体原文切在同一位置，比全文必然「完全一致」。",
+    "outboundNotFound": "转储文件里没有这一轮的记录（可能写在了更早的批次，或那一轮走了别的上游）。"
   }
 }

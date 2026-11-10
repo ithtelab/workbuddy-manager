@@ -2249,7 +2249,7 @@
     "noRecon": "このターンには再構築できる出力がありません（エラー応答または空の返答）",
     "rawTruncated": "リクエスト本文（切り詰め済み、原文表示）",
     "truncatedHint": "この記録は 1 件あたりの上限を超えたため、リクエスト本文は切り詰められました",
-    "requestBody": "クライアントのリクエスト本文",
+    "requestBody": "リクエスト本文",
     "upstreamBody": "上流へ送ったリクエスト本文",
     "rawStream": "上流の生ストリーム",
     "diffFirst": "最初のターンのため、比較対象がありません",
@@ -2265,7 +2265,8 @@
     "viewLabel": "視点",
     "view": {
       "client": "クライアント",
-      "gateway": "ゲートウェイ"
+      "gateway": "ゲートウェイ",
+      "tencent": "騰訊"
     },
     "clientRequest": "クライアントのリクエスト本文（そのまま）",
     "clientRequestHint": "ゲートウェイが触る前の、クライアントが送ったままの内容",
@@ -2294,6 +2295,34 @@
     "hasAux": "+{n} 補助",
     "auxInline": "補助呼び出し {n} 件：",
     "kindTitle": "タイトル",
-    "kindCompact": "圧縮"
+    "kindCompact": "圧縮",
+    "formatLabel": "表示",
+    "format": {
+      "preview": "プレビュー",
+      "raw": "生データ"
+    },
+    "diffBefore": "変更前",
+    "diffAfter": "変更後",
+    "locate": "位置へ",
+    "outboundHint": "上流（workbuddy2api）がテンセントへ実際に送る区間です。realm プレフィックスの除去、モデル名の書き換え、プロンプトの書き換え、会話ヘッダーとリスクヘッダーはここで行われます",
+    "outboundReqHeaders": "テンセントへ送るヘッダー",
+    "outboundReqBody": "テンセントへ送る本文",
+    "outboundRespHeaders": "テンセントからの応答ヘッダー",
+    "outboundRespBody": "テンセントからの応答本文",
+    "outboundDuration": "{ms} ms",
+    "outboundUnavailable": "上流で出站トレースが無効なため、この区間は表示できません。workbuddy2api の config.json で outbound_trace.enabled を true にしてください（既定は無効）",
+    "outboundNoTrace": "このターンには関連キーがありません（出站トレース有効化前の記録）",
+    "outboundEmpty": "上流のダンプは有効ですが、このターンは最近の記録にありません（ダンプは直近約 16 MB——おおよそ過去 1 時間分を保持し、それより古いターンは参照できません）",
+    "outboundError": "上流出站ダンプの読み取りに失敗しました：{reason}",
+    "outboundPath": "ダンプファイル：{path}",
+    "outboundTruncated": "1 件あたりの上限を超えたため切り詰められました",
+    "clientResponse": "クライアントが受け取ったレスポンス（翻訳後）",
+    "outboundOutOfWindow": "このターンは走査ウィンドウの外です（ファイルが大きいため）：直近の出力記録のみ保持しています。新しい呼び出しを確認してください",
+    "expandAll": "すべて展開",
+    "collapseAll": "すべて折りたたむ",
+    "salvageTail": "切り詰められた残り（原文）",
+    "upstreamRequestBody": "ゲートウェイのリクエスト本文（書き換え後）",
+    "diffDigestNote": "両方のリクエスト本文が切り詰められているため、**要約**（メッセージごとの役割と内容ハッシュ）で比較しています。本文は同じ位置で切られるため、全文比較では常に「同一」になります。",
+    "outboundNotFound": "ダンプファイルにこのターンの記録がありません（前のバッチで書かれたか、そのターンが別の上流に送られた可能性があります）。"
   }
 }
