@@ -258,7 +258,15 @@ class DbTest(unittest.TestCase):
         cls._orig = (config.DB_PATH, config.USERS_FILE, config.STATIC_DIR)
         config.DB_PATH = d / 'tap.db'
         config.USERS_FILE = d / 'users.json'
-        config.STATIC_DIR = d / 'no-static'
+        # STATIC_DIR 要**真的存在**（含 index.html 与 _next/）：main.py 只在
+        # import 时刻看这个目录挂 SPA 兜底，而整个测试进程只 import 一次 ——
+        # 若这里给一个不存在的目录，后面任何依赖兜底路由的测试
+        # （如 gateway_error_contract 的「404 回 JSON 而不是 HTML」）拿到的就是
+        # 没有兜底的 app，404 变成 405（路径只有 POST，GET 撞 Method 检查）。
+        static = d / 'static'
+        (static / '_next').mkdir(parents=True)
+        (static / 'index.html').write_text('<html>panel</html>', encoding='utf-8')
+        config.STATIC_DIR = static
         config.USERS_FILE.write_text(json.dumps({
             'secret': 'T' * 64,
             'users': [
