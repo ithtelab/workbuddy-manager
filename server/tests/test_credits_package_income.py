@@ -8,6 +8,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -63,6 +64,53 @@ class PackageIncomeTest(unittest.TestCase):
         credits.record_balance('u4', '四号', 500, [{'at': 9, 'amount': 10}])
         self.assertIsNone(credits.record_balance('u4', '四号', 500, [{'at': 9, 'amount': 10}]))
         self.assertEqual(self._logs(), [])
+
+    def test_consuming_package_does_not_count_remaining_balance_as_income(self) -> None:
+        credits.record_balance('u5', '', 1367, [{'at': 3000, 'amount': 1367}])
+        self.assertIsNone(credits.record_balance('u5', '', 1366, [{'at': 3000, 'amount': 1366}]))
+        self.assertIsNone(credits.record_balance('u5', '', 1365, [{'at': 3000, 'amount': 1365}]))
+        self.assertEqual(self._logs(), [])
+
+    def test_same_expiry_topup_only_counts_positive_difference(self) -> None:
+        credits.record_balance('u6', '', 90, [{'at': 3000, 'amount': 90}])
+        self.assertEqual(credits.record_balance('u6', '', 100, [{'at': 3000, 'amount': 100}]), 10)
+        self.assertEqual([row['credits'] for row in self._logs()], [10])
+
+    def test_new_package_and_consumed_old_package_are_separate(self) -> None:
+        credits.record_balance('u7', '', 1000, [{'at': 3000, 'amount': 1000}])
+        income = credits.record_balance('u7', '', 1000,
+            [{'at': 3000, 'amount': 900}, {'at': 4000, 'amount': 100}])
+        self.assertEqual(income, 100)
+
+    def test_multiple_packages_at_same_expiry_are_aggregated(self) -> None:
+        credits.record_balance('u8', '', 100,
+            [{'at': 3000, 'amount': 50}, {'at': 3000, 'amount': 50}])
+        self.assertIsNone(credits.record_balance('u8', '', 90,
+            [{'at': 3000, 'amount': 40}, {'at': 3000, 'amount': 50}]))
+        self.assertEqual(credits.record_balance('u8', '', 120,
+            [{'at': 3000, 'amount': 50}, {'at': 3000, 'amount': 70}]), 30)
+        self.assertEqual([row['credits'] for row in self._logs()], [30])
+
+    def test_missing_expiries_does_not_create_an_empty_package_baseline(self) -> None:
+        credits.record_balance('u9', '', 1000, [{'at': 3000, 'amount': 1000}])
+        credits.record_balance('u9', '', 900, [])
+        self.assertIsNone(credits.record_balance('u9', '', 899, [{'at': 3000, 'amount': 899}]))
+        self.assertEqual(self._logs(), [])
+
+    def test_legacy_empty_package_snapshot_only_establishes_package_baseline(self) -> None:
+        db.set_setting(credits._SNAP_KEY, {'old': {'credits': 1000, 'at': 123, 'packages': []}})
+        self.assertIsNone(credits.record_balance('old', '', 999, [{'at': 3000, 'amount': 999}]))
+        self.assertEqual(self._logs(), [])
+
+    def test_zero_balance_empty_packages_can_receive_real_income(self) -> None:
+        credits.record_balance('empty', '', 0, [])
+        self.assertEqual(credits.record_balance('empty', '', 20, [{'at': 3000, 'amount': 20}]), 20)
+
+    def test_repeat_topups_in_same_second_are_not_lost(self) -> None:
+        with mock.patch.object(credits.time, 'time', return_value=123):
+            for value in (90, 100, 90, 100):
+                credits.record_balance('repeat', '', value, [{'at': 3000, 'amount': value}])
+        self.assertEqual([row['credits'] for row in self._logs()], [10, 10])
 
 
 if __name__ == '__main__':
