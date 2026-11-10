@@ -1730,13 +1730,15 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                         account_expected=False)
         return _failed(str(exc), 503, 'api_error', 'upstream_unavailable')
     url = f'{upstream["base_url"]}/v1/chat/completions'
+    # 转发头只构造一次：既给 httpx，也给抓包（双视角的一半）
+    up_headers = gateway._upstream_headers(upstream)
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
                 resp = await client.post(url, json=payload,
-                                         headers=gateway._upstream_headers(upstream))
+                                         headers=up_headers)
             latency = int((time.time() - started) * 1000)
             usage: dict = {}
             try:
@@ -1766,7 +1768,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 status=resp.status_code, latency_ms=latency, stream=False,
                 payload=data, usage=usage,
                 error=None if resp.status_code < 400 else str(data)[:500],
-                upstream_body=payload, client_response=client_doc,
+                upstream_body=payload, upstream_headers=up_headers,
+                client_response=client_doc,
             )
             if resp.status_code >= 400:
                 return _failed(_upstream_error_text(data, resp), resp.status_code,
@@ -1802,7 +1805,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,
                 path='/v1/responses', protocol='responses', status=502,
                 latency_ms=latency, stream=False, error=str(exc),
-                upstream_body=payload,
+                upstream_body=payload, upstream_headers=up_headers,
             )
             return _failed(f'上游不可用：{exc}', 502)
 
@@ -1810,7 +1813,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
         req = client.build_request('POST', url, json=payload,
-                                   headers=gateway._upstream_headers(upstream))
+                                   headers=up_headers)
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
@@ -1952,7 +1955,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 path='/v1/responses', protocol='responses', status=200,
                 latency_ms=latency, first_token_ms=first_token_ms, stream=True,
                 text=raw_stream.text(), usage=usage, error=error_text,
-                upstream_body=payload, client_response=client_stream.text() or None,
+                upstream_body=payload, upstream_headers=up_headers,
+                client_response=client_stream.text() or None,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

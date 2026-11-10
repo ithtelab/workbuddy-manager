@@ -97,6 +97,7 @@
 - **多上游** —— 「设置 → 上游」配多个实例，各带地址与 `api_key`
 - **安全** —— 入站 IP 白 / 黑名单（CIDR）、审计日志、会话与令牌分离
 - **更新与备份** —— 一键更新（核验发布包摘要）、PostgreSQL 异地备份
+- **轨迹（调用抓包）** —— 回放每一次调用的完整上下文；客户端 / 网关两个视角可切换，能看到网关改写了什么，也能和上一轮逐块对比，并可一键导出单文件 HTML
 - **五语种界面** —— 简体中文 / 繁体 / English / 日本語 / 한국어
 
 完整清单（每条带详解）见 [功能一览（完整版）](docs/features.md)。
@@ -120,6 +121,27 @@
 <img src="docs/images/logs.png" alt="调用日志" width="100%" />
 
 调用日志：每一笔的模型、状态、首字延迟与扣费
+
+<img src="docs/images/traces.png" alt="轨迹（调用抓包）" width="100%" />
+
+轨迹：一次 agent 任务里的每一轮请求与响应；客户端名与版本、上下文规模、工具清单都在一屏内
+
+<details>
+<summary><b>客户端视角 / 网关视角 / 与上一轮对比</b>（点击展开）</summary>
+
+<img src="docs/images/traces-headers-client.png" alt="客户端视角：客户端原样发出的请求头与请求体" width="100%" />
+
+客户端视角：客户端**原样**发出的请求头与请求体（密钥打码，保留前 6 位）
+
+<img src="docs/images/traces-headers-gateway.png" alt="网关视角：网关改写后发往上游的请求" width="100%" />
+
+网关视角：网关改写后发往上游的请求，顶部列出被改写的字段（模型映射、参数钳制…）
+
+<img src="docs/images/traces-diff.png" alt="与上一轮对比" width="100%" />
+
+与上一轮对比：新增 / 修改的消息逐条列出，参数、system、工具变化分块显示
+
+</details>
 
 其余界面截图见 [界面预览（全部）](docs/screenshots.md)。
 

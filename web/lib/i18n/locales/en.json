@@ -2304,6 +2304,11 @@
     "translatedNote": "Translated: this is what the client actually received (switch to Gateway for the upstream shape)",
     "upstreamNote": "Upstream raw: the hop between gateway and upstream (SSE frames or JSON)",
     "clientRawStream": "Raw stream received by the client",
-    "notCaptured": "Not captured: this record was written before the client perspective existed"
+    "notCaptured": "Not captured: this record was written before the client perspective existed",
+    "viewHint": "Switch perspective: what the client (downstream) actually sent and received, or what the gateway (upstream) rewrote and got back",
+    "headers": "Headers (client)",
+    "upstreamHeaders": "Headers (gateway → upstream)",
+    "headersHint": "Credentials are masked, keeping the first 6 characters so you can still tell which key it was",
+    "noHeaders": "No headers captured — this record predates the feature"
   }
 }

@@ -14,6 +14,33 @@
 
 </details>
 
+### 轨迹（调用抓包）
+
+> 一次 agent 任务里的每一轮请求与响应；客户端名与版本、上下文规模、工具清单一屏看完
+
+<img src="images/traces.png" alt="轨迹（调用抓包）" width="100%" />
+
+<details>
+<summary><b>客户端视角 / 网关视角 / 与上一轮对比</b>（点击展开）</summary>
+
+<img src="images/traces-headers-client.png" alt="客户端视角" width="100%" />
+
+客户端视角：客户端**原样**发出的请求头与请求体（密钥类字段打码，保留前 6 位以便认出是哪一把）
+
+<img src="images/traces-headers-gateway.png" alt="网关视角" width="100%" />
+
+网关视角：网关改写后发往上游的请求，顶部列出被改写的字段（模型映射、`max_tokens` 钳制、`stream_options` 注入…）
+
+<img src="images/traces-diff.png" alt="与上一轮对比" width="100%" />
+
+与上一轮对比：新增 / 修改的消息逐条列出，参数、system、工具变化分块显示
+
+<img src="images/traces-dock.png" alt="底栏的「轨迹」入口" width="100%" />
+
+底栏第 7 个图标即「轨迹」，与日志 / 统计同级
+
+</details>
+
 ### 账号管理
 > Token 有效期按剩余时间分档着色（已过期 / 即将过期 / 偏紧 / 健康）
 

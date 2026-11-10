@@ -313,6 +313,7 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'PUT /api/tap/config',
         'POST /api/tap/clear',
         'POST /api/tap/prune',
+        'POST /api/tap/backfill',
         'DELETE /api/tap/sessions/{session_id}',
         'POST /api/tokens',
         'POST /api/users',

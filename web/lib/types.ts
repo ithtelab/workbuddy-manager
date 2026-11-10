@@ -1955,6 +1955,8 @@ export interface TapSession {
   key_id: number | null;
   key_name: string | null;
   client: string | null;
+  /** 原始 UA。`client` 是从它派生的分类，版本号也从这里取。 */
+  client_ua?: string | null;
   /** 客户端说的协议：chat / anthropic / responses。 */
   protocol: string;
   model: string | null;

@@ -459,8 +459,12 @@ CREATE TABLE IF NOT EXISTS tap_sessions (
   -- 因此能把「一次任务」里的多轮请求归成一组，不需要客户端配合上报 run id。
   fingerprint       TEXT    NOT NULL,
   key_id            INTEGER,
-  -- 客户端家族（claude / codex / cursor / cli / other）：由 UA 归类。
+  -- 客户端家族（claude / codex / dsh / cursor / cli / <UA 的 product token>）：
+  -- 由 UA 归类；认不出来时直接用 UA 首个 token，而不是一律 `other`。
   client            TEXT,
+  -- 原始 UA。版本号从这里取（同一客户端不同版本行为会变），也用于把旧记录
+  -- 重新归类（`client` 是**派生**值，UA 才是事实）。
+  client_ua         TEXT,
   -- 客户端说的协议（chat / anthropic / responses）。上游一律是 OpenAI 形态，
   -- 这个字段记的是**进来时**的协议 —— 它决定请求体怎么解读。
   protocol          TEXT    NOT NULL DEFAULT 'chat',
@@ -721,6 +725,8 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 抓包要能对着看「上游说的」与「客户端收到的」：存量库缺这一列时，
     # 界面按「未采集」处理，而不是把上游原文冒充成客户端视角。
     ('tap_turns', 'client_response_text', 'TEXT'),
+    # 抓包会话的原始 UA（版本号从这里取；旧记录按它重新归类）
+    ('tap_sessions', 'client_ua', 'TEXT'),
     ('request_logs', 'credit', 'REAL'),
     ('usage_daily', 'credit', 'REAL NOT NULL DEFAULT 0'),
     # 首字延迟：可空（历史记录与非流式请求为 NULL）

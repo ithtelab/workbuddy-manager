@@ -37,18 +37,34 @@ export function sessionTitle(s: TapSession): string {
   return `${model} · ${s.turns} 轮 · ${s.fingerprint.slice(0, 6)}`;
 }
 
+/**
+ * 从 UA 取版本号（`name/1.2.3 (+url)` → `1.2.3`）。
+ *
+ * 为什么显示版本：同一个客户端的协议字段/工具形态会随版本变，只写名字在排障时
+ * 不够用（「同一个 Claude Code，2.0 和 1.0 发的头就不一样」）。
+ */
+export function clientVersion(ua: string | null | undefined): string {
+  if (!ua) return '';
+  const first = ua.trim().split(' ')[0];
+  if (!first.includes('/')) return '';
+  return first.split('/')[1].replace(/[^0-9A-Za-z.-]/g, '').slice(0, 24);
+}
+
 /** 客户端家族 → 展示名。未知值原样返回（上游改了 UA 归类也不该显示空白）。 */
 export function clientLabel(client: string | null | undefined): string {
   const key = (client || '').toLowerCase();
   const map: Record<string, string> = {
     claude: 'Claude Code',
     codex: 'Codex',
+    dsh: 'DeepSeek Harness',
     cursor: 'Cursor',
     vscode: 'VS Code',
     cli: 'CLI',
     other: '其它',
     unknown: '未知',
   };
+  // 认不出的家族：后端现在会回落成 UA 的 product token（如 `my-agent`），
+  // 原样显示比「其它」有用 —— 至少知道是什么东西在调用。
   return map[key] || client || '未知';
 }
 

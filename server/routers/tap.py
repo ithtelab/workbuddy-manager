@@ -43,6 +43,18 @@ def put_config(body: dict, request: Request,
     return {'config': after, 'stats': tap.stats()}
 
 
+@router.post('/backfill')
+def post_backfill(user: dict = Depends(security.require_session_admin)) -> dict:
+    """按入库的 UA 重新归类历史会话。
+
+    单独一个端点而不是启动时自动跑：这是一次**会改历史数据**的动作（把旧的
+    `other` 纠正成真实客户端名），应当有人在界面上明确触发，也能在日志里查到
+    是谁做的。UA 原文一直在 `tap_turns` 里，重算不需要重新抓包。
+    """
+    changed = tap.backfill_clients()
+    return {'changed': changed, 'stats': tap.stats()}
+
+
 @router.post('/prune')
 def post_prune(user: dict = Depends(security.require_session_admin)) -> dict:
     """立刻按保留策略清理一次。写入侧本来是周期的，这里给一个「马上腾地方」的入口。"""

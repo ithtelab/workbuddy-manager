@@ -499,7 +499,10 @@ def client_channel(ua: str | None) -> str:
         return 'unknown'
     if 'codex' in text:
         return 'codex'
-    if 'claude-code' in text or 'claude code' in text:
+    if 'claude' in text or 'anthropic' in text:
+        # UA 实际有 `claude-code/…`、`claude-cli/2.0.1 (external, cli)`、
+        # `claude_cli/…` 几种写法；早先只认前两种，于是**真正的 Claude Code CLI**
+        # 在请求日志里被记成 other（轨迹页的同类守卫实测发现）。
         return 'claude-code'
     if 'deepseek' in text or 'dsh' in text:
         return 'dsh'
@@ -1346,12 +1349,15 @@ async def _chat(request: Request, upstream_path: str):
     if upstream_err:
         return upstream_err
     url = f'{upstream["base_url"]}{upstream_path}'
+    # 转发头只构造一次：既给 httpx，也给抓包（「网关发了什么请求头」是双视角的
+    # 一半，另一处再造一份就可能与真正发出去的不一致）。
+    up_headers = _upstream_headers(upstream)
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=body, headers=_upstream_headers(upstream))
+                resp = await client.post(url, json=body, headers=up_headers)
             latency = int((time.time() - started) * 1000)
             usage = {}
             try:
@@ -1379,7 +1385,7 @@ async def _chat(request: Request, upstream_path: str):
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,
                 path=upstream_path, protocol='chat', status=rec_status,
                 latency_ms=latency, stream=False, payload=data, usage=usage,
-                error=error, upstream_body=body,
+                error=error, upstream_body=body, upstream_headers=up_headers,
             )
             if missing is not None:
                 return JSONResponse(missing, status_code=404)
@@ -1399,13 +1405,14 @@ async def _chat(request: Request, upstream_path: str):
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,
                 path=upstream_path, protocol='chat', status=502, latency_ms=latency,
                 stream=False, error=str(exc), upstream_body=body,
+                upstream_headers=up_headers,
             )
             return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     # 流式转发
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
-        req = client.build_request('POST', url, json=body, headers=_upstream_headers(upstream))
+        req = client.build_request('POST', url, json=body, headers=up_headers)
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
@@ -1489,7 +1496,7 @@ async def _chat(request: Request, upstream_path: str):
                 path=upstream_path, protocol='chat', status=status_code,
                 latency_ms=latency, first_token_ms=first_token_ms, stream=True,
                 text=raw_stream.text(), usage=usage, error=error_text,
-                upstream_body=body,
+                upstream_body=body, upstream_headers=up_headers,
             )
 
     return StreamingResponse(generator(), status_code=status_code, media_type=content_type)

@@ -105,6 +105,9 @@ upstream repo is gone, and its source is now maintained here.
 - **Multiple upstreams** — configure several instances, each with its own address and `api_key`
 - **Security** — inbound IP allow / deny lists (CIDR), audit log, separate session and API tokens
 - **Updates & backup** — one-click update (checksum-verified), off-site PostgreSQL backup
+- **Traces (call capture)** — replay the full context of every call; switch between client
+  and gateway perspectives to see what the gateway rewrote, diff a turn against the previous
+  one block by block, and export a single-file HTML
 - **Five locales** — Simplified / Traditional Chinese, English, Japanese, Korean
 
 The exhaustive list (with detail per item) lives in [the full feature list](docs/features.md).
@@ -128,6 +131,27 @@ Usage: daily / hourly, failures and latency
 <img src="docs/images/logs.png" alt="Request logs" width="100%" />
 
 Request logs: model, status, TTFB and billing per call
+
+<img src="docs/images/traces.png" alt="Traces (call capture)" width="100%" />
+
+Traces: every turn of one agent task, with client name and version, context size and tool list
+
+<details>
+<summary><b>Client vs gateway perspective, and diff with the previous turn</b> (click to expand)</summary>
+
+<img src="docs/images/traces-headers-client.png" alt="Client perspective: headers and body exactly as the client sent them" width="100%" />
+
+Client perspective: headers and body **exactly as sent** by the client (credentials masked, first 6 characters kept)
+
+<img src="docs/images/traces-headers-gateway.png" alt="Gateway perspective: what the gateway actually sent upstream" width="100%" />
+
+Gateway perspective: what the gateway sent upstream after rewriting, with the rewritten fields listed on top
+
+<img src="docs/images/traces-diff.png" alt="Diff against the previous turn" width="100%" />
+
+Diff against the previous turn: added and changed messages, plus parameter, system-prompt and tool changes
+
+</details>
 
 More screenshots: [full gallery](docs/screenshots.md).
 

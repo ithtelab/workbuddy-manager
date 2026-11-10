@@ -1033,13 +1033,15 @@ async def messages(request: Request):
         # anthropic 的错误体没有 code 字段（只有 type），故第三参给 type
         return _err(str(exc), 503, 'api_error')
     url = f'{upstream["base_url"]}/v1/chat/completions'
+    # 转发头只构造一次：既给 httpx，也给抓包（双视角的一半）
+    up_headers = gateway._upstream_headers(upstream)
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
                 resp = await client.post(url, json=payload,
-                                         headers=gateway._upstream_headers(upstream))
+                                         headers=up_headers)
             latency = int((time.time() - started) * 1000)
             usage: dict = {}
             try:
@@ -1073,7 +1075,8 @@ async def messages(request: Request):
                 status=resp.status_code, latency_ms=latency, stream=False,
                 payload=data, usage=usage,
                 error=None if resp.status_code < 400 else str(data)[:500],
-                upstream_body=payload, client_response=client_doc,
+                upstream_body=payload, upstream_headers=up_headers,
+                client_response=client_doc,
             )
             if resp.status_code >= 400:
                 msg = ''
@@ -1098,7 +1101,7 @@ async def messages(request: Request):
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,
                 path='/v1/messages', protocol='anthropic', status=502,
                 latency_ms=latency, stream=False, error=str(exc),
-                upstream_body=payload,
+                upstream_body=payload, upstream_headers=up_headers,
             )
             return _err(f'上游不可用：{exc}', 502, 'api_error')
 
@@ -1106,7 +1109,7 @@ async def messages(request: Request):
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
         req = client.build_request('POST', url, json=payload,
-                                   headers=gateway._upstream_headers(upstream))
+                                   headers=up_headers)
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
@@ -1244,7 +1247,8 @@ async def messages(request: Request):
                 path='/v1/messages', protocol='anthropic', status=status_code,
                 latency_ms=latency, first_token_ms=first_token_ms, stream=True,
                 text=raw_stream.text(), usage=usage, error=error_text,
-                upstream_body=payload, client_response=client_stream.text() or None,
+                upstream_body=payload, upstream_headers=up_headers,
+                client_response=client_stream.text() or None,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

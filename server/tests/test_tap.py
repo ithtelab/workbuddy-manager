@@ -71,6 +71,21 @@ class PureTest(unittest.TestCase):
         # 仍然可解析：脱敏替换的是值，不是结构
         json.loads(out)
 
+    def test_mask_keeps_credential_prefix_behind_scheme(self) -> None:
+        """`Bearer xxx` 要打到凭证上，而不是只留下 `Bearer`。
+
+        第一版就是错的：取整串前 6 个字符 → `Bearer***`，凭证一位都看不到，
+        而「这是哪一把密钥」正是抓包页要对照的东西。
+        """
+        out = tap.redact_headers([
+            ('authorization', 'Bearer wbk_6eotk5VAabcdefg'),
+            ('x-api-key', 'sk-upstream-abcdef123456'),
+        ])
+        self.assertEqual(out['authorization'], 'Bearer wbk_6e***')
+        self.assertEqual(out['x-api-key'], 'sk-ups***')
+        for value in out.values():
+            self.assertNotIn('abcdefg', value)
+
     def test_redact_headers_masks_secrets(self) -> None:
         out = tap.redact_headers([
             ('authorization', 'Bearer sk-livesecret1234'),
@@ -212,6 +227,45 @@ class PureTest(unittest.TestCase):
         self.assertIsNone(tap.client_reconstruct(None, 'anthropic'))
         self.assertIsNone(tap.client_reconstruct('', 'responses'))
 
+    def test_client_family_reads_dsh_and_unknown_ua(self) -> None:
+        """UA 里写着是什么客户端，就不该显示成「其它」。
+
+        实测反馈：`deepseek-harness/0.2.2-rc.1` 的 UA 被归成 `other`，界面上只剩
+        一个「其它」——UA 明明写着名字。规则里补了 dsh，并且**认不出来的 UA 回落
+        成它的 product token**，而不是一律 `other`（新客户端不必改代码就能显示）。
+        """
+        ua = 'deepseek-harness/0.2.2-rc.1 (+https://github.com/deepseek-ai/deepseek-harness)'
+        self.assertEqual(tap._client_family(ua), 'dsh')
+        self.assertEqual(tap._client_version(ua), '0.2.2-rc.1')
+        # 未收录的客户端：回落成小写的 product token
+        self.assertEqual(tap._client_family('my-agent/1.0.3'), 'my-agent')
+        self.assertEqual(tap._client_version('my-agent/1.0.3'), '1.0.3')
+        # 空 UA 才记 unknown
+        self.assertEqual(tap._client_family(''), 'unknown')
+
+    def test_client_family_agrees_with_the_logs_channel(self) -> None:
+        """轨迹页与日志页对同一批 UA 必须给出一致的结论。
+
+        这两处各有一份 UA 归类（日志页要 `codex / vscode / api…` 这套词表，
+        轨迹页要 `claude / dsh / cli…`），但**认不认得出同一个客户端**必须一致 ——
+        实测就是这样翻车的：日志页早已认识 `deepseek-harness`（记成 dsh），
+        轨迹页那张表没有它，同一批请求在日志页显示 dsh、在轨迹页显示「其它」。
+        这条守卫专门抓这种「两套词表各长一半」的分叉。
+        """
+        from server.routers import gateway
+
+        samples = [
+            'deepseek-harness/0.2.2-rc.1 (+https://github.com/deepseek-ai/deepseek-harness)',
+            'claude-cli/2.0.1 (external, cli)',
+            'codex_cli_rs/0.9.0',
+            'curl/8.4.0',
+        ]
+        for ua in samples:
+            tap_family = tap._client_family(ua)
+            logs_channel = gateway.client_channel(ua)
+            self.assertNotIn(tap_family, ('other', 'unknown'), f'轨迹页认不出：{ua}')
+            self.assertNotIn(logs_channel, ('other', 'unknown'), f'日志页认不出：{ua}')
+
     def test_client_family(self) -> None:
         self.assertEqual(tap._client_family('claude-code/1.0'), 'claude')
         self.assertEqual(tap._client_family('codex_cli_rs/0.9'), 'codex')
@@ -278,6 +332,8 @@ class DbTest(unittest.TestCase):
     def _capture(self, **kwargs) -> int | None:
         base = dict(
             body=_body(), headers=[('authorization', 'Bearer sk-live1234567890')],
+            upstream_headers={'Content-Type': 'application/json',
+                              'Authorization': 'Bearer sk-upstream-9999'},
             key={'id': 1}, ua='claude-code/1.0', path='/v1/chat/completions',
             protocol='chat', status=200, latency_ms=100, stream=True,
             text=SSE, usage={'prompt_tokens': 11, 'completion_tokens': 7},
@@ -355,6 +411,35 @@ class DbTest(unittest.TestCase):
         self.assertEqual(req['body']['model'], 'gpt-4o', '客户端视角必须是原样')
         self.assertEqual(req['upstream_body']['model'], 'cn:gpt-4o', '网关视角必须是改写后')
 
+    def test_capture_keeps_both_header_sets_masked(self) -> None:
+        """客户端请求头与「网关发往上游」的请求头都要留，且都要打码。
+
+        两边的 Authorization 是**不同的凭证**（客户端拿的是本面板密钥，上游那条
+        是上游 api_key）。只留一份时，「凭证换了没换 / 打错账号池」这类问题在
+        界面上完全看不出来 —— 而这正是 401 排查的第一现场。
+        """
+        tap.save_settings({'enabled': True})
+        turn_id = self._capture(
+            headers=[('authorization', 'Bearer wbk_client_abcdef123456'),
+                     ('content-type', 'application/json')],
+            upstream_headers={'Content-Type': 'application/json',
+                              'Authorization': 'Bearer sk-upstream-abcdef123456'},
+        )
+        assert turn_id is not None
+        view = tap.turn_view(turn_id)
+        assert view is not None
+        req = view['request']
+        client_auth = req['headers']['authorization']
+        upstream_auth = req['upstream_headers']['Authorization']
+        self.assertIn('***', client_auth)
+        self.assertIn('***', upstream_auth)
+        # 谁也没被对方覆盖：两套头分别可见、前缀不同
+        self.assertTrue(client_auth.startswith('Bearer'))
+        self.assertTrue(upstream_auth.startswith('Bearer'))
+        self.assertNotIn('abcdef123456', client_auth)
+        self.assertNotIn('abcdef123456', upstream_auth)
+        self.assertEqual(req['upstream_headers']['Content-Type'], 'application/json')
+
     def test_capture_stores_client_response_for_translators(self) -> None:
         """Anthropic / Responses 的「客户端视角」是翻译后的报文，不能等同上游原文。"""
         tap.save_settings({'enabled': True})
@@ -378,6 +463,26 @@ class DbTest(unittest.TestCase):
         assert view is not None
         self.assertTrue(view['passthrough'])
         self.assertEqual(view['client_response'], view['response'])
+
+    def test_session_keeps_raw_ua_and_backfill_fixes_old_rows(self) -> None:
+        """`client` 是从 UA 派生的；规则变了要能把旧记录重算，而不是永远错着。"""
+        tap.save_settings({'enabled': True})
+        self._capture(
+            ua='deepseek-harness/0.2.2-rc.1 (+https://x)',
+            # 回填走的是「从入库的请求头里把 UA 读回来」这条路（旧记录没有
+            # client_ua 列），所以这里必须真的把 UA 存进请求头。
+            headers=[('authorization', 'Bearer wbk_test1234567890'),
+                     ('user-agent', 'deepseek-harness/0.2.2-rc.1 (+https://x)')],
+        )
+        session = tap.list_sessions()['items'][0]
+        self.assertEqual(session['client'], 'dsh')
+        self.assertIn('deepseek-harness', session['client_ua'] or '')
+        # 模拟旧记录：分类写成 other、UA 留空
+        db.execute('UPDATE tap_sessions SET client = ?, client_ua = NULL WHERE id = ?',
+                   ('other', session['id']))
+        self.assertEqual(tap.backfill_clients(), 1)
+        fixed = tap.list_sessions()['items'][0]
+        self.assertEqual(fixed['client'], 'dsh')
 
     def test_prune_respects_max_sessions(self) -> None:
         tap.save_settings({'enabled': True, 'max_sessions': 10})
