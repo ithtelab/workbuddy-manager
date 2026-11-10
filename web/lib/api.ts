@@ -59,6 +59,11 @@ import type {
   RequestLog,
   SecurityConfig,
   StatsSummary,
+  TapConfigResponse,
+  TapDiff,
+  TapSession,
+  TapSessionDetail,
+  TapTurn,
   TaskLogResponse,
   TaskRunStatus,
   UpdateCheck,
@@ -648,6 +653,33 @@ export const logApi = {
   clear: () => post<{ok: boolean}>('/api/logs/clear'),
   /** 账号列的自诊断：日志从哪读、读到几行、为什么可能是空的（issue #232） */
   accountBackfill: () => get<AccountBackfillInfo>('/api/logs/account-backfill'),
+};
+
+/* ── 调用抓包（Trace Tap）───────────────────────────── */
+export const tapApi = {
+  config: () => get<TapConfigResponse>('/api/tap/config'),
+  saveConfig: (
+    body: Partial<{enabled: boolean; max_body: number; retention_days: number; max_sessions: number}>,
+  ) => put<TapConfigResponse>('/api/tap/config', body),
+  prune: () => post<{turns: number; stats: TapConfigResponse['stats']}>('/api/tap/prune'),
+  sessions: (params: Record<string, unknown>) =>
+    get<{total: number; items: TapSession[]}>('/api/tap/sessions', params),
+  /** 触发一次历史重算：按库里已有的 UA 重新归类、并把辅助调用挂回主会话。 */
+  backfill: () => post<{changed: number; aux: number}>('/api/tap/backfill'),
+  session: (id: number) => get<TapSessionDetail>(`/api/tap/sessions/${id}`),
+  remove: (id: number) => del<{ok: boolean}>(`/api/tap/sessions/${id}`),
+  turn: (id: number) => get<TapTurn>(`/api/tap/turns/${id}`),
+  diff: (before: number, after: number) =>
+    get<TapDiff>('/api/tap/diff', {before, after}),
+  clear: () => post<{ok: boolean; turns: number}>('/api/tap/clear'),
+  /**
+   * 导出自包含 HTML 的地址。
+   *
+   * 走浏览器原生下载（而不是 axios 取文本再拼 Blob）：附件带
+   * `Content-Disposition`，由浏览器决定落在哪里，也不会把几十 KB 的 HTML
+   * 塞进前端内存再拼一遍。带 BASE_PATH —— 子路径部署时裸路径会 404。
+   */
+  exportUrl: (id: number) => `${BASE_PATH}/api/tap/sessions/${id}/export`,
 };
 
 /* ── 用量统计 ───────────────────────────────────────── */

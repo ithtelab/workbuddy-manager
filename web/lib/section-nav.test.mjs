@@ -177,7 +177,8 @@ check(
 
 check('/dashboard 认不出', at('/dashboard'), null);
 check('/stats 认不出', at('/stats'), null);
-check('/logs 认不出', at('/logs'), null);
+check('/logs 认不出（它是底栏目的地，没有二级导航）', at('/logs'), null);
+check('/traces 认不出（同上）', at('/traces'), null);
 check('/security 认不出', at('/security'), null);
 check('/ 认不出', at('/'), null);
 check('空串认不出', at(''), null);

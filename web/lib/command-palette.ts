@@ -98,6 +98,8 @@ export const NAV_COMMANDS: readonly NavSeed[] = [
    keywords: 'stats statistics usage 统计 用量'},
   {href: '/logs', labelKey: 'nav.logs', groupKey: 'nav.groupGovernance',
    keywords: 'logs log 日志'},
+  {href: '/traces', labelKey: 'nav.traces', groupKey: 'nav.groupGovernance',
+   keywords: 'traces trace tap payload prompt diff 轨迹 抓包 请求体 上下文 对比'},
   {href: '/security', labelKey: 'nav.security', groupKey: 'nav.groupGovernance',
    keywords: 'security ip allow deny 安全 白名单'},
   {href: '/settings', labelKey: 'nav.settings', groupKey: 'nav.groupGovernance',

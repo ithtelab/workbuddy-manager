@@ -111,7 +111,7 @@ jobs:
           # server/tests/test_docs_packaging.py 双向守着（README 链到的必须
           # 在名单里；名单里不许有 README 链不到的）。
           # docs-pack:begin
-          DOCS_LIST="usage.md features.md screenshots.md development.md security-notes.md api-tokens.md account-proxy-routes.md SECURITY-AUDIT.md release-signing.md watchdog.md qq-bot.md"
+          DOCS_LIST="usage.md features.md screenshots.md development.md security-notes.md api-tokens.md api-traffic-tap.md account-proxy-routes.md SECURITY-AUDIT.md release-signing.md watchdog.md qq-bot.md"
           mkdir -p "$STAGE/docs"
           for f in $DOCS_LIST; do
             cp "docs/$f" "$STAGE/docs/" || { echo "::error::发布包缺少用户文档 docs/$f"; exit 1; }
