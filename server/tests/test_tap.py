@@ -621,58 +621,6 @@ class DbTest(unittest.TestCase):
         ]}
         self.assertEqual(tap._aux_kind(normal), 'main')
 
-    def test_truncated_turns_diff_uses_digest(self) -> None:
-        """截断的两轮也必须能比出差异（不能永远是「完全一致」）。
-
-        实测现场：请求体 2 MB、单条上限 512 KB → 两轮都切在**同一字节位置**，
-        抢救出的前缀逐字相同，比前缀必然说「一致」——那是假信息。摘要在截断
-        **之前**算（逐条消息的角色 + 内容哈希 + 工具名），与截断无关。
-        """
-        tap.save_settings({'enabled': True, 'max_body': 4096})
-        big = 'x' * 20000
-        body_a = _body(messages=[BODY['messages'][0],
-                                   {'role': 'user', 'content': big}])
-        body_b = _body(messages=[BODY['messages'][0],
-                                   {'role': 'user', 'content': big},
-                                   {'role': 'assistant', 'content': 'done'}])
-        a = self._capture(body=body_a, stream=False)
-        b = self._capture(body=body_b, stream=False)
-        assert a is not None and b is not None
-        self.assertTrue(tap.turn(a)['truncated'], '这一轮应当被截断（测试前提）')
-        d = tap.diff(a, b)
-        assert d is not None
-        self.assertTrue(d.get('from_digest'), '截断场景应当走摘要比较')
-        self.assertGreaterEqual(d['summary']['added'], 1,
-                                '摘要比较应发现新增的那条消息')
-
-    def test_outbound_falls_back_to_previous_generation(self) -> None:
-        """轮转后当前文件可能还不存在（要等下一次调用），上一代要兜底。
-
-        实测：转储文件超过上限被改名成 .1（116 MB），而新文件要等下一次调用
-        才被上游创建 —— 这段空窗期里只查当前文件会得到「文件不存在」。
-        """
-        import os
-        import tempfile
-
-        tap.save_settings({'enabled': True})
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'outbound-trace.jsonl'
-            prev = Path(str(path) + '.1')
-            prev.write_text(
-                '{"kind":"request","trace_id":"abc","ts":1}\n'
-                '{"kind":"response","trace_id":"abc","ts":2}\n', encoding='utf-8')
-            old_env = os.environ.get('WB_TAP_OUTBOUND_FILE')
-            os.environ['WB_TAP_OUTBOUND_FILE'] = str(path)
-            try:
-                res = tap.outbound('abc')
-            finally:
-                if old_env is None:
-                    os.environ.pop('WB_TAP_OUTBOUND_FILE', None)
-                else:
-                    os.environ['WB_TAP_OUTBOUND_FILE'] = old_env
-        self.assertTrue(res['available'])
-        self.assertEqual(len(res['entries']), 2, '上一代里的记录应当能查到')
-
     def test_prune_respects_max_sessions(self) -> None:
         tap.save_settings({'enabled': True, 'max_sessions': 10})
         for i in range(14):

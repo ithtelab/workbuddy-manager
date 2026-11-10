@@ -36,8 +36,7 @@ import type {
   TapTurnBrief,
 } from '@/lib/types';
 import {PageHeader} from '@/components/common/layout/PageHeader';
-import {JsonPreview, salvageJson} from '@/components/common/trace/JsonView';
-import type {JsonPath} from '@/lib/json-path';
+import {JsonPreview, jsonAnchor, type JsonPath} from '@/components/common/trace/JsonView';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
@@ -134,12 +133,6 @@ export default function TracesPage() {
    * 逐层展开并高亮，用户不用自己去树上找。
    */
   const [focusPath, setFocusPath] = useState<JsonPath | null>(null);
-  /**
-   * Preview 树的展开/收起信号。大报文默认**全收起**（展开两层在 500 KB 的
-   * 截断体上等于整页树），用户点「展开全部」再摊开 —— 这是可逆操作，
-   * 手动展开过的节点在收起信号撤销后保留原状。
-   */
-  const [expandAll, setExpandAll] = useState<boolean | undefined>(undefined);
   const [turn, setTurn] = useState<TapTurn | null>(null);
   /** 单轮正文取不到（404 / 网络错误）：要明确说，而不是让骨架屏一直转。 */
   const [turnFailed, setTurnFailed] = useState(false);
@@ -699,15 +692,6 @@ export default function TracesPage() {
                           </button>
                         ))}
                       </div>
-                      {format === 'preview' && (
-                        <button
-                          type="button"
-                          onClick={() => setExpandAll((v) => !(v ?? false))}
-                          className="rounded-full border px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted"
-                        >
-                          {expandAll ? t('trace.collapseAll') : t('trace.expandAll')}
-                        </button>
-                      )}
                     </div>
                   )}
                 </div>
@@ -730,8 +714,7 @@ export default function TracesPage() {
                   {turn && tab === 'request' && (
                     <div className="min-w-0">
                       <RequestTab turn={turn} view={view} outbound={outbound}
-                                  format={format} highlight={focusPath}
-                                  expandAll={expandAll} focusPath={focusPath} />
+                                  format={format} highlight={focusPath} />
                     </div>
                   )}
                   {turn && tab === 'response' && (
@@ -741,18 +724,17 @@ export default function TracesPage() {
                   )}
                   {turn && tab === 'diff' && (
                     <DiffTab diff={diff} hasPrev={Boolean(before)} onLocate={(path) => {
-                        // 路径前缀取决于树顶层的形状：
-                        //   · 截断体：根是 {headers, upstream_headers, body}，消息在
-                        //     body.messages 下 → 要补 'body'；
-                        //   · 完整体：根**就是** body 本身（键是 model/messages/…）
-                        //     → 不能补，否则多一层找不到（实测定位停在半路）。
                         setFocusPath(path);
                         setTab('request');
                         setView('gateway');
                         setFormat('preview');
-                        // 滚动由树自己做（JsonView 的 focusPath）：它需要先**展开**
-                        // 目标行所在的那几层 —— 折叠状态下目标行不在 DOM 里，
-                        // 页面层 scrollIntoView 只会滚到空白处。
+                        // 滚动放在页面层做：树是切页签后**新挂载**的，节点出现的
+                        // 时机取决于展开层级与容器高度，交给 JsonView 内部去滚实测
+                        // 不可靠（目标停在视口外）。这里等两帧再按 id 找。
+                        window.setTimeout(() => {
+                          document.getElementById(jsonAnchor(path))
+                            ?.scrollIntoView({block: 'nearest'});
+                        }, 180);
                       }} />
                   )}
                 </div>
@@ -831,65 +813,24 @@ function Overview({turn}: {turn: TapTurn}) {
  * tencent 视角的报文不在库里，而在上游写的转储文件里 —— 取不到时给出
  * **指向原因**的提示（没开启 / 没有该轮 / 文件不存在），而不是一片空白。
  */
-function RequestTab({turn, view, outbound, format, highlight, expandAll, focusPath}: {
+function RequestTab({turn, view, outbound, format, highlight}: {
   turn: TapTurn;
   view: 'client' | 'gateway' | 'tencent';
   outbound: TapOutbound | null;
   format: 'preview' | 'raw';
   highlight: JsonPath | null;
-  expandAll?: boolean;
-  /** diff「定位」的目标路径：树会展开到那一行。 */
-  focusPath?: JsonPath | null;
 }) {
   const t = useT();
   const req = turn.request && typeof turn.request === 'object'
     ? (turn.request as Record<string, unknown>)
     : null;
 
-  // 截断的请求体：JSON 已经解析不了，但**能切出前缀树** —— 从原文里截到哪一层
-  // 就展示到哪一层，比甩一坨 500 KB 的 <pre> 有用得多（实测反馈：滚动半分钟
-  // 找不到重点）。解析不出来的剩余尾巴单独给一段原文。
-  // useMemo 必须在所有 early return 之前（React Hooks 规则），tencent 分支
-  // 的早退挪到 salvage 计算之后。
-  const salvage = useMemo(() => {
-    if (turn.request_ok) return null;
-    const raw = turn.request_raw || '';
-    // 截断发生在 body 中段，而 headers 排在最前面 —— 几乎总是完整的。
-    // 先切「body 之前」的部分（headers 等完整字段），能整体解析就直接用；
-    // body 本身再单独切前缀树，两块拼起来展示。
-    // `"body"` 可能出现在 headers 的**值**里（UA/cookie 都可能含这个词），
-    // 所以必须找 `"body": {` 这种带值的形态，并且取最后一次出现 —— 入库结构
-    // 固定是 {headers, body}，body 一定在最后。
-    let bodyStart = -1;
-    const needle = '"body": {';
-    let scan = 0;
-    while (true) {
-      const at = raw.indexOf(needle, scan);
-      if (at < 0) break;
-      bodyStart = at;
-      scan = at + 1;
-    }
-    const headPart = bodyStart > 0 ? raw.slice(0, bodyStart - 1) : '';
-    let headersDoc: unknown = null;
-    if (headPart) {
-      // headPart 以逗号结尾（body 是最后一个键），补 `}` 前先去掉
-      try {
-        const headFixed = `${headPart.replace(/[\s,]+$/, '')}}`;
-        headersDoc = JSON.parse(headFixed) as Record<string, unknown>;
-      } catch { /* headers 段不完整（极少见），退回不展示 */ }
-    }
-    const bodyRaw = bodyStart > 0 ? raw.slice(bodyStart + '"body": '.length) : raw;
-    const prefix = salvageJson(bodyRaw);
-    if (prefix === null && headersDoc === null) return null;
-    return {headers: headersDoc, prefix, tail: '', ok: false};
-  }, [turn.request_ok, turn.request_raw]);
-
   // 腾讯视角：整页换成出站转储里那一跳（请求侧），不走库里的两份。
   if (view === 'tencent') {
     return <OutboundSide outbound={outbound} side="request" />;
   }
 
-  if (!turn.request_ok && !salvage) {
+  if (!turn.request_ok) {
     return <Block title={t('trace.rawTruncated')} body={turn.request_raw || ''} />;
   }
 
@@ -903,15 +844,8 @@ function RequestTab({turn, view, outbound, format, highlight, expandAll, focusPa
   // 请求头也是两份：客户端发来的（含它自己的网关密钥）与网关发给上游的
   // （含上游密钥）。两边 Authorization 是**不同的凭证**，只看 body 永远看不出
   // 「凭证换了没换」——而这是排查 401 / 打错账号池的第一现场。
-  // 截断体：headers 从抢救结果里来（入库的 request_json 解析不了，但 headers
-  // 段几乎总是完整的 —— 它在截断点之前）。不救的话界面上会显示「未采集到」，
-  // 而下面树里明明有 headers，自相矛盾（实测反馈）。
-  const clientHeaders = salvage && salvage.headers
-    ? asHeaders((salvage.headers as Record<string, unknown>).headers ?? salvage.headers)
-    : asHeaders(req ? req.headers : null);
-  const upstreamHeaders = salvage && salvage.headers
-    ? asHeaders((salvage.headers as Record<string, unknown>).upstream_headers ?? null)
-    : asHeaders(req ? req.upstream_headers : null);
+  const clientHeaders = asHeaders(req ? req.headers : null);
+  const upstreamHeaders = asHeaders(req ? req.upstream_headers : null);
   const headers = view === 'client' ? clientHeaders : upstreamHeaders;
 
   return (
@@ -940,29 +874,13 @@ function RequestTab({turn, view, outbound, format, highlight, expandAll, focusPa
       />
       <section>
         <h4 className="mb-1 text-xs font-medium">
-          {view === 'client' ? t('trace.requestBody') : t('trace.upstreamRequestBody')}
+          {view === 'client' ? t('trace.clientRequest') : t('trace.upstreamRequest')}
         </h4>
-        {!turn.request_ok && salvage ? (
-          // 截断体：headers（完整）+ body 前缀树拼成一棵展示；默认全收起。
-          format === 'preview' ? (
-            <JsonPreview
-              value={{...(salvage.headers as object), body: salvage.prefix}}
-              expandAll={expandAll}
-              focusPath={focusPath}
-              maxHeight="max-h-[60vh]" />
-          ) : (
-            <pre className={BLOCK_SCROLL + " rounded-md bg-muted/40 p-2 font-mono text-[11px]"}>
-              {turn.request_raw}
-            </pre>
-          )
-        ) : format === 'preview' ? (
-          <JsonPreview value={shown} highlight={highlight} expandAll={expandAll}
-                       focusPath={focusPath} />
-        ) : (
-          <pre className={BLOCK_SCROLL + " rounded-md bg-muted/40 p-2 font-mono text-[11px]"}>
-            {pretty(shown)}
-          </pre>
-        )}
+        {format === 'preview'
+          ? <JsonPreview value={shown} highlight={highlight} />
+          : <pre className={BLOCK_SCROLL + " rounded-md bg-muted/40 p-2 font-mono text-[11px]"}>
+              {pretty(shown)}
+            </pre>}
       </section>
     </div>
   );
@@ -1156,22 +1074,10 @@ function DiffTab({diff, hasPrev, onLocate}: {
   }
   if (!diff) return <SkeletonBar className="h-32 w-full" />;
   if (diffIsEmpty(diff)) {
-    return (
-      <div className="space-y-1">
-        <p className="text-xs text-muted-foreground">{t('trace.diffEmpty')}</p>
-        {diff.from_digest && (
-          <p className="text-[11px] text-muted-foreground">{t('trace.diffDigestNote')}</p>
-        )}
-      </div>
-    );
+    return <p className="text-xs text-muted-foreground">{t('trace.diffEmpty')}</p>;
   }
   return (
     <div className="space-y-4 text-xs">
-      {diff.from_digest && (
-        <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">
-          {t('trace.diffDigestNote')}
-        </p>
-      )}
       {diff.params.length > 0 && (
         <section>
           <h4 className="mb-1 font-medium">{t('trace.diffParams')}</h4>
@@ -1438,31 +1344,7 @@ function OutboundSide({outbound, side}: {
       : outbound.reason === 'no-file'
         ? t('trace.outboundUnavailable')
         : t('trace.outboundError', {reason: outbound.reason});
-    return (
-      <div className="space-y-2 text-xs">
-        <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-amber-700 dark:text-amber-300">
-          {hint}
-        </p>
-        <p className="text-[11px] text-muted-foreground">
-          {t('trace.outboundPath', {path: outbound.path})}
-        </p>
-      </div>
-    );
-  }
-  if (outbound.reason === 'not-found') {
-    // 文件在、也扫完了整个文件，确实没有这一轮的记录 —— 与「没开转储」是两回事
-    return (
-      <div className="space-y-2 text-xs">
-        <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-amber-700 dark:text-amber-300">
-          {t('trace.outboundNotFound')}
-        </p>
-        <p className="text-[11px] text-muted-foreground">
-          {t('trace.outboundPath', {path: outbound.path})}
-        </p>
-      </div>
-    );
-  }
-  if (outbound.reason === 'out-of-window') {
+  } else if (outbound.reason === 'out-of-window') {
     // 有文件但这一轮已经滑出扫描窗口（活跃池子几小时就写出上百 MB）：
     // 不是错误，也不是"还没有"，如实说清楚原因。
     return (

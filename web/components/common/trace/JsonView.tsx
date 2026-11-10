@@ -1,185 +1,214 @@
 'use client';
 
-/**
- * 抓包报文的 JSON 预览。
- *
- * 用 [**react-obj-view**](https://github.com/vothanhdat/react-obj-view)（虚拟化渲染、
- * 零运行时依赖、React 19 原生）。换掉 @uiw/react-json-view 的原因：
- *
- * 1. **按需加载是库内建能力**，不用在数据层预切：`arrayGroupSize` / `objectGroupSize`
- *   把大集合变成「分组节点」（`0 … 9`、`10 … 19`），点开才枚举那一组 —— 这正是
- *   「默认前 N 项、点加载更多继续看」的交互，而且是**无限层**的（每组里还能再分组），
- *   比一次性渲染 20 条再「加载更多」按钮流畅得多。
- * 2. **虚拟化**：只渲染可见行，10 万+ 节点不卡。抓包的 325 条消息展开后是几千行，
- *    前一个库没有虚拟化，DOM 数量随展开线性涨。
- * 3. 自研的 `salvageJson`（截断体救援）与 `jsonAnchor`（定位锚点）保留，仍被
- *    page 层使用。
- *
- * 分组大小取 10：与「默认前 10 项、每次多看 10 项」的直觉一致。
- */
-import {ObjectView, themeDefault} from 'react-obj-view';
-import type {ObjectViewHandle} from 'react-obj-view';
-import 'react-obj-view/dist/react-obj-view.css';
-import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {useEffect, useMemo, useRef, useState} from 'react';
+import {ChevronRight} from 'lucide-react';
 import {useT} from '@/lib/i18n/provider';
 import {cn} from '@/lib/utils';
-import type {JsonPath} from '@/lib/json-path';
-
-
-
-/** 分组大小：每组 10 项 —— 与「默认前 10、每次 +10」的交互直觉一致。 */
-const GROUP_SIZE = 10;
 
 /**
- * 从**被截断**的 JSON 文本里抢救出「能解析的前缀」，补齐未闭合的括号。
+ * JSON 预览（Preview）：可折叠的树，而不是一整块 `<pre>`。
  *
- * 截断体本身是非法 JSON（半条消息、半个工具定义）。逐字符扫描，记录字符串
- * 边界与括号栈，扫到结尾后按栈补齐右括号 —— 得到「原文的前缀 + 合法闭合」，
- * 树就能正常渲染。返回 null 表示连前缀都切不出来，调用方退回原文。
+ * 为什么要它：抓包的请求体动辄几十 KB（上百条历史消息 + 113 个工具定义），
+ * 直接甩一坨格式化 JSON 出来，用户只能 Ctrl+F 大海捞针 —— 而且行号一多，
+ * 「这一轮到底改了什么」根本看不出来。树形视图把「结构」摆在前面：
+ * 默认展开两层，其余按需点开；长字符串单独折叠，不把一行撑到天边。
+ *
+ * 与 Raw 的分工：Raw 保留原文（空格、键序、转义原样），用来逐字节对照；
+ * Preview 用来读。两者都不是「唯一的真相」，所以做成可切换，而不是二选一。
  */
-export function salvageJson(text: string): unknown | null {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return null;
-  const stack: Array<'{' | '['> = [];
-  let inString = false;
-  let escaped = false;
-  let end = 0;
-  for (let i = 0; i < trimmed.length; i++) {
-    const ch = trimmed[i] as string;
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') { inString = true; continue; }
-    if (ch === '{' || ch === '[') { stack.push(ch as '{' | '['); continue; }
-    if (ch === '}' || ch === ']') {
-      stack.pop();
-      if (stack.length === 0) { end = i + 1; break; }
-      end = i + 1;
-    }
-    if (ch === ',' && stack.length > 0) end = i;
+
+/** 长字符串的折叠阈值：超过它默认收起，给「展开」按钮。 */
+const LONG_STRING = 240;
+/** 数组/对象在折叠状态下的摘要里最多显示多少项。 */
+const SUMMARY_ITEMS = 6;
+
+export type JsonPath = (string | number)[];
+type Path = JsonPath;
+
+function typeOf(value: unknown): 'object' | 'array' | 'string' | 'number' | 'boolean' | 'null' {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  const t = typeof value;
+  if (t === 'string' || t === 'number' || t === 'boolean') return t;
+  return 'object';
+}
+
+/** 一行的缩进：用 padding 而不是空格串，选中/高亮时背景能铺满。 */
+function indent(depth: number) {
+  return {paddingLeft: `${depth * 14 + 4}px`};
+}
+
+/**
+ * 高亮定位：diff 里点「定位」跳到 Preview 时，需要把目标节点**展开并滚到眼前**。
+ *
+ * 用「路径前缀」判定：`["messages", 3]` 高亮时，它的祖先 `["messages"]` 也要展开，
+ * 否则目标节点根本不在 DOM 里。这里由父节点逐层判断，不依赖外部滚动逻辑。
+ */
+function isPrefix(prefix: Path, path: Path): boolean {
+  if (prefix.length > path.length) return false;
+  return prefix.every((seg, i) => String(seg) === String(path[i]));
+}
+
+export function JsonView({
+  value,
+  name,
+  path = [],
+  depth = 0,
+  defaultExpand = 2,
+  highlight,
+}: {
+  value: unknown;
+  /** 这一层的键名（根节点不传）。 */
+  name?: string;
+  path?: Path;
+  depth?: number;
+  defaultExpand?: number;
+  /** 需要高亮的目标路径（diff 定位用）。 */
+  highlight?: Path | null;
+}) {
+  const kind = typeOf(value);
+  const container = kind === 'object' || kind === 'array';
+  const highlighted = Boolean(highlight && highlight.length === path.length
+    && isPrefix(highlight, path) && path.length > 0);
+  // 默认展开：浅层直接摊开；带高亮时，祖先链必须全部展开
+  const shouldOpen = highlight
+    ? isPrefix(path, highlight) || depth < defaultExpand
+    : depth < defaultExpand;
+  const [open, setOpen] = useState(shouldOpen);
+  const [showLong, setShowLong] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  // 高亮节点滚进视野（只在真正命中时滚一次）。
+  //
+  // 用 rAF 推迟一帧：从差异页「定位」过来时，节点是在**同一次提交**里刚展开的，
+  // 立刻 scrollIntoView 拿到的还是旧布局（实测滚不到位，目标停在视口外 2000px）。
+  useEffect(() => {
+    if (!highlight || !highlighted) return;
+    // 两段式：rAF 保证节点已经提交进 DOM，setTimeout 再等一次布局稳定。
+    // 只做 rAF 时实测滚不到位（目标停在视口外 2000px）—— 树是在同一次提交里
+    // 展开的，父节点的展开会继续改变高度，滚动位置随之作废。
+    // 用 `block: 'center'` + 默认（非 smooth）行为：定位是"跳转"，不是"浏览"。
+    const scroll = () => ref.current?.scrollIntoView({block: 'nearest'});
+    const raf = window.requestAnimationFrame(() => {
+      scroll();
+      window.setTimeout(scroll, 120);
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [highlight, highlighted]);
+
+  if (!container) {
+    const isString = kind === 'string';
+    const text = isString ? (value as string) : JSON.stringify(value);
+    const long = isString && text.length > LONG_STRING;
+    return (
+      <div
+        ref={ref}
+        id={jsonAnchor(path)}
+        style={indent(depth)}
+        className={cn(
+          'flex items-start gap-1 py-[1px] font-mono text-[11px] leading-5',
+          highlighted && 'rounded bg-amber-500/20',
+        )}
+      >
+        {name !== undefined && <span className="shrink-0 text-sky-600 dark:text-sky-400">{name}:</span>}
+        <span className={cn('min-w-0 whitespace-pre-wrap break-all',
+          kind === 'string' && 'text-emerald-700 dark:text-emerald-400',
+          kind === 'number' && 'text-violet-600 dark:text-violet-400',
+          kind === 'boolean' && 'text-orange-600 dark:text-orange-400',
+          kind === 'null' && 'text-muted-foreground')}>
+          {isString ? `"${long && !showLong ? `${text.slice(0, LONG_STRING)}…` : text}"` : text}
+        </span>
+        {long && (
+          <button type="button" onClick={() => setShowLong((v) => !v)}
+                  className="shrink-0 rounded border px-1 text-[10px] text-muted-foreground hover:bg-muted">
+            {showLong ? '−' : `+${text.length - LONG_STRING}`}
+          </button>
+        )}
+      </div>
+    );
   }
-  if (end <= 0) return null;
-  let prefix = trimmed.slice(0, end);
-  for (const open of stack.reverse()) prefix += open === '{' ? '}' : ']';
-  prefix = prefix.replace(/[,:\s]+$/, '');
-  try {
-    return JSON.parse(prefix);
-  } catch {
-    return null;
+
+  const entries: [string | number, unknown][] = kind === 'array'
+    ? (value as unknown[]).map((v, i) => [i, v])
+    : Object.entries(value as Record<string, unknown>);
+  const summary = kind === 'array'
+    ? `[…${entries.length}]`
+    : `{…${entries.length}}`;
+  const preview = entries.slice(0, SUMMARY_ITEMS)
+    .map(([k, v]) => `${k}: ${shortOf(v)}`)
+    .join(', ');
+
+  return (
+    <div ref={ref} id={jsonAnchor(path)}>
+      <div
+        style={indent(depth)}
+        className={cn(
+          'flex cursor-pointer items-center gap-1 py-[1px] font-mono text-[11px] leading-5 hover:bg-muted/50',
+          highlighted && 'rounded bg-amber-500/20',
+        )}
+        onClick={() => setOpen((v) => !v)}
+        role="button"
+        tabIndex={0}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setOpen((v) => !v); }}
+      >
+        <ChevronRight className={cn('h-3 w-3 shrink-0 text-muted-foreground transition-transform',
+          open && 'rotate-90')} />
+        {name !== undefined && <span className="shrink-0 text-sky-600 dark:text-sky-400">{name}:</span>}
+        <span className="text-muted-foreground">{summary}</span>
+        {!open && entries.length > 0 && (
+          <span className="truncate text-muted-foreground/70">{preview}</span>
+        )}
+      </div>
+      {open && entries.map(([key, child]) => (
+        <JsonView
+          key={String(key)}
+          value={child}
+          name={String(key)}
+          path={[...path, key]}
+          depth={depth + 1}
+          defaultExpand={defaultExpand}
+          highlight={highlight}
+        />
+      ))}
+    </div>
+  );
+}
+
+/** 折叠状态下的单行摘要：对象/数组给类型，字符串截断。 */
+function shortOf(value: unknown): string {
+  const kind = typeOf(value);
+  if (kind === 'object') return '{…}';
+  if (kind === 'array') return `[${(value as unknown[]).length}]`;
+  if (kind === 'string') {
+    const s = value as string;
+    return `"${s.length > 24 ? `${s.slice(0, 24)}…` : s}"`;
   }
+  return JSON.stringify(value);
 }
 
 /** DOM 锚点：diff 定位靠它滚动，路径进 id 时把非字母数字换掉。 */
-export function jsonAnchor(path: JsonPath): string {
+export function jsonAnchor(path: Path): string {
   return `json-${path.map((seg) => String(seg).replace(/[^\w-]/g, '_')).join('.') || 'root'}`;
 }
 
-export function JsonPreview({value, expandAll, focusPath, maxHeight = 'max-h-[60vh]'}: {
+/** 把任意值渲染成 Preview 树的薄封装（供页面少写点 props）。 */
+export function JsonPreview({value, highlight, defaultExpand = 2}: {
   value: unknown;
-  highlight?: JsonPath | null;
-  /** true=全展开，false=全收起，undefined=默认展开 2 层。 */
-  expandAll?: boolean;
-  /**
-   * 要定位到的路径（diff「定位」用）。传进来会自动**展开沿途节点**并滚到那一行。
-   *
-   * 为什么由这里做而不是页面层：库的 `scrollToPaths` 只会滚动，**不会展开** ——
-   * 目标节点在折叠状态下根本不在 DOM 里，滚过去也是空的。库的
-   * `expandAndGetIndex` 正好做这件事：沿途展开并返回行索引。
-   */
-  focusPath?: JsonPath | null;
-  maxHeight?: string;
+  highlight?: Path | null;
+  defaultExpand?: number;
 }) {
   const t = useT();
-  const stable = useMemo(() => value, [value]);
-  const viewRef = useRef<ObjectViewHandle | undefined>(undefined);
-  const lastFocus = useRef<string>('');
-  /**
-   * 定位路径的**根前缀**：完整体的根就是 body 本身，而截断体的根是
-   * {headers, upstream_headers, body} —— 两种形状差一层。传进来的路径是相对
-   * **body** 的（diff 那边比的就是 body），所以这里按实际形状决定要不要补
-   * 'body' 这一层（补错就找不到那一条）。
-   */
-  const rootPrefix = useMemo(() => {
-    if (!value || typeof value !== 'object') return [];
-    const keys = Object.keys(value as Record<string, unknown>);
-    // 根里有 body 且它是个对象 → 截断体形状，消息在 body 下
-    if (keys.includes('body') && typeof (value as Record<string, unknown>).body === 'object') {
-      return ['body'];
-    }
-    return [];
+  // 顶层不是对象/数组时（例如一段纯文本），直接按标量渲染
+  const isScalar = useMemo(() => {
+    const kind = typeOf(value);
+    return kind !== 'object' && kind !== 'array';
   }, [value]);
-
-  /**
-   * 定位模式下**关闭分组**并临时全展开。
-   *
-   * 为什么必须关分组：库的分组会把大数组代理成「`50 … 60`」这样的**复合键**，
-   * 路径 `messages.60` 在分组态下根本不存在 —— 库的路径查找拿到的是分组代理，
-   * 按索引找不到任何东西（实测：61 条消息的会话，定位后仍停在分组列表上）。
-   *
-   * 为什么必须全展开：`scrollToPaths` 只负责**滚动**，不改展开状态；折叠着的
-   * `messages` 下并没有 `messages[60]` 这一行，目标行不在 DOM 里，滚过去是空的。
-   *
-   * 代价是展开后行数变多 —— 但虚拟化只渲染可见行，DOM 数量不涨。
-   */
-  const [focusMode, setFocusMode] = useState(false);
-
-  /** 展开到目标路径并滚过去。路径不存在时静默返回（不报错、不打断）。 */
-  const focus = useCallback(async (path: JsonPath) => {
-    const handle = viewRef.current;
-    if (!handle || path.length === 0) return;
-    // 树可能还没初始化完（库的 state 未就绪时会抛 "Paths not inited"），
-    // 所以重试几次：每次间隔一帧，等它准备好。
-    for (let attempt = 0; attempt < 8; attempt++) {
-      try {
-        await handle.scrollToPaths(path as PropertyKey[]);
-        return;
-      } catch {
-        await new Promise((r) => window.setTimeout(r, 60));
-      }
-    }
-    // 路径不存在于当前数据（截断体抢救出来的前缀可能缺这一段）：不打扰用户
-  }, []);
-
-  useEffect(() => {
-    if (!focusPath || focusPath.length === 0) return;
-    const key = focusPath.join('.');
-    if (key === lastFocus.current) return;
-    lastFocus.current = key;
-    setFocusMode(true);
-    // 等树按新数据挂载完、并完成这一轮展开后再定位
-    const timer = window.setTimeout(() => void focus([...rootPrefix, ...focusPath]), 220);
-    return () => window.clearTimeout(timer);
-  }, [focusPath, focus, rootPrefix]);
-
-  if (value === undefined || value === null) {
+  if (value === undefined) {
     return <p className="text-[11px] text-muted-foreground">{t('trace.notCaptured')}</p>;
   }
-
   return (
-    // min-w-0：树内长字符串靠库的省略号折叠，容器不能被撑开
-    <div className={cn(
-      'min-w-0 overflow-auto rounded-md border bg-background/60',
-      maxHeight,
-    )}>
-      <ObjectView
-        ref={viewRef}
-        valueGetter={() => stable}
-        // 分组：大集合变成「0 … 9 / 10 … 19」的分组节点，点开才枚举 —— 按需加载。
-        // 定位模式下关掉：分组键是「50 … 60」这种复合键，按索引的路径找不到。
-        arrayGroupSize={focusMode ? 0 : GROUP_SIZE}
-        objectGroupSize={focusMode ? 0 : GROUP_SIZE}
-        // expandLevel：默认展开 2 层（与「默认前 10 项」的直觉一致）；
-        // expandAll 信号切换全展开/全收起；定位模式下临时全展开（见上方注释）
-        expandLevel={focusMode ? 100 : expandAll === undefined ? 2 : expandAll ? 100 : false}
-        showLineNumbers={false}
-        lineHeight={18}
-        overscan={40}
-        style={themeDefault}
-        className="text-[12px]"
-      />
+    <div className="max-h-80 overflow-auto rounded-md bg-muted/30 py-1">
+      <JsonView value={value} defaultExpand={isScalar ? 0 : defaultExpand} highlight={highlight} />
     </div>
   );
 }

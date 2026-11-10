@@ -2249,7 +2249,7 @@
     "noRecon": "이 턴에는 재구성할 출력이 없습니다(오류 응답 또는 빈 응답)",
     "rawTruncated": "요청 본문(잘림, 원문 표시)",
     "truncatedHint": "이 기록이 건당 상한을 넘어 요청 본문이 잘렸습니다",
-    "requestBody": "요청 본문",
+    "requestBody": "클라이언트 요청 본문",
     "upstreamBody": "업스트림으로 보낸 요청 본문",
     "rawStream": "업스트림 원본 스트림",
     "diffFirst": "첫 턴이라 비교할 대상이 없습니다",
@@ -2317,12 +2317,6 @@
     "outboundPath": "덤프 파일: {path}",
     "outboundTruncated": "건당 상한을 넘어 잘렸습니다",
     "clientResponse": "클라이언트가 받은 응답(번역됨)",
-    "outboundOutOfWindow": "이 턴은 스캔 윈도우를 벗어났습니다(파일이 큼): 최근 호출 기록만 유지됩니다. 더 최근 호출을 확인하세요",
-    "expandAll": "모두 펼치기",
-    "collapseAll": "모두 접기",
-    "salvageTail": "잘린 나머지(원문)",
-    "upstreamRequestBody": "게이트웨이 요청 본문(변환 후)",
-    "diffDigestNote": "두 요청 본문이 모두 잘려 있어 **요약**(메시지별 역할과 내용 해시)으로 비교합니다. 본문은 같은 위치에서 잘려 전체 비교는 항상 \"동일\"이 됩니다.",
-    "outboundNotFound": "덤프 파일에 이 턴의 기록이 없습니다(이전 배치에 기록되었거나 다른 업스트림으로 갔을 수 있습니다)."
+    "outboundOutOfWindow": "이 턴은 스캔 윈도우를 벗어났습니다(파일이 큼): 최근 호출 기록만 유지됩니다. 더 최근 호출을 확인하세요"
   }
 }

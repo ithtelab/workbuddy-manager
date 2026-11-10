@@ -511,14 +511,6 @@ CREATE TABLE IF NOT EXISTS tap_turns (
   -- 请求体（已脱敏、已按 max_body 截断）的 JSON 文本。truncated=1 时界面按
   -- 原文展示，而不是假装还能解析成结构。
   request_json      TEXT,
-  -- 请求体的**摘要**（在截断**之前**算好）：消息逐条的 role + 内容哈希、工具
-  -- 名列表、顶层参数。
-  --
-  -- 为什么必须有：请求体常有两三 MB，而单条上限默认 512 KB —— 截断会把两轮都
-  -- 切在**同一个字节位置**，抢救出的前缀逐字相同，于是「与上一轮对比」会说
-  -- 「完全一致」，那是**假信息**（实测：325 条消息的会话，真实差异全在末尾）。
-  -- 摘要在截断前算，体积只有几 KB，与截断无关，永远可比。
-  request_digest    TEXT,
   -- 上游原始响应：流式是 SSE 原文，非流式是 JSON 文本，同样脱敏并截断。
   response_text     TEXT,
   -- **回给客户端的**响应。chat 是透传（与 response_text 相同），Anthropic /
@@ -751,7 +743,6 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ('tap_turns', 'trace_id', 'TEXT'),
     # 抓包会话的原始 UA（版本号从这里取；旧记录按它重新归类）
     ('tap_sessions', 'client_ua', 'TEXT'),
-    ('tap_turns', 'request_digest', 'TEXT'),
     ('tap_sessions', 'first_user', 'TEXT'),
     ('tap_sessions', 'kind', "TEXT NOT NULL DEFAULT 'main'"),
     ('tap_sessions', 'parent_id', 'INTEGER'),
