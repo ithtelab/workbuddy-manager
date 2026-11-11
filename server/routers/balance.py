@@ -12,8 +12,8 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from .. import keysvc, upstreamsvc
-from ..services import credits, wb2api
+from .. import db, keysvc, upstreamsvc
+from ..services import balance_realm, credits, wb2api
 
 router = APIRouter(tags=['balance'])
 
@@ -127,6 +127,46 @@ async def _pool_credits(key: dict) -> float:
     return total
 
 
+async def _realm_credits(key: dict, realm: str) -> float | None:
+    """按版本汇总池内积分；拿不到返回 None（调用方回退合并口径）。"""
+    try:
+        upstream = upstreamsvc.resolve_for_key(key)
+    except upstreamsvc.UpstreamUnavailable:
+        return None
+    marker = f"{upstream.get('id') or 'default'}:{realm}"
+    now = time.time()
+    hit = _pool_cache.get(marker)
+    if hit and now - hit[0] <= POOL_TTL_SECONDS:
+        return hit[1]
+    status = await wb2api.get_status(base_url=upstream.get('base_url'),
+                                     api_key=upstreamsvc.forward_api_key(upstream))
+    value = balance_realm.realm_credits(status, realm)
+    if value is None:
+        return None
+    if not value:
+        # 与 `_pool_total` 同口径：上游该版本整档报 0 时改用本地快照
+        # （上游 credits 只在自身定时任务里刷新，0 分不清「真花光」与「没上报」）
+        value = _snapshot_total(balance_realm.realm_uids(status, realm))
+    _pool_cache[marker] = (now, value)
+    return value
+
+
+def _last_call_realm(key: dict) -> str:
+    """这把密钥最近一次**真实**调用的版本。
+
+    必须过滤 `model=''`：查余额自身也会写一条 0 token 的请求日志，
+    不过滤的话每查一次余额就把自己污染成「国内」。
+    """
+    try:
+        row = db.query_one(
+            "select realm from request_logs"
+            " where key_id=? and model!='' order by id desc limit 1",
+            (key.get('id'),))
+    except Exception:  # noqa: BLE001
+        return ''
+    return str((row['realm'] if row else '') or '')
+
+
 @router.get('/api/usage/token/')
 async def token_usage(request: Request):
     """按密钥返回剩余额度。停用 / 过期 / 用尽都照常给数，不拦。
@@ -146,8 +186,20 @@ async def token_usage(request: Request):
         )
 
     has_limit = _number(key.get('quota_credit')) or _number(key.get('quota'))
+    scope = balance_realm.resolve_scope(
+        key_realm=key.get('realm') or '',
+        has_limit=bool(has_limit),
+        last_realm=_last_call_realm(key),
+        requested=request.query_params.get('scope') or '',
+    )
     pool = 0.0 if has_limit else await _pool_credits(key)
     available, used, total = _amounts(key, pool)
+    # 未设上限时才按池拆分：拆出来的是「那个版本此刻能花多少」；
+    # 设了上限的密钥回答的是它自己的额度，拆了就自相矛盾。
+    if not has_limit and scope in balance_realm.POOL_SCOPES:
+        split = await _realm_credits(key, scope)
+        if split is not None:
+            available, used, total = split, 0.0, split
     return {
         'code': True,
         'data': {
@@ -158,6 +210,8 @@ async def token_usage(request: Request):
             'total_granted': total,
             'total_used': used,
             'total_available': available,
+            # 口径：cn / global / merged。客户端不必理解，供面板与排障
+            'scope': scope,
         },
     }
 
@@ -172,5 +226,30 @@ def status() -> dict:
             'quota_display_type': 'CUSTOM',
             'custom_currency_symbol': UNIT,
             'custom_currency_exchange_rate': 1,
+        },
+    }
+
+@router.get('/v1/credits')
+async def client_credits(request: Request):
+    """客户端默认余额路径。
+
+    RikkaHub 的 OpenAI 兼容服务商默认配置是 `{{baseUrl}}/credits`（即这里），
+    并把 `data.total_usage` 当作「余额」显示；new-api 的写法是
+    `data.total_available`。同一份数值给两个键，客户端不必改配置。
+    """
+    result = await token_usage(request)
+    if isinstance(result, JSONResponse):
+        return result
+    data = result.get('data') or {}
+    return {
+        'code': True,
+        'data': {
+            'object': 'credits',
+            'total_credits': data.get('total_granted'),
+            'total_used': data.get('total_used'),
+            'total_available': data.get('total_available'),
+            # RikkaHub 读这个当余额；与 total_available 同值
+            'total_usage': data.get('total_available'),
+            'scope': data.get('scope'),
         },
     }
