@@ -1285,6 +1285,12 @@
     "shareText": "Open this link to authorise (sign in with a browser, or scan the code). The account is then checked in and added automatically",
     "retry": "Get a new code",
     "stateLost": "Authorization is no longer valid (the server restarted while waiting). Please request a new one",
+    "reloginTitle": "Sign in again: {name}",
+    "reloginDesc": "This login only refreshes that account’s credentials ({realm}); scanning a different account will not be written.",
+    "reloginPanelDisabled": "This account is paused in this panel: signing in again refreshes its credentials but does not re-enable it.",
+    "accountMismatch": "You scanned “{got}”, not “{want}”. Nothing was written — please scan again with the target account.",
+    "reviveStillDisabled": "Credentials updated, but the upstream still marks this account as disabled: {reason}",
+    "revivePending": "Credentials updated. The upstream has not confirmed the account is back in the pool yet; clearing the disabled flag continues in the background and the list refreshes shortly.",
     "realmMismatch": "This QR code belongs to the other edition (CN / Global). Please request a new one"
   },
   "region": {

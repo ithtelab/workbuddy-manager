@@ -75,18 +75,15 @@ export function ReloginQueueDialog({
   }
 
   /**
-   * 重登成功后的收尾：立即刷新一次，并补几次延迟刷新。
+   * 重登成功后的收尾：直接交给调用方。
    *
-   * 为什么不能只刷一次：后端的「登录后自动解除系统禁用」（_revive_after_login）
-   * 是后台任务，最长要等约 20 秒（等上游热加载 + revive）。前端立刻刷新拿到的
-   * 仍是旧快照（账号还标着 disabled），于是账号会一直留在封禁队列里，直到 30s
-   * 心跳才挪走。补几次延迟刷新，让账号在 revive 完成后尽快离开队列。
+   * 「立刻刷一次 + 几次延迟刷新」的节奏由账号页统一持有（`handleLoginSuccess`）：
+   * 「添加账户」与「重登」两条路以前各写一份，刷新时机不同 —— 同一件事在两条路上
+   * 表现不一致，正是这次要消灭的东西。后端在重登响应里已经带回 `revive` 的执行
+   * 结果（见 `_revive_inline`），不再需要靠多刷几次去「等它好」。
    */
   function handleReloginSuccess() {
     onSuccess?.();
-    [3000, 8000, 15000].forEach((ms) => {
-      window.setTimeout(() => onSuccess?.(), ms);
-    });
   }
 
   function statusBadge(a: Account) {
@@ -276,11 +273,24 @@ export function ReloginQueueDialog({
         </DialogContent>
       </Dialog>
 
+      {/* 重登必须**带着目标账号**进弹窗：版本跟它走、扫到别的号不落盘、
+          落盘就地写它已有的文件。以前这里只打开一个通用的「添加账户」，
+          于是「重登」与「添加账户」在服务端是同一件事 —— 扫了别的号就等于又加了
+          一个账号，队列里那一行自然一直清不掉。 */}
       <AddAccountDialog
         open={reloginOpen}
         onOpenChange={setReloginOpen}
         onSuccess={handleReloginSuccess}
         upstreamId={upstreamId}
+        target={current
+          ? {
+              uid: current.uid,
+              nickname: current.nickname,
+              realm: current.realm ?? 'cn',
+              file: current.file,
+              panel_disabled: current.disabled_by_panel === true,
+            }
+          : null}
       />
     </>
   );

@@ -1258,6 +1258,12 @@
     "shareText": "打開這個連結完成授權（瀏覽器裡登入即可，也可掃碼），之後會自動簽到並納入帳號池",
     "retry": "重新取得",
     "stateLost": "授權已失效（伺服端在等待期間重啟過），請重新取得",
+    "reloginTitle": "重登帳號「{name}」",
+    "reloginDesc": "這次登入只更新該帳號的憑證（{realm}）；掃到其他帳號不會寫入。",
+    "reloginPanelDisabled": "該帳號在本面板被「暫時停用」：重登只更新憑證，不會自動啟用它。",
+    "accountMismatch": "掃到的是「{got}」，不是要重登的「{want}」；本次沒有寫入任何帳號，請用目標帳號重新掃碼。",
+    "reviveStillDisabled": "憑證已更新，但上游仍標示「已停用」：{reason}",
+    "revivePending": "憑證已更新；上游還沒確認該帳號入池，已在後台繼續解除停用，稍後會自動重新整理。",
     "realmMismatch": "這個二維碼是另一個版本（國內 / 國際）的，請重新取得"
   },
   "region": {

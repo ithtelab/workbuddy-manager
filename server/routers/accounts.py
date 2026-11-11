@@ -290,10 +290,62 @@ _login_regions: dict[str, str] = {}
 # 成功了就完成，失败则把「去修目录权限」那条可执行提示原样报给前端。
 _login_ready: dict[str, tuple[dict, str, str, float]] = {}      # state → 国际版地区（可能晚于 auth/start 到达）
 _login_owner: dict[str, str] = {}        # state → 发起人，用于收掉同一用户的旧轮询
+# `_login_targets`：这张码是**针对某个已有账号**发的（「重登队列」里点重登）。
+#
+# 为什么要在服务端记（而不是让前端每次轮询都带上 uid）：后台轮询
+# （`_poll_login_background`）与前端轮询走的是同一个 `auth_poll`，两条路都必须
+# 遵守同一条约束，否则约束只是「界面上看起来有」。记在 state 上，所有入口
+# 自动一致。
+#
+# 它解决两件在队列里反复出现的事：
+#   1. **版本必须跟随账号**。扫码端点由 realm 决定，而 realm 以前只取自界面上
+#      那个全局「国内版 / 国际版」开关 —— 在国际版账号上点重登、而界面停在
+#      国内版时，拿到的是国内版的码，写回去的 `auth.realm` 也被改写成 cn，
+#      于是这个国际版账号拿着一张国内版令牌去请求，聊天立刻 401、账号被系统
+#      禁用，再也不会离开重登队列。目标账号已知，版本就不该再问界面。
+#   2. **扫到的必须是它**。没有这层校验时，扫了另一个微信号等于「又添加了一个
+#      账号」：目标账号的旧凭证原封不动，队列里那一行自然纹丝不动。用户看到的是
+#      「重登成功了但队列里还在」。
+_login_targets: dict[str, str] = {}      # state → 目标 uid
 
 
 def _owner_key(user: dict, upstream_id: int | None) -> str:
     return f"{user.get('username') or ''}|{upstream_id if upstream_id is not None else ''}"
+
+
+def _relogin_target(uid: str, group: dict) -> dict | None:
+    """按 uid 定位要重登的那个账号（含文件、昵称、版本）。
+
+    返回 None = 这个分组里没有这个账号（调用方据此拒绝发码：给一个不存在的账号
+    发码，用户扫完才发现写不进去，是最糟的顺序）。
+
+    为什么连 `.json.disabled` 也认：面板「临时停用」只是改名，账号仍是同一个。
+    这时重登**可以**刷新凭证（`write_auth_file` 会就地写那份改名后的文件），
+    但它不会替用户把「停用」解除 —— 那要看 `panel_disabled` 这位，界面上说清楚。
+    """
+    uid = str(uid or '').strip()
+    if not uid:
+        return None
+    base = _require_dir(group)
+    for path in (sorted(base.glob('workbuddy*.json'))
+                 + sorted(base.glob('workbuddy*.json.disabled'))):
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:  # noqa: BLE001 —— 坏文件不参与匹配
+            continue
+        acct = (raw.get('account') if isinstance(raw, dict) else None) or {}
+        auth = (raw.get('auth') if isinstance(raw, dict) else None) or {}
+        if not isinstance(acct, dict) or str(acct.get('uid') or '') != uid:
+            continue
+        return {
+            'uid': uid,
+            'file': path.name,
+            'nickname': str(acct.get('nickname') or ''),
+            'realm': realm_of({'realm': raw.get('realm') or auth.get('realm'),
+                               'domain': auth.get('domain')}),
+            'panel_disabled': path.name.endswith('.disabled'),
+        }
+    return None
 
 
 def _cancel_other_login_polls(state: str, owner: str) -> None:
@@ -328,10 +380,14 @@ def _prune_login_polls() -> None:
         _login_tasks.pop(st, None)
         _login_regions.pop(st, None)
         _login_owner.pop(st, None)
+        # 目标账号（重登）也要随 state 一起清：它是按张码记的，码过期后留着
+        # 就是一条永远用不上的记账（长期运行会缓慢增长）。
+        _login_targets.pop(st, None)
     # 「等重试落盘」的备忘也要按同样的 TTL 清（它没有 _login_polls 条目，
     # 上面那轮扫不到它）
     for st in [k for k, v in _login_ready.items() if now - float(v[3]) > _LOGIN_RESULT_TTL]:
         _login_ready.pop(st, None)
+        _login_targets.pop(st, None)
 
 
 def _today_start() -> int:
@@ -621,10 +677,30 @@ async def auth_start(
         description='国际版地区代码（如 HK）；也可用 JSON body 传 {"region": "..."}',
     ),
     upstream_id: int | None = Query(None),
+    uid: str | None = Query(
+        None,
+        description='要**重登**的账号 uid；也可用 JSON body 传 {"uid": "..."}。'
+                    '给了它就进入「针对该账号的重登」语义（见下）',
+    ),
     body: dict | None = Body(None),
     user: dict = Depends(security.require_admin),
 ) -> dict:
     """发起扫码登录。realm 决定国内版 / 国际版端点（缺省国内版）。
+
+    ## 传了 `uid` 就是「重登这个账号」，与「添加账号」有三处硬性区别
+
+    「重登队列」里点重登、与账号页点「添加账户」，前端进的是同一个扫码弹窗；
+    但两者**不是同一件事**，差别必须在服务端落定（前端保证不了，后台轮询那条
+    路径也绕不过去）：
+
+      1. **版本跟随账号**，不跟随界面上的全局切换。国际版账号在界面停在国内版
+         时点重登，此前拿到的是国内版二维码，落盘时 `auth.realm` 还被改写成 cn
+         —— 这个账号随后拿一张国内版令牌去请求，聊天 401、被上游系统禁用，
+         重登一百次也不会离开队列（每次都在重复同一个错误）。目标账号已知，
+         版本就该由它决定，`realm` 参数在这种情况下被忽略。
+      2. **扫到的必须是它**（见 `auth_poll` 的 `account_mismatch`）。
+      3. 落盘**就地写该账号已有的那份文件**（见 `tencent.find_auth_file_for_uid`），
+         不给同一个 uid 造第二份文件。
 
     **参数来源要同时接受 body 与 query**：前端 post() 把参数放在 JSON body 里，
     而早先这里声明的是普通标量参数 —— FastAPI 对标量默认按 **query** 解析，
@@ -639,11 +715,31 @@ async def auth_start(
     """
     # 分组在这里只做**提前校验**：真正的落盘发生在 auth/poll（那里也要带
     # 同一个分组）。先拒掉不存在的分组，用户不会扫完码才发现目标分组没了。
-    _group(upstream_id)
+    group = _group(upstream_id)
     raw = realm
     if isinstance(body, dict) and body.get('realm') is not None:
         raw = str(body.get('realm'))
     r = 'global' if str(raw or '').strip().lower() == 'global' else 'cn'
+
+    # 目标账号（重登）：版本以**账号**为准，界面传上来的 realm 不再参与决策。
+    # 直呼路由函数（测试 / 内部复用）时拿到的是 FastAPI 的 Query 哨兵对象，
+    # 不是 str —— 照 `_group` 对 upstream_id 的处理，非字符串一律当「没传」，
+    # 否则会把哨兵当成一个 uid 去查账号，报出莫名其妙的 404。
+    raw_uid = uid if isinstance(uid, str) else ''
+    if isinstance(body, dict) and body.get('uid') is not None:
+        raw_uid = str(body.get('uid'))
+    target: dict | None = None
+    target_uid = str(raw_uid or '').strip()
+    if target_uid:
+        target = _relogin_target(target_uid, group)
+        if target is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(f'分组「{group["name"]}」的账号目录里找不到 uid={target_uid[:16]}… '
+                        '的账号文件，无法重登。它可能已被删除或移到了别的分组；'
+                        '请刷新账号列表后重试'),
+            )
+        r = target['realm']
     raw_region = region
     if isinstance(body, dict) and body.get('region') is not None:
         raw_region = str(body.get('region'))
@@ -662,6 +758,9 @@ async def auth_start(
         # 起后台轮询：前端是否被节流都不影响检测节奏（见文件上方说明）
         st = str(out.get('state') or '')
         if st:
+            if target is not None:
+                # 与 state 绑定：前台轮询、后台轮询（同一个 auth_poll）都据此校验
+                _login_targets[st] = target['uid']
             if reg:
                 _login_regions[st] = reg
             if st not in _login_tasks or _login_tasks[st].done():
@@ -671,6 +770,9 @@ async def auth_start(
                 _login_owner[st] = _owner_key(user, upstream_id)
                 _login_tasks[st] = asyncio.create_task(
                     _poll_login_background(st, r, reg, upstream_id, user))
+        if target is not None:
+            # 前端据此显示「正在重登：谁 / 哪个版本」，并在扫错号时给出可执行的提示
+            out['target'] = target
         return out
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -722,7 +824,7 @@ async def auth_poll(
         # 上次已经拿到授权、只是没落盘：直接重试落盘（不再问腾讯——那边可能已经
         # 不再报 ready，继续问只会让用户一直「等待中」）。
         memo_result, memo_realm, memo_msg = ready[0], ready[1], ready[2]
-        return _save_and_finish(memo_result, memo_realm, memo_msg, state, group=group)
+        return await _finish_and_revive(memo_result, memo_realm, memo_msg, state, group)
 
     try:
         result = await tencent.poll_login(state, r)
@@ -734,10 +836,18 @@ async def auth_poll(
         return result
 
     realm_of_result = result.get('realm') or 'cn'
+
+    # 目标账号校验（重登）：扫到的账号必须就是队列里那一行。
+    #
+    # 放在**供给之前**是有意的：签到、领 trial、地区注册都带副作用，落在错误的
+    # 账号上等于替别人做了一堆动作，而目标账号半点没被修好。宁可什么都不做。
+    mismatch = _reject_wrong_account(state, result, group)
+    if mismatch is not None:
+        return mismatch
+
     if provisioned:
         # 已经供给过：只补落盘（上次就是败在这一步），其余一律不重做
-        return _save_and_finish(result, realm_of_result, region_msg='', state=state,
-                                group=group)
+        return await _finish_and_revive(result, realm_of_result, '', state, group)
 
     # 探测 dict：billing 域身份头（X-User-Id / X-Domain 等）需要这些字段，
     # 与 _auth_dict 同构；device_token 此刻还没有（落盘时由外部写入）
@@ -778,7 +888,7 @@ async def auth_poll(
     creditsvc.invalidate(str(result.get('uid', '')))
     # 落盘前记下这份结果：万一落盘失败，重试要能只重做落盘（见 _login_ready 注释）
     _login_ready[state] = (result, realm_of_result, region_msg, time.time())
-    out = _save_and_finish(result, realm_of_result, region_msg, state, group=group)
+    out = await _finish_and_revive(result, realm_of_result, region_msg, state, group)
     _login_ready.pop(state, None)
     return out
 
@@ -938,6 +1048,117 @@ def _schedule_revive_after_login(uid: str, group: dict) -> None:
                      exc_info=True)
 
 
+def _reject_wrong_account(state: str, result: dict, group: dict) -> dict | None:
+    """重登时扫到了**别的**账号：拒绝落盘，并把两边都说清楚。
+
+    没有这道闸时，用户在重登弹窗里扫了另一个微信号，得到的是「再添加一个账号」：
+    目标账号的旧凭证一个字节没变，所以它在重登队列里的那一行纹丝不动 ——
+    用户看到的现象正是「重登成功了，可它还在队列里」。
+
+    返回 None = 校验通过（或本来就不是重登）。
+    """
+    target_uid = _login_targets.get(state)
+    if not target_uid:
+        return None
+    scanned = str(result.get('uid') or '')
+    if scanned == target_uid:
+        return None
+
+    try:
+        target = _relogin_target(target_uid, group) or {}
+    except HTTPException:
+        target = {}
+    logger.info('重登扫到了别的账号：期望 uid=%s，实际 uid=%s（未落盘）',
+                target_uid[:8], scanned[:8] or '-')
+
+    # 这张码已经用过（腾讯侧授权已完成），留着只会让用户在同一张码上继续轮询；
+    # 丢掉它，界面重新发一张、重新扫。
+    tencent.drop_state(state)
+    _login_targets.pop(state, None)
+    _provisioned_states.pop(state, None)
+    _login_ready.pop(state, None)
+    _login_polls.pop(state, None)
+    return {
+        'status': 'account_mismatch',
+        'expected_uid': target_uid,
+        'expected_name': str(target.get('nickname') or ''),
+        'uid': scanned,
+        'nickname': str(result.get('nickname') or ''),
+    }
+
+
+async def _finish_and_revive(result: dict, realm_of_result: str, region_msg: str,
+                             state: str, group: dict) -> dict:
+    """落盘 + （重登时）当场解除系统禁用，两条收尾路径共用。
+
+    为什么抽出来：落盘有**三条**进入路径（首次供给、已经供给过的重试、落盘失败的
+    重试）。只给其中一条接上 revive，另外两条就会出现「凭证写进去了、账号还停在
+    禁用状态」—— 而它们恰恰是用户点「重试」时走的那两条，最容易撞上。
+    """
+    target_uid = _login_targets.get(state) or ''
+    out = _save_and_finish(result, realm_of_result, region_msg, state, group=group)
+    if target_uid:
+        # 重登是**用户正盯着这个弹窗**的一次修复：解除系统禁用的结果必须当场
+        # 回给他，而不是只写一行日志（那条路此前让「凭证已更新、账号却仍显示
+        # 已停用」变成一个没有解释的死结 —— 队列里的那一行永远清不掉）。
+        out['revive'] = await _revive_inline(target_uid, group)
+    return out
+
+
+# 重登（针对某个账号）时**当场**尝试解除系统禁用的窗口。
+#
+# 取 6s：账号文件刚落盘时上游热加载约 5 秒，等一轮就够；而用户此刻正盯着弹窗，
+# 超过几秒的等待比「先说成功、队列里却还挂着」更难接受。等不到就交回后台那套
+# 更长窗口的任务，并在响应里如实写「还在处理」。
+_REVIVE_INLINE_WAIT_SECONDS = 6.0
+_REVIVE_INLINE_POLL_SECONDS = 1.0
+
+
+async def _revive_inline(uid: str, group: dict) -> dict:
+    """重登成功后的**当场**解除禁用，返回给界面看的结构化结果。
+
+    为什么不能只靠后台的 `_revive_after_login`：它是 fire-and-forget，失败只写
+    一行日志。而重登是用户为解决「这个号已停用」按的按钮 —— 结果必须回到他眼前，
+    否则「凭证已更新、徽章还红着、队列里还排着」就是死结：用户没有任何线索知道
+    是上游管理接口没开、还是 api_key 不对、还是账号被封禁了。
+
+    返回字段：
+      · `ok`            真的解除了（或本来就没被禁用）；
+      · `still_disabled` 三态：True 仍禁用 / False 确认已在池里 / None 读不到；
+      · `pending`       还没等到账号入池，已转后台继续；
+      · `message`       给用户的一句话（成功时为空）。
+    """
+    base_url = group.get('base_url')
+    api_key = upstreamsvc.forward_api_key(group)
+    deadline = time.monotonic() + _REVIVE_INLINE_WAIT_SECONDS
+    while True:
+        still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
+        if still is False:
+            return {'attempted': True, 'ok': True, 'still_disabled': False, 'message': ''}
+        if still is True:
+            ok, msg, after = await _revive_if_disabled(
+                uid, base_url=base_url, api_key=api_key)
+            logger.info('重登后解除系统禁用 uid=%s：%s%s', uid[:8],
+                        '成功' if ok else '失败', f'（{msg}）' if msg else '')
+            if ok and after is False:
+                return {'attempted': True, 'ok': True, 'still_disabled': False,
+                        'message': msg}
+            return {'attempted': True, 'ok': False, 'still_disabled': after,
+                    'message': msg or '解除系统禁用失败'}
+        # None = 上游读不到它（还没收录 / 上游不可达），等下一轮
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(_REVIVE_INLINE_POLL_SECONDS)
+
+    # 窗口内没等到：交回后台那套（它有 20 秒窗口，且失败会写日志），
+    # 同时如实告诉界面「还在处理」——不能报成功，也不能报失败。
+    _schedule_revive_after_login(uid, group)
+    return {
+        'attempted': True, 'ok': False, 'pending': True, 'still_disabled': None,
+        'message': '上游还没收录这个账号（或暂时读不到状态），已在后台继续尝试解除停用',
+    }
+
+
 def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
                      state: str, group: dict | None = None) -> dict:
     """落盘 + 收尾（重载上游、丢弃 state）。落盘失败时抛出**可执行**的提示。
@@ -980,9 +1201,14 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
     if not existed:
         db.record_account_added(str(result['uid']), auth_dir)
 
+    # 目标账号只在这里取一次：下面要丢掉 state 上的记账，而提交方（auth_poll）
+    # 还要用它做当场解除禁用。
+    targeted = bool(_login_targets.get(state))
+
     # 账号已确实落盘，这时才丢 state（成功路径的收尾）
     tencent.drop_state(state)
     _provisioned_states.pop(state, None)
+    _login_targets.pop(state, None)
 
     # 让上游加载新账号：**先等它的 auths 热加载，超时才重启**（后台执行，
     # 不阻塞本次响应）。此前无脑重启，而重启期间上游 /status 不可用 —— 前端
@@ -991,7 +1217,10 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
     reload.request_reload_or_restart(str(result.get('uid') or ''),
                                      upstream=_reload_target(group))
     # 登录后尝试恢复会话失效导致的系统禁用；revive_account 会拒绝上游封禁账号。
-    _schedule_revive_after_login(str(result.get('uid') or ''), group)
+    # 重登（`targeted`）不走这里：那条路要**当场**把结果回给界面，由 auth_poll
+    # 调 `_revive_inline` 完成；两条同时跑会对着同一个账号重复 revive。
+    if not targeted:
+        _schedule_revive_after_login(str(result.get('uid') or ''), group)
 
     return {
         'status': 'success',

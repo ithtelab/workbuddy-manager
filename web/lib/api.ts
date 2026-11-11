@@ -199,6 +199,26 @@ export const accountRiskApi = {
   acknowledge: (id: string) => post<{ok: boolean}>(`/api/account-risk/${encodeURIComponent(id)}/acknowledge`),
 };
 
+/**
+ * `POST /api/auth/start` 的响应。
+ *
+ * `target` 只有**重登**（请求里带了 `uid`）时才有：后端据此回显「这次到底在给
+ * 哪个账号换凭证」，界面拿它显示标题与版本，并在扫错号时继续显示目标是谁。
+ */
+export interface AuthStartResult {
+  state: string;
+  authUrl: string;
+  realm: Realm;
+  target?: {
+    uid: string;
+    nickname: string;
+    realm: Realm;
+    file: string;
+    /** 面板里被「临时停用」：重登只刷凭证，不会自动启用它 */
+    panel_disabled: boolean;
+  };
+}
+
 export const accountApi = {
   proxies: () => get<{routes: string[]; default: string}>('/api/proxies'),
   /** 上游「账号管理接口」（admin.enabled）开关状态；供解禁队列判断能否真的解封。
@@ -255,13 +275,21 @@ export const accountApi = {
    * （国际版新号聊天报 14017）。用户在弹窗里改地区会重新发码，所以这里带的
    * 总是当前这张码对应的地区。
    */
-  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string, proxy?: string) =>
-    post<{state: string; authUrl: string; realm: Realm}>(
-      '/api/auth/start' + groupQs(upstreamId), {realm, region, proxy}),
+  /**
+   * 发起扫码登录。
+   *
+   * `uid` 非空 = **重登这个账号**（见后端 `auth_start` 的说明）：版本会跟随该
+   * 账号、扫到的账号必须就是它、落盘就地写它已有的那份文件。不传 = 添加新账号。
+   */
+  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string,
+          proxy?: string, uid?: string) =>
+    post<AuthStartResult>(
+      '/api/auth/start' + groupQs(upstreamId), {realm, region, proxy, uid}),
   /** 轮询扫码结果。region 仅国际版需要（新号必须先做地区注册） */
   poll: (state: string, realm?: Realm, region?: string, upstreamId?: number | null) =>
     get<{
-      status: 'waiting' | 'success' | 'expired' | 'invalid' | 'realm_mismatch';
+      status: 'waiting' | 'success' | 'expired' | 'invalid' | 'realm_mismatch'
+        | 'account_mismatch';
       uid?: string;
       nickname?: string;
       updated?: boolean;
@@ -269,6 +297,21 @@ export const accountApi = {
       region_note?: string;
       expected?: Realm;
       got?: Realm;
+      /** account_mismatch：要重登的是谁、扫到的又是谁 */
+      expected_uid?: string;
+      expected_name?: string;
+      /**
+       * 重登成功后**当场**解除上游系统禁用的结果。没有这个字段 = 不是重登。
+       * `ok=false` 时 `message` 就是要给用户看的原因（管理接口没开 / api_key
+       * 不对 / 账号被封禁）；`pending=true` = 还在后台尝试。
+       */
+      revive?: {
+        attempted: boolean;
+        ok: boolean;
+        still_disabled?: boolean | null;
+        pending?: boolean;
+        message?: string;
+      };
     }>('/api/auth/poll', {state, realm, region, upstream_id: upstreamId ?? undefined}),
   remove: (file: string, upstreamId?: number | null) =>
     del<{success: boolean}>(`/api/accounts/${encodeURIComponent(file)}${groupQs(upstreamId)}`),
