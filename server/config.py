@@ -152,6 +152,22 @@ DEFAULT_ACCOUNT_PROXY = _env('WB_DEFAULT_ACCOUNT_PROXY', '')
 # 路径可用 WB_CCSWITCH_DIR / WB_ZCODE_DIR 覆盖（非默认安装位置），
 # 见 services/keyimport.py。
 LOCAL_IMPORT_ENABLED = _env_bool('WB_LOCAL_IMPORT', False)
+
+# ── 调用抓包（Trace Tap，见 services/tap.py）──────────────────────────────
+#
+# **默认关闭**：打开后会把每一次调用的请求体（system prompt、全部历史消息、
+# 工具定义）与模型回复写进本地库。这是排障时最想要的东西，也是最该由用户
+# 自己决定开不开的东西 —— 面板不替用户做这个决定。面板里可随时开关（状态
+# 存在 settings 表），这里的值只作为**默认值**。
+TAP_ENABLED = _env_bool('WB_TAP_ENABLED', False)
+# 单条请求/响应的存储上限（字节）。超出部分截断并标记，界面按原文展示。
+# 下限 4 KiB：再小连一个 system prompt 都存不下，抓了也没有意义。
+TAP_MAX_BODY = max(4096, _env_int('WB_TAP_MAX_BODY', 512 * 1024))
+# 保留天数：抓包是排障证据，过期就该消失，否则库会无声地涨到几十 GB。
+TAP_RETENTION_DAYS = max(1, _env_int('WB_TAP_RETENTION_DAYS', 7))
+# 会话数上限：按天清理之外再加一道「条数」闸门 —— 一个高频客户端能在一天
+# 里刷出上千个会话，只按时间清理挡不住它。
+TAP_MAX_SESSIONS = max(10, _env_int('WB_TAP_MAX_SESSIONS', 300))
 # 会话**总时长**上限（天）：登录后最多维持这么久，到点必须重新登录。
 #
 # 下限钳到 1 天：0（或负数）会让 cookie 的 exp 等于签发时刻，即「登录成功但

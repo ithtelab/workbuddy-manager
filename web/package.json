@@ -48,6 +48,7 @@
     "react-day-picker": "^9.7.0",
     "react-dom": "^19.0.0",
     "react-dropzone": "^14.3.8",
+    "react-obj-view": "^1.1.11",
     "react-use-measure": "^2.1.7",
     "recharts": "^2.15.3",
     "sonner": "^2.0.4",

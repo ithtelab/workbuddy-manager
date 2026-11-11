@@ -444,6 +444,100 @@ CREATE TABLE IF NOT EXISTS upstreams (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- ── 调用抓包（Trace Tap，见 services/tap.py）──────────────────────────────
+--
+-- 为什么单独两张表、而不是给 request_logs 加列：两者的取舍正好相反。
+-- request_logs 是**计量**数据（谁、何时、多少 token），字段少、行数多、长期聚合；
+-- 抓包是**排障证据**（这一轮到底发了什么），单行可到几百 KB，只能按保留期滚动删。
+-- 混在一张表里的后果是双向的：抓包开关会拖慢每一次日志查询，清日志也会把证据
+-- 一起清掉 —— 而「清完日志还想看当时发了什么」正是排障里最常见的一步。
+CREATE TABLE IF NOT EXISTS tap_sessions (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- 会话指纹：system + 首条 user 消息 + 协议 的哈希（见 tap._fingerprint）。
+  -- 同一轮 agent 任务的每次请求都带着同样的 system 与同一条开头的 user 消息，
+  -- 因此能把「一次任务」里的多轮请求归成一组，不需要客户端配合上报 run id。
+  fingerprint       TEXT    NOT NULL,
+  key_id            INTEGER,
+  -- 客户端家族（claude / codex / dsh / cursor / cli / <UA 的 product token>）：
+  -- 由 UA 归类；认不出来时直接用 UA 首个 token，而不是一律 `other`。
+  client            TEXT,
+  -- 原始 UA。版本号从这里取（同一客户端不同版本行为会变），也用于把旧记录
+  -- 重新归类（`client` 是**派生**值，UA 才是事实）。
+  client_ua         TEXT,
+  -- 首条 user 消息（截断）。存下来是为了把**辅助调用**挂回它所属的主会话：
+  -- 标题生成这类请求会把人类消息原文塞在自己的 user 内容里，用它做包含匹配
+  -- 就能精确对上，不必猜时间窗。
+  first_user        TEXT,
+  -- 会话类型：main（一轮对话）/ title（会话标题生成）等辅助调用。
+  -- 辅助调用有自己的 system prompt，指纹必然与主会话不同 —— 不标记的话，
+  -- 一次对话会在列表里显示成两条，看起来像"重复记录"（实测反馈）。
+  kind              TEXT    NOT NULL DEFAULT 'main',
+  -- 辅助调用所属的主会话 id（对不上时为 NULL）。
+  parent_id         INTEGER,
+  -- 客户端说的协议（chat / anthropic / responses）。上游一律是 OpenAI 形态，
+  -- 这个字段记的是**进来时**的协议 —— 它决定请求体怎么解读。
+  protocol          TEXT    NOT NULL DEFAULT 'chat',
+  model             TEXT,
+  started_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL,
+  turns             INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tap_sessions_updated ON tap_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_tap_sessions_fp ON tap_sessions(fingerprint, key_id, protocol);
+
+CREATE TABLE IF NOT EXISTS tap_turns (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id        INTEGER NOT NULL,
+  -- 会话内序号，从 1 开始。用序号而不是时间戳：并发的两轮请求秒级时间戳会
+  -- 并列，而界面的「和上一轮比」依赖一个确定的先后。
+  seq               INTEGER NOT NULL,
+  ts                INTEGER NOT NULL,
+  path              TEXT,
+  protocol          TEXT,
+  model             TEXT,
+  mapped_model      TEXT,
+  status            INTEGER,
+  stream            INTEGER NOT NULL DEFAULT 0,
+  latency_ms        INTEGER,
+  first_token_ms    INTEGER,
+  prompt_tokens     INTEGER,
+  completion_tokens INTEGER,
+  cache_hit_tokens  INTEGER,
+  cache_miss_tokens INTEGER,
+  cost              REAL,
+  -- 请求体（已脱敏、已按 max_body 截断）的 JSON 文本。truncated=1 时界面按
+  -- 原文展示，而不是假装还能解析成结构。
+  request_json      TEXT,
+  -- 请求体的**摘要**（在截断**之前**算好）：消息逐条的 role + 内容哈希、工具
+  -- 名列表、顶层参数。
+  --
+  -- 为什么必须有：请求体常有两三 MB，而单条上限默认 512 KB —— 截断会把两轮都
+  -- 切在**同一个字节位置**，抢救出的前缀逐字相同，于是「与上一轮对比」会说
+  -- 「完全一致」，那是**假信息**（实测：325 条消息的会话，真实差异全在末尾）。
+  -- 摘要在截断前算，体积只有几 KB，与截断无关，永远可比。
+  request_digest    TEXT,
+  -- 上游原始响应：流式是 SSE 原文，非流式是 JSON 文本，同样脱敏并截断。
+  response_text     TEXT,
+  -- **回给客户端的**响应。chat 是透传（与 response_text 相同），Anthropic /
+  -- Responses 两条协议是**翻译后**的形态 —— 同一个请求，「上游说了什么」与
+  -- 「客户端收到了什么」是两份不同的报文，排查协议转换只能两边对着看。
+  client_response_text TEXT,
+  -- 关联键：manager 发往上游时带的 X-Trace-ID，用来把「上游出站转储」里的
+  -- 请求 / 响应两行精确对回这一轮（腾讯视角）。NULL = 该记录写于本功能之前，
+  -- 或上游没开转储。
+  trace_id          TEXT,
+  -- 从上面那段响应里重建出的「模型到底说了什么」：正文、思考、工具调用。
+  -- 流式响应没法直接读；不重建，用户在界面上只能看到一堆 `data:` 行。
+  recon_json        TEXT,
+  usage_json        TEXT,
+  error             TEXT,
+  truncated         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tap_turns_session ON tap_turns(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_tap_turns_ts ON tap_turns(ts);
 """
 
 
@@ -650,6 +744,17 @@ def replace_database(staging: Path) -> None:
 # 因此新增字段必须显式 ALTER。每条用 PRAGMA 检测后再加，可重复执行。
 _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # (表名, 列名, 列定义)
+    # 抓包要能对着看「上游说的」与「客户端收到的」：存量库缺这一列时，
+    # 界面按「未采集」处理，而不是把上游原文冒充成客户端视角。
+    ('tap_turns', 'client_response_text', 'TEXT'),
+    # 腾讯视角的关联键（见 tap_turns.trace_id 的说明）
+    ('tap_turns', 'trace_id', 'TEXT'),
+    # 抓包会话的原始 UA（版本号从这里取；旧记录按它重新归类）
+    ('tap_sessions', 'client_ua', 'TEXT'),
+    ('tap_turns', 'request_digest', 'TEXT'),
+    ('tap_sessions', 'first_user', 'TEXT'),
+    ('tap_sessions', 'kind', "TEXT NOT NULL DEFAULT 'main'"),
+    ('tap_sessions', 'parent_id', 'INTEGER'),
     ('request_logs', 'credit', 'REAL'),
     ('usage_daily', 'credit', 'REAL NOT NULL DEFAULT 0'),
     # 首字延迟：可空（历史记录与非流式请求为 NULL）

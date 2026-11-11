@@ -370,3 +370,19 @@ button {
     justify-content: flex-start;
   }
 }
+
+/**
+ * 关掉 react-obj-view 自带的字符串浮窗。
+ *
+ * 库里对长字符串用 CSS popover（`.popover-anchor:hover + .popover-content`）
+ * 弹一层原文 —— 但它把换行显示成**字面量 `\n`**，读起来像一坨，而且会和我们
+ * 自己的 Preview/Raw 浮窗**同时出现**（两个浮窗叠在一起）。
+ *
+ * 我们的浮窗把原文按真实换行渲染，还带 Preview/Raw 切换，功能是它的超集 ——
+ * 所以直接关掉它，别让两个浮窗同时冒出来。
+ *
+ * 保留 `.popover-anchor` 本身（它负责省略号截断与换行布局），只藏内容层。
+ */
+.big-objview-root .popover-content {
+  display: none !important;
+}

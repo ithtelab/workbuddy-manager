@@ -305,6 +305,16 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         # 与一键更新同级，只对会话开放。
         'PUT /api/settings/auto-update',
         'POST /api/task-logs/clear',
+        # 调用抓包（Trace Tap）：开关与清理都是**会话级**动作。
+        #   · PUT config：打开抓包等于授权「把完整对话写进本机库」，关掉则抹掉
+        #     后续证据；泄露的 token 不该能做这个决定。
+        #   · clear / delete / prune：删除即销毁证据（排查记录），与「清空日志」
+        #     同类，属于抹痕迹。
+        'PUT /api/tap/config',
+        'POST /api/tap/clear',
+        'POST /api/tap/prune',
+        'POST /api/tap/backfill',
+        'DELETE /api/tap/sessions/{session_id}',
         'POST /api/tokens',
         'POST /api/users',
         # 多上游（账号池分组）：这几条带着上游的 api_key，而且能改「谁的流量走哪个池」——

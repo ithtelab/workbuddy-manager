@@ -14,6 +14,54 @@
 
 </details>
 
+### 轨迹（调用抓包）
+
+> 一次 agent 任务里的每一轮请求与响应；客户端名与版本、上下文规模、工具清单一屏看完
+
+<img src="images/traces.png" alt="轨迹（调用抓包）" width="100%" />
+
+<details>
+<summary><b>客户端视角 / 网关视角 / 与上一轮对比</b>（点击展开）</summary>
+
+<img src="images/traces-headers-client.png" alt="客户端视角" width="100%" />
+
+客户端视角：客户端**原样**发出的请求头与请求体（密钥类字段打码，保留前 6 位以便认出是哪一把）
+
+<img src="images/traces-headers-gateway.png" alt="网关视角" width="100%" />
+
+网关视角：网关改写后发往上游的请求，顶部列出被改写的字段（模型映射、`max_tokens` 钳制、`stream_options` 注入…）
+
+<img src="images/traces-diff.png" alt="与上一轮对比" width="100%" />
+
+与上一轮对比：新增 / 修改的消息逐条列出，参数、system、工具变化分块显示
+
+<img src="images/traces-dock.png" alt="底栏的「轨迹」入口" width="100%" />
+
+底栏第 7 个图标即「轨迹」，与日志 / 统计同级
+
+</details>
+
+<details>
+<summary><b>长字符串浮窗 / 定位 / 自动刷新</b>（点击展开）</summary>
+
+<img src="images/traces-string-hover.png" alt="长字符串悬停浮窗" width="100%" />
+
+长字符串悬停浮窗：system prompt、工具描述这类几千字的内容，悬停即看全文。Preview 按**真实换行**渲染，Raw 是转义原文
+
+<img src="images/traces-locate.png" alt="差异定位到 JSON 路径" width="100%" />
+
+差异「定位」：点一下直接跳到请求页，展开沿途节点并滚到差异所在的那一行（橙色高亮）
+
+<img src="images/traces-refresh-settings.png" alt="刷新间隔设置" width="100%" />
+
+齿轮里调自动刷新的间隔（默认 20 秒，存在浏览器本地）；关掉自动刷新后新轮次到达时只给一条提示，不抢当前正在看的那一轮
+
+<img src="images/traces-aux.png" alt="辅助调用挂回主会话" width="100%" />
+
+辅助调用（会话标题生成 / 上下文压缩）挂回主会话：列表里是「+1 辅助」，详情里能点进去看
+
+</details>
+
 ### 账号管理
 > Token 有效期按剩余时间分档着色（已过期 / 即将过期 / 偏紧 / 健康）
 

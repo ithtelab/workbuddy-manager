@@ -1916,3 +1916,192 @@ export interface PricingInfo {
   aliases: Record<string, string>;
   priced_models: string[];
 }
+
+/* ── 调用抓包（Trace Tap，见 docs/api-traffic-tap.md）──────────────────
+ *
+ * 与请求日志（`RequestLog`）是两套数据：那边的每一行只是**计量**，
+ * 这里的每一行是**证据** —— 完整请求体、完整响应、重建后的模型输出。
+ */
+
+/** 抓包开关与容量。 */
+export interface TapConfig {
+  enabled: boolean;
+  /** 单条请求/响应的存储上限（字节），超出即截断并标记。 */
+  max_body: number;
+  /** 保留天数。 */
+  retention_days: number;
+  /** 会话数上限。 */
+  max_sessions: number;
+}
+
+export interface TapStats {
+  sessions: number;
+  turns: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  first_at: number | null;
+  last_at: number | null;
+}
+
+export interface TapConfigResponse {
+  config: TapConfig;
+  stats: TapStats;
+}
+
+/** 一次 agent 任务（按 system + 首条 user 消息的指纹归并）。 */
+export interface TapSession {
+  id: number;
+  fingerprint: string;
+  key_id: number | null;
+  key_name: string | null;
+  client: string | null;
+  /** 原始 UA。`client` 是从它派生的分类，版本号也从这里取。 */
+  client_ua?: string | null;
+  /** `main` = 一轮对话；`title` 等 = 辅助调用（会话标题生成），属于某条主会话。 */
+  kind: string;
+  /** 辅助调用所属的主会话 id。 */
+  parent_id: number | null;
+  /** 这条主会话底下挂了几次辅助调用（标题 / 压缩）。 */
+  aux_count?: number;
+  /** 客户端说的协议：chat / anthropic / responses。 */
+  protocol: string;
+  model: string | null;
+  started_at: number;
+  updated_at: number;
+  turns: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+/** 会话里的一轮（详情列表项，不含正文）。 */
+export interface TapTurnBrief {
+  id: number;
+  seq: number;
+  ts: number;
+  status: number | null;
+  stream: boolean;
+  latency_ms: number | null;
+  first_token_ms: number | null;
+  model: string | null;
+  mapped_model: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cache_hit_tokens: number | null;
+  cache_miss_tokens: number | null;
+  cost: number | null;
+  error: string | null;
+  truncated: boolean;
+  protocol: string | null;
+  request_bytes: number;
+  response_bytes: number;
+}
+
+export interface TapSessionDetail extends TapSession {
+  items: TapTurnBrief[];
+  /** 挂在它名下的辅助调用（点一下可跳转）。 */
+  aux?: {id: number; kind: string; ts: number; model: string | null}[];
+}
+
+/** 请求体的结构摘要（后端现算，不落库）。 */
+export interface TapTurnSummary {
+  messages: number;
+  roles: Record<string, number>;
+  tools: number;
+  system_chars: number;
+  tool_names: string[];
+}
+
+export interface TapToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+/** 流式响应重建的结果。 */
+export interface TapRecon {
+  text: string;
+  reasoning: string;
+  tool_calls: TapToolCall[];
+  finish?: string | null;
+  events?: number;
+  done?: boolean;
+}
+
+/** 一轮完整内容。 */
+export interface TapTurn extends Omit<TapTurnBrief, 'request_bytes' | 'response_bytes'> {
+  session_id: number;
+  path: string | null;
+  request: Record<string, unknown> | null;
+  /** false = 被截断或格式异常，只能看原文（`request_raw`）。 */
+  request_ok: boolean;
+  request_raw: string | null;
+  response: unknown;
+  response_ok: boolean;
+  response_raw: string | null;
+  recon: TapRecon;
+  usage: Record<string, unknown>;
+  summary: TapTurnSummary;
+
+  /* ── 两端视角 ────────────────────────────────────────────────
+   *
+   * 一次调用有两份请求、两份响应，缺哪一份都排不了「网关/转换层改了什么」：
+   *   · 请求：`request.body` 是客户端**原样**发的，`request.upstream_body`
+   *     是网关改写后发往上游的；
+   *   · 响应：`upstream_*` 是网关卡在上游与客户端中间看到的原文，
+   *     `client_*` 是客户端手里真正收到的那份。
+   *
+   * 对 Chat 协议两者相同（透传），`passthrough` 为 true。
+   */
+  upstream_response: unknown;
+  upstream_response_ok: boolean;
+  upstream_recon: TapRecon;
+  client_response: unknown;
+  client_response_ok: boolean;
+  /** 客户端视角无法解析成 JSON 时的原文（流式或已截断）。 */
+  client_response_raw: string | null;
+  client_recon: TapRecon | null;
+  passthrough: boolean;
+  client_protocol: string;
+  /** 关联键：网关发往上游时带的 X-Trace-ID（对账用）。NULL = 老记录。 */
+  trace_id?: string | null;
+}
+
+/** 两轮请求的结构化差异（claude-tap 的 diff 视图）。 */
+export interface TapDiff {
+  before: {id: number; seq: number; ts: number; model: string | null};
+  after: {id: number; seq: number; ts: number; model: string | null};
+  params: {key: string; before: string | null; after: string | null}[];
+  system: {
+    changed: boolean;
+    before_chars: number;
+    after_chars: number;
+    before: string;
+    after: string;
+  };
+  messages: {
+    before_total: number;
+    after_total: number;
+    common: number;
+    added: {index: number; role: string; preview: string; chars: number}[];
+    removed: {index: number; role: string; preview: string}[];
+    changed: {index: number; role: string; before: string; after: string}[];
+  };
+  tools: {
+    added: string[];
+    removed: string[];
+    changed: {name: string; before: string; after: string}[];
+  };
+  summary: {
+    params: number;
+    system: number;
+    added: number;
+    removed: number;
+    changed: number;
+    tools: number;
+  };
+  /**
+   * true = 两轮请求体都被截断，这次比的是**摘要**（逐条消息的角色 + 内容哈希），
+   * 而不是请求体全文 —— 截断会把两轮切在同一位置，比前缀必然「完全一致」。
+   */
+  from_digest?: boolean;
+}
