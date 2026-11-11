@@ -161,7 +161,9 @@ class PostParamLocationAuditTest(unittest.TestCase):
     # 允许使用 query 参数的 POST 端点（前端必须相应发 query）
     ALLOWED_QUERY_POSTS = {
         '/api/accounts/refresh-credits': {'force', 'upstream_id'},
-        '/api/auth/start': {'realm', 'region', 'upstream_id'},
+        # realm / region / uid 都同时接受 query（旧调用方）与 JSON body（前端），
+        # 声明成 Query 只是保留兼容；前端一律发 body。
+        '/api/auth/start': {'realm', 'region', 'uid', 'upstream_id'},
         # 账号分组（多账号池）：下列写端点都接受 `?upstream_id=` 指定作用于哪个
         # 分组（前端 accountApi 统一按 query 拼；缺省不传 = 默认分组）。
         '/api/accounts/checkin-all': {'upstream_id'},

@@ -13,7 +13,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import {accountApi, errText} from '@/lib/api';
-import {useRealm} from '@/lib/realm-context';
+import {useRealm, type Realm} from '@/lib/realm-context';
 import {Button} from '@/components/ui/button';
 import {CopyButton, ShareButton} from '@/components/ui/copy-button';
 import {
@@ -24,7 +24,15 @@ import {
   DialogHeader,
 } from '@/components/animate-ui/radix/dialog';
 
-type Phase = 'loading' | 'waiting' | 'success' | 'error';
+type Phase = 'loading' | 'waiting' | 'success' | 'error'
+  /**
+   * 凭证已写入、但上游的「系统禁用」没解除（或还在后台尝试）。
+   *
+   * 与 `error` 分开：这时**重扫二维码没有意义**（凭证是对的，缺的是上游那一步），
+   * 所以不能给「重新获取」按钮，否则用户会一遍遍重扫同一个已经成功的账号，
+   * 却始终看到它留在队列里 —— 那正是这条修复要终结的循环。
+   */
+  | 'reviveFailed';
 
 /**
  * 连续失败几次才打断轮询。
@@ -73,22 +81,50 @@ function wakeEvents(): Array<[EventTarget, string]> {
   ];
 }
 
+/**
+ * 「重登队列」里点重登时带过来的目标账号。
+ *
+ * 为什么要把账号本身传进来，而不是像以前那样只打开一个通用的「添加账户」：
+ * 这两件事在服务端是不同的语义（`auth_start` 的 `uid` 参数）——
+ *
+ *   · **版本**必须跟账号走。以前 realm 只取自界面上的全站开关：在国际版账号上
+ *     重登、而界面停在国内版时，拿到的是国内版的码、落盘时 realm 还被改写成 cn，
+ *     这个账号随后拿国内版令牌去请求 → 聊天 401 → 继续被系统禁用 → 重登多少次
+ *     都留在队列里。目标账号已知，版本就不该再问界面。
+ *   · **扫到的必须是它**。不校验时，扫另一个号等于「又加了一个账号」，目标账号
+ *     一个字节没变，队列里那一行自然纹丝不动。
+ *   · 界面要说得清「现在在重登谁」—— 否则用户扫完才发现修的是别的号。
+ */
+export interface ReloginTarget {
+  uid: string;
+  nickname?: string;
+  realm: Realm;
+  file?: string;
+  /** 面板里被「临时停用」（文件名带 .disabled）：重登刷凭证，但不会自动启用它 */
+  panel_disabled?: boolean;
+}
+
 export function AddAccountDialog({
   open,
   onOpenChange,
   onSuccess,
   upstreamId,
+  target,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   onSuccess?: () => void;
   /** 目标分组（多账号池）：新账号落进该分组的账号目录；null / 省略 = 默认分组 */
   upstreamId?: number | null;
+  /** 非空 = 重登这个账号（不是添加新账号）；版本以它为准 */
+  target?: ReloginTarget | null;
 }) {
   const t = useT();
   const [phase, setPhase] = useState<Phase>('loading');
-  /** 版本跟随全站切换：切到国际版时扫码走国际版端点，并需要选地区 */
-  const {realm, label: realmName} = useRealm();
+  /** 版本：重登时跟目标账号，添加时跟全站切换（国际版要选地区） */
+  const {realm: uiRealm, label: uiRealmName} = useRealm();
+  const realm: Realm = target?.realm ?? uiRealm;
+  const realmName = target ? (realm === 'global' ? t('realm.global') : t('realm.cn')) : uiRealmName;
   /** 国际版地区代码（如 HK）。不预选：地区属于账号归属信息，交由用户决定 */
   const [region, setRegion] = useState('');
   const [proxy, setProxy] = useState<string | undefined>(undefined);
@@ -158,7 +194,8 @@ export function AddAccountDialog({
     try {
       // region 一起发：服务端要替这张码盯着（前端被节流也不影响），而地区
       // 登记必须在落盘前完成，它那条路径读不到弹窗里的 state，只能在这里给。
-      const data = await accountApi.start(realm, upstreamId, region || undefined, proxy);
+      const data = await accountApi.start(realm, upstreamId, region || undefined, proxy,
+                                          target?.uid);
       stateRef.current = data.state;
       setAuthUrl(data.authUrl);
       setPhase('waiting');
@@ -181,6 +218,21 @@ export function AddAccountDialog({
           failsRef.current = 0;
           if (res.status === 'success') {
             stopPoll();
+            // 重登：凭证写进去了，但上游的「系统禁用」位只有 revive 能清。
+            // 这一步失败（管理接口没开 / api_key 不对 / 账号被封禁）时以前只写
+            // 一行日志，界面上什么也没有 —— 用户看到的就是「重登成功了，可它还
+            // 在重登队列里」。现在把原因原样摆出来，并保留重试入口。
+            const revive = res.revive;
+            if (revive && !revive.ok) {
+              setPhase('reviveFailed');
+              setMessage(revive.pending
+                ? t('addAccount.revivePending')
+                : t('addAccount.reviveStillDisabled', {reason: revive.message || ''}));
+              // 账号本身已落盘，列表必须刷新（凭证确实是新的）
+              window.dispatchEvent(new Event('workbuddy-manager:accounts-changed'));
+              onSuccess?.();
+              return;
+            }
             setPhase('success');
             const accountName = res.nickname || res.uid || '';
             setMessage(
@@ -215,6 +267,15 @@ export function AddAccountDialog({
             stopPoll();
             setPhase('error');
             setMessage(t('addAccount.realmMismatch'));
+          } else if (res.status === 'account_mismatch') {
+            // 扫的是另一个账号：服务端没落盘（也不该落），目标账号原封不动。
+            // 直接说清「扫到的是谁、要的是谁」，否则用户只会重复同一个动作。
+            stopPoll();
+            setPhase('error');
+            setMessage(t('addAccount.accountMismatch', {
+              got: res.nickname || res.uid || '?',
+              want: target?.nickname || res.expected_name || res.expected_uid || '?',
+            }));
           }
         } catch (e) {
           // 不再静默吞掉：轮询出错（落盘失败 / 网络抖动 / 上游超时）以前会被
@@ -247,7 +308,8 @@ export function AddAccountDialog({
       setPhase('error');
       setMessage(errText(e));
     }
-  }, [onOpenChange, onSuccess, stopPoll, realm, region, proxy, t, upstreamId]);
+  }, [onOpenChange, onSuccess, stopPoll, realm, region, proxy, t, upstreamId,
+      target?.uid]);
 
   useEffect(() => {
     if (open && routesReady) {
@@ -258,21 +320,49 @@ export function AddAccountDialog({
     return stopPoll;
     // 版本或地区变化时重新申请：扫码码是绑定端点的，旧码不能跨版本用
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, realm, region, upstreamId, proxy, routesReady]);
+  }, [open, realm, region, upstreamId, proxy, routesReady, target?.uid]);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-[420px]" showCloseButton>
         <DialogHeader>
-          <DialogTitle>{t('addAccount.title', {realm: realmName})}</DialogTitle>
+          <DialogTitle>
+            {target
+              ? t('addAccount.reloginTitle', {name: target.nickname || target.uid})
+              : t('addAccount.title', {realm: realmName})}
+          </DialogTitle>
           <DialogDescription>
-            {realm === 'global'
-              ? t('addAccount.descGlobal')
-              : t('addAccount.descCn')}
+            {target
+              ? t('addAccount.reloginDesc', {realm: realmName})
+              : realm === 'global'
+                ? t('addAccount.descGlobal')
+                : t('addAccount.descCn')}
           </DialogDescription>
         </DialogHeader>
 
         <div className="flex w-full min-w-0 flex-col items-center gap-4 px-6 pb-6">
+          {/* 重登时把「给谁修」摆明：版本已由该账号决定，界面上的全局切换在这里
+              不参与（否则国际版账号会被写进一张国内版凭证）。 */}
+          {target && (
+            <div className="w-full rounded-xl border border-border/60 bg-muted/50 px-3 py-2 text-[11px] leading-4">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium">
+                  {target.nickname || t('accounts.unnamed')}
+                </span>
+                <span className="rounded-full bg-background px-2 py-0.5 text-muted-foreground">
+                  {realmName}
+                </span>
+              </div>
+              <div className="mt-0.5 font-mono text-[10px] text-muted-foreground truncate">
+                {target.uid}
+              </div>
+              {target.panel_disabled && (
+                <div className="mt-1 text-amber-600 dark:text-amber-400">
+                  {t('addAccount.reloginPanelDisabled')}
+                </div>
+              )}
+            </div>
+          )}
           {routeError && <p role="alert" className="text-xs text-destructive">{routeError}</p>}
           {/* 没有配置任何线路时整个选择器都不出现：那时下拉里只有「直连」一项，
               摆出来只会让人以为能选却选不动（线路表读自上游配置的 proxies）。 */}
@@ -321,13 +411,15 @@ export function AddAccountDialog({
           {/* 固定尺寸，避免 loading/waiting/error 各阶段弹窗高度跳动 */}
           <div className="grid h-[212px] w-[212px] shrink-0 place-items-center overflow-hidden rounded-2xl bg-white p-3 ring-1 ring-black/5">
             {phase === 'loading' && <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />}
-            {phase === 'error' && <AlertTriangle className="h-7 w-7 text-amber-500" />}
+            {(phase === 'error' || phase === 'reviveFailed') &&
+              <AlertTriangle className="h-7 w-7 text-amber-500" />}
             {(phase === 'waiting' || phase === 'success') && authUrl && (
               <QRCodeSVG value={authUrl} size={188} level="M" />
             )}
           </div>
 
-          {authUrl && (
+          {/* reviveFailed = 这张码已经用掉了（凭证写入成功），再点开它没有意义 */}
+          {authUrl && phase !== 'reviveFailed' && (
             <div className="w-full space-y-2">
               {/* 链接本身可点开；旁边给复制与分享，便于把授权链接发给朋友 */}
               <div className="flex w-full items-center gap-1.5 rounded-full bg-muted px-3 py-1.5">
@@ -365,7 +457,7 @@ export function AddAccountDialog({
               'flex items-center gap-2 px-2 text-xs ' +
               (phase === 'success' ?
                 'text-emerald-500' :
-                phase === 'error' ?
+                phase === 'error' || phase === 'reviveFailed' ?
                   'text-red-500' :
                   'text-muted-foreground')
             }

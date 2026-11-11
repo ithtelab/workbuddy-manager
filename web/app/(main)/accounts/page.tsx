@@ -608,6 +608,24 @@ export default function AccountsPage() {
     }
   }
 
+  /**
+   * 扫码登录成功后的收尾（「添加账户」与「重登」**共用**这一份）。
+   *
+   * 为什么不能只刷一次：落盘之后还有两步收尾 —— 上游热加载收录新凭证、
+   * 系统禁用的账号再走一次 revive。它们都是后台进行的，前端立刻刷新拿到的
+   * 仍是旧快照（账号还标着已停用），于是那一行会一直挂在重登队列里，直到
+   * 30 秒心跳才挪走。补几次延迟刷新，让它在收尾完成后尽快落到界面上。
+   *
+   * 两条路共用一份：以前「重登」会补刷、「添加账户」只刷一次，同一件事在两处
+   * 表现不同 —— 用户看到的就是「重登能清掉、添加账户清不掉」。
+   */
+  function handleLoginSuccess() {
+    reloadAll();
+    [3000, 8000, 15000].forEach((ms) => {
+      window.setTimeout(() => reloadAll(), ms);
+    });
+  }
+
   /** 账号状态徽章（表格与移动端卡片共用）。
    *
    *  分档顺序与文案都取自 `lib/account-status`——首页的健康快照用**同一套**
@@ -1726,14 +1744,14 @@ export default function AccountsPage() {
         </Link>
       </div>
 
-      <AddAccountDialog open={addOpen} onOpenChange={setAddOpen} onSuccess={reloadAll}
-                        upstreamId={groupId} />
+      <AddAccountDialog open={addOpen} onOpenChange={setAddOpen}
+                        onSuccess={handleLoginSuccess} upstreamId={groupId} />
       <ReloginQueueDialog
         open={queueOpen}
         onOpenChange={setQueueOpen}
         accounts={visible}
         upstreamId={groupId}
-        onSuccess={reloadAll}
+        onSuccess={handleLoginSuccess}
         adminApiEnabled={adminApiEnabled}
       />
       <MoveAccountDialog

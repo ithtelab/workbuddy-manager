@@ -1259,6 +1259,12 @@
     "shareText": "打开这个链接完成授权（浏览器里登录即可，也可扫码），之后会自动签到并纳入账号池",
     "retry": "重新获取",
     "stateLost": "授权已失效（服务端在等待期间重启过），请重新获取",
+    "reloginTitle": "重登账号「{name}」",
+    "reloginDesc": "这次登录只刷新该账号的凭证（{realm}）；扫到其他账号不会写入。",
+    "reloginPanelDisabled": "该账号在本面板被「临时停用」：重登只刷新凭证，不会自动启用它。",
+    "accountMismatch": "扫到的是「{got}」，不是要重登的「{want}」；本次没有写入任何账号，请用目标账号重新扫码。",
+    "reviveStillDisabled": "凭证已更新，但上游仍标着「已停用」：{reason}",
+    "revivePending": "凭证已更新；上游还没确认该账号入池，已在后台继续解除停用，稍后会自动刷新。",
     "realmMismatch": "这个二维码是另一个版本（国内 / 国际）的，请重新获取"
   },
   "region": {

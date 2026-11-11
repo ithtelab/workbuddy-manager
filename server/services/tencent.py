@@ -443,6 +443,48 @@ def _safe_auth_path(filename: str, auth_dir: Path | None = None) -> Path:
     return (auth_dir or config.AUTH_DIR) / filename
 
 
+def find_auth_file_for_uid(uid: str, auth_dir: Path | None = None) -> Path | None:
+    """按 **uid** 找出该账号已经存在的凭证文件（任意合规文件名），找不到返回 None。
+
+    为什么不能只认「`workbuddy-<uid>.json` 这一个名字」：上游是按 **uid** 建池的
+    （`SyncToDir` 里 `seen[a.UID]`，同 uid 后读到的覆盖先读到的），而面板是按
+    **文件**列的。两者只有在「一个 uid 恰好一个文件」时才等价。
+
+    当目录里已经有该 uid 的另一份文件（旧版本命名、手工放进来的
+    `workbuddy_new.json` 之类），`write_auth_file` 若仍按规范名新建一份，就会
+    出现**同 uid 两份文件**：
+
+      · 面板多出一行幽灵账号（其中一行带着旧凭证，永远显示旧的失败状态）；
+      · 上游按文件名排序后只认其中一份 —— 新写的那份若排在前面，就会被后面的
+        旧文件覆盖，于是「重登成功了，凭证却还是旧的」，账号继续 401、继续被
+        系统禁用，**在重登队列里怎么都清不掉**。
+
+    这正是「同一账号在『添加账户』与『重登』两条路上表现不一致」的来源：结果
+    取决于目录里那份文件叫什么名字。写入前先按 uid 找文件，把两条路收敛成一条。
+
+    `.json.disabled`（面板的「临时停用」标记）也参与匹配，但**排在后面**：
+    在线文件优先；只有在没有在线文件时才认改名后的那份 —— 否则「重登一个被面板
+    停用的账号」会在旁边新建一份在线副本，等于绕过用户自己的停用意图。
+    """
+    uid = str(uid or '').strip()
+    if not uid:
+        return None
+    base = auth_dir or config.AUTH_DIR
+    if not base.is_dir():
+        return None
+    candidates = (sorted(base.glob('workbuddy*.json'))
+                  + sorted(base.glob('workbuddy*.json.disabled')))
+    for path in candidates:
+        try:
+            raw = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:  # noqa: BLE001 —— 坏文件不参与匹配，交给上层按规范名写
+            continue
+        acct = (raw.get('account') if isinstance(raw, dict) else None) or {}
+        if isinstance(acct, dict) and str(acct.get('uid') or '') == uid:
+            return path
+    return None
+
+
 def write_auth_file(account: dict, auth_dir: Path | None = None,
                     *, allow_overwrite: bool = True) -> tuple[str, bool]:
     """严格按 workbuddy2api 的嵌套结构落盘，返回 (文件名, 是否覆盖)。
@@ -467,7 +509,10 @@ def write_auth_file(account: dict, auth_dir: Path | None = None,
         raise ValueError(f'账号 uid 形态异常，已拒绝写入（{uid[:40]!r}）')
     base = auth_dir or config.AUTH_DIR
     base.mkdir(parents=True, exist_ok=True)
-    target = base / f'workbuddy-{uid}.json'
+    # 先找「这个 uid 已经有的那份文件」：重登/重新导入要**就地改写**，不能在旁边
+    # 再建一份规范名的新文件（同 uid 两份文件会让上游读哪份变成文件名排序的
+    # 运气问题，见 find_auth_file_for_uid 的说明）。
+    target = find_auth_file_for_uid(uid, base) or (base / f'workbuddy-{uid}.json')
     disabled_target = base / f'{target.name}.disabled'
     if not target.exists() and disabled_target.exists():
         target = disabled_target
