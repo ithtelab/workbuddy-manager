@@ -27,7 +27,6 @@
 """
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import time
@@ -981,7 +980,7 @@ async def messages(request: Request):
         return _err('model 必须是字符串')
     # 客户端原样的 Anthropic 请求体（快照要在 clamp_max_tokens 之前：那一步会
     # 就地改 `max_tokens`，之后就看不出客户端原本要了多少）。
-    client_body = copy.deepcopy(body)
+    client_body = tap_svc.snapshot(body)
     # max_tokens 在 Anthropic 协议里是**必填项**，缺失即 400（与 OpenAI 不同）
     if body.get('max_tokens') is None:
         return _err('缺少必填字段 max_tokens')
@@ -1036,8 +1035,11 @@ async def messages(request: Request):
     # 转发头只构造一次：既给 httpx，也给抓包（双视角的一半）
     up_headers = gateway._upstream_headers(upstream)
     # 关联键：让上游的出站转储能精确对回这一轮（见 gateway 同名注释）
-    trace_id = uuid.uuid4().hex[:16]
-    up_headers['X-Trace-ID'] = trace_id
+    # 关联键只服务抓包：关闭时不发这个头，交给上游自己按会话生成 32 位 ID。
+    # 开着时也用 32 位 hex（与上游/官方客户端同形），16 位会改变出站头的形状。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:

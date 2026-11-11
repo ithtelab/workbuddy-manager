@@ -34,7 +34,6 @@ Harness 的 `openai-responses` 协议、部分 OpenAI 官方 SDK 用法）只发
 from __future__ import annotations
 
 import base64
-import copy
 import json
 import re
 import logging
@@ -1680,7 +1679,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
 
     # 客户端原样的 Responses 请求体（快照要在 clamp_max_tokens 之前 —— 那一步
     # 会就地改 `max_output_tokens`，之后就看不出客户端原本要了多少）。
-    client_body = copy.deepcopy(body)
+    client_body = tap_svc.snapshot(body)
 
     # 鉴权：与 gateway._authorize 同一套检查、同一顺序（含版本隔离与配额）
     # 映射先算：版本归属判的是**映射后**的实际模型名（issue #47）
@@ -1733,8 +1732,11 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     # 转发头只构造一次：既给 httpx，也给抓包（双视角的一半）
     up_headers = gateway._upstream_headers(upstream)
     # 关联键：让上游的出站转储能精确对回这一轮（见 gateway 同名注释）
-    trace_id = uuid.uuid4().hex[:16]
-    up_headers['X-Trace-ID'] = trace_id
+    # 关联键只服务抓包：关闭时不发这个头，交给上游自己按会话生成 32 位 ID。
+    # 开着时也用 32 位 hex（与上游/官方客户端同形），16 位会改变出站头的形状。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:

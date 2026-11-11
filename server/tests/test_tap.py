@@ -729,3 +729,51 @@ class DbTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class HotPathCostTest(unittest.TestCase):
+    """抓包关闭时不得给转发路径加成本（回归：无条件 deepcopy / 无条件缓冲）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = config.DB_PATH
+        config.DB_PATH = Path(self._tmp.name) / 'hot.db'
+        db._conn = None
+        db.connect()
+        db.set_setting(tap.SETTING_KEY, {'enabled': False})
+
+    def tearDown(self) -> None:
+        if db._conn is not None:
+            db._conn.close()
+        db._conn = None
+        config.DB_PATH = self._orig
+        db.set_setting(tap.SETTING_KEY, {'enabled': False})
+        self._tmp.cleanup()
+
+    def test_snapshot_returns_same_object_when_disabled(self) -> None:
+        body = {'model': 'x', 'messages': [{'role': 'user', 'content': 'hi' * 1000}]}
+        self.assertIs(tap.snapshot(body), body,
+                      '抓包关闭时必须原样返回，不做深拷贝')
+
+    def test_snapshot_copies_when_enabled(self) -> None:
+        db.set_setting(tap.SETTING_KEY, {'enabled': True})
+        body = {'model': 'x', 'messages': []}
+        copy_obj = tap.snapshot(body)
+        self.assertIsNot(copy_obj, body)
+        self.assertEqual(copy_obj, body)
+        copy_obj['model'] = 'changed'
+        self.assertEqual(body['model'], 'x', '快照必须是独立副本')
+
+    def test_raw_stream_ignores_feed_when_disabled(self) -> None:
+        stream = tap.RawStream()
+        for _ in range(100):
+            stream.feed('data: ' + 'x' * 1000)
+        self.assertEqual(stream.kept, 0, '关闭抓包时流缓冲必须整体失效')
+        self.assertEqual(stream.text(), '')
+
+    def test_raw_stream_collects_when_enabled(self) -> None:
+        db.set_setting(tap.SETTING_KEY, {'enabled': True})
+        stream = tap.RawStream()
+        stream.feed('data: hi\n')
+        self.assertGreater(stream.kept, 0)
+        self.assertIn('data: hi', stream.text())

@@ -413,20 +413,23 @@ class RawStream:
     在热路径上 decode 两遍。
     """
 
-    __slots__ = ('parts', 'kept')
+    __slots__ = ('parts', 'kept', 'on')
 
-    def __init__(self) -> None:
+    def __init__(self, on: bool | None = None) -> None:
+        # 抓包关闭时这个缓冲必须整体失效：流式响应每个 chunk 都会进来，
+        # 无脑累积等于给每条长流白存最多 4 MB（默认关闭是大多数部署的常态）。
+        self.on = enabled() if on is None else bool(on)
         self.parts: list[str] = []
         self.kept = 0
 
     def feed(self, text: str) -> None:
-        if self.kept >= RAW_LIMIT:
+        if not self.on or self.kept >= RAW_LIMIT:
             return
         self.parts.append(text)
         self.kept += len(text)
 
     def text(self) -> str:
-        return ''.join(self.parts)
+        return ''.join(self.parts) if self.on else ''
 
 
 def _merge_tool_delta(state: dict[int, dict], call: dict) -> None:
@@ -805,6 +808,23 @@ def _clean(value: object, limit: int) -> str | None:
     text = str(value).replace('\r', ' ').replace('\n', ' ')
     text = ''.join(ch for ch in text if ch >= ' ' or ch == '\t')
     return text[:limit]
+
+
+def snapshot(body: object) -> object:
+    """客户端原始请求体的快照，供抓包的「客户端视角」使用。
+
+    **关闭抓包时直接返回原对象**，不做深拷贝：`_chat` / `/v1/messages` /
+    `/v1/responses` 都在转发前置阶段调用它，而大上下文请求几十万 token 的
+    JSON 深拷贝一次就是几十毫秒与等量内存 —— 抓包默认关闭，不能让它给正常
+    转发加这份成本。开启时才拷贝，且必须早于任何改写。
+    """
+    if not enabled():
+        return body
+    import copy
+    try:
+        return copy.deepcopy(body)
+    except Exception:  # noqa: BLE001 - 快照失败不该影响请求
+        return body
 
 
 def capture(*, body: object, headers: Iterable[tuple[str, str]] | None,

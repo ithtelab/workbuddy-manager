@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import os
 import re
@@ -1303,7 +1302,7 @@ async def _chat(request: Request, upstream_path: str):
     # 后面的模型映射、max_tokens 钳制、图片归一、stream_options 注入都会就地
     # 改动 `body`，改完就再也拿不到「客户端到底发了什么」——而抓包页的
     # 「客户端视角」正是要看这一份，和网关改写后的那份对着看。
-    client_body = copy.deepcopy(body)
+    client_body = tap_svc.snapshot(body)
 
     requested_model = body.get('model') if isinstance(body, dict) else None
     # model 必须是字符串：非字符串（对象/数组/数字）会让后面的 _map_model 与
@@ -1355,8 +1354,11 @@ async def _chat(request: Request, upstream_path: str):
     up_headers = _upstream_headers(upstream)
     # 关联键：上游开启出站转储后，会把「它发往腾讯」的请求 / 响应按这个头落两行，
     # 管理端的「腾讯视角」据此精确对回这一轮（不靠时间窗猜）。
-    trace_id = uuid.uuid4().hex[:16]
-    up_headers['X-Trace-ID'] = trace_id
+    # 关联键只服务抓包：关闭时不发这个头，交给上游自己按会话生成 32 位 ID。
+    # 开着时也用 32 位 hex（与上游/官方客户端同形），16 位会改变出站头的形状。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:
