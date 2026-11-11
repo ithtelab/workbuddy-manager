@@ -1,0 +1,328 @@
+diff --git a/internal/pool/cooldown.go b/internal/pool/cooldown.go
+index e0f14b2..b74c198 100644
+--- a/internal/pool/cooldown.go
++++ b/internal/pool/cooldown.go
+@@ -57,10 +57,9 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
+ 		e.until = time.Now().Add(d)
+ 		e.coolKind = kind
+ 		e.reason = reason
+-		// 非模型级冷却入口：清空 6004 模型级独立冷却表（modelCooldowns），
+-		// 避免上一次模型级限流的模型豁免泄漏到本次**账号级**限流上
+-		// （否则换模型请求会错误绕过本次冷却）。
+-		e.modelCooldowns = nil
++		// healthyForModel 优先判定账号级 healthy(now)，账号级冷却期间全模型天然不可选。
++		// 模型级限流（6004/11102）未到恢复时间前继续保留，账号级冷却过后恢复拦截。
++		e.pruneExpiredModelCooldowns(time.Now())
+ 		p.dirty.Store(true)
+ 	}
+ }
+@@ -245,7 +244,8 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
+ 		}
+ 		e.coolKind = CoolSoft
+ 		e.reason = reason
+-		e.modelCooldowns = nil // 账号级软冷却：清空模型豁免（切模型不绕过）
++		// 账号级软冷却期间 healthy 整体短路，保留活跃的模型级限流直至其恢复时刻
++		e.pruneExpiredModelCooldowns(now)
+ 		p.dirty.Store(true)
+ 	}
+ }
+diff --git a/internal/pool/entry.go b/internal/pool/entry.go
+index 478caf5..81385dc 100644
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -245,7 +245,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
+ 	if !ok {
+ 		return false
+ 	}
+-	return !mc.Until.IsZero() && now.Before(mc.Until)
++	return mc.active(now)
+ }
+ 
+ // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）。
+@@ -305,7 +305,7 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
+ 		return
+ 	}
+ 	for m, mc := range e.modelCooldowns {
+-		if mc.Until.IsZero() || !now.Before(mc.Until) {
++		if !mc.active(now) {
+ 			delete(e.modelCooldowns, m)
+ 		}
+ 	}
+@@ -461,6 +461,27 @@ type modelCooldown struct {
+ 	Hits int
+ }
+ 
++// active 报告该模型的独立冷却是否仍在生效（未到恢复时刻）。
++// 只要上游权威重置墙钟 ResetAt 在未来，或冷却截止 Until 在未来，即视为仍在冷却。
++func (mc modelCooldown) active(now time.Time) bool {
++	if !mc.ResetAt.IsZero() && now.Before(mc.ResetAt) {
++		return true
++	}
++	return !mc.Until.IsZero() && now.Before(mc.Until)
++}
++
++// effectiveUntil 返回当前活跃状态下对外展示的有效截止时间。
++// 若 Until 已随软退避窗口过去但 ResetAt 仍在未来，有效截止延伸到 ResetAt；
++// 否则返回 Until。
++func (mc modelCooldown) effectiveUntil(now time.Time) time.Time {
++	if !mc.ResetAt.IsZero() && now.Before(mc.ResetAt) {
++		if mc.Until.IsZero() || !now.Before(mc.Until) {
++			return mc.ResetAt
++		}
++	}
++	return mc.Until
++}
++
+ // stateFile 持久化格式。
+ type stateFile struct {
+ 	Accounts map[string]stateAccount `json:"accounts"`
+diff --git a/internal/pool/modelcooldown_test.go b/internal/pool/modelcooldown_test.go
+index 83f499a..bb5091f 100644
+--- a/internal/pool/modelcooldown_test.go
++++ b/internal/pool/modelcooldown_test.go
+@@ -2,6 +2,7 @@ package pool
+ 
+ import (
+ 	"os"
++	"path/filepath"
+ 	"reflect"
+ 	"strings"
+ 	"testing"
+@@ -182,17 +183,18 @@ func TestModelCooldownsPreservedByNoteSuccess(t *testing.T) {
+ 	}
+ }
+ 
+-// TestModelCooldownsClearedByRevive 签到解冻（reviveCoolingLocked）→ 模型级 6004 冷却清零。
+-func TestModelCooldownsClearedByRevive(t *testing.T) {
++// TestModelCooldownsRetainedOnRevive 签到解冻（reviveCoolingLocked）不得清除仍在活跃期的 6004 模型级冷却。
++func TestModelCooldownsRetainedOnRevive(t *testing.T) {
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
++	reset := time.Now().Add(time.Hour)
++	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004")
+ 	p.ReenableIfCredits("u1", 500)
+ 	p.mu.RLock()
+-	n := len(p.byUID["u1"].modelCooldowns)
++	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
+ 	p.mu.RUnlock()
+-	if n != 0 {
+-		t.Errorf("revive 后 modelCooldowns=%d want 0", n)
++	if !ok || !mc.active(time.Now()) {
++		t.Fatalf("revive 不得清除活跃的模型冷却: ok=%v, mc=%+v", ok, mc)
+ 	}
+ }
+ 
+@@ -773,3 +775,89 @@ func TestBlockModelBackoffPickSkips(t *testing.T) {
+ 		t.Fatalf("其他模型应豁免 u1, got %+v", got)
+ 	}
+ }
++
++// TestModelCooldownUntilExpiredButResetAtFutureKeepsStatusAndCooldown
++// 当 6004 软退避截断时间 Until 已过，但上游真实重置时间 ResetAt 仍在未来时：
++// 1. pruneExpiredModelCooldowns 不得误删条目；
++// 2. modelCooled 仍判定为冷却中；
++// 3. /status 台账 RateLimitedModels 必须继续透出该模型，不得虚假恢复。
++func TestModelCooldownUntilExpiredButResetAtFutureKeepsStatusAndCooldown(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.SetSoftRateMax(10 * time.Millisecond) // 截断到极短，快速触发 Until 过期
++	reset := time.Now().Add(2 * time.Hour)  // 上游真实重置时间在 2 小时后
++	p.CooldownSoftForModel("u1", time.Millisecond, reset, "hy4free", "6004 model rate limit")
++
++	time.Sleep(30 * time.Millisecond) // 等 Until 过期
++	now := time.Now()
++
++	p.mu.Lock()
++	e := p.byUID["u1"]
++	e.pruneExpiredModelCooldowns(now)
++	p.mu.Unlock()
++
++	// 1. prune 之后 modelCooldowns 仍应保留
++	p.mu.RLock()
++	mc, ok := p.byUID["u1"].modelCooldowns["hy4free"]
++	p.mu.RUnlock()
++	if !ok {
++		t.Fatalf("Until 过期但 ResetAt 仍在未来时，prune 不得删除 modelCooldowns")
++	}
++	if mc.ResetAt.IsZero() || !mc.ResetAt.Equal(reset) {
++		t.Fatalf("ResetAt 应保持为上游真实时间 %v, got %v", reset, mc.ResetAt)
++	}
++
++	// 2. modelCooled 仍必须判定为处于冷却中
++	p.mu.RLock()
++	isCooled := e.modelCooled(now, "hy4free")
++	p.mu.RUnlock()
++	if !isCooled {
++		t.Fatalf("Until 过期但 ResetAt 在未来时，modelCooled 应仍为 true")
++	}
++
++	// 3. Status 台账必须继续透出
++	st, ok := p.Status("u1")
++	if !ok {
++		t.Fatalf("status missing")
++	}
++	if len(st.RateLimitedModels) != 1 {
++		t.Fatalf("Until 过期但 ResetAt 在未来时，/status 应继续包含台账行，got %+v", st.RateLimitedModels)
++	}
++	row := st.RateLimitedModels[0]
++	if row.Model != "hy4free" {
++		t.Errorf("model=%q want hy4free", row.Model)
++	}
++	if !row.ResetAt.Equal(reset) {
++		t.Errorf("row.ResetAt=%v want %v", row.ResetAt, reset)
++	}
++	if row.Until.Before(now) {
++		t.Errorf("row.Until=%v 应延伸到未来（有效截止），不得早于 now=%v", row.Until, now)
++	}
++}
++
++// TestModelCooldownPersistWhenUntilExpiredButResetAtFuture
++// 持久化往返：Until 已过但 ResetAt 仍在未来时，落盘和恢复均不得丢弃条目。
++func TestModelCooldownPersistWhenUntilExpiredButResetAtFuture(t *testing.T) {
++	fp := filepath.Join(t.TempDir(), "state.json")
++	p := New(fp)
++	p.Add(&auth.Auth{UID: "u1"})
++	p.SetSoftRateMax(10 * time.Millisecond)
++	reset := time.Now().Add(3 * time.Hour)
++	p.CooldownSoftForModel("u1", time.Millisecond, reset, "hy4free", "6004 model rate limit")
++
++	time.Sleep(30 * time.Millisecond) // 等 Until 过期
++	p.Flush()
++
++	p2 := New(fp)
++	p2.Add(&auth.Auth{UID: "u1"})
++
++	p2.mu.RLock()
++	mc, ok := p2.byUID["u1"].modelCooldowns["hy4free"]
++	p2.mu.RUnlock()
++	if !ok {
++		t.Fatalf("重启后 Until 已过期但 ResetAt 在未来的 modelCooldowns 应恢复")
++	}
++	if !mc.ResetAt.Equal(reset) {
++		t.Fatalf("恢复后的 ResetAt 应为 %v, got %v", reset, mc.ResetAt)
++	}
++}
+diff --git a/internal/pool/persist.go b/internal/pool/persist.go
+index 9a485e8..d0c3511 100644
+--- a/internal/pool/persist.go
++++ b/internal/pool/persist.go
+@@ -197,19 +197,20 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+ 		if s.DegradeUntil != nil && !s.DegradeUntil.IsZero() && now.Before(*s.DegradeUntil) {
+ 			e.degradeUntil = *s.DegradeUntil
+ 		}
+-		// 恢复 modelCooldowns，惰性过滤已过期条目（Until 在未来才恢复）。
++		// 恢复 modelCooldowns，惰性过滤已过期条目（ResetAt 或 Until 在未来才恢复）。
+ 		// 防止重启后残留已过期的模型级冷却条目（与 pick 路径的 pruneExpiredModelCooldowns 同口径）。
+ 		if len(s.ModelCooldowns) > 0 {
+ 			e.modelCooldowns = make(map[string]modelCooldown, len(s.ModelCooldowns))
+ 			for m, smc := range s.ModelCooldowns {
+-				if smc.Until.IsZero() || !now.Before(smc.Until) {
+-					continue // 过期/零值丢弃
+-				}
+-				e.modelCooldowns[m] = modelCooldown{
++				mc := modelCooldown{
+ 					Until:   smc.Until,
+ 					ResetAt: smc.ResetAt,
+ 					Reason:  smc.Reason,
+ 				}
++				if !mc.active(now) {
++					continue // 过期/零值丢弃
++				}
++				e.modelCooldowns[m] = mc
+ 			}
+ 			if len(e.modelCooldowns) == 0 {
+ 				e.modelCooldowns = nil
+@@ -356,7 +357,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
+ 		if len(e.modelCooldowns) > 0 {
+ 			mcs = make(map[string]stateModelCooldown, len(e.modelCooldowns))
+ 			for m, mc := range e.modelCooldowns {
+-				if mc.Until.IsZero() || !now.Before(mc.Until) {
++				if !mc.active(now) {
+ 					continue // 已过期：不落盘（惰性清理）
+ 				}
+ 				mcs[m] = stateModelCooldown{
+diff --git a/internal/pool/state.go b/internal/pool/state.go
+index 87e16e2..4f9952c 100644
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -560,7 +560,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
+ 
+ // rateLimitedModelsLocked 构建单账号的限额台账行，从 modelCooldowns 遍历输出——
+ // 每模型一行（含该模型的独立 until + 上游原始 resetAt），多模型同时 6004 全部展示。
+-// 有效期判据 = 该模型的独立冷却 until 未过；随到期自然消失（与 /status 观感一致）。
++// 有效期判据 = 该模型的独立冷却尚未到期（ResetAt 或 Until 任一在未来）；随到期自然消失（与 /status 观感一致）。
+ // 无模型级冷却（普通软冷却/硬冷却）→ nil（零回归）。调用方必须已持有 p.mu。
+ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedModel {
+ 	if len(e.modelCooldowns) == 0 {
+@@ -575,10 +575,10 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
+ 	rows := make([]RateLimitedModel, 0, len(models))
+ 	for _, m := range models {
+ 		mc := e.modelCooldowns[m]
+-		if !mc.Until.IsZero() && now.Before(mc.Until) {
++		if mc.active(now) {
+ 			row := RateLimitedModel{
+ 				Model:  m,
+-				Until:  mc.Until,
++				Until:  mc.effectiveUntil(now),
+ 				Reason: mc.Reason,
+ 			}
+ 			// 上游「将在 … 重置」的原始墙钟：无论是否被 soft_rate_max 截断都透出——
+diff --git a/internal/pool/transition.go b/internal/pool/transition.go
+index 09bc420..15f765f 100644
+--- a/internal/pool/transition.go
++++ b/internal/pool/transition.go
+@@ -29,15 +29,17 @@ package pool
+ 
+ import "time"
+ 
+-// clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
++// clearCoolingLocked 清冷却域：until/coolKind/softStreak 全归零，
+ // reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
++// 注意：活跃的模型级冷却（如 6004、11102）未到恢复时刻前仍有效，
++// 签到获得积分或解冻账号不得抹除上游真实模型的频率限制（仅惰性清理已过期条目）。
+ // 调用方必须已持有 p.mu。
+ func (e *entry) clearCoolingLocked() {
+ 	e.until = time.Time{}
+ 	e.coolKind = 0
+ 	e.reason = ""
+ 	e.softStreak = 0
+-	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
++	e.pruneExpiredModelCooldowns(time.Now())
+ }
+ 
+ // disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。
+@@ -51,6 +53,7 @@ func (e *entry) clearCoolingLocked() {
+ // 熔断观测仍有效，不应被禁用覆盖。
+ func (p *Pool) disableLocked(e *entry, reason string) {
+ 	e.clearCoolingLocked()
++	e.modelCooldowns = nil
+ 	e.disabled = true
+ 	e.reason = reason
+ 	p.dirty.Store(true)
+diff --git a/internal/pool/transition_test.go b/internal/pool/transition_test.go
+index ec62b52..fa9c6bf 100644
+--- a/internal/pool/transition_test.go
++++ b/internal/pool/transition_test.go
+@@ -129,9 +129,7 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
+ }
+ 
+ // TestTransitionReviveClearsCoolingKeepsBreaker reviveCoolingLocked（签到解冻）语义：
+-// 清冷却域（until/coolKind/reason/softStreak/modelCooldowns）+ 更新 credits，不动熔断。
+-// 既有单维度测试已各自锁定 reason/softStreak/modelCooldowns，本用例一次性断言完整
+-// 字段集，锁定迁移原语对冷却域/熔断域的处置永远一致。
++// 清账号级冷却域（until/coolKind/reason/softStreak）+ 更新 credits，不动熔断与活跃模型限流。
+ func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+@@ -149,8 +147,8 @@ func TestTransitionReviveClearsCoolingKeepsBreaker(t *testing.T) {
+ 		t.Errorf("revive 后 credits=%d want 700", st.Credits)
+ 	}
+ 	until, kind, reason, streak, mc := coolingDomain(t, p, "u1")
+-	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 0 {
+-		t.Errorf("revive 应清冷却域：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
++	if !until.IsZero() || kind != 0 || reason != "" || streak != 0 || mc != 1 {
++		t.Errorf("revive 应清账号级冷却域并保留活跃模型冷却：until=%v kind=%v reason=%q streak=%d modelCooldowns=%d",
+ 			until, kind, reason, streak, mc)
+ 	}
+ 	if bt, ok := p.breakerUntil("u1"); !ok || bt.IsZero() {
