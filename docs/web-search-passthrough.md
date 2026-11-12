@@ -108,13 +108,13 @@ GitHub：[WaveBird/dsh-web-search-workbuddy](https://github.com/WaveBird/dsh-web
 把这个端点注册成 DSH web seam 的 search provider：
 
 ```yaml
-# ~/.dsh/profiles/web/cordis.patch.yml
+# ~/.dsh/profiles/web/cordis.patch.yml —— 零配置：
+# baseURL 与 apiKeyEnv 自动从会话当前模型 provider 路由派生
+# （读 llm-pi-ai 路由 profile，与模型共用同一把 wbk_ 密钥；
+# 模型换路由时搜索自动跟随。插件 0.3.0+）
 - insert:
     - id: web-search-workbuddy
-      name: 'dsh-web-search-workbuddy'        # npm 安装后即此名
-      config:
-        baseURL: http://127.0.0.1:7864        # manager 地址
-        apiKeyEnv: WORKBUDDY_MANNAGER_CN_API_KEY   # 与模型同一把 wbk_ 密钥
+      name: 'dsh-web-search-workbuddy'
 - id: web
   name: '@deepseek-ai/dsh-web'
   config:
