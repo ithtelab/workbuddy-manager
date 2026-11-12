@@ -1558,10 +1558,11 @@ async def tools_search(request: Request):
     ip = iputil.client_ip(request)
     ua = request.headers.get('user-agent')
     path = request.url.path
-    # 入站鉴权与 chat 同管线（wbk_ 密钥 / IP 规则 / 频控）。搜索没有模型维度：
-    # model=None → 密钥的模型白名单与版本校验按「非模型调用」口径（与 /v1/usage
-    # 同理），不会因为一把密钥没绑模型而被拒。
-    key, ip, err = _authorize(request, None)
+    # 入站鉴权与 chat 同管线（wbk_ 密钥 / IP 规则 / 频控）。搜索没有模型维度，
+    # 因此走 is_model_list=True 口径（与 /v1/models 同理）：版本归属与模型白名单
+    # 在这种「不带 model 的数据面调用」上不拦——拦了会让限定版本的密钥连搜索都
+    # 用不了；真正的隔离由上游网关的账号池把关（realm 由上游按账号侧决定）。
+    key, ip, err = _authorize(request, None, is_model_list=True)
     if err:
         return err
 
