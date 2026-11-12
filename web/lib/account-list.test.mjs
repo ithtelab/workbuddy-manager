@@ -142,6 +142,17 @@ check('添加时间支持升序，未知仍在后面', files(selectAccounts(addi
 check('按添加时间排序仍与搜索结合', files(selectAccounts(additions,
   {q: 'new', group: 'all', sort: 'added', direction: 'desc'}, deps)), ['new']);
 check('添加时间排序不改变源数组', files(additions), ['legacy', 'old', 'new', 'same', 'unknown']);
+
+/* ── selectAccounts：自定义顺序（拖拽排序） ───────────────────── */
+
+const manualDeps = {...deps, orderRank: (a) => ({c: 0, a: 1})[a.file] ?? null};
+check('自定义顺序按名次排列，未登记的保持原顺序排在最后', files(selectAccounts(pool,
+  {q: '', group: 'all', sort: 'manual'}, manualDeps)), ['c', 'a', 'b', 'd']);
+check('没有顺序来源时退化成后端顺序（不是随机打乱）', files(selectAccounts(pool,
+  {q: '', group: 'all', sort: 'manual'}, deps)), ['a', 'b', 'c', 'd']);
+check('自定义顺序同样与搜索结合', files(selectAccounts(pool,
+  {q: 'c', group: 'all', sort: 'manual'}, manualDeps)), ['c']);
+check('自定义顺序不改动入参数组', files(pool), ['a', 'b', 'c', 'd']);
 for (const direction of ['asc', 'desc']) {
   const invalid = [acct('nan', {credits: NaN}), acct('known', {credits: 1}), acct('inf', {credits: Infinity})];
   check(`非有限数值在 ${direction} 下也放最后`, files(selectAccounts(invalid,

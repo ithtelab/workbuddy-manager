@@ -251,6 +251,16 @@ export const accountApi = {
   list: (upstreamId?: number | null) =>
     get<AccountsResponse>('/api/accounts',
                           upstreamId == null ? undefined : {upstream_id: upstreamId}),
+  /**
+   * 本分组的自定义顺序（拖拽排序）。
+   *
+   * 顺序存在服务端而不是浏览器里：它是这份部署的**共享视图**，换设备 / 换浏览器
+   * 打开要看到同一份顺序。它只是展示顺序，不影响上游选号或任何一次调用的结果。
+   */
+  order: (upstreamId?: number | null) =>
+    get<{order: string[]}>('/api/accounts/order' + groupQs(upstreamId)),
+  saveOrder: (order: string[], upstreamId?: number | null) =>
+    put<{order: string[]}>('/api/accounts/order' + groupQs(upstreamId), {order}),
   exportZip: async (upstreamId?: number | null) => {
     const response = await http.get<Blob>('/api/accounts/export' + groupQs(upstreamId), {
       responseType: 'blob',

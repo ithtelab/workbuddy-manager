@@ -17,8 +17,8 @@ from fastapi.responses import StreamingResponse
 from .. import config, db, security, upstreamsvc
 from ..iputil import client_ip
 from ..services import (
-    credits as creditsvc, dailyplan, modelcatalog, reload, renew, tasklog, taskrun,
-    tencent, wb2api,
+    accountorder, credits as creditsvc, dailyplan, modelcatalog, reload, renew,
+    tasklog, taskrun, tencent, wb2api,
 )
 from ..services.realm import realm_of, supports_checkin
 from ..services import taskpacing
@@ -568,6 +568,36 @@ async def list_accounts(upstream_id: int | None = Query(None),
         'auth_dir': str(base_dir or ''),
         'manageable': base_dir is not None,
     }
+
+
+@router.get('/accounts/order')
+def get_account_order(upstream_id: int | None = Query(None),
+                      user: dict = Depends(security.current_user)) -> dict:
+    """本分组的自定义顺序（uid 数组）。
+
+    只读不设管理员门槛：顺序是**共享视图**，只读用户看到的必须与改它的人一致，
+    否则同一份数据在两块屏幕上顺序不同、却说不出谁对。
+    """
+    group = _group(upstream_id)
+    return {'order': accountorder.load(group['id'])}
+
+
+@router.put('/accounts/order')
+def save_account_order(body: dict,
+                       upstream_id: int | None = Query(None),
+                       user: dict = Depends(security.require_admin)) -> dict:
+    """保存自定义顺序。限管理员：它改变的是**所有人**看到的列表顺序。
+
+    `order` 里没提到的账号不会被删/改，只是排到末尾（见 accountorder.apply）——
+    所以前端可以只提交当前可见的那几条，不必把整池 uid 都带上。
+    """
+    group = _group(upstream_id)
+    try:
+        order = accountorder.save(group['id'], (body or {}).get('order'))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    security.audit(user, 'save_account_order', '', f'{len(order)} 个账号')
+    return {'order': order}
 
 
 @router.get('/upstream/status')
