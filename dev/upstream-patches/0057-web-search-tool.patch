@@ -14,10 +14,10 @@ index 456354c..56a1168 100644
  	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 diff --git a/internal/server/tool_search.go b/internal/server/tool_search.go
 new file mode 100644
-index 0000000..24b0512
+index 0000000..86b4c99
 --- /dev/null
 +++ b/internal/server/tool_search.go
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,190 @@
 +package server
 +
 +import (
@@ -121,11 +121,7 @@ index 0000000..24b0512
 +		if acct == nil {
 +			break
 +		}
-+		// global 账号在 agenttool 域未验证：直接跳过不试错（不写 tried——
-+		// 若池里只剩 global 号，下一轮 pick 会再次选中它，break 即可）。
-+		if acct.IsGlobal() {
-+			break
-+		}
++		// realm 由账号本身决定（agentToolSearchBase 分域），CN/global 都可搜。
 +		tried[acct.UID] = true
 +		if !h.cfg.Pool.Acquire(acct.UID) {
 +			continue // 在途满：换号
@@ -214,10 +210,10 @@ index 0000000..24b0512
 +}
 diff --git a/internal/server/tool_search_test.go b/internal/server/tool_search_test.go
 new file mode 100644
-index 0000000..1c19c59
+index 0000000..4e9b85f
 --- /dev/null
 +++ b/internal/server/tool_search_test.go
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,227 @@
 +package server
 +
 +import (
@@ -421,18 +417,19 @@ index 0000000..1c19c59
 +	}
 +}
 +
-+func TestToolSearchGlobalAccountSkipped(t *testing.T) {
++func TestToolSearchGlobalAccountSearched(t *testing.T) {
 +	rec := &searchRecorder{}
 +	up := newSearchUpstream(t, rec, searchOK)
-+	// 池里只有 global 号：不试错，直接 503（agenttool global 域未验证）。
++	// global realm 已支持：agenttool 域按账号 realm 分域（global → workbuddy.ai，
++	// 两域端点均已探针验证存在）。global 号应正常搜索。
 +	h := newSearchHandler(up, &auth.Auth{UID: "g1", AccessToken: "at1", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
 +	res := httptest.NewRecorder()
 +	h.ServeHTTP(res, searchReq(`{"query":"q"}`))
-+	if res.Code != http.StatusServiceUnavailable {
-+		t.Fatalf("want 503 for global-only pool, got %d body=%s", res.Code, res.Body.String())
++	if res.Code != http.StatusOK {
++		t.Fatalf("want 200 for global account, got %d body=%s", res.Code, res.Body.String())
 +	}
-+	if rec.callCount() != 0 {
-+		t.Fatalf("global account must not be sent upstream, got %d calls", rec.callCount())
++	if rec.callCount() != 1 {
++		t.Fatalf("want 1 upstream call, got %d", rec.callCount())
 +	}
 +}
 +
@@ -446,10 +443,10 @@ index 0000000..1c19c59
 +}
 diff --git a/internal/upstream/agenttool_search.go b/internal/upstream/agenttool_search.go
 new file mode 100644
-index 0000000..0133a57
+index 0000000..49eb10b
 --- /dev/null
 +++ b/internal/upstream/agenttool_search.go
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,187 @@
 +package upstream
 +
 +import (
@@ -513,17 +510,18 @@ index 0000000..0133a57
 +	return r.Code == 15001
 +}
 +
-+// agentToolSearchBase agenttool 域的 base：CN = product endpoint
-+// www.workbuddy.cn（CLI product.json endpoint 字段；04 文档 §2）。
-+// AgentToolBaseOverride 非空时优先（测试注入 / 部署侧端点覆盖）。
-+// global realm 上游暂无公开 agenttool 域：调用方（handler）对 global 账号直接拒绝，
-+// 不在本层猜测国际版端点（避免拿生产账号试错）。
++// agentToolSearchBase agenttool 域按账号 realm 分域（与 chatBase/billingBase
++// 同一分域约定）：CN = www.workbuddy.cn，global = www.workbuddy.ai——两个
++// product.json 的 endpoint 字段即各自域（CN app: workbuddy.cn；intl app:
++// workbuddy.ai），且 /agenttool/v1/search 在两域均已验证存在（未带凭证探针
++// 双双回 401，路由存在 + 要求鉴权）。AgentToolBaseOverride 非空时优先
++// （测试注入 / 部署侧端点覆盖，覆盖时 realm 分域失效——整池同域）。
 +func (c *Client) agentToolSearchBase(a *auth.Auth) string {
 +	if c.AgentToolBaseOverride != "" {
 +		return c.AgentToolBaseOverride
 +	}
 +	if a != nil && a.IsGlobal() {
-+		return c.globalProductBase()
++		return AgentToolBaseGlobal
 +	}
 +	return AgentToolBaseCN
 +}
@@ -631,15 +629,11 @@ index 0000000..0133a57
 +	return &Error{Kind: ErrServer, Status: 0, Msg: truncate(err.Error(), 200)}
 +}
 +
-+// globalProductBase international product endpoint（global realm 的 agenttool 兜底域）。
-+// 上游 CLI 对 global 的 agenttool 域未见公开文档：返回国际版 product 域由调用方决策，
-+// 本函数不发起网络请求。
-+func (c *Client) globalProductBase() string {
-+	return "https://www.workbuddy.ai"
-+}
-+
-+// AgentToolBaseCN CN agenttool 域（CLI product.json endpoint）。
-+const AgentToolBaseCN = "https://www.workbuddy.cn"
++// agenttool 域常量（CLI product.json endpoint，两版 app 各自的域）。
++const (
++	AgentToolBaseCN     = "https://www.workbuddy.cn"
++	AgentToolBaseGlobal = "https://www.workbuddy.ai"
++)
 diff --git a/internal/upstream/client.go b/internal/upstream/client.go
 index bfc5a07..affc4d7 100644
 --- a/internal/upstream/client.go
