@@ -25,7 +25,9 @@ export type SortKey =
   /** 按积分排序；没有数据的始终排最后 */
   | 'credits'
   /** 按本面板记录的添加时间排序；未知历史时间的始终排最后 */
-  | 'added';
+  | 'added'
+  /** 按管理员拖拽保存的自定义顺序；顺序里没有的账号保持原顺序排在后面 */
+  | 'manual';
 
 export type SortDirection = 'asc' | 'desc';
 
@@ -69,6 +71,8 @@ export interface SelectDeps {
   groupOf: (a: Account) => AvailabilityGroup;
   /** 账号 → 当前积分（含刚查到的实时值）；**没有数据返回 null**，不要用 0 冒充 */
   creditOf: (a: Account) => number | null;
+  /** 账号 → 自定义顺序里的名次；未登记返回 null（只有 sort='manual' 用得上） */
+  orderRank?: (a: Account) => number | null;
 }
 
 /**
@@ -88,6 +92,20 @@ export function selectAccounts(
       (query.group === 'all' || deps.groupOf(a) === query.group) && matchesQuery(a, query.q),
   );
   if (query.sort === 'default') return rows;
+  if (query.sort === 'manual') {
+    const rankOf = deps.orderRank;
+    // 没有顺序来源时退化成「后端顺序」而不是把所有账号当成未知、随机翻转：
+    // 排序选项可以手动选中，但数据还没到，此时保持不动最不意外。
+    if (!rankOf) return rows;
+    return [...rows].sort((a, b) => {
+      const ra = rankOf(a);
+      const rb = rankOf(b);
+      if (ra === null && rb === null) return 0;
+      if (ra === null) return 1;
+      if (rb === null) return -1;
+      return ra - rb;
+    });
+  }
   const direction = (query.direction ?? (query.sort === 'added' ? 'desc' : 'asc')) === 'desc' ? -1 : 1;
   const valueOf = (a: Account) => query.sort === 'remain' ? (a.expires_at === 0 ? null : a.remain_seconds)
     : query.sort === 'added' ? a.added_at : deps.creditOf(a);
