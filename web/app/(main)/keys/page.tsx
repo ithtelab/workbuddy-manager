@@ -65,6 +65,8 @@ interface FormState {
   quota: string;
   /** 积分额度（issue #27）：0 = 不限。按上游返回的**真实扣费**累计 */
   quotaCredit: string;
+  /** 每日 token 限额：0 = 不限，按服务器本地日期每天 0 点恢复 */
+  dailyQuota: string;
   /** 版本归属：'cn' | 'global' | ''（不限制，仅存量密钥） */
   realm: Realm | '';
   /** 绑定的上游（账号池分组）：null = 默认上游。见 server/upstreamsvc.py */
@@ -80,6 +82,7 @@ const emptyForm: FormState = {
   models: '',
   quota: '0',
   quotaCredit: '0',
+  dailyQuota: '0',
   realm: 'cn',
   upstream_id: null,
 };
@@ -247,6 +250,7 @@ export default function KeysPage() {
       models: (k.models || []).join(', '),
       quota: String(k.quota ?? 0),
       quotaCredit: String(k.quota_credit ?? 0),
+      dailyQuota: String(k.daily_quota ?? 0),
       realm: k.realm || '',
       upstream_id: k.upstream_id ?? null,
     });
@@ -273,6 +277,7 @@ export default function KeysPage() {
         models: toLines(form.models),
         quota: Number(form.quota) || 0,
         quota_credit: Number(form.quotaCredit) || 0,
+        daily_quota: Math.max(0, Math.floor(Number(form.dailyQuota) || 0)),
         // '' 是有意义的取值（不限制版本），必须照传——后端以它区分
         // 「存量密钥，两版都能调」与「限定了某一版」
         //
@@ -638,7 +643,8 @@ export default function KeysPage() {
               // 否则会出现「列表显示正常、调用却被 429」，用户会以为是网关坏了。
               const overQuota =
                 (!!k.quota && k.used_tokens >= k.quota) ||
-                (!!k.quota_credit && k.used_credit >= k.quota_credit);
+                (!!k.quota_credit && k.used_credit >= k.quota_credit) ||
+                (!!k.daily_quota && (k.daily_used_tokens ?? 0) >= k.daily_quota);
               return (
                 <TableRow key={k.id} className="border-b border-border/40">
                   <TableCell className="pl-4 text-sm font-medium">
@@ -717,6 +723,23 @@ export default function KeysPage() {
                             {fmtNumber(k.used_tokens)}
                             {k.quota ? ` / ${fmtNumber(k.quota)}` : ''}
                           </span>
+                          {!!k.daily_quota && (() => {
+                            const dUsed = k.daily_used_tokens ?? 0;
+                            const dRatio = dUsed / k.daily_quota;
+                            const dTone = dRatio >= 1
+                              ? 'text-red-600 dark:text-red-400 font-medium'
+                              : dRatio >= 0.8
+                                ? 'text-amber-600 dark:text-amber-400 font-medium'
+                                : 'text-muted-foreground';
+                            return (
+                              <span className={`text-[10px] ${dTone}`} title={t('keys.quotaDaily')}>
+                                {t('keys.dailyUsed', {
+                                  used: fmtNumber(dUsed),
+                                  quota: fmtNumber(k.daily_quota),
+                                })}
+                              </span>
+                            );
+                          })()}
                           {!!k.quota_credit && (
                             <span
                               className={`text-[10px] ${cTone}`}
@@ -911,6 +934,20 @@ export default function KeysPage() {
                     value={form.quota}
                     onChange={(e) => setForm({...form, quota: e.target.value})}
                   />
+                </div>
+                <div className="space-y-1.5">
+                  {/* 每日 token 限额：与总额度各自独立，按服务器本地日期每天 0 点恢复 */}
+                  <Label className="text-[11px] text-muted-foreground">{t('keys.quotaDaily')}</Label>
+                  <Input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={form.dailyQuota}
+                    onChange={(e) => setForm({...form, dailyQuota: e.target.value})}
+                  />
+                  <p className="text-[11px] leading-4 text-muted-foreground">
+                    {t('keys.quotaDailyHint')}
+                  </p>
                 </div>
                 <div className="space-y-1.5">
                   {/* 积分额度：与 token 额度各自独立，任一超限即拒绝，两个都留 0 = 不限。

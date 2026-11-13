@@ -118,6 +118,12 @@ CREATE TABLE IF NOT EXISTS api_keys (
   -- （如 0.05 表示一次调用的倍率扣费）。
   quota_credit  REAL    NOT NULL DEFAULT 0,
   used_credit   REAL    NOT NULL DEFAULT 0,
+  -- 每日 token 限额：0 = 不限。与总额度 quota 各自独立，任一超限即拒绝。
+  -- daily_used_tokens 只记 daily_used_day 那一天（本地日期，与 usage_daily 同口径）；
+  -- 日期一变即视为 0，不需要定时任务去清零。
+  daily_quota       INTEGER NOT NULL DEFAULT 0,
+  daily_used_tokens INTEGER NOT NULL DEFAULT 0,
+  daily_used_day    TEXT    NOT NULL DEFAULT '',
   created_at    INTEGER NOT NULL,
   last_used_at  INTEGER,
   -- 密钥明文（供管理员在密钥页再次查看 / 复制）。
@@ -798,6 +804,11 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ('request_logs', 'cache_write_tokens', 'INTEGER'),
     ('api_keys', 'quota_credit', 'REAL NOT NULL DEFAULT 0'),
     ('api_keys', 'used_credit', 'REAL NOT NULL DEFAULT 0'),
+    # 每日 token 限额。存量密钥为 0 = **不限**，行为不变。
+    # 已用量按本地日期记在 daily_used_day 名下，跨天自动归零（读时判断，写时重置）。
+    ('api_keys', 'daily_quota', 'INTEGER NOT NULL DEFAULT 0'),
+    ('api_keys', 'daily_used_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+    ('api_keys', 'daily_used_day', "TEXT NOT NULL DEFAULT ''"),
     # 密钥明文（供「密钥页再次查看 / 复制」，见 SCHEMA 里这一列的说明）。
     # 存量密钥为空串 = 取不回明文：那一版只存哈希，界面上要说清「去重建一把」，
     # 而不是显示一个空密钥让人以为复制坏了。

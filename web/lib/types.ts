@@ -488,6 +488,10 @@ export interface ApiKey {
    */
   quota_credit: number;
   used_credit: number;
+  /** 每日 token 限额：0 = 不限；与 quota 各自独立，任一超限即拒绝 */
+  daily_quota: number;
+  /** 今天（服务器本地日期）已用的 token，次日 0 点归零 */
+  daily_used_tokens: number;
   /**
    * 绑定的上游接入点（多上游 / 分组隔离）；null = 默认上游。
    *
@@ -942,7 +946,7 @@ export interface IpAccessLog {
   ua: string | null;
   /**
    * 拦截原因短码（issue #33）：missing_key / invalid_key / ip_blocked /
-   * key_disabled / key_expired / quota_exhausted / credit_quota_exhausted /
+   * key_disabled / key_expired / quota_exhausted / daily_quota_exhausted / credit_quota_exhausted /
    * ip_not_allowed / too_many_ips / realm_mismatch / model_not_allowed /
    * rate_limited / key_auth_flood 等。
    *

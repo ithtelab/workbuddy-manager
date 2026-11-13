@@ -974,6 +974,8 @@ def key_usage(request: Request):
         },
         'tokens': allowance(key.get('quota'), key.get('used_tokens')),
         'credits': allowance(key.get('quota_credit'), key.get('used_credit')),
+        # 今日 token（本地日期，次日 0 点恢复）；limit 为 None = 不限
+        'daily_tokens': allowance(key.get('daily_quota'), key.get('daily_used_tokens')),
         'last_used_at': int(key.get('last_used_at') or 0),
         # 这几个数字是面板**已记录**的值，读取时刻即 snapshot_at；不是向上游现问的。
         'snapshot_at': now,
