@@ -1,0 +1,652 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 456354c..56a1168 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -200,6 +200,9 @@ func NewHandler(cfg Config) *Handler {
+ 	}
+ 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), largeUsed: make(map[string][]time.Time)}
+ 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
++	// agenttool web search 透传（0057）：与 chat 同鉴权面；账号池轮转 +
++	// 15001 搜索配额软冷却（见 tool_search.go）。
++	h.mux.HandleFunc("POST /v1/tools/search", h.withAuth(h.toolSearch))
+ 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+ 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+ 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
+diff --git a/internal/server/tool_search.go b/internal/server/tool_search.go
+new file mode 100644
+index 0000000..86b4c99
+--- /dev/null
++++ b/internal/server/tool_search.go
+@@ -0,0 +1,190 @@
++package server
++
++import (
++	"encoding/json"
++	"errors"
++	"log"
++	"net/http"
++	"strings"
++	"time"
++
++	"workbuddy2api/internal/logfmt"
++	"workbuddy2api/internal/pool"
++	"workbuddy2api/internal/upstream"
++)
++
++// ---------------------------------------------------------------------------
++// /v1/tools/search —— agenttool web search 透传（账号池轮转 + 15001 配额冷却）
++// ---------------------------------------------------------------------------
++
++// toolSearchRequest /v1/tools/search 入站请求体。
++type toolSearchRequest struct {
++	Query          string   `json:"query"`
++	MaxResults     int      `json:"max_results"`
++	AllowedDomains []string `json:"allowed_domains"`
++	BlockedDomains []string `json:"blocked_domains"`
++	Freshness      string   `json:"freshness"`
++}
++
++// toolSearchValidity 搜索配额冷却的统一时长（账号级，无模型豁免语义）。
++// 15001 是日配额：与硬冷却不同，它随当日重置自然恢复，软冷却到次日 04:00 的
++// 既有 CooldownUntilTomorrow4AM 语义最贴近（签到/配额刷新窗口一致），
++// 但保守起见先给短软冷却——若上游日初即重置，短冷却让号更早回池；
++// 持续 15001 的号会被后续请求反复冷却，自然收敛到“全天不可用”。
++const toolSearchQuotaCooldown = 10 * time.Minute
++
++// toolSearch handler：POST /v1/tools/search
++//
++// 选号语义（与 chatCompletions 的关键差异）：
++//   - **不走会话粘性**：搜索无上下文，粘住单号会把该号的 15001 搜索日配额打穿。
++//     每次请求纯轮换（PickExcludingForRealm，reqModel="" → 无模型豁免维度）。
++//   - realm 支持：请求体 model 字段可带 "[cn:]" / "[global:]" 前缀（与 chat 同协议，
++//     可选；不传则全池）。
++//   - 15001（quota_web_search）→ 账号软冷却 + 换号重试；全部号配额耗尽 → 429 透传。
++//   - global realm：上游无公开 agenttool 域，选到 global 号即跳过（不试错）。
++func (h *Handler) toolSearch(w http.ResponseWriter, r *http.Request) {
++	start := time.Now()
++	var req toolSearchRequest
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		writeJSON(w, http.StatusBadRequest, map[string]any{
++			"error": "invalid request body: " + err.Error(),
++		})
++		return
++	}
++	req.Query = strings.TrimSpace(req.Query)
++	if req.Query == "" {
++		writeJSON(w, http.StatusBadRequest, map[string]any{
++			"error": "query is required",
++		})
++		return
++	}
++	if req.MaxResults <= 0 {
++		req.MaxResults = 5
++	}
++	if req.MaxResults > 20 {
++		req.MaxResults = 20
++	}
++	switch req.Freshness {
++	case "", "d1", "m1", "y1":
++	default:
++		writeJSON(w, http.StatusBadRequest, map[string]any{
++			"error": "freshness must be one of: d1, m1, y1",
++		})
++		return
++	}
++
++	// blocked_domains：官方 CLI 语义是拼进 query 文本（" -site:domain"）。
++	// 在网关层完成拼接，调用方（DSH 插件）无需自行处理。
++	q := req.Query
++	for _, d := range req.BlockedDomains {
++		d = strings.TrimSpace(d)
++		if d != "" {
++			q += " -site:" + d
++		}
++	}
++
++	upReq := upstream.AgentToolSearchRequest{
++		Query:          q,
++		Type:           "text2text",
++		MaxResults:     req.MaxResults,
++		AllowedDomains: req.AllowedDomains,
++		Freshness:      req.Freshness,
++	}
++
++	tried := map[string]bool{}
++	var lastBody string
++	var lastStatus int
++	quotaExhausted := 0 // 15001 计数：全部号配额耗尽时末端语义化
++
++	for i := 0; i < h.cfg.MaxRotate; i++ {
++		acct := h.cfg.Pool.PickExcludingForRealm(tried, "", "") // 无模型、无粘性、纯轮换
++		if acct == nil {
++			break
++		}
++		// realm 由账号本身决定（agentToolSearchBase 分域），CN/global 都可搜。
++		tried[acct.UID] = true
++		if !h.cfg.Pool.Acquire(acct.UID) {
++			continue // 在途满：换号
++		}
++
++		resp, err := h.cfg.Upstream.AgentToolSearch(r.Context(), acct, upReq)
++		h.cfg.Pool.Release(acct.UID)
++
++		var uerr *upstream.Error
++		if errors.As(err, &uerr) {
++			lastStatus = uerr.Status
++			lastBody = uerr.Msg
++			switch uerr.Kind {
++			case upstream.ErrSoftRate, upstream.ErrAccountFault, upstream.ErrWafBlock,
++				upstream.ErrServer, upstream.ErrNotFound:
++				// 账号级可轮转故障：走既有错误策略（冷却/计数）+ 换号。
++				h.applyErrorPolicy(acct.UID, uerr.Kind, uerr.Msg, "", uerr)
++				h.cfg.Pool.NoteError(acct.UID)
++				continue
++			case upstream.ErrSessionDead, upstream.ErrAuthRejected:
++				h.applyErrorPolicy(acct.UID, uerr.Kind, uerr.Msg, "", uerr)
++				continue
++			default:
++				// ErrClient / ErrBadParams / 其他：请求问题，不罚号不轮转，透传。
++				writeJSON(w, http.StatusBadRequest, map[string]any{
++					"error": "search request rejected by upstream",
++					"code":  int(uerr.Kind),
++					"msg":   uerr.Msg,
++				})
++				log.Printf("WARN: [server] search client error acct=%s: %s", logfmt.Label(acct.UID, acct.Nickname), uerr.Msg)
++				return
++			}
++		}
++		if err != nil {
++			// 非分类错误（marshal 等本地问题）：透传 500。
++			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
++			return
++		}
++
++		// 上游 200 但业务码非 0（搜索域的业务信封，如 15001）。
++		if resp.Code != 0 {
++			lastBody = resp.Msg
++			lastStatus = http.StatusTooManyRequests
++			if resp.IsQuotaExhausted() {
++				quotaExhausted++
++				// 15001 是账号级搜索日配额：软冷却该号（不熔断不禁用），换号重试。
++				// 固定时长软冷却（不走 CooldownSoftRate 的 streak 退避：搜索配额
++				// 与请求频率无关，固定 10 分钟即语义；恢复由上游日重置或冷却到期）。
++				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, toolSearchQuotaCooldown, "15001 web search quota")
++				log.Printf("INFO: [server] search quota exhausted acct=%s, rotating", logfmt.Label(acct.UID, acct.Nickname))
++				continue
++			}
++			// 其他业务码：原样透传（与 chat 的 error-passthrough 同哲学）。
++			writeJSON(w, http.StatusOK, resp)
++			return
++		}
++
++		// 成功：原样透传上游信封（results/total_results/response_time_ms/provider）。
++		h.cfg.Pool.NoteSuccess(acct.UID)
++		log.Printf("INFO: [server] search ok acct=%s results=%d ms=%d total=%s",
++			logfmt.Label(acct.UID, acct.Nickname), len(resp.Results), resp.ResponseTimeMs,
++			time.Since(start).Round(time.Millisecond))
++		writeJSON(w, http.StatusOK, resp)
++		return
++	}
++
++	// 轮转结束仍无成功。
++	if quotaExhausted > 0 {
++		// 全池搜索配额耗尽：429 + 语义化提示（DSH 插件按此提示用户）。
++		writeJSON(w, http.StatusTooManyRequests, map[string]any{
++			"error":  "web search quota exhausted on all available accounts (upstream code 15001); quota resets daily",
++			"code":   "quota_web_search",
++			"tried":  quotaExhausted,
++			"detail": lastBody,
++		})
++		return
++	}
++	status := http.StatusServiceUnavailable
++	if lastStatus >= 400 {
++		status = lastStatus
++	}
++	writeJSON(w, status, map[string]any{
++		"error":  "no account available for web search",
++		"detail": lastBody,
++	})
++}
+diff --git a/internal/server/tool_search_test.go b/internal/server/tool_search_test.go
+new file mode 100644
+index 0000000..4e9b85f
+--- /dev/null
++++ b/internal/server/tool_search_test.go
+@@ -0,0 +1,227 @@
++package server
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/upstream"
++)
++
++// searchRecorder 记录 agenttool 出站请求体（0057 测试专用，与 newFakeUpstream
++// 的 roundTripFunc 管线同构：不联网、按调用序返回）。
++type searchRecorder struct {
++	mu     sync.Mutex
++	bodies []map[string]any
++	seq    []string // 每次上游调用应返回的原始 body
++	calls  int
++}
++
++func newSearchUpstream(t *testing.T, rec *searchRecorder, responses ...string) *upstream.Client {
++	t.Helper()
++	rec.seq = responses
++	return &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			rec.mu.Lock()
++			idx := rec.calls
++			rec.calls++
++			rec.mu.Unlock()
++			var in map[string]any
++			_ = json.NewDecoder(r.Body).Decode(&in)
++			rec.mu.Lock()
++			rec.bodies = append(rec.bodies, in)
++			body := rec.seq[min(idx, len(rec.seq)-1)]
++			rec.mu.Unlock()
++			return &http.Response{
++				StatusCode: 200,
++				Header:     http.Header{"Content-Type": []string{"application/json"}},
++				Body:       io.NopCloser(strings.NewReader(body)),
++			}, nil
++		})},
++		ChatBaseCN:            "https://fake.example",
++		BillingBaseCN:         "https://fake.example",
++		AgentToolBaseOverride: "https://fake.example",
++	}
++}
++
++func (rec *searchRecorder) requestBodies() []map[string]any {
++	rec.mu.Lock()
++	defer rec.mu.Unlock()
++	return append([]map[string]any(nil), rec.bodies...)
++}
++
++func (rec *searchRecorder) callCount() int {
++	rec.mu.Lock()
++	defer rec.mu.Unlock()
++	return rec.calls
++}
++
++// newSearchHandler 单账号池（或 caller 传入多账号）的最小 handler 装配。
++func newSearchHandler(up *upstream.Client, auths ...*auth.Auth) *Handler {
++	cfg := Config{
++		Pool:      testPoolWith(auths...),
++		Upstream:  up,
++		MaxRotate: 3,
++	}
++	return NewHandler(cfg)
++}
++
++func searchReq(query string) *http.Request {
++	return httptest.NewRequest("POST", "/v1/tools/search", strings.NewReader(query))
++}
++
++const searchOK = `{"code":0,"msg":"","results":[{"title":"t","url":"https://a.example/x","snippet":"s"}],"total_results":1,"response_time_ms":12,"provider":"bocha"}`
++
++func TestToolSearchRequiresAuth(t *testing.T) {
++	up := &upstream.Client{AgentToolBaseOverride: "https://fake.example"}
++	h := newSearchHandler(up)
++	h.cfg.APIKey = "k1"
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, searchReq(`{"query":"x"}`))
++	if rec.Code != http.StatusUnauthorized {
++		t.Fatalf("want 401, got %d", rec.Code)
++	}
++}
++
++func TestToolSearchEmptyQuery(t *testing.T) {
++	h := newSearchHandler(&upstream.Client{})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, searchReq(`{"query":"  "}`))
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("want 400, got %d", rec.Code)
++	}
++}
++
++func TestToolSearchBadFreshness(t *testing.T) {
++	h := newSearchHandler(&upstream.Client{})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, searchReq(`{"query":"x","freshness":"forever"}`))
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("want 400, got %d", rec.Code)
++	}
++}
++
++func TestToolSearchBlockedDomainsAppended(t *testing.T) {
++	rec := &searchRecorder{}
++	up := newSearchUpstream(t, rec, searchOK)
++	h := newSearchHandler(up, &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	res := httptest.NewRecorder()
++	h.ServeHTTP(res, searchReq(`{"query":"go generics","blocked_domains":["reddit.com"],"max_results":3}`))
++	if res.Code != http.StatusOK {
++		t.Fatalf("want 200, got %d body=%s", res.Code, res.Body.String())
++	}
++	bodies := rec.requestBodies()
++	if len(bodies) != 1 {
++		t.Fatalf("want 1 upstream call, got %d", len(bodies))
++	}
++	if q, _ := bodies[0]["query"].(string); !strings.Contains(q, "-site:reddit.com") {
++		t.Fatalf("blocked domain not appended: %q", q)
++	}
++	if mr, _ := bodies[0]["max_results"].(float64); int(mr) != 3 {
++		t.Fatalf("max_results not passed: %v", bodies[0]["max_results"])
++	}
++	if tp, _ := bodies[0]["type"].(string); tp != "text2text" {
++		t.Fatalf("type not text2text: %v", bodies[0]["type"])
++	}
++}
++
++func TestToolSearchRotatesOnQuota15001(t *testing.T) {
++	rec := &searchRecorder{}
++	up := newSearchUpstream(t, rec,
++		`{"code":15001,"msg":"quota_web_search"}`,
++		searchOK)
++	h := newSearchHandler(up,
++		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999})
++	res := httptest.NewRecorder()
++	h.ServeHTTP(res, searchReq(`{"query":"q"}`))
++	if res.Code != http.StatusOK {
++		t.Fatalf("want 200 after rotate, got %d body=%s", res.Code, res.Body.String())
++	}
++	if rec.callCount() != 2 {
++		t.Fatalf("want 2 upstream calls (rotate), got %d", rec.callCount())
++	}
++	var out struct {
++		Code    int `json:"code"`
++		Results []struct {
++			URL string `json:"url"`
++		} `json:"results"`
++	}
++	if err := json.Unmarshal(res.Body.Bytes(), &out); err != nil {
++		t.Fatal(err)
++	}
++	if out.Code != 0 || len(out.Results) != 1 {
++		t.Fatalf("want code=0 with 1 result, got %+v", out)
++	}
++}
++
++func TestToolSearchQuotaAllExhausted429(t *testing.T) {
++	rec := &searchRecorder{}
++	up := newSearchUpstream(t, rec, `{"code":15001,"msg":"quota_web_search"}`)
++	h := newSearchHandler(up,
++		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999})
++	res := httptest.NewRecorder()
++	h.ServeHTTP(res, searchReq(`{"query":"q"}`))
++	if res.Code != http.StatusTooManyRequests {
++		t.Fatalf("want 429, got %d body=%s", res.Code, res.Body.String())
++	}
++	var out map[string]any
++	if err := json.Unmarshal(res.Body.Bytes(), &out); err != nil {
++		t.Fatal(err)
++	}
++	if out["code"] != "quota_web_search" {
++		t.Fatalf("want quota_web_search, got %v", out["code"])
++	}
++	// MaxRotate=3：两个号都冷却后第三轮 pick nil 提前终止 → 上游最多 2 次调用。
++	if rec.callCount() != 2 {
++		t.Fatalf("want 2 upstream calls, got %d", rec.callCount())
++	}
++}
++
++func TestToolSearchQuotaCooldownApplied(t *testing.T) {
++	rec := &searchRecorder{}
++	up := newSearchUpstream(t, rec, `{"code":15001,"msg":"quota_web_search"}`)
++	h := newSearchHandler(up, &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	res := httptest.NewRecorder()
++	h.ServeHTTP(res, searchReq(`{"query":"q"}`))
++	if res.Code != http.StatusTooManyRequests {
++		t.Fatalf("want 429, got %d", res.Code)
++	}
++	// 单号 15001 → 固定软冷却：该号从可用集合消失。
++	// （pick 在全池冷却时会走 fallback_earliest_expiry 兜底——既有池语义，
++	// 测试断言用「可用账号数」而不是 pick 是否 nil。）
++	if n := len(h.cfg.Pool.AvailableUIDsForRealm("")); n != 0 {
++		t.Fatalf("u1 should be cooled down after 15001, but %d account(s) available", n)
++	}
++}
++
++func TestToolSearchGlobalAccountSearched(t *testing.T) {
++	rec := &searchRecorder{}
++	up := newSearchUpstream(t, rec, searchOK)
++	// global realm 已支持：agenttool 域按账号 realm 分域（global → workbuddy.ai，
++	// 两域端点均已探针验证存在）。global 号应正常搜索。
++	h := newSearchHandler(up, &auth.Auth{UID: "g1", AccessToken: "at1", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"})
++	res := httptest.NewRecorder()
++	h.ServeHTTP(res, searchReq(`{"query":"q"}`))
++	if res.Code != http.StatusOK {
++		t.Fatalf("want 200 for global account, got %d body=%s", res.Code, res.Body.String())
++	}
++	if rec.callCount() != 1 {
++		t.Fatalf("want 1 upstream call, got %d", rec.callCount())
++	}
++}
++
++func TestToolSearchNoAccounts503(t *testing.T) {
++	h := newSearchHandler(newSearchUpstream(t, &searchRecorder{}, searchOK))
++	res := httptest.NewRecorder()
++	h.ServeHTTP(res, searchReq(`{"query":"q"}`))
++	if res.Code != http.StatusServiceUnavailable {
++		t.Fatalf("want 503, got %d", res.Code)
++	}
++}
+diff --git a/internal/upstream/agenttool_search.go b/internal/upstream/agenttool_search.go
+new file mode 100644
+index 0000000..49eb10b
+--- /dev/null
++++ b/internal/upstream/agenttool_search.go
+@@ -0,0 +1,187 @@
++package upstream
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/session"
++)
++
++// ---------------------------------------------------------------------------
++// agenttool 搜索（web search）：CLI 内置 WebSearchTool.performWebSearch 的同款上游接口
++// ---------------------------------------------------------------------------
++
++// agenttoolSearchTimeout 单次搜索的硬超时。对齐官方 CLI WebSearchTool 的
++// AbortController 20s 约定（逆向 docs/04-upstream-protocols.md §2）。
++const agenttoolSearchTimeout = 20 * time.Second
++
++// AgentToolSearchPath CN agenttool 域的搜索端点路径。
++const AgentToolSearchPath = "/agenttool/v1/search"
++
++// AgentToolSearchRequest agenttool/v1/search 请求体（官方 CLI buildRequestBody 逐字段）。
++// BlockedDomains 不在此层处理：官方语义是把 blocked 域拼进 query 文本（" -site:x"），
++// 由调用方（handler）完成拼接后传 Query。
++type AgentToolSearchRequest struct {
++	Query          string   `json:"query"`
++	Type           string   `json:"type"` // 固定 "text2text"
++	MaxResults     int      `json:"max_results"`
++	AllowedDomains []string `json:"allowed_domains,omitempty"`
++	Freshness      string   `json:"freshness,omitempty"` // "d1" | "m1" | "y1"
++}
++
++// AgentToolSearchResult 单条搜索结果（官方响应 results[] 形态）。
++type AgentToolSearchResult struct {
++	Title   string `json:"title"`
++	URL     string `json:"url"`
++	Snippet string `json:"snippet"`
++}
++
++// AgentToolSearchResponse agenttool/v1/search 响应信封（原样透传给客户端，
++// 网关不做 filterUnsafeResults —— 客户端过滤与否由调用方决定）。
++type AgentToolSearchResponse struct {
++	Code           int                     `json:"code"`
++	Msg            string                  `json:"msg"`
++	Results        []AgentToolSearchResult `json:"results"`
++	TotalResults   int                     `json:"total_results"`
++	ResponseTimeMs int64                   `json:"response_time_ms"`
++	Provider       string                  `json:"provider"`
++}
++
++// IsQuotaExhausted 报告搜索响应是否为 web-search 日配额耗尽（业务码 15001，
++// classifyErrorDetail: quota_web_search）。该配额是**账号级**的：
++// 处置 = 该号软冷却 + 立即换号（与 6004 模型级冷却同构，但无模型豁免语义——
++// 搜索没有模型维度）。
++func (r *AgentToolSearchResponse) IsQuotaExhausted() bool {
++	return r.Code == 15001
++}
++
++// agentToolSearchBase agenttool 域按账号 realm 分域（与 chatBase/billingBase
++// 同一分域约定）：CN = www.workbuddy.cn，global = www.workbuddy.ai——两个
++// product.json 的 endpoint 字段即各自域（CN app: workbuddy.cn；intl app:
++// workbuddy.ai），且 /agenttool/v1/search 在两域均已验证存在（未带凭证探针
++// 双双回 401，路由存在 + 要求鉴权）。AgentToolBaseOverride 非空时优先
++// （测试注入 / 部署侧端点覆盖，覆盖时 realm 分域失效——整池同域）。
++func (c *Client) agentToolSearchBase(a *auth.Auth) string {
++	if c.AgentToolBaseOverride != "" {
++		return c.AgentToolBaseOverride
++	}
++	if a != nil && a.IsGlobal() {
++		return AgentToolBaseGlobal
++	}
++	return AgentToolBaseCN
++}
++
++// AgentToolSearch 用账号 a 执行一次 web search。失败返回 *upstream.Error
++// （Kind 已分类），成功返回解析后的响应信封（Code/Msg 原样保留——业务码
++// 15001 等由调用方按 IsQuotaExhausted 处置）。
++//
++// 头体系与官方 CLI WebSearchTool.performWebSearch 对齐（04 文档 §2 头表）：
++//   - CommonHeaders：UA 三段式 / Origin/Referer / X-Requested-With /
++//     X-CodeBuddy-Request / Accept-Language / X-Machine-ID / X-Session-ID
++//   - injectAttribution：X-Agent-Purpose / X-Product / X-IDE-*（用量归因）
++//   - Authorization: Bearer accessToken（搜索是账号业务面，非匿名接口）
++//   - X-User-Id / 企业与域头：与 ChatHeaders 同款（账号维度必发）
++//   - X-Device-Token：与 billing 同策略（resolveDeviceToken 三级兜底）
++//   - 会话头族：搜索是无会话单轮，X-Conversation-ID 用请求级随机
++//     （session.NewMessageID），不引入任何粘性键
++func (c *Client) AgentToolSearch(ctx context.Context, a *auth.Auth, req AgentToolSearchRequest) (*AgentToolSearchResponse, error) {
++	if req.Type == "" {
++		req.Type = "text2text"
++	}
++	if req.MaxResults <= 0 {
++		req.MaxResults = 5
++	}
++	body, err := json.Marshal(req)
++	if err != nil {
++		return nil, &Error{Kind: ErrBadParams, Status: http.StatusBadRequest, Msg: "marshal search body: " + err.Error()}
++	}
++
++	ctx, cancel := context.WithTimeout(ctx, agenttoolSearchTimeout)
++	defer cancel()
++	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.agentToolSearchBase(a)+AgentToolSearchPath, bytes.NewReader(body))
++	if err != nil {
++		return nil, &Error{Kind: ErrBadParams, Status: http.StatusBadRequest, Msg: "build search request: " + err.Error()}
++	}
++
++	// 官方指纹头组（与 chat/billing 同管线，见 headers.go 注释）。
++	c.CommonHeaders(httpReq, a)
++	c.injectAttribution(httpReq)
++	if at := a.AccessTokenValue(); at != "" {
++		httpReq.Header.Set("Authorization", "Bearer "+at)
++	} else {
++		httpReq.Header.Set("X-No-Authorization", "1")
++	}
++	if a.UID != "" {
++		httpReq.Header.Set("X-User-Id", a.UID)
++	}
++	if a != nil && !a.IsGlobal() {
++		if a.EnterpriseID != "" {
++			httpReq.Header.Set("X-Enterprise-Id", a.EnterpriseID)
++		} else {
++			httpReq.Header.Set("X-No-Enterprise-Id", "1")
++		}
++		if d := a.DomainValue(); d != "" {
++			httpReq.Header.Set("X-Domain", d)
++		} else {
++			httpReq.Header.Set("X-No-Department-Info", "1")
++		}
++	}
++	c.injectDeviceToken(httpReq, a)
++	// 会话头族：请求级随机（无会话粘性——搜索无上下文，粘住单号会把该号的
++	// 15001 日配额打穿）。复用 injectConversationHeaders 的完整 B3 链路。
++	c.injectConversationHeaders(httpReq, ChatMeta{
++		ConversationID:        session.NewMessageID(),
++		ConversationRequestID: session.NewMessageID(),
++	})
++
++	client, cerr := c.clientFor(a, false) // 非 chat：走账号代理出口 + 120s client 兜底超时
++	if cerr != nil {
++		return nil, wrapTransport(a, cerr)
++	}
++	resp, err := client.Do(httpReq)
++	if err != nil {
++		return nil, wrapTransport(a, err)
++	}
++	defer resp.Body.Close()
++	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
++	if err != nil {
++		return nil, wrapTransport(a, fmt.Errorf("read search body: %w", err))
++	}
++
++	// 非成功状态：走统一分类（与 doJSON 同口径），调用方按 Kind 处置。
++	if resp.StatusCode >= 400 {
++		kind := Classify(resp.StatusCode, string(raw))
++		if kind == ErrNone {
++			kind = ErrClient
++		}
++		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
++	}
++
++	var out AgentToolSearchResponse
++	if err := json.Unmarshal(raw, &out); err != nil {
++		return nil, &Error{Kind: ErrServer, Status: resp.StatusCode, Msg: "search response parse failed: " + truncate(string(raw), 160)}
++	}
++	return &out, nil
++}
++
++// wrapTransport 把传输层错误包成 *Error（Kind=ErrServer 语义），日志带账号标签。
++func wrapTransport(a *auth.Auth, err error) *Error {
++	label := ""
++	if a != nil {
++		label = a.UID
++	}
++	_ = label // upstream client 已在更深处打日志；此处只包错误
++	return &Error{Kind: ErrServer, Status: 0, Msg: truncate(err.Error(), 200)}
++}
++
++// agenttool 域常量（CLI product.json endpoint，两版 app 各自的域）。
++const (
++	AgentToolBaseCN     = "https://www.workbuddy.cn"
++	AgentToolBaseGlobal = "https://www.workbuddy.ai"
++)
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index bfc5a07..affc4d7 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -840,6 +840,11 @@ type Client struct {
+ 	ChatBaseCN    string
+ 	BillingBaseCN string
+ 
++	// AgentToolBaseOverride agenttool 域覆盖（0057 web search）。
++	// 空 = 内置默认 https://www.workbuddy.cn（CLI product.json endpoint）。
++	// 仅供测试注入；生产需要换域时再走 config 落地，保持配置面最小。
++	AgentToolBaseOverride string
++
+ 	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
+ 	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
+ 	ChatBaseGlobal    string

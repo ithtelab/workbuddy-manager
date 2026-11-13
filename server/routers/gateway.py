@@ -1538,3 +1538,95 @@ async def gateway_health() -> dict:
     except Exception:  # noqa: BLE001
         # 不回异常详情：那会暴露上游地址与网络拓扑
         return {'service': 'workbuddy-manager', 'upstream_ok': False}
+
+
+# ── agenttool web search 透传（/v1/tools/search）────────────────
+# 把下游的 web_search 请求原样转发到上游网关的 agenttool 搜索端点
+# （workbuddy2api 0057-web-search-tool.patch：账号池轮转 + 15001 配额冷却）。
+#
+# 为什么加这条路由：DSH 的 web-search-workbuddy 插件用**同一把密钥**既调模型
+# （/v1/chat/completions）又调搜索——密钥体系一把钥匙走全部数据面，搜索不该
+# 另立凭证。manager 在这里只做：鉴权（_authorize）→ 按密钥解析上游
+# （_upstream_for，多分组隔离语义与 chat 一致）→ 换上游 api_key 转发 → 记账。
+#
+# 协议是「透传」不是「翻译」：上游的信封（code/results/total_results/…）原样
+# 回给客户端，非 15001 的业务码也原样透传——过滤语义由调用方决定（与 chat 的
+# error-passthrough 同哲学）。
+SEARCH_UPSTREAM_PATH = '/v1/tools/search'
+
+
+@router.post('/v1/tools/search')
+async def tools_search(request: Request):
+    ip = iputil.client_ip(request)
+    ua = request.headers.get('user-agent')
+    path = request.url.path
+    # 入站鉴权与 chat 同管线（wbk_ 密钥 / IP 规则 / 频控）。搜索没有模型维度，
+    # 因此走 is_model_list=True 口径（与 /v1/models 同理）：版本归属与模型白名单
+    # 在这种「不带 model 的数据面调用」上不拦——拦了会让限定版本的密钥连搜索都
+    # 用不了；真正的隔离由上游网关的账号池把关（realm 由上游按账号侧决定）。
+    key, ip, err = _authorize(request, None, is_model_list=True)
+    if err:
+        return err
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, '请求体不是合法 JSON', False,
+                account_expected=False)
+        return _oai_error('请求体必须是 JSON 对象', 400, 'invalid_request_error', 'invalid_body')
+
+    query = str((body or {}).get('query') or '').strip()
+    if not query:
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, 'query 为空', False,
+                account_expected=False)
+        return _oai_error('query 不能为空', 400, 'invalid_request_error', 'empty_query')
+
+    upstream, upstream_err = _upstream_for(key, ip=ip, model='', mapped='', ua=ua)
+    if upstream_err:
+        return upstream_err
+    url = f'{upstream["base_url"]}{SEARCH_UPSTREAM_PATH}'
+    up_headers = _upstream_headers(upstream)
+    # 出站转储关联键：与 chat 同协议（上游开启转储后按它落两行，双视角对回）。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
+
+    started = time.time()
+    try:
+        async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
+            resp = await client.post(url, json=body, headers=up_headers)
+        latency = int((time.time() - started) * 1000)
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001
+            data = None
+        # 记账：搜索没有 token 计量（上游 agenttool 不回 usage），0/0 与
+        # /v1/models、/v1/usage 的口径一致；错误时透传上游原文前 500 字。
+        error = None if resp.status_code < 400 else (
+            str(data)[:500] if data is not None else resp.text[:500])
+        # 客户端语义化：全池 15001 时上游网关回 429 + quota_web_search，
+        # 原样透传（客户端按 code 路由提示语）。
+        _record(key, ip, '', '', resp.status_code, 0, 0, latency, ua, error, False)
+        tap_svc.capture(
+            body=body, headers=request.headers.items(), key=key, ua=ua,
+            path=SEARCH_UPSTREAM_PATH, protocol='chat', status=resp.status_code,
+            latency_ms=latency, stream=False, payload=data,
+            error=error, upstream_body=body, upstream_headers=up_headers,
+            trace_id=trace_id,
+        )
+        if data is not None:
+            return JSONResponse(data, status_code=resp.status_code)
+        return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}},
+                            status_code=resp.status_code)
+    except Exception as exc:  # noqa: BLE001
+        latency = int((time.time() - started) * 1000)
+        _record(key, ip, '', '', 502, 0, 0, latency, ua, str(exc), False,
+                account_expected=False)
+        tap_svc.capture(
+            body=body, headers=request.headers.items(), key=key, ua=ua,
+            path=SEARCH_UPSTREAM_PATH, protocol='chat', status=502,
+            latency_ms=latency, stream=False, error=str(exc),
+            upstream_body=body, upstream_headers=up_headers, trace_id=trace_id,
+        )
+        return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502,
+                          'api_error', 'upstream_unavailable')
