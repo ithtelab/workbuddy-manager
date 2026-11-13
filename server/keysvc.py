@@ -163,6 +163,28 @@ def _json_list(raw: object) -> list[str]:
     return [str(x) for x in parsed if x]
 
 
+def _row_get(row, name: str):
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
+def _daily_used(row) -> int:
+    """今天（本地日期，与 usage_daily 同口径）已用的 token；记账日不是今天即为 0。"""
+    if (_row_get(row, 'daily_used_day') or '') != db.day_of():
+        return 0
+    return int(_row_get(row, 'daily_used_tokens') or 0)
+
+
+def _norm_daily_quota(value: object) -> int:
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, n)
+
+
 def _parse(row) -> dict:
     return {
         'id': row['id'],
@@ -181,6 +203,9 @@ def _parse(row) -> dict:
         'used_tokens': row['used_tokens'],
         'quota_credit': row['quota_credit'],
         'used_credit': row['used_credit'],
+        # 每日 token 限额：0 = 不限。已用量只算今天（本地日期），记账日不是今天即为 0。
+        'daily_quota': int(_row_get(row, 'daily_quota') or 0),
+        'daily_used_tokens': _daily_used(row),
         'created_at': row['created_at'],
         'last_used_at': row['last_used_at'],
     }
@@ -217,6 +242,7 @@ def create_key(
     realm: str = '',
     quota_credit: float = 0,
     upstream_id: int | None = None,
+    daily_quota: int = 0,
     *,
     _conn: sqlite3.Connection | None = None,
 ) -> dict:
@@ -237,8 +263,8 @@ def create_key(
     token = TOKEN_PREFIX + secrets.token_urlsafe(32)
     sql = ('INSERT INTO api_keys(name, key_hash, key_plain, prefix, enabled, expires_at, '
            'max_ips, ip_allowlist, models, realm, quota, used_tokens, quota_credit, '
-           'used_credit, created_at, upstream_id) '
-           'VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)')
+           'used_credit, created_at, upstream_id, daily_quota) '
+           'VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)')
     args = (
         name,
         _hash(token),
@@ -253,6 +279,7 @@ def create_key(
         _norm_credit_quota(quota_credit),
         int(time.time()),
         _norm_upstream_id(upstream_id),
+        _norm_daily_quota(daily_quota),
     )
     if _conn is not None:
         key_id = int(_conn.execute(sql, args).lastrowid or 0)
@@ -315,6 +342,8 @@ def update_key(key_id: int, patch: dict) -> dict | None:
         fields['quota'] = int(patch['quota'] or 0)
     if 'quota_credit' in patch:
         fields['quota_credit'] = _norm_credit_quota(patch['quota_credit'])
+    if 'daily_quota' in patch:
+        fields['daily_quota'] = _norm_daily_quota(patch['daily_quota'])
     if 'upstream_id' in patch:
         # 显式传 null / 0 是**允许**的：管理员可以把密钥改回「默认上游」。
         # 与 realm 同口径，不能用真值判断（否则改不回默认上游）。
@@ -346,7 +375,8 @@ def reset_usage(key_id: int) -> bool:
     """
     if not db.query_one('SELECT id FROM api_keys WHERE id = ?', (key_id,)):
         return False
-    db.execute('UPDATE api_keys SET used_tokens = 0, used_credit = 0 WHERE id = ?', (key_id,))
+    db.execute('UPDATE api_keys SET used_tokens = 0, used_credit = 0, '
+               'daily_used_tokens = 0 WHERE id = ?', (key_id,))
     return True
 
 
@@ -529,6 +559,13 @@ def validate(key: dict, ip: str, model: str | None,
         # 配额用尽与认证无关，用 429 才对（403 会被客户端读成「密钥无效」：
         # 用户于是去查密钥、而不是去调额度，方向就被带偏了）。
         return Rejection('密钥配额已用尽', 429, 'insufficient_quota', 'quota_exhausted')
+    # 每日 token 限额：与总额度各自独立；按本地日期计，次日 0 点自动恢复。
+    daily_quota = int(key.get('daily_quota') or 0)
+    daily_used = int(key.get('daily_used_tokens') or 0)
+    if daily_quota and daily_used >= daily_quota:
+        return Rejection(
+            f'密钥今日 token 额度已用尽（已用 {daily_used} / 上限 {daily_quota}），次日 0 点恢复',
+            429, 'insufficient_quota', 'daily_quota_exhausted')
     # 积分额度（issue #27）：与 token 额度**各自独立**，任一超限即拦。
     # 文案里带上具体数字：这个额度是按真实扣费算的，用户需要知道「超了多少、
     # 该充多少」，只说「已用尽」会让他去翻日志。
@@ -613,6 +650,16 @@ def touch(key: dict, ip: str, tokens: int = 0, credit: float | None = None) -> N
     db.execute('UPDATE api_keys SET last_used_at = ? WHERE id = ?', (int(time.time()), key['id']))
     if tokens:
         db.execute('UPDATE api_keys SET used_tokens = used_tokens + ? WHERE id = ?', (tokens, key['id']))
+        # 每日已用：记账日是今天就累加，否则从本次开始重新计（跨天自动归零）。
+        # 单条 UPDATE 完成判断与累加，并发请求不会互相覆盖。
+        today = db.day_of()
+        db.execute(
+            'UPDATE api_keys SET '
+            '  daily_used_tokens = CASE WHEN daily_used_day = ? '
+            '    THEN daily_used_tokens + ? ELSE ? END, '
+            '  daily_used_day = ? '
+            'WHERE id = ?',
+            (today, tokens, tokens, today, key['id']))
     if credit:
         db.execute('UPDATE api_keys SET used_credit = used_credit + ? WHERE id = ?',
                    (float(credit), key['id']))
