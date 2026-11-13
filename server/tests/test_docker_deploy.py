@@ -498,6 +498,8 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         from server import db
         msg = db._explain_db_open_failure(sqlite3.OperationalError('x'))
         self.assertIn('卷', msg, '应提示命名卷作为替代')
+        self.assertIn('WB_DATA_VOLUME', msg,
+                      '要给出能直接照做的一行配置，而不只是描述思路')
 
     def test_connect_wraps_into_runtime_error(self) -> None:
         """connect() 要把 sqlite 的原始错误换成上面那条说明。
@@ -525,14 +527,32 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         self.assertIsNone(db._conn, 'failed connect 后应把 _conn 复位')
 
     def test_compose_documents_data_ownership(self) -> None:
-        """compose 里 `./data` 那条必须带权限提示（上游 compose 就有）。"""
+        """compose 里 data 挂载必须带权限提示（上游 compose 就有，issue #30）。"""
         compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
-        idx = compose.find('- ./data:/app/data')
-        self.assertGreater(idx, 0, '没找到 data 挂载')
-        # 该行上方 200 字符内应有 chown 提示
-        above = compose[max(0, idx - 400):idx]
-        self.assertIn('chown', above, './data 挂载缺少属主提示（issue #30 的成因）')
+        idx = compose.find('- ${WB_DATA_VOLUME:-./data}:/app/data')
+        self.assertGreater(idx, 0, '没找到 data 挂载（默认值必须仍是 ./data）')
+        # 挂载行上方要有「为什么不可写 + 怎么修」，光报错不解决用户的实际问题
+        above = compose[max(0, idx - 1400):idx]
+        self.assertIn('chown', above, 'data 挂载缺少属主提示（issue #30 的成因）')
         self.assertIn('10001', above, '应写明 uid')
+        self.assertIn('WB_DATA_VOLUME=wb-manager-data', above,
+                      '改不了属主的环境要有能直接照做的命名卷开关')
+
+    def test_compose_named_volume_switch_is_declared(self) -> None:
+        """NAS / SMB 改不了属主时，一行 .env 就能切到命名卷（issue #30 复发）。
+
+        命名卷首次创建会继承镜像内 /app/data 的属主（10001），所以无需宿主 chown。
+        开关要同时满足两点：挂载行做变量插值、顶层声明同名卷 —— 只改挂载行
+        而不声明卷，compose 会把它当成相对路径的 bind mount 并报错。
+        """
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
+        self.assertTrue(
+            any('${WB_DATA_VOLUME:-./data}:/app/data' in v for v in vols),
+            'data 挂载未做成可切换的卷；默认值必须是 ./data，别破坏已有部署')
+        self.assertIn('wb-manager-data', (dc.get('volumes') or {}),
+                      '顶层没声明 wb-manager-data，切到命名卷会失败')
 
 
 class DockerAssetsTest(unittest.TestCase):
