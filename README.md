@@ -276,6 +276,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 - [账号出口线路](docs/account-proxy-routes.md) —— 每个账号走不同代理出口
 - [API 令牌](docs/api-tokens.md) —— 只读令牌与作用域
 - [调用抓包](docs/api-traffic-tap.md) —— 回放每一次调用的完整上下文
+- [Web 搜索透传](docs/web-search-passthrough.md) —— `/v1/tools/search` 的用法与上游补丁要求
 - [页面监控](docs/watchdog.md) —— 上游网页改版检测、LLM 判读与邮件 / QQ 通知
 - [QQ 机器人通知与开放接口](docs/qq-bot.md) —— AstrBot 对接、UMO 与机器人控制边界
 
