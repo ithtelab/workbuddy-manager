@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as _StarletteHTTPException
+from starlette.middleware.gzip import GZipMiddleware
 
 import json
 import logging
@@ -285,6 +286,12 @@ class ApiBodyLimitMiddleware:
 
 
 app.add_middleware(ApiBodyLimitMiddleware)
+
+# 压缩响应体（主要是 web/out 下的 JS/CSS）。放在这里而不是文件末尾：
+# Starlette 的中间件是「后注册的在外层」，StripBasePathMiddleware 必须保持
+# 最外层才能先剥掉子路径前缀，所以本行插在它前面。
+if config.GZIP_ENABLED:
+    app.add_middleware(GZipMiddleware, minimum_size=config.GZIP_MIN_SIZE)
 
 # ── 路由注册顺序很重要：先 API / 网关，最后挂静态文件 ──
 app.include_router(auth.router)
