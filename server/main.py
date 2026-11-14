@@ -287,11 +287,36 @@ class ApiBodyLimitMiddleware:
 
 app.add_middleware(ApiBodyLimitMiddleware)
 
-# 压缩响应体（主要是 web/out 下的 JS/CSS）。放在这里而不是文件末尾：
-# Starlette 的中间件是「后注册的在外层」，StripBasePathMiddleware 必须保持
-# 最外层才能先剥掉子路径前缀，所以本行插在它前面。
+# 压缩静态资源（web/out 下的 JS/CSS，首屏 2 MB 的大头）。
+#
+# 为什么**只压静态资源**而不是全局：
+#   · 本应用外层还有 `@app.middleware('http')`（cache_headers / 限流），那层会把
+#     下游响应包成**流式**转发，Starlette 的 GZipMiddleware 遇到流式响应会无条件
+#     压缩，`minimum_size` 直接失效 —— 实测 140 字节的 /api/status 也被压了，
+#     白白付 CPU 与几字节头开销。
+#   · 全局压缩还会碰到 `/v1` 的流式对话；虽然 Starlette 会跳过 text/event-stream，
+#     但静态路径白名单更明确，不依赖它对 content-type 的判定。
+_STATIC_COMPRESS_SUFFIXES = ('.js', '.css', '.svg', '.json', '.map', '.txt', '.woff2')
+
+
+class StaticGzipMiddleware:
+    """只对静态产物做 gzip；其余请求原样穿过（含 /v1 流式与管理面 JSON）。"""
+
+    def __init__(self, app, *, minimum_size: int = 1024) -> None:
+        self.app = app
+        self.gz = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') == 'http' and scope.get('method') in ('GET', 'HEAD'):
+            path = scope.get('path') or ''
+            if path.startswith('/_next/') or path.endswith(_STATIC_COMPRESS_SUFFIXES):
+                await self.gz(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 if config.GZIP_ENABLED:
-    app.add_middleware(GZipMiddleware, minimum_size=config.GZIP_MIN_SIZE)
+    app.add_middleware(StaticGzipMiddleware, minimum_size=config.GZIP_MIN_SIZE)
 
 # ── 路由注册顺序很重要：先 API / 网关，最后挂静态文件 ──
 app.include_router(auth.router)

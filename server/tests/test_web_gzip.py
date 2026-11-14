@@ -80,14 +80,67 @@ class MainAppMiddlewareTest(unittest.TestCase):
 
         names = [m.cls.__name__ for m in main.app.user_middleware]
         if config.GZIP_ENABLED:
-            self.assertIn('GZipMiddleware', names)
+            self.assertIn('StaticGzipMiddleware', names)
         else:
-            self.assertNotIn('GZipMiddleware', names)
+            self.assertNotIn('StaticGzipMiddleware', names)
 
     def test_gzip_defaults_on(self) -> None:
         # 默认开启：多数部署靠公网直连，压缩是净收益；需要时可用环境变量关掉
         self.assertIsInstance(config.GZIP_ENABLED, bool)
         self.assertGreaterEqual(config.GZIP_MIN_SIZE, 512)
+
+
+class StaticOnlyGzipTest(unittest.TestCase):
+    """真实应用里只压静态资源。
+
+    回归背景：全局 GZipMiddleware 被外层 `@app.middleware('http')` 包成流式转发后
+    `minimum_size` 失效，140 字节的 /api/status 也被压。修法是按路径白名单只压
+    静态产物；这里钉住「管理面 JSON 不压、静态产物压」两条。
+    """
+
+    def setUp(self) -> None:
+        from server import main
+        self.c = TestClient(main.app)
+
+    def test_api_json_not_compressed(self) -> None:
+        r = self.c.get('/api/status', headers={'Accept-Encoding': 'gzip'})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn('content-encoding', r.headers,
+                         '管理面 JSON 不该被压缩（minimum_size 在流式转发下会失效）')
+
+    def test_static_chunk_compressed(self) -> None:
+        from server import config
+        static = config.STATIC_DIR
+        probe = static / '_next' / 'static' / 'chunks'
+        files = sorted(probe.glob('*.js')) if probe.is_dir() else []
+        if not files:
+            self.skipTest('没有构建产物（web/out），跳过静态压缩断言')
+        rel = files[0].relative_to(static).as_posix()
+        r = self.c.get('/' + rel, headers={'Accept-Encoding': 'gzip'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers.get('content-encoding'), 'gzip')
+        self.assertIn('accept-encoding', r.headers.get('vary', '').lower())
+
+    def test_event_stream_not_compressed(self) -> None:
+        """SSE 走的是非静态路径，StaticGzipMiddleware 直接放行。"""
+        from fastapi import FastAPI
+        from fastapi.responses import StreamingResponse
+        from server.main import StaticGzipMiddleware
+
+        app = FastAPI()
+
+        @app.get('/v1/chat/completions')
+        async def sse():
+            async def gen():
+                yield 'data: ' + chr(123) + chr(125) + chr(10) * 2
+                yield 'data: [DONE]' + chr(10) * 2
+            return StreamingResponse(gen(), media_type='text/event-stream')
+
+        app.add_middleware(StaticGzipMiddleware, minimum_size=1024)
+        r = TestClient(app).get('/v1/chat/completions',
+                                headers={'Accept-Encoding': 'gzip'})
+        self.assertNotIn('content-encoding', r.headers)
+        self.assertIn(b'[DONE]', r.content)
 
 
 if __name__ == '__main__':
