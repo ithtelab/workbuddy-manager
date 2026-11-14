@@ -546,6 +546,10 @@ class EventLoopResponsivenessTest(unittest.TestCase):
                     await asyncio.sleep(0.05)
 
             hb = asyncio.create_task(beat())
+            # 先让心跳跑一次再开始计时：`delay=0` 的占位调用可能在调度器还没轮到
+            # 心跳任务时就返回，那一轮 ticks 会是 0（CI 上实测偶发）。这不是被测
+            # 行为，只是起跑顺序，所以显式让出一次。
+            await asyncio.sleep(0.01)
             with mock.patch('subprocess.run', side_effect=self._slow_docker(delay)):
                 await coro_factory()
             stop.set()
