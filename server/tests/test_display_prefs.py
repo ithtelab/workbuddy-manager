@@ -78,3 +78,27 @@ class DisplayPrefsTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CreditBadgeDayMergeTest(unittest.TestCase):
+    """账号行到期角标按本地自然日合并（issue #434）。
+
+    源码级守卫：同一天到期的多笔要合并成「当天合计」，否则只显示最早一笔会把
+    「当天要没多少」低估（实测 90 + 100 + 100 只显示 90）。悬停明细必须保持逐包，
+    那是对账用的。
+    """
+
+    def setUp(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.src = (root / 'web' / 'components' / 'common' / 'accounts'
+                    / 'CreditCountdown.tsx').read_text(encoding='utf-8')
+
+    def test_badge_uses_day_grouping(self) -> None:
+        self.assertIn('groupExpiriesByDay(expiries)[0]', self.src,
+                      '角标必须先按自然日合并再取第一天')
+        self.assertNotIn('expiries?.[0]', self.src,
+                         '不能直接用第一笔（同日多笔会被低估）')
+
+    def test_tooltip_keeps_per_package_lines(self) -> None:
+        self.assertIn('all.map((e) =>', self.src,
+                      '悬停明细必须逐包列出，不能被日合并')

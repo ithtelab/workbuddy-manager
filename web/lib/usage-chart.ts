@@ -51,6 +51,8 @@ export interface ChartPoint {
   /** 完整标识，给 tooltip 用（小时 `2026-09-29 09:00`） */
   full: string;
   tokens: number;
+  /** 当日 / 当小时的实际扣费积分（issue #427）；与 token 差几个量级，图里走副轴 */
+  credit: number;
   requests: number;
   failed: number;
   success: number;
@@ -75,6 +77,7 @@ export function hourlySeries(points: readonly UsageHourPoint[], nowHour?: number
       label: `${pad(h)}:00`,
       full: `${p?.day ?? ''} ${pad(h)}:00`,
       tokens: (p?.prompt_tokens ?? 0) + (p?.completion_tokens ?? 0),
+      credit: p?.credit ?? 0,
       requests: p?.requests ?? 0,
       failed: p?.failed ?? 0,
       success: p?.success ?? 0,
@@ -106,6 +109,7 @@ export function dailySeries(
       label: key.slice(5),
       full: key,
       tokens: (p?.prompt_tokens ?? 0) + (p?.completion_tokens ?? 0),
+      credit: p?.credit ?? 0,
       requests: p?.requests ?? 0,
       failed: p?.failed ?? 0,
       success: p?.success ?? 0,

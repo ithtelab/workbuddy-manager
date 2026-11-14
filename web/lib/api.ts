@@ -368,7 +368,7 @@ export const accountApi = {
        upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 并发刷新所有账号的实时积分 */
   /** 查询全部账号积分；force=false 时 60 秒内命中服务端缓存 */
-  refreshCredits: (force = true, upstreamId?: number | null) =>
+  refreshCredits: (force = true, upstreamId?: number | null, file?: string) =>
     post<{
       total: number;
       succeeded: number;
@@ -376,7 +376,9 @@ export const accountApi = {
       meta: Record<string, CreditsMeta>;
       failed: string[];
     }>('/api/accounts/refresh-credits?force=' + (force ? 'true' : 'false')
-       + (upstreamId == null ? '' : `&upstream_id=${encodeURIComponent(String(upstreamId))}`)),
+       + (upstreamId == null ? '' : `&upstream_id=${encodeURIComponent(String(upstreamId))}`)
+       // 单账号刷新（issue #432）：给了文件名就只刷这一个号
+       + (file ? `&file=${encodeURIComponent(file)}` : '')),
   checkinAll: (upstreamId?: number | null) =>
     post<{
       /**

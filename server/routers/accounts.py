@@ -1485,6 +1485,7 @@ def credits_snapshot(include_inactive: bool = Query(False),
 async def refresh_all_credits(
     force: bool = True,
     upstream_id: int | None = Query(None),
+    file: str | None = Query(None, description='只刷新这一个账号文件（issue #432）'),
     user: dict = Depends(security.current_user),
 ) -> dict:
     """并发查询所有账号的积分，返回 {uid: credits} 与每条是否来自缓存。
@@ -1511,6 +1512,19 @@ async def refresh_all_credits(
 
     base_dir = _require_dir(_group(upstream_id))
     accounts = wb2api.list_auth_accounts(base_dir)
+    # 直呼路由函数（测试 / 内部复用）时拿到的是 FastAPI 的 Query 哨兵，不是 str；
+    # 非字符串一律当「没传」，否则会把哨兵当成文件名去匹配（必然 404）。
+    if isinstance(file, str) and file.strip():
+        # 单账号刷新（issue #432）：账号多时只想更新某一个号的积分，
+        # 不必为它把整池都打一遍上游。文件名不在本组时按 404 处理，
+        # 不静默退化成「刷了全部」——那会让用户以为只刷新了一个。
+        wanted = str(file).strip()
+        picked = [a for a in accounts
+                  if str(a.get('file') or '') == wanted
+                  or _export_account_name(Path(str(a.get('file') or ''))) == wanted]
+        if not picked:
+            raise HTTPException(status_code=404, detail='账号不存在（可能已被删除或不在该分组）')
+        accounts = picked
     # 扇出上限（issue #161）：本接口对**全部账号**并发，而它们共用同一个 httpx
     # 连接池（借用语义见 config.http_client）。不设上限时账号一多就把池占满，
     # 排队超过 pool 超时（WB_TENCENT_TIMEOUT）即抛 PoolTimeout —— 报告人看到的

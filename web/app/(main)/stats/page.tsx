@@ -508,6 +508,9 @@ export default function StatsPage() {
                 <YAxis yAxisId="cnt" orientation="right" tickLine={false} axisLine={false}
                        fontSize={11} stroke="var(--muted-foreground)" allowDecimals={false}
                        width={40} />
+                {/* 积分（issue #427）：与 token 也不同量级，单独一根更靠外的右轴，
+                    不和次数挤在一根上。hidden 只保留轴线占位，避免三根轴互相覆盖。 */}
+                <YAxis yAxisId="cr" orientation="right" hide />
                 <Tooltip
                   cursor={{fill: 'var(--accent)'}}
                   contentStyle={{
@@ -524,6 +527,9 @@ export default function StatsPage() {
                     }
                     if (label === 'success') {
                       return [fmtNumber(Number(value)), t('stats.successRequests')];
+                    }
+                    if (label === 'credit') {
+                      return [fmtCredit(Number(value)), t('stats.creditSeries')];
                     }
                     return [fmtNumber(Number(value)), t('metric.requests')];
                   }}
@@ -570,6 +576,19 @@ export default function StatsPage() {
                   name="success"
                   stroke="var(--chart-2)"
                   strokeWidth={1.5}
+                  dot={false}
+                />
+                {/* 积分消耗（issue #427）：与签到收入图不同，这条是**实际扣费**按
+                    时段聚合，走独立的右轴。虚线是为了与成功/失败两条次数线区分开——
+                    三者都可能贴 0，样式不给区分就分不清谁是谁。 */}
+                <Line
+                  yAxisId="cr"
+                  type="monotone"
+                  dataKey="credit"
+                  name="credit"
+                  stroke="var(--chart-4)"
+                  strokeWidth={1.5}
+                  strokeDasharray="5 3"
                   dot={false}
                 />
                 {/* 失败数用一条线叠在同一张图上：它与 token 柱不同量级，做成柱子

@@ -4,6 +4,7 @@ import {useT} from '@/lib/i18n/provider';
 import {fmtDateTime, fmtNumber} from '@/lib/format';
 import {useNow} from '@/lib/use-now';
 import type {CreditExpiry} from '@/lib/types';
+import {groupExpiriesByDay} from '@/lib/display-prefs';
 
 /**
  * 积分到期倒计时。
@@ -27,7 +28,10 @@ import type {CreditExpiry} from '@/lib/types';
 export function CreditCountdown({expiries}: {expiries?: CreditExpiry[] | null}) {
   // 没有到期信息（套餐永不过期 / 尚未查到）时不渲染任何东西 —— 包括不订阅时钟。
   // 拆成两层就是为了这个：useNow 是 hook，不能在提前 return 之后才调用。
-  const next = expiries?.[0];
+  // 角标按**本地自然日**合并后再取第一天（issue #434）：同一天到期的多笔会一起
+  // 作废，只显示最早那一笔会把「当天要没多少」低估（实测 90 + 100 + 100 只显示 90）。
+  // 悬停明细仍逐包列出——那是对账用的，不能合并。
+  const next = expiries ? groupExpiriesByDay(expiries)[0] : undefined;
   if (!next) return null;
   return <Countdown next={next} all={expiries ?? []} />;
 }

@@ -64,6 +64,8 @@ console.log('hourlySeries：固定 24 个点');
      '第 9 小时数值正确（token 为 prompt+completion）', JSON.stringify(series[9]));
   ok(series[13].isNow === true && series[9].isNow === false, '当前小时被标记出来（UI 会高亮）');
   ok(series[10].tokens === 0 && series[10].requests === 0, '没有数据的时段是 0，不是缺格');
+  ok(series[9].credit === 1 && series[10].credit === 0,
+     '积分同样按时段归位并补 0（issue #427 趋势积分线）');
   ok(series[9].success === 2 && series[10].success === 0,
      '成功数与失败数各自独立补齐（issue #369 趋势成功线）');
   // 乱序输入也要归位
@@ -84,6 +86,7 @@ console.log('dailySeries：窗口内定长、缺的天补零');
      '窗口是「今天往前数 7 天」', `${series[0].label} … ${series[6].label}`);
   ok(series[6].tokens === 75 && series[6].failed === 3, '今天的数据对得上');
   ok(series[6].success === 4 && series[5].success === 0, '每日成功数同样按日归位并补 0');
+  ok(series[6].credit === 0 && series[5].credit === 0, '积分按日归位（该样本为 0）');
   ok(series[5].tokens === 0 && series[5].requests === 0,
      '没有请求的那天补 0（不补的话那天会从图上消失）');
   ok(series[4].tokens === 30, '中间那天有数据', JSON.stringify(series[4]));

@@ -345,6 +345,30 @@ export default function AccountsPage() {
     }
   }, [groupId]);
 
+  /** 只刷新单个账号的积分（issue #432）：账号多时不必把整池都打一遍上游 */
+  const refreshOneCredits = useCallback(async (file: string) => {
+    setCreditsBusy(true);
+    try {
+      const r = await accountApi.refreshCredits(true, groupId, file);
+      const num = Object.fromEntries(
+        Object.entries(r.credits).filter(([, v]) => typeof v === 'number') as [string, number][],
+      );
+      setLiveCredits((prev) => ({...prev, ...num}));
+      setCreditsMeta((prev) => ({...prev, ...(r.meta ?? {})}));
+      if (r.failed.length === 0) {
+        notify.ok(t('accounts.creditsRefreshed'), t('accounts.creditsRefreshedDetail',
+          {ok: r.succeeded, total: r.total}));
+      } else {
+        notify.warn(t('accounts.creditsPartial'), t('accounts.creditsPartialDetail',
+          {ok: r.succeeded, total: r.total}));
+      }
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setCreditsBusy(false);
+    }
+  }, [groupId, t]);
+
   /** 一键刷新所有账号的 accessToken（真的续期，末尾只重载一次上游） */
   const [refreshTokensBusy, setRefreshTokensBusy] = useState(false);
   const refreshAllTokens = useCallback(async () => {
@@ -1236,6 +1260,13 @@ export default function AccountsPage() {
               onClick={() => run(a.file, () => accountApi.refresh(a.file, groupId),
                                  t('accounts.refreshDone'))}>
               <KeyRound className="h-3.5 w-3.5" />
+            </Button>
+            {/* 单号刷新积分（issue #432）：账号多时只想更新这一个号的余额，
+                不必为它把整池都打一遍上游。 */}
+            <Button variant="ghost" size="icon" className="h-7 w-7 rounded-md"
+              title={t('accounts.refreshOneCredits')} disabled={busy}
+              onClick={() => void refreshOneCredits(a.file)}>
+              <Coins className="h-3.5 w-3.5" />
             </Button>
           </>
         )}
