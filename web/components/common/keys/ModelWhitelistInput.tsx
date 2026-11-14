@@ -1,6 +1,6 @@
 'use client';
 
-import {useMemo, useState} from 'react';
+import {useMemo, useRef, useState} from 'react';
 import {Check, ChevronsUpDown, Search, X} from 'lucide-react';
 import {accountApi, modelApi} from '@/lib/api';
 import type {CatalogModel} from '@/lib/types';
@@ -56,6 +56,9 @@ export function ModelWhitelistInput({
   const names = useMemo(() => splitNames(value), [value]);
   const [draft, setDraft] = useState('');
   const [open, setOpen] = useState(false);
+  /** 弹窗内使用时，浮层要挂进弹窗子树（issue #438） */
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const [portalContainer, setPortalContainer] = useState<HTMLElement | null>(null);
   const [query, setQuery] = useState('');
   const [catalog, setCatalog] = useState<{cn: CatalogModel[]; global: CatalogModel[]; realms: Set<Realm> | null} | null>(null);
   /** 只看上游标注为「限时免费」的模型（issue #208）；tags 缺失时按不在免费目录处理 */
@@ -191,11 +194,19 @@ export function ModelWhitelistInput({
           open={open}
           onOpenChange={(next) => {
             setOpen(next);
-            if (next) void ensureCatalog();
+            if (next) {
+              // Portal 落点要放进当前弹窗内容里（issue #438）：Radix Dialog 的
+              // RemoveScroll 只放行「被锁元素子树内」的滚轮，默认挂 body 的浮层
+              // 会被判为外部、滚轮被拦截（拖滚动条不受影响，所以很容易漏掉）。
+              setPortalContainer(
+                triggerRef.current?.closest('[data-slot="dialog-content"]') as HTMLElement | null);
+              void ensureCatalog();
+            }
           }}
         >
           <PopoverTrigger asChild>
             <Button
+              ref={triggerRef}
               type="button"
               variant="outline"
               size="sm"
@@ -206,7 +217,7 @@ export function ModelWhitelistInput({
               {t('keys.modelPick')}
             </Button>
           </PopoverTrigger>
-          <PopoverContent align="end" className="w-[320px] p-2">
+          <PopoverContent align="end" container={portalContainer} className="w-[320px] p-2">
             <div className="mb-2 flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-1">
               <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <input

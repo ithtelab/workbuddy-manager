@@ -21,10 +21,16 @@ function PopoverContent({
   className,
   align = 'center',
   sideOffset = 4,
+  container,
   ...props
-}: React.ComponentProps<typeof PopoverPrimitive.Content>) {
+}: React.ComponentProps<typeof PopoverPrimitive.Content> & {
+  /** 指定 Portal 落点。弹窗内使用时应传弹窗内容元素：Radix Dialog 的
+   *  RemoveScroll 只允许「被锁元素子树内」的滚轮滚动，而默认挂到 body 的
+   *  浮层会被判为外部、滚轮被拦截（issue #438）。 */
+  container?: HTMLElement | null;
+}) {
   return (
-    <PopoverPrimitive.Portal>
+    <PopoverPrimitive.Portal container={container ?? undefined}>
       <PopoverPrimitive.Content
         data-slot="popover-content"
         align={align}
