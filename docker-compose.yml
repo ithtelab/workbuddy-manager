@@ -106,7 +106,15 @@ services:
       #   # 文件末尾另加：
       #   volumes:
       #     wb-manager-data:
-      - ./data:/app/data
+      #
+      # **更省事的做法（NAS / 群晖 / 没开 SSH）**：不用改这份文件，也不用 chown。
+      # 命名卷首次创建时会继承镜像内 /app/data 的属主（10001），容器直接可写。
+      # 在 compose 同目录的 .env 里加一行，再执行 `docker compose up -d`：
+      #   WB_DATA_VOLUME=wb-manager-data
+      # 不设该变量时，下面这行等价于原来的 `- ./data:/app/data`，老部署行为不变。
+      # 切过去之后数据库不再落在宿主 ./data 里，取文件用：
+      #   docker compose cp workbuddy-manager:/app/data/manager.db ./manager.db
+      - ${WB_DATA_VOLUME:-./data}:/app/data
       # 上游**整个仓库目录**。一次挂载覆盖下面三件事（分开挂子路径会互相重叠，
       # 反而让权限语义变模糊）：
       #   · 读/写上游 config.json —— 管理端「设置」页保存的目标
@@ -157,3 +165,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+# 顶层卷声明：只在 .env 里设置 WB_DATA_VOLUME=wb-manager-data 时才会被引用。
+# 默认（未设变量）仍走 ./data，这个卷不会被写入数据，也不影响已有部署。
+volumes:
+  wb-manager-data:
