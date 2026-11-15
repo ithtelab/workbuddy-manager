@@ -7,7 +7,9 @@
   4. 上游 429（quota_web_search）→ 状态码与信封原样透传；
   5. 上游 200 但业务码非 0 → 原样透传（不做过滤语义）；
   6. 上游不可达 → 502 upstream_unavailable；
-  7. 每次可观测调用落一条请求日志（_record）。
+  7. 每次可观测调用落一条请求日志（_record）；
+  8. agenttool 全参数（type/max_results/allowed_domains/
+     blocked_domains/freshness）逐字段原样转发、非法值 400 早失败。
 """
 from __future__ import annotations
 
@@ -70,6 +72,8 @@ class ToolSearchRoute(unittest.TestCase):
     def _patch_common(self, *, key=None, auth_err=None, upstream=None, up_err=None,
                       response=None, up_exc=None, recorded=None):
         """统一 mock：_authorize / _upstream_for / config.http_client / _record。"""
+        captured: dict = {}
+        self.captured = captured
         p1 = mock.patch.object(gateway, '_authorize',
                                return_value=(key or {'name': 'k'}, '1.2.3.4', auth_err))
         p2 = mock.patch.object(gateway, '_upstream_for',
@@ -115,6 +119,9 @@ class ToolSearchRoute(unittest.TestCase):
                         self.posted_url = url
                         self.posted_json = json
                         self.posted_headers = headers
+                        captured['posted_url'] = url
+                        captured['posted_json'] = json
+                        captured['posted_headers'] = headers
                         return _Resp(*response)
                 yield _C()
             p6 = mock.patch.object(gateway.config, 'http_client', fake_client)
@@ -168,6 +175,72 @@ class ToolSearchRoute(unittest.TestCase):
         self.recorded.assert_called_once()
         args = self.recorded.call_args.args
         self.assertEqual(args[4], 200)  # status
+
+    def test_full_agenttool_params_passthrough(self):
+        """agenttool 全参数：逐字段原样转发（不重命名、不删、不改写）。"""
+        payload = {
+            'query': 'go generics',
+            'type': 'text2text',
+            'max_results': 7,
+            'allowed_domains': ['go.dev', 'blog.golang.org'],
+            'blocked_domains': ['reddit.com'],
+            'freshness': 'm1',
+        }
+        upstream_body = {'code': 0, 'msg': '', 'results': [], 'total_results': 0}
+        self._patch_common(key={'name': 'k'},
+                           upstream={'base_url': 'http://up.example', 'api_key': 'gwk'},
+                           response=(200, upstream_body))
+        raw = json.dumps(payload, ensure_ascii=False).encode()
+        resp = _run(gateway.tools_search(_request(raw)))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.captured['posted_url'],
+                         f'http://up.example{gateway.SEARCH_UPSTREAM_PATH}')
+        self.assertEqual(self.captured['posted_json'], payload)
+        self.assertEqual(json.loads(resp.body), upstream_body)
+
+    def test_future_params_pass_through_unmodified(self):
+        """未知字段也原样放行：manager 不做白名单裁剪，兼容 agenttool 后续扩展。"""
+        payload = {'query': 'q', 'future_param': {'a': [1, 2]}}
+        self._patch_common(key={'name': 'k'},
+                           upstream={'base_url': 'http://up', 'api_key': 'gk'},
+                           response=(200, {'code': 0, 'results': []}))
+        resp = _run(gateway.tools_search(_request(json.dumps(payload).encode())))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.captured['posted_json'], payload)
+
+    def test_invalid_search_params_400_without_upstream_call(self):
+        """非法可选参数在 manager 早失败，不消耗账号池搜索配额。"""
+        bad_bodies = [
+            {'query': 'q', 'type': 'image2text'},
+            {'query': 'q', 'max_results': 0},
+            {'query': 'q', 'max_results': 21},
+            {'query': 'q', 'max_results': '5'},
+            {'query': 'q', 'max_results': True},
+            {'query': 'q', 'allowed_domains': 'go.dev'},
+            {'query': 'q', 'blocked_domains': ['ok', 123]},
+            {'query': 'q', 'freshness': 'forever'},
+        ]
+        for payload in bad_bodies:
+            with self.subTest(payload=payload):
+                self._patch_common(key={'name': 'k'},
+                                   upstream={'base_url': 'http://up', 'api_key': 'gk'})
+                resp = _run(gateway.tools_search(_request(json.dumps(payload).encode())))
+                self.assertEqual(resp.status_code, 400)
+                self.assertNotIn('posted_json', self.captured)
+                self.recorded.assert_called_once()
+                self.assertEqual(self.recorded.call_args.args[4], 400)
+                self.tearDown()
+                self.setUp()
+
+    def test_empty_freshness_string_accepted(self):
+        """freshness='' 等同不传，但字段仍原样透传给上游。"""
+        payload = {'query': 'q', 'freshness': ''}
+        self._patch_common(key={'name': 'k'},
+                           upstream={'base_url': 'http://up', 'api_key': 'gk'},
+                           response=(200, {'code': 0, 'results': []}))
+        resp = _run(gateway.tools_search(_request(json.dumps(payload).encode())))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.captured['posted_json'], payload)
 
     def test_quota_429_passthrough(self):
         quota = {'error': 'web search quota exhausted on all available accounts',
