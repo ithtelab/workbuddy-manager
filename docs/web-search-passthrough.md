@@ -183,6 +183,14 @@ manager 收到的 wire body（轨迹抓包）为：
 
 ![工具详情：参数、结果、Schema 与计时](images/web-search-full-params-tool-detail.jpg)
 
+另有一组参数组合实测：单/多 query 合并、`maxResults` 分别设 5/3/4、
+`allowedDomains` 限定 `arxiv.org`、`blockedDomains` 排除 `deepseek.com`、
+`freshness: y1`。其中 `blockedDomains` 部分生效但仍有个别该域结果返回，属
+0057 网关的 `-site:` 拼接语义/上游检索行为，manager 不改写 body、也不做结果
+侧过滤。
+
+![参数组合测试矩阵：queries / maxResults / allowedDomains / blockedDomains / freshness](images/web-search-params-matrix.jpg)
+
 ## 测试
 
 ```bash
