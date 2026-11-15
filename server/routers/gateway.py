@@ -1551,8 +1551,43 @@ async def gateway_health() -> dict:
 #
 # 协议是「透传」不是「翻译」：上游的信封（code/results/total_results/…）原样
 # 回给客户端，非 15001 的业务码也原样透传——过滤语义由调用方决定（与 chat 的
-# error-passthrough 同哲学）。
+# error-passthrough 同哲学）。请求体同理：只校验已知参数，不改写、不删字段，
+# 未知字段也原样放行（兼容后续 agenttool 参数扩展）。
 SEARCH_UPSTREAM_PATH = '/v1/tools/search'
+
+# agenttool/v1/search 支持的全部可选参数（0057 网关 toolSearchRequest 同款）。
+# freshness：d1=一天内 / m1=一月内 / y1=一年内；空串等同不传。
+SEARCH_FRESHNESS_VALUES = ('', 'd1', 'm1', 'y1')
+SEARCH_MAX_RESULTS_BOUND = 20
+
+
+def _validate_search_params(body: object) -> str | None:
+    """校验 /v1/tools/search 的入站参数，返回错误描述；None 表示合法。
+
+    只校验、不改写 body：校验通过后 body 原样转发给 0057 网关，由网关负责
+    max_results 兜底、blocked_domains 拼 `-site:` 进 query、以及 agenttool
+    上游请求体的组装。非法参数在 manager 层早失败，不消耗账号池搜索配额。
+    """
+    if not isinstance(body, dict):
+        return '请求体必须是 JSON 对象'
+    if not isinstance(body.get('query'), str):
+        return 'query 必须是字符串'
+    if 'type' in body and body['type'] != 'text2text':
+        return 'type 必须是 "text2text"'
+    if 'max_results' in body:
+        value = body['max_results']
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= SEARCH_MAX_RESULTS_BOUND:
+            return f'max_results 必须是 1..{SEARCH_MAX_RESULTS_BOUND} 的整数'
+    for key in ('allowed_domains', 'blocked_domains'):
+        if key in body:
+            value = body[key]
+            if not isinstance(value, list) or any(not isinstance(d, str) for d in value):
+                return f'{key} 必须是字符串数组'
+    if 'freshness' in body:
+        value = body['freshness']
+        if not isinstance(value, str) or value not in SEARCH_FRESHNESS_VALUES:
+            return 'freshness 必须是 d1 | m1 | y1'
+    return None
 
 
 @router.post('/v1/tools/search')
@@ -1575,11 +1610,24 @@ async def tools_search(request: Request):
                 account_expected=False)
         return _oai_error('请求体必须是 JSON 对象', 400, 'invalid_request_error', 'invalid_body')
 
-    query = str((body or {}).get('query') or '').strip()
-    if not query:
-        _record(key, ip, '', '', 400, 0, 0, 0, ua, 'query 为空', False,
+    if not isinstance(body, dict):
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, '请求体不是 JSON 对象', False,
                 account_expected=False)
-        return _oai_error('query 不能为空', 400, 'invalid_request_error', 'empty_query')
+        return _oai_error('请求体必须是 JSON 对象', 400, 'invalid_request_error', 'invalid_body')
+
+    query = str(body.get('query') or '').strip()
+    if not isinstance(body.get('query'), str) or not query:
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, 'query 为空或非字符串', False,
+                account_expected=False)
+        return _oai_error('query 不能为空且必须是字符串', 400, 'invalid_request_error', 'empty_query')
+
+    # agenttool 全参数入站校验（type / max_results / allowed_domains /
+    # blocked_domains / freshness）。合法 body 原样转发，不重命名、不删字段。
+    param_error = _validate_search_params(body)
+    if param_error:
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, f'搜索参数非法: {param_error}', False,
+                account_expected=False)
+        return _oai_error(param_error, 400, 'invalid_request_error', 'invalid_search_params')
 
     upstream, upstream_err = _upstream_for(key, ip=ip, model='', mapped='', ua=ua)
     if upstream_err:

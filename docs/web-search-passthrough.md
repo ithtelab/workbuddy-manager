@@ -35,12 +35,26 @@ Content-Type: application/json
 
 {
   "query": "搜索词（必填）",
+  "type": "text2text",                    // 可选，固定值；上游 agenttool 请求类型
   "max_results": 5,                       // 可选，默认 5，1..20
-  "allowed_domains": ["go.dev"],          // 可选
-  "blocked_domains": ["reddit.com"],      // 可选，manager 层拼成 " -site:x" 进 query
-  "freshness": "d1"                       // 可选：d1 | m1 | y1
+  "allowed_domains": ["go.dev"],          // 可选，字符串数组；只返回这些域
+  "blocked_domains": ["reddit.com"],      // 可选，字符串数组；网关拼成 " -site:x" 进 query
+  "freshness": "d1"                       // 可选：d1 | m1 | y1（一天 / 一月 / 一年内）
 }
 ```
+
+> manager 对请求体的处理是**校验 + 原样转发**：`query` 非空、`type` 只能为
+> `text2text`、`max_results` 为 1..20 整数、两个域名参数为字符串数组、
+> `freshness` 属于 `d1|m1|y1`（空串等同不传）。非法参数在 manager 返回
+> `400 invalid_search_params`，不消耗账号池搜索配额；合法 body 逐字段原样
+> 转发（不重命名、不删字段），未知字段也放行以兼容后续 agenttool 扩展。
+> `max_results` 的默认/兜底与 `blocked_domains` 的 `-site:` 拼接都在 0057
+> 网关完成，manager 不改写 body（见调用日志与轨迹抓包：入站/出站同体）。
+>
+> 这道入站校验是**可选纵深护栏**：配套插件 `dsh-web-search-workbuddy` 已
+> 在客户端侧完成参数构造与主校验（枚举、1..20 钳制、域名归一化、非法值
+> 不发请求），路由从首版起就是 `json=body` 全量透传，单一可信插件链路
+> 原本已足够；manager 侧校验主要面向绕过插件直连本端点的调用方。
 
 ### 响应（上游信封原样透传，不翻译）
 
@@ -59,7 +73,7 @@ Content-Type: application/json
 
 | HTTP | 场景 | body 形态 |
 |---|---|---|
-| 400 | query 为空 / body 非 JSON / freshness 非法 | OpenAI error 信封 |
+| 400 | query 为空 / 非字符串 / body 非 JSON / 任一可选参数非法（type、max_results、allowed_domains、blocked_domains、freshness）→ `invalid_search_params` | OpenAI error 信封 |
 | 401/403/429 | 密钥无效 / IP 拦截 / 频控（与 chat 同管线） | OpenAI error 信封 |
 | 429 | **全池搜索配额耗尽**（上游 15001） | `{"error":"...quota...","code":"quota_web_search","tried":N}` |
 | 200 + code≠0 | 上游其他业务码 | 上游信封原样（`code`/`msg` 字段，客户端自行路由） |
@@ -105,16 +119,20 @@ cd workbuddy2api && git apply dev/upstream-patches/0057-web-search-tool.patch
 
 DSH 的 `dsh-web-search-workbuddy` 插件（npm：[`dsh-web-search-workbuddy`](https://www.npmjs.com/package/dsh-web-search-workbuddy)、
 GitHub：[WaveBird/dsh-web-search-workbuddy](https://github.com/WaveBird/dsh-web-search-workbuddy)）
-把这个端点注册成 DSH web seam 的 search provider：
+把这个端点注册成 DSH web seam 的 search provider。插件 0.4.1 起支持
+`modelControlled: true`：模型可以在一次 `web_search` 调用里自主选择
+`allowedDomains` / `blockedDomains` / `freshness` / `maxResults`，插件把这些
+字段透传进 `ctx.web.search()` 的请求对象，经 seam 原样到达本路由。
 
 ```yaml
-# ~/.dsh/profiles/web/cordis.patch.yml —— 零配置：
+# ~/.dsh/profiles/web/cordis.patch.yml —— 零配置 + 模型可控过滤
 # baseURL 与 apiKeyEnv 自动从会话当前模型 provider 路由派生
-# （读 llm-pi-ai 路由 profile，与模型共用同一把 wbk_ 密钥；
-# 模型换路由时搜索自动跟随。插件 0.3.0+）
+# （读 llm-pi-ai 路由 profile，与模型共用同一把 wbk_ 密钥）。
 - insert:
     - id: web-search-workbuddy
       name: 'dsh-web-search-workbuddy'
+      config:
+        modelControlled: true
 - id: web
   name: '@deepseek-ai/dsh-web'
   config:
@@ -122,21 +140,54 @@ GitHub：[WaveBird/dsh-web-search-workbuddy](https://github.com/WaveBird/dsh-web
     searchProvider: workbuddy-gateway         # 插件注册的 provider id
 - id: tool-web
   name: '@deepseek-ai/dsh-tool-web'
-  config: { fetch: true, search: true, searchTimeoutMs: 60000 }
+  # 每个 agent preset 里的 tool-web 也要同步改 search: false
+  config: { fetch: true, search: false, searchTimeoutMs: 60000 }
 ```
+
+`modelControlled: false`（默认）时使用官方 `web_search` 工具，上述四项为
+部署级默认值：`config: { fetch: true, search: true, searchTimeoutMs: 60000 }`。
 
 安装：
 
 ```bash
-cd ~/.dsh/profiles/web && pnpm add dsh-web-search-workbuddy
-# 重启 dsh web 后，新会话的模型工具目录里出现 web_search
+cd ~/.dsh/profiles/web && pnpm add dsh-web-search-workbuddy@^0.4.1
+# 重启 dsh web 后，新会话的模型工具目录里出现带过滤参数的 web_search
 ```
 
 任意 OpenAI 兼容客户端也可以直接 HTTP 调（见上文协议节）。
+
+### 实测效果
+
+模型在会话中自主传入全部过滤参数：
+
+```json
+{
+  "queries": ["Go generics official tutorial"],
+  "allowedDomains": ["go.dev"],
+  "blockedDomains": ["reddit.com"],
+  "freshness": "y1",
+  "maxResults": 3
+}
+```
+
+manager 收到的 wire body（轨迹抓包）为：
+
+```json
+{"query":"Go generics official tutorial","type":"text2text","max_results":3,
+ "allowed_domains":["go.dev"],"blocked_domains":["reddit.com"],"freshness":"y1"}
+```
+
+返回 3 条全部来自 `go.dev`，manager `200`、0057 网关 `search ok results=3`。
+
+![对话中的 web_search 调用卡片与 3 条 go.dev 结果](images/web-search-full-params-conversation.jpg)
+
+![工具详情：参数、结果、Schema 与计时](images/web-search-full-params-tool-detail.jpg)
 
 ## 测试
 
 ```bash
 python3 -m pytest server/tests/test_gateway_tools_search.py -q
-# 8 例：鉴权 / 空 query / 坏 body / 成功透传 / 429 配额 / 200 业务码 / 502 / 503
+# 12 例 + 8 subtests：鉴权 / 空 query / 坏 body / 成功透传 / 429 配额 /
+# 200 业务码 / 502 / 503 / agenttool 全参数原样转发 / 非法参数早失败 /
+# freshness 空串 / 未知字段放行
 ```
