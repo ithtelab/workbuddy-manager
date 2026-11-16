@@ -32,6 +32,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import db
+from .autoupdate import _as_bool
 
 # 设置项在 settings 表里的键名。单键存整个配置对象（与 tap / proxy_pool 同思路）。
 SETTING_KEY = 'gateway_cors'
@@ -40,6 +41,20 @@ SETTING_KEY = 'gateway_cors'
 # `/api/status`、`/api/usage/token/` 是给客户端读余额的、同样用 Bearer 鉴权，
 # 但它们挂在 `/api/*` 下 —— 不在这里放开，避免与 Cookie 管理面的边界混淆。
 DATA_API_PREFIXES = ('/v1', '/v2')
+
+
+def is_data_api_path(path: str) -> bool:
+    """判断路径是否属于数据面。
+
+    **按路径段匹配**，不是 `startswith`：后者会把 `/v1foo`、`/v10/x`、`/v2abc`
+    也算进来（实测确认过），给这些本不属于数据面的路径加上 CORS 头。
+    将来若真挂了 `/v1beta/x` 这类路由，那也是**同一个数据面**，按段匹配仍能覆盖。
+    """
+    p = path or ''
+    for prefix in DATA_API_PREFIXES:
+        if p == prefix or p.startswith(prefix + '/'):
+            return True
+    return False
 
 # 允许的来源条数上限。来源列表是人手维护的（谁会在前端嵌入这个网关），几十条
 # 已远超正常用量；设上限是为了让「误粘贴一大段」不会把设置项撑大。
@@ -69,6 +84,12 @@ def _clean_origin(value: object) -> str:
     `Origin` 头的形态是 `scheme://host[:port]`（或字面量 `null`），**不带路径**。
     用户常把 `https://app.example.com/` 连斜杠一起粘进来，浏览器比对时会不相等
     （预检通过、真实请求被拒，症状很费解），所以在这里统一削掉。
+
+    **必须是纯 ASCII**：值最终要写进 HTTP 响应头，而 ASGI 头按 latin-1 编码。
+    中文域名（`https://例子.com`）看似合法，一旦回显就会抛 UnicodeEncodeError，
+    把每次预检变成 500 —— 而且配置已经落库，用户从面板上再也进不去。
+    浏览器发出的 `Origin` 一律是 punycode（`xn--...`），所以拒绝非 ASCII 不会
+    挡住任何真实场景，只挡住手写中文域名的配置错误。
     """
     text = str(value or '').strip()
     if not text:
@@ -83,12 +104,25 @@ def _clean_origin(value: object) -> str:
         return ''
     if any(ch in text for ch in ' \t\r\n"\'<>,;\\'):
         return ''
+    # 非 ASCII 一律拒绝（理由见 docstring）
+    try:
+        text.encode('latin-1')
+    except UnicodeEncodeError:
+        return ''
     return text.rstrip('/')
 
 
 def settings() -> dict[str, Any]:
-    """当前配置。DB 里的值优先，缺项/脏值回落到默认值。"""
-    raw = db.get_setting(SETTING_KEY, {}) or {}
+    """当前配置。DB 里的值优先，缺项/脏值回落到默认值。
+
+    **绝不抛异常**：这个函数跑在 `/v1` 的每个请求上。数据库忙、连接断了、
+    settings 行被手工改成怪东西——任何一种都不该让网关整体 500。读失败时
+    按「未配置」处理（等于关闭），请求照常往后走，由鉴权与上游决定成败。
+    """
+    try:
+        raw = db.get_setting(SETTING_KEY, {}) or {}
+    except Exception:  # noqa: BLE001 —— 旁路配置不能拖死数据面
+        raw = {}
     if not isinstance(raw, dict):
         raw = {}
     origins: list[str] = []
@@ -104,7 +138,9 @@ def settings() -> dict[str, Any]:
     except (TypeError, ValueError):
         max_age = int(DEFAULT['max_age'])
     return {
-        'enabled': bool(raw.get('enabled', DEFAULT['enabled'])) and bool(origins),
+        # 严格布尔：`bool('false')` 是 True —— 那会让「已经关掉了」的配置
+        # 实际仍在放行，方向上是**错误放行**，必须按字面值判断（同 autoupdate）。
+        'enabled': _as_bool(raw.get('enabled'), bool(DEFAULT['enabled'])) and bool(origins),
         'origins': origins,
         # 浏览器侧上限 7200；负值没有意义（等同于每次预检）
         'max_age': max(0, min(max_age, 7200)),
@@ -120,7 +156,8 @@ def save_settings(patch: dict[str, Any]) -> dict[str, Any]:
     cur = settings()
     merged = dict(cur)
     if 'enabled' in patch:
-        merged['enabled'] = bool(patch['enabled'])
+        # 与读路径同一套严格布尔：外部调用方把开关写成 "false" 时不能变成开启
+        merged['enabled'] = _as_bool(patch['enabled'], bool(DEFAULT['enabled']))
     if 'origins' in patch:
         raw = patch['origins']
         if raw is None:

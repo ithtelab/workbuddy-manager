@@ -202,7 +202,64 @@ if config.CORS_ORIGINS:
 # 预检由这里直接应答：`/v1/*` 只有 POST 路由，OPTIONS 落到路由表会被 405，
 # 浏览器那边就报跨域失败 —— 这是 issue #445 现象的直接来源。
 _CORS_ALLOW_HEADERS = 'authorization,content-type,x-api-key,anthropic-version,x-trace-id'
+
+# 预检里回显 `Access-Control-Request-Headers` 的白名单前缀/全名。
+#
+# 为什么不能直接把请求方要的头原样回显：那等于对任意头放行。但只回一份固定
+# 列表又会挡住真实客户端 —— OpenAI SDK 会带 `openai-organization`、
+# `openai-beta`，Anthropic SDK 会带 `anthropic-beta`，这些请求会因为预检失败
+# 而根本发不出去。折中：命名空间前缀 + 明确列出的头名，其余一律不放。
+_CORS_ALLOWED_HEADER_EXACT = frozenset(_CORS_ALLOW_HEADERS.split(','))
+_CORS_ALLOWED_HEADER_PREFIXES = ('x-stainless-', 'anthropic-', 'openai-')
+
+
+def _echo_request_headers(requested: str) -> str:
+    """把预检请求要的头裁到白名单内，返回可直接写进响应头的值。
+
+    返回空串表示「一个都不允许」——调用方据此把整个预检拒掉，而不是给一个
+    缺头的允许响应（那样浏览器照样拦，但报错方向会误导人）。
+    """
+    wanted: list[str] = []
+    for raw in (requested or '').split(','):
+        name = raw.strip().lower()
+        if not name or not name.isascii():
+            continue
+        # 头名只允许 token 字符（RFC 7230）——防止有人拿逗号/换行拼出额外的头
+        if any(ch not in 'abcdefghijklmnopqrstuvwxyz0123456789-_' for ch in name):
+            continue
+        if name in _CORS_ALLOWED_HEADER_EXACT or name.startswith(_CORS_ALLOWED_HEADER_PREFIXES):
+            # 只有前缀、没有后半截（如 `openai-`）不是有效头名
+            if name.endswith('-'):
+                continue
+            if name not in wanted:
+                wanted.append(name)
+    return ','.join(wanted)
 _CORS_ALLOW_METHODS = 'GET,POST,OPTIONS'
+
+
+def _merge_vary_origin(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    """把 `Origin` 并进 `Vary`（已有值保留）。
+
+    CORS 响应的缓存正确性依赖 `Vary: Origin`：同一个 URL 对不同来源回不同的
+    `Access-Control-Allow-Origin`，不声明就会让共享缓存把一份响应发给另一个来源。
+    下游可能已经写了 `Vary: Accept-Encoding`（压缩），所以这里**合并**而不是追加
+    一条独立的 `Vary`（多条 Vary 的语义是「所有值的并集」，但不少代理只看第一条）。
+    """
+    out: list[tuple[bytes, bytes]] = []
+    merged: list[str] = []
+    for key, value in headers:
+        if key.lower() != b'vary':
+            out.append((key, value))
+            continue
+        for item in value.decode('latin-1').split(','):
+            name = item.strip()
+            if name and not any(n.lower() == name.lower() for n in merged):
+                merged.append(name)
+    if not any(n.lower() == 'origin' for n in merged):
+        merged.append('Origin')
+    # 只写一条 Vary：多条虽然语义上是并集，但不少代理/缓存实现只看第一条
+    out.append((b'vary', ', '.join(merged).encode('latin-1')))
+    return out
 
 
 class GatewayCorsMiddleware:
@@ -216,7 +273,7 @@ class GatewayCorsMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope.get('path') or ''
-        if not path.startswith(gatewaycors.DATA_API_PREFIXES):
+        if not gatewaycors.is_data_api_path(path):
             await self.app(scope, receive, send)
             return
 
@@ -231,16 +288,31 @@ class GatewayCorsMiddleware:
             if not allow:
                 # 来源未放行：回 403 而不是静默 200 —— 静默放行会让浏览器在
                 # 真实请求上才失败，用户看不到「预检被拒」这个明确信号。
+                # 403 也带 `Vary: Origin`：否则中间缓存可能把一个来源的拒绝
+                # 结果复用给另一个来源。
                 response = JSONResponse(
                     {'error': {'message': '来源不在网关 CORS 白名单内',
                                'type': 'cors_error', 'code': 'origin_not_allowed'}},
-                    status_code=403)
+                    status_code=403,
+                    headers={'Vary': 'Origin'})
+                await response(scope, receive, send)
+                return
+            # 没有 `Access-Control-Request-Headers` 是**合法**的（简单请求的
+            # 预检只问方法）；只有「要了头但一个都不在白名单里」才拒。
+            raw_requested = headers.get('access-control-request-headers') or ''
+            requested = _echo_request_headers(raw_requested)
+            if raw_requested.strip() and not requested:
+                response = JSONResponse(
+                    {'error': {'message': '预检请求了不被允许的自定义请求头',
+                               'type': 'cors_error', 'code': 'header_not_allowed'}},
+                    status_code=403,
+                    headers={'Vary': 'Origin'})
                 await response(scope, receive, send)
                 return
             extra = [
                 (b'access-control-allow-origin', allow.encode('latin-1')),
                 (b'access-control-allow-methods', _CORS_ALLOW_METHODS.encode()),
-                (b'access-control-allow-headers', _CORS_ALLOW_HEADERS.encode()),
+                (b'access-control-allow-headers', requested.encode('latin-1')),
                 (b'access-control-max-age', str(cfg['max_age']).encode()),
                 (b'vary', b'Origin'),
             ]
@@ -271,8 +343,10 @@ class GatewayCorsMiddleware:
                 if b'access-control-expose-headers' not in {k.lower() for k, _ in headers}:
                     headers.append((b'access-control-expose-headers',
                                     b'x-trace-id,x-request-id'))
-                if b'vary' not in {k.lower() for k, _ in headers}:
-                    headers.append((b'vary', b'Origin'))
+                # Vary 必须**并进已有值**，不能「有就跳过」：下游可能已经带了
+                # `Vary: Accept-Encoding`（压缩中间件），跳过就等于没声明按 Origin
+                # 区分，共享缓存会把 A 来源的响应复用给 B 来源。
+                headers = _merge_vary_origin(headers)
                 message['headers'] = headers
             await send(message)
 

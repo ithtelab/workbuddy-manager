@@ -128,6 +128,54 @@ class SettingsShapeTest(unittest.TestCase):
         self.assertTrue(gc.allows('https://App.Example.com', cfg))
         self.assertFalse(gc.allows('https://app.example.com', cfg))
 
+    def test_non_ascii_origin_rejected(self) -> None:
+        """中文域名不能存：响应头按 latin-1 编码，回显时抛异常 = 每次预检 500。"""
+        for bad in ('https://例子.com', 'https://a.test/😀'):
+            with self.assertRaises(ValueError, msg=bad):
+                gc.save_settings({'origins': [bad]})
+
+    def test_dirty_non_ascii_stored_value_does_not_break(self) -> None:
+        """历史落库的脏值（旧版本/手改库）不能让预检 500 —— 读配置时就被滤掉。"""
+        db.set_setting(gc.SETTING_KEY, {'enabled': True, 'origins': ['https://例子.com'],
+                                        'max_age': 600})
+        cfg = gc.settings()
+        self.assertEqual(cfg['origins'], [])
+        self.assertFalse(cfg['enabled'], '没有合法来源时开关必须自认关闭')
+
+    def test_db_failure_never_raises(self) -> None:
+        """settings() 跑在 /v1 每个请求上，DB 故障不能把网关打成 500。"""
+        class _Boom:
+            def get_setting(self, *a, **k):
+                raise RuntimeError('database is locked')
+        real = gc.db
+        gc.db = _Boom()
+        try:
+            self.assertEqual(gc.settings()['origins'], [])
+        finally:
+            gc.db = real
+
+    def test_path_matching_is_segment_aware(self) -> None:
+        """/v1foo、/v10/x 不属于数据面，不该被加上 CORS 头（实测曾命中）。"""
+        for bad in ('/v1foo', '/v10/x', '/v2abc', '/v1beta'):
+            self.assertFalse(gc.is_data_api_path(bad), bad)
+        for good in ('/v1', '/v1/chat/completions', '/v2/chat/completions', '/v1/messages'):
+            self.assertTrue(gc.is_data_api_path(good), good)
+
+    def test_false_like_strings_do_not_enable(self) -> None:
+        """`bool('false')` 是 True —— 那会让「已经关掉」的配置仍在放行（错误放行）。"""
+        gc.save_settings({'enabled': True, 'origins': [_OK_ORIGIN]})
+        for value in ('false', '0', 'off', 'no', '', False, 0):
+            gc.save_settings({'enabled': value})
+            self.assertFalse(gc.settings()['enabled'], f'enabled={value!r} 不应等于开启')
+        for value in ('true', '1', 'on', 'yes', True, 1):
+            gc.save_settings({'enabled': value})
+            self.assertTrue(gc.settings()['enabled'], f'enabled={value!r} 应等于开启')
+
+    def test_dirty_stored_enabled_string_does_not_enable(self) -> None:
+        """历史落库/手改库写成字符串时，读路径也要按字面值判断。"""
+        db.set_setting(gc.SETTING_KEY, {'enabled': 'false', 'origins': [_OK_ORIGIN]})
+        self.assertFalse(gc.settings()['enabled'])
+
 
 class PreflightTest(unittest.TestCase):
     """预检（OPTIONS + Access-Control-Request-Method）由中间件直接应答。"""
@@ -191,6 +239,62 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(self._preflight('/v1/chat/completions', _OK_ORIGIN).status_code, 204)
         gc.save_settings({'enabled': False})
         self.assertEqual(self._preflight('/v1/chat/completions', _OK_ORIGIN).status_code, 403)
+
+    def test_simple_preflight_without_request_headers_passes(self) -> None:
+        """没有 Access-Control-Request-Headers 是合法的（简单请求），不能拒。"""
+        gc.save_settings({'enabled': True, 'origins': [_OK_ORIGIN]})
+        r = self._preflight('/v1/chat/completions', _OK_ORIGIN)
+        self.assertEqual(r.status_code, 204)
+
+    def test_sdk_specific_headers_are_echoed(self) -> None:
+        """OpenAI / Anthropic SDK 会带 openai-* / anthropic-* 头，不回显就发不出去。"""
+        gc.save_settings({'enabled': True, 'origins': [_OK_ORIGIN]})
+        r = self.client.options('/v1/chat/completions', headers={
+            'Origin': _OK_ORIGIN,
+            'Access-Control-Request-Method': 'POST',
+            'Access-Control-Request-Headers': 'authorization,openai-organization,anthropic-beta',
+        })
+        self.assertEqual(r.status_code, 204)
+        got = r.headers['access-control-allow-headers']
+        self.assertIn('openai-organization', got)
+        self.assertIn('anthropic-beta', got)
+
+    def test_unknown_headers_are_not_echoed(self) -> None:
+        """请求方要的头不能原样全回显 —— 只放白名单里的，其余丢弃。"""
+        gc.save_settings({'enabled': True, 'origins': [_OK_ORIGIN]})
+        r = self.client.options('/v1/chat/completions', headers={
+            'Origin': _OK_ORIGIN,
+            'Access-Control-Request-Method': 'POST',
+            'Access-Control-Request-Headers': 'authorization,x-evil,x-bad',
+        })
+        self.assertEqual(r.status_code, 204)
+        got = r.headers['access-control-allow-headers']
+        self.assertNotIn('x-evil', got)
+        self.assertNotIn('x-bad', got)
+
+    def test_preflight_with_only_rejected_headers_is_403(self) -> None:
+        """一个都不允许时明确拒，而不是给个缺头的允许响应（后者报错方向会误导）。"""
+        gc.save_settings({'enabled': True, 'origins': [_OK_ORIGIN]})
+        r = self.client.options('/v1/chat/completions', headers={
+            'Origin': _OK_ORIGIN,
+            'Access-Control-Request-Method': 'POST',
+            'Access-Control-Request-Headers': 'x-evil,x-bad',
+        })
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()['error']['code'], 'header_not_allowed')
+
+    def test_rejection_carries_vary_origin(self) -> None:
+        """403 也要 Vary: Origin，否则中间缓存会把一个来源的拒绝复用给另一个。"""
+        r = self._preflight('/v1/chat/completions', _OK_ORIGIN)
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.headers.get('vary'), 'Origin')
+
+    def test_non_surface_prefixes_get_no_headers(self) -> None:
+        """/v1foo、/v10/x 不属于数据面（曾因 startswith 误命中）。"""
+        gc.save_settings({'enabled': True, 'origins': ['*']})
+        for path in ('/v1foo', '/v10/x', '/v2abc'):
+            r = self._preflight(path, _OK_ORIGIN, method='GET')
+            self.assertNotIn('access-control-allow-origin', r.headers, path)
 
 
 class ActualRequestTest(unittest.TestCase):
@@ -274,3 +378,26 @@ class EndpointTest(unittest.TestCase):
                             json={'enabled': True, 'origins': ['nope']})
         self.assertEqual(r.status_code, 400)
         self.assertIn('格式', r.json()['detail'])
+
+class VaryMergeTest(unittest.TestCase):
+    """`Vary` 必须与下游已有值合并 —— 否则共享缓存会跨来源复用响应。"""
+
+    def test_adds_origin_when_absent(self) -> None:
+        from server.main import _merge_vary_origin
+        self.assertEqual(_merge_vary_origin([]), [(b'vary', b'Origin')])
+
+    def test_merges_with_accept_encoding(self) -> None:
+        from server.main import _merge_vary_origin
+        got = _merge_vary_origin([(b'vary', b'Accept-Encoding')])
+        self.assertEqual(got, [(b'vary', b'Accept-Encoding, Origin')])
+
+    def test_does_not_duplicate_origin(self) -> None:
+        from server.main import _merge_vary_origin
+        got = _merge_vary_origin([(b'Vary', b'accept-encoding, origin')])
+        self.assertEqual(got, [(b'vary', b'accept-encoding, origin')])
+
+    def test_collapses_multiple_vary_headers(self) -> None:
+        """多条 Vary 语义上是并集，但不少代理只看第一条 —— 合并成一条更稳。"""
+        from server.main import _merge_vary_origin
+        got = _merge_vary_origin([(b'vary', b'Accept-Encoding'), (b'vary', b'Origin')])
+        self.assertEqual(got, [(b'vary', b'Accept-Encoding, Origin')])

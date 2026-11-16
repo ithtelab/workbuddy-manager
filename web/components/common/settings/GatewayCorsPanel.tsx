@@ -13,7 +13,7 @@
  * 跨域时，能立刻看到「那套是另一处配置」，而不是反复点保存。
  */
 
-import {useCallback, useEffect, useMemo, useState} from 'react';
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {Globe2, Loader2, Plus, Save, ShieldAlert, Trash2} from 'lucide-react';
 import {errText, systemApi} from '@/lib/api';
 import type {GatewayCors} from '@/lib/types';
@@ -49,12 +49,17 @@ export function GatewayCorsPanel() {
    * 那一行就被删掉了），所以这里保留原始文本行，保存时才过滤空行交给后端。
    */
   const [lines, setLines] = useState<string[]>(['']);
+  /** 上次保存（或刚加载）时的开关与缓存秒数，用来判断「有未保存改动」 */
+  const savedEnabled = useRef(false);
+  const savedMaxAge = useRef(600);
 
   const load = useCallback(async () => {
     try {
       const r = await systemApi.gatewayCors();
       setForm(r);
       setLines(r.origins.length ? r.origins : ['']);
+      savedEnabled.current = r.enabled;
+      savedMaxAge.current = r.max_age;
       setLoadError(false);
     } catch {
       setLoadError(true);
@@ -70,10 +75,13 @@ export function GatewayCorsPanel() {
     [lines],
   );
   const wildcard = effectiveLines.includes('*');
-  const dirty = useMemo(() => {
-    const before = [...form.origins].join('\n');
-    return before !== effectiveLines.join('\n');
-  }, [form.origins, effectiveLines]);
+  // 三项都要比：只看 origins 的话，只改开关或只改缓存秒数时界面不提示
+  // 「未保存」，用户会以为已经生效了（保存按钮旁边那句提示就是为此存在）。
+  const dirty = useMemo(() => (
+    [...form.origins].join('\n') !== effectiveLines.join('\n')
+    || form.max_age !== savedMaxAge.current
+    || form.enabled !== savedEnabled.current
+  ), [form.origins, form.max_age, form.enabled, effectiveLines]);
 
   function setLine(index: number, value: string) {
     setLines((cur) => cur.map((s, i) => (i === index ? value : s)));
@@ -97,6 +105,8 @@ export function GatewayCorsPanel() {
       });
       setForm(r);
       setLines(r.origins.length ? r.origins : ['']);
+      savedEnabled.current = r.enabled;
+      savedMaxAge.current = r.max_age;
       notify.ok(t('gatewayCors.saved'));
     } catch (e) {
       // 400 的 detail 已经写清了哪一条格式不对，直接透出比「保存失败」有用
