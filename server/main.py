@@ -254,18 +254,26 @@ class GatewayCorsMiddleware:
 
         # 普通请求：补上 CORS 头。注意**不加** allow-credentials —— 数据面用
         # Bearer，不需要 Cookie；带上一旦将来来源放宽成 `*` 就会与规范冲突。
+        #
+        # **必须先删掉下游已有的同名头再加自己的**：`WB_CORS_ORIGINS` 装上全局
+        # `CORSMiddleware` 时它也会处理 `/v1`，两层各加一次的结果是
+        # `Access-Control-Allow-Origin: https://a, https://a` —— 浏览器按单个值
+        # 解析，重复值直接判定为非法来源，表现为「明明加了白名单还是跨域」。
+        # 实测确认过（见 test_gateway_cors.GlobalCorsCoexistenceTest）。
+        # 同理丢掉对方的 allow-credentials：数据面不该声明它。
         async def send_with_cors(message):
             if message.get('type') == 'http.response.start':
                 message = dict(message)
-                extra = [
-                    (b'access-control-allow-origin', allow.encode('latin-1')),
-                    (b'vary', b'Origin'),
-                ]
-                if 'access-control-expose-headers' not in {
-                        k.lower() for k, _ in message.get('headers') or []}:
-                    extra.append((b'access-control-expose-headers',
-                                  b'x-trace-id,x-request-id'))
-                message['headers'] = list(message.get('headers') or []) + extra
+                drop = {b'access-control-allow-origin', b'access-control-allow-credentials'}
+                headers = [(k, v) for k, v in message.get('headers') or []
+                           if k.lower() not in drop]
+                headers.append((b'access-control-allow-origin', allow.encode('latin-1')))
+                if b'access-control-expose-headers' not in {k.lower() for k, _ in headers}:
+                    headers.append((b'access-control-expose-headers',
+                                    b'x-trace-id,x-request-id'))
+                if b'vary' not in {k.lower() for k, _ in headers}:
+                    headers.append((b'vary', b'Origin'))
+                message['headers'] = headers
             await send(message)
 
         await self.app(scope, receive, send_with_cors)
