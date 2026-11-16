@@ -2369,5 +2369,27 @@
     "copyValue": "Copy value",
     "longStrings": "Long strings worth reading ({n}):",
     "loadMore": "Load more ({n} more)"
+  },
+  "gatewayCors": {
+    "loading": "Loading gateway CORS settings…",
+    "loadFailed": "Could not load gateway CORS settings — that does not mean none were saved. Please retry.",
+    "title": "Gateway CORS",
+    "desc": "When a page in a browser calls this gateway's /v1 endpoints **directly**, the browser blocks it with a cross-origin error. List the allowed origins here and the browser will let the request through.\n\nThis only covers the data plane (/v1, /v2), which authenticates with an `Authorization: Bearer` key. The `/api` admin surface is governed by the deployment-time environment variable WB_CORS_ORIGINS and cannot be changed here.",
+    "enable": "Enable gateway CORS",
+    "enableHint": "When off, browser calls are rejected; command-line tools, SDKs and server-side code are unaffected (they send no Origin).",
+    "originsTitle": "Allowed origins",
+    "originsHint": "One per line, like `https://app.example.com` (no path or trailing slash). Up to {max}. Use `*` for any origin; use `null` for local file:// pages.",
+    "originPlaceholder": "https://app.example.com",
+    "addOrigin": "Add origin",
+    "maxAge": "Preflight cache (seconds)",
+    "maxAgeHint": "How long the browser remembers that this origin is allowed, avoiding a preflight on every request. 0 = ask every time. Maximum 7200.",
+    "wildcardWarn": "You listed `*`: any web page can read responses from this gateway. Your key still applies, but make sure this key is meant to be used that way.",
+    "save": "Save",
+    "saved": "Gateway CORS saved — effective immediately",
+    "unsaved": "Unsaved changes",
+    "scope": "Applies to {prefixes}",
+    "adminTitle": "Admin surface origins (read-only)",
+    "adminHint": "The /api admin surface uses cookie sessions, so allowing `*` there would hand the console to any web page. It can only be configured at deploy time via WB_CORS_ORIGINS (comma-separated). This shows the current effective value.",
+    "adminEmpty": "Not configured (same-origin deployment, the default). /api only accepts requests from the panel's own origin."
   }
 }

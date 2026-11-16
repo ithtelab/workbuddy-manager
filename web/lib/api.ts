@@ -34,6 +34,7 @@ import type {
   AutoUpdateConfig,
   AutoUpdateInfo,
   GithubMirror,
+  GatewayCors,
   IpAccessLog,
   IpRule,
   KeyExportResult,
@@ -928,6 +929,10 @@ export const systemApi = {
   githubMirror: () => get<GithubMirror>('/api/settings/github-mirror'),
   saveGithubMirror: (mirror: string) =>
     put<GithubMirror>('/api/settings/github-mirror', {mirror}),
+  /** 网关数据面 CORS（issue #445）：给浏览器里的前端页面直连 `/v1` 用 */
+  gatewayCors: () => get<GatewayCors>('/api/settings/gateway-cors'),
+  saveGatewayCors: (body: Partial<Pick<GatewayCors, 'enabled' | 'origins' | 'max_age'>>) =>
+    put<GatewayCors>('/api/settings/gateway-cors', body),
   /** 自动更新：定时检测，在时间窗内自动执行一键更新 */
   autoUpdate: () => get<AutoUpdateInfo>('/api/settings/auto-update'),
   saveAutoUpdate: (cfg: AutoUpdateConfig) =>

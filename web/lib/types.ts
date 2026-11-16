@@ -1379,6 +1379,26 @@ export interface GithubMirror {
   presets: string[];
 }
 
+/**
+ * 网关数据面 CORS（issue #445）。
+ *
+ * 与 `WB_CORS_ORIGINS`（管理面 `/api/*`，Cookie 会话）是**两套**东西：
+ * 这里管 `/v1`、`/v2`，鉴权走 Bearer，所以允许 `*`。
+ */
+export interface GatewayCors {
+  enabled: boolean;
+  /** 来源白名单；`*` = 任意，`null` = file:// 页面的字面量来源 */
+  origins: string[];
+  /** 预检结果缓存秒数（0 = 不缓存） */
+  max_age: number;
+  /** 条数上限（超过时保存会被拒） */
+  max_origins: number;
+  /** 本配置作用的路径前缀 */
+  prefixes: string[];
+  /** 管理面来源（`WB_CORS_ORIGINS`，只读展示） */
+  admin_origins: string[];
+}
+
 /** 更新日志中的一条（level 1 = 二级缩进，作为子项展示） */
 export interface ChangelogItem {
   level: number;

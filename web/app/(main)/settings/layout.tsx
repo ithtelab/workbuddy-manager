@@ -52,6 +52,7 @@ import {ResetPasswordDialog} from '@/components/common/settings/ResetPasswordDia
 import {useAuth} from '@/lib/auth-context';
 import {UpdatePanel} from '@/components/common/settings/UpdatePanel';
 import {PgSyncPanel} from '@/components/common/settings/PgSyncPanel';
+import {GatewayCorsPanel} from '@/components/common/settings/GatewayCorsPanel';
 import {ProxyPanel} from '@/components/common/settings/ProxyPanel';
 import {TokensPanel} from '@/components/common/settings/TokensPanel';
 import {ChangelogPanel} from '@/components/common/settings/ChangelogPanel';
@@ -2212,6 +2213,9 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
         {/* ═══ 系统更新 ═══ */}
         <TabsContent value="system" className="mt-4 space-y-4">
           <UpdatePanel />
+          {/* 网关跨域（issue #445）：这是本服务自身的入站策略，与上游 config.json
+              无关，所以放在「系统」而不是「上游」。 */}
+          <GatewayCorsPanel />
         </TabsContent>
 
         {/* ═══ 页面监控 ═══ */}

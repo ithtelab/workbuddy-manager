@@ -25,8 +25,8 @@ from .routers import (
     watchdog as watchdog_router,
 )
 from .services import (
-    accountlog, accountrisk, autoupdate, cooling, dailyplan, modelrecovery, pgsync, renew, tasklog,
-    taskrun, watchdog,
+    accountlog, accountrisk, autoupdate, cooling, dailyplan, gatewaycors, modelrecovery, pgsync,
+    renew, tasklog, taskrun, watchdog,
 )
 
 # 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
@@ -187,6 +187,91 @@ if config.CORS_ORIGINS:
         allow_methods=['*'],
         allow_headers=['*'],
     )
+
+# ── 数据面 CORS（`/v1`、`/v2`）────────────────────────────────────
+#
+# 与上面 `WB_CORS_ORIGINS` 是**两套**东西，别合并：
+#   · 上面那套管 `/api/*`（Cookie 会话），`allow_credentials=True`，禁止 `*`；
+#   · 这一套管 `/v1`、`/v2`（`Authorization: Bearer`），不涉及 Cookie，因此
+#     可以允许 `*` —— 任何网页都能跨域发请求，但拿不到密钥还是调不动。
+#
+# 为什么不用 `CORSMiddleware`：它的 allow_origins 是启动时固定的，改配置要重启。
+# 而这是面板上的配置项 —— 改完不生效会被当成「没保存成功」，所以这里每请求现读
+# 设置（读 SQLite 一行），即时生效。
+#
+# 预检由这里直接应答：`/v1/*` 只有 POST 路由，OPTIONS 落到路由表会被 405，
+# 浏览器那边就报跨域失败 —— 这是 issue #445 现象的直接来源。
+_CORS_ALLOW_HEADERS = 'authorization,content-type,x-api-key,anthropic-version,x-trace-id'
+_CORS_ALLOW_METHODS = 'GET,POST,OPTIONS'
+
+
+class GatewayCorsMiddleware:
+    """纯 ASGI：只处理数据面路径，来源白名单每次现读面板设置。"""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http':
+            await self.app(scope, receive, send)
+            return
+        path = scope.get('path') or ''
+        if not path.startswith(gatewaycors.DATA_API_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.decode('latin-1').lower(): v.decode('latin-1')
+                   for k, v in scope.get('headers') or []}
+        origin = headers.get('origin') or ''
+        cfg = gatewaycors.settings()
+        allow = gatewaycors.allow_origin_value(origin, cfg)
+
+        # 预检：直接应答，不进路由（进了也是 405）。
+        if scope.get('method') == 'OPTIONS' and headers.get('access-control-request-method'):
+            if not allow:
+                # 来源未放行：回 403 而不是静默 200 —— 静默放行会让浏览器在
+                # 真实请求上才失败，用户看不到「预检被拒」这个明确信号。
+                response = JSONResponse(
+                    {'error': {'message': '来源不在网关 CORS 白名单内',
+                               'type': 'cors_error', 'code': 'origin_not_allowed'}},
+                    status_code=403)
+                await response(scope, receive, send)
+                return
+            extra = [
+                (b'access-control-allow-origin', allow.encode('latin-1')),
+                (b'access-control-allow-methods', _CORS_ALLOW_METHODS.encode()),
+                (b'access-control-allow-headers', _CORS_ALLOW_HEADERS.encode()),
+                (b'access-control-max-age', str(cfg['max_age']).encode()),
+                (b'vary', b'Origin'),
+            ]
+            await send({'type': 'http.response.start', 'status': 204, 'headers': extra})
+            await send({'type': 'http.response.body', 'body': b''})
+            return
+
+        if not allow:
+            await self.app(scope, receive, send)
+            return
+
+        # 普通请求：补上 CORS 头。注意**不加** allow-credentials —— 数据面用
+        # Bearer，不需要 Cookie；带上一旦将来来源放宽成 `*` 就会与规范冲突。
+        async def send_with_cors(message):
+            if message.get('type') == 'http.response.start':
+                message = dict(message)
+                extra = [
+                    (b'access-control-allow-origin', allow.encode('latin-1')),
+                    (b'vary', b'Origin'),
+                ]
+                if 'access-control-expose-headers' not in {
+                        k.lower() for k, _ in message.get('headers') or []}:
+                    extra.append((b'access-control-expose-headers',
+                                  b'x-trace-id,x-request-id'))
+                message['headers'] = list(message.get('headers') or []) + extra
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors)
+
+
+app.add_middleware(GatewayCorsMiddleware)
 
 # 管理端请求体上限。网关那条路有自己的逐块校验（gateway._read_json_body），
 # 但 `/api/*` 此前**没有任何上限** —— 未鉴权的 `/api/login` 就能用大 body

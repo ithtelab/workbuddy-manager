@@ -2107,5 +2107,27 @@
     "copyValue": "复制内容",
     "longStrings": "值得细看的长字符串（{n} 个）：",
     "loadMore": "加载更多（还有 {n} 条）"
+  },
+  "gatewayCors": {
+    "loading": "正在读取网关跨域配置…",
+    "loadFailed": "网关跨域配置没取到 —— 这不代表没配置过，请重试。",
+    "title": "网关跨域（CORS）",
+    "desc": "浏览器里的网页**直接**请求本网关的 /v1 接口时，受浏览器的同源策略限制，会先在控制台报「跨域」。这里把允许的来源列出来，浏览器就会放行。\n\n它只管数据面（/v1、/v2），鉴权用 `Authorization: Bearer` 密钥；管理面 /api 的来源由部署时的环境变量 WB_CORS_ORIGINS 决定，不在这个面板里改。",
+    "enable": "启用网关跨域",
+    "enableHint": "关掉时浏览器直连一律被拒；命令行、SDK、服务端程序不受影响（它们不发 Origin）。",
+    "originsTitle": "允许的来源",
+    "originsHint": "一行一个，形如 `https://app.example.com`（不带路径与斜杠）。最多 {max} 条。填 `*` 表示任意来源；本地 file:// 页面填 `null`。",
+    "originPlaceholder": "https://app.example.com",
+    "addOrigin": "添加来源",
+    "maxAge": "预检缓存（秒）",
+    "maxAgeHint": "浏览器记住「这个来源被允许」多久，避免每次请求都发预检。0 = 每次预检都回源。上限 7200。",
+    "wildcardWarn": "来源填了 `*`：任何网页都能读取本网关的响应。密钥仍然有效，但请确认这把密钥本来就允许被那样使用。",
+    "save": "保存",
+    "saved": "网关跨域配置已保存，立即生效",
+    "unsaved": "有未保存的改动",
+    "scope": "作用于 {prefixes}",
+    "adminTitle": "管理面来源（只读）",
+    "adminHint": "管理面 /api 用 Cookie 会话，允许 `*` 等于把控制台交给任何网页，所以只能在部署时用环境变量 WB_CORS_ORIGINS 配置（逗号分隔）。这里显示当前生效值。",
+    "adminEmpty": "未配置（同源部署，默认）。/api 只接受与面板同源的请求。"
   }
 }

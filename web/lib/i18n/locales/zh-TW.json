@@ -2342,5 +2342,27 @@
     "copyValue": "複製內容",
     "longStrings": "值得細看的長字串（{n} 個）：",
     "loadMore": "載入更多（還有 {n} 條）"
+  },
+  "gatewayCors": {
+    "loading": "正在讀取閘道跨域設定…",
+    "loadFailed": "閘道跨域設定沒取到 —— 這不代表沒設定過，請重試。",
+    "title": "閘道跨域（CORS）",
+    "desc": "瀏覽器裡的網頁**直接**請求本閘道的 /v1 介面時，受瀏覽器的同源策略限制，會先在主控台報「跨域」。這裡把允許的來源列出來，瀏覽器就會放行。\n\n它只管資料面（/v1、/v2），驗證用 `Authorization: Bearer` 金鑰；管理面 /api 的來源由部署時的環境變數 WB_CORS_ORIGINS 決定，不在這個面板裡改。",
+    "enable": "啟用閘道跨域",
+    "enableHint": "關掉時瀏覽器直連一律被拒；命令列、SDK、伺服端程式不受影響（它們不送 Origin）。",
+    "originsTitle": "允許的來源",
+    "originsHint": "一行一個，形如 `https://app.example.com`（不帶路徑與斜線）。最多 {max} 條。填 `*` 表示任意來源；本機 file:// 頁面填 `null`。",
+    "originPlaceholder": "https://app.example.com",
+    "addOrigin": "新增來源",
+    "maxAge": "預檢快取（秒）",
+    "maxAgeHint": "瀏覽器記住「這個來源被允許」多久，避免每次請求都送預檢。0 = 每次預檢都回源。上限 7200。",
+    "wildcardWarn": "來源填了 `*`：任何網頁都能讀取本閘道的回應。金鑰仍然有效，但請確認這把金鑰本來就允許被那樣使用。",
+    "save": "儲存",
+    "saved": "閘道跨域設定已儲存，立即生效",
+    "unsaved": "有未儲存的變更",
+    "scope": "作用於 {prefixes}",
+    "adminTitle": "管理面來源（唯讀）",
+    "adminHint": "管理面 /api 用 Cookie 工作階段，允許 `*` 等於把主控台交給任何網頁，所以只能在部署時用環境變數 WB_CORS_ORIGINS 設定（逗號分隔）。這裡顯示目前生效值。",
+    "adminEmpty": "未設定（同源部署，預設）。/api 只接受與面板同源的請求。"
   }
 }

@@ -290,7 +290,10 @@ WAL 模式下还有 `-wal` / `-shm` 伴生文件，同样含未落盘数据。
 #### 依赖与配置默认值
 - `npm audit`：**0 漏洞**；`pip-audit`：**无已知漏洞**
 - `/docs`、`/redoc`、`/openapi.json` **默认关闭**（`WB_ENABLE_DOCS=1` 才开）
-- CORS 默认**不启用**（仅在配置了 `WB_CORS_ORIGINS` 时才挂中间件）
+- 管理面 CORS 默认**不启用**（仅在配置了 `WB_CORS_ORIGINS` 时才挂中间件）；`/api/*`
+  用 Cookie 会话，因此该变量**禁止** `*`（检测到直接拒绝启动）
+- 数据面 CORS（`/v1`、`/v2`，issue #445）走 Bearer 密钥、`allow_credentials=False`，
+  可在面板「设置 → 系统」配置来源，允许 `*`；两套边界互不影响
 - SQLite 错误与上游错误**不透传内部细节**（只回状态码与布尔）
 
 #### 其他

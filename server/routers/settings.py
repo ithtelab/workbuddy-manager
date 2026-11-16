@@ -9,10 +9,10 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from .. import db, security
+from .. import config, db, security
 from ..services import pricing
 from ..iputil import client_ip
-from ..services import autoupdate, modelmap, reload, updater, wb2api
+from ..services import autoupdate, gatewaycors, modelmap, reload, updater, wb2api
 
 router = APIRouter(prefix='/api', tags=['settings'])
 
@@ -240,6 +240,40 @@ def save_github_token(body: dict, user: dict = Depends(security.require_admin)) 
     db.set_setting('github_token', raw)
     security.audit(user, 'update_github_token', '', '已配置' if raw else '已清除')
     return {'configured': bool(raw), 'masked': updater.mask_token(raw)}
+
+
+# ── 网关 CORS（issue #445）────────────────────────────────────
+#
+# 与 `WB_CORS_ORIGINS`（管理面 / Cookie）是两套：这里管 `/v1`、`/v2` 数据面，
+# 鉴权走 Bearer，所以可以允许 `*`。详见 services/gatewaycors.py 的模块说明。
+@router.get('/settings/gateway-cors')
+def get_gateway_cors(user: dict = Depends(security.require_admin)) -> dict:
+    return {
+        **gatewaycors.settings(),
+        # 管理面的来源白名单不在面板上改（改错等于把控制台交出去），
+        # 但要让用户看得见「为什么 /api 还是跨域失败」。
+        'admin_origins': list(config.CORS_ORIGINS),
+        'max_origins': gatewaycors.MAX_ORIGINS,
+        'prefixes': list(gatewaycors.DATA_API_PREFIXES),
+    }
+
+
+@router.put('/settings/gateway-cors')
+def save_gateway_cors(body: dict, request: Request,
+                      user: dict = Depends(security.require_admin)) -> dict:
+    """保存网关 CORS。改完即时生效（中间件每请求现读设置，不需要重启）。"""
+    try:
+        result = gatewaycors.save_settings(body or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    security.audit(user, 'update_gateway_cors', '',
+                   f"开关={'开' if result['enabled'] else '关'}；"
+                   f"来源={','.join(result['origins']) or '（空）'}；"
+                   f"缓存={result['max_age']}s；来源 {client_ip(request)}",
+                   ip=client_ip(request))
+    return {**result, 'max_origins': gatewaycors.MAX_ORIGINS,
+            'prefixes': list(gatewaycors.DATA_API_PREFIXES),
+            'admin_origins': list(config.CORS_ORIGINS)}
 
 
 # ── GitHub 镜像（issue #216）─────────────────────────────────
