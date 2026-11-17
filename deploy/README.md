@@ -650,24 +650,25 @@ docker compose build     # 重新构建，看真正的报错
 构建在国内网络下最常见的失败点是**软件源/依赖源不可达**，典型报错：
 
 ```
-E: Failed to fetch http://deb.debian.org/... 502  Bad Gateway
-E: The repository '...' is no longer signed.
+fetch https://dl-cdn.alpinelinux.org/... 502 Bad Gateway
 SSL: UNEXPECTED_EOF_WHILE_READING        # pip 拉 PyPI 时
 ```
 
-官方源（`deb.debian.org` / `pypi.org`）走国际 CDN，国内实测约 367 kB/s 且频繁
-502。Dockerfile 内置了一次**自动降级**（失败后改用阿里云 / 清华镜像重试），
-所以通常能自己建成功，只是会先白等几分钟。想直接跳过这段等待，显式指定镜像源：
+镜像基于 `python:3.12-alpine`。官方源（`dl-cdn.alpinelinux.org` / `pypi.org`）
+走国际 CDN，国内偶有卡顿或 502。Dockerfile 内置了一次**自动降级**（pip 官方源
+失败后改用清华镜像重试），所以通常能自己建成功；想直接跳过等待，显式指定镜像源：
 
 ```bash
 docker compose build \
-  --build-arg DEBIAN_MIRROR=mirrors.aliyun.com \
+  --build-arg ALPINE_MIRROR=mirrors.aliyun.com \
   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 docker compose up -d
 ```
 
-也可以把这两个值写进 `docker-compose.yml` 的 `build.args`，之后 `up --build` 就不必再带参数。
+`ALPINE_MIRROR` 是现在的参数名；老版本用的 `DEBIAN_MIRROR` 仍保留兼容（同样填
+`mirrors.aliyun.com` 即可）。也可以把值写进 `docker-compose.yml` 的 `build.args`，
+之后 `up --build` 就不必再带参数。
 可选镜像：`mirrors.aliyun.com` / `mirrors.tuna.tsinghua.edu.cn` / `mirrors.ustc.edu.cn`。
 
 **Q：扫码后账号没出现**
