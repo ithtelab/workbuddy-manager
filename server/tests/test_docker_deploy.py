@@ -1345,3 +1345,38 @@ class UpstreamHealthProbeAddressTest(unittest.TestCase):
                          f'现在有 {src.count(literal)} 处')
         self.assertIn('wait_health(upstream_health_url()', src,
                       '就绪等待要传派生地址')
+
+class AlpineTimezoneTest(unittest.TestCase):
+    """Alpine 基础镜像必须能按本地时区统计（审计发现 PR #459 漏了 tzdata）。
+
+    本项目的「按天」口径全部依赖本地时区：
+      · `db.day_of()` 用 `time.localtime()`；
+      · SQL 里用 `'localtime'` 修饰符分桶；
+      · 密钥每日 Token 限额按本地日期零点复位。
+    Debian slim 也没装 tzdata，但它自带 `/etc/localtime`（UTC），行为一致。
+    **Alpine 的 busybox 不带 tzdata**，若不显式处理，设了时区也只会静默退回 UTC
+    —— 表现是「时区 +8、统计按 UTC 分天」，且不报任何错。
+    """
+
+    DOCKERFILE = _ROOT / 'Dockerfile'
+
+    def setUp(self) -> None:
+        self.src = self.DOCKERFILE.read_text(encoding='utf-8')
+
+    def test_tz_arg_installs_tzdata(self) -> None:
+        """设了 TZ 就必须装 tzdata 并落 /etc/localtime，不能只写环境变量。"""
+        self.assertIn('ARG TZ=', self.src, '缺少 TZ 构建参数')
+        self.assertIn('apk add --no-cache tzdata', self.src,
+                      'Alpine 必须显式装 tzdata，否则 localtime 静默退回 UTC')
+        self.assertIn('/usr/share/zoneinfo/', self.src, '必须从 zoneinfo 取时区文件')
+        self.assertIn('/etc/localtime', self.src, '必须落 /etc/localtime（musl 优先读它）')
+
+    def test_no_bash_dependency(self) -> None:
+        """Alpine 没有 bash：脚本只能靠 /bin/sh。"""
+        for m in re.finditer(r'^RUN .*', self.src, re.M):
+            self.assertNotIn('/bin/bash', m.group(0), 'Alpine 里没有 /bin/bash')
+
+    def test_uses_busybox_adduser_not_useradd(self) -> None:
+        self.assertIn('adduser', self.src, 'Alpine 用 busybox 的 adduser')
+        self.assertNotRegex(self.src, r'useradd(?![a-z])',
+                            'useradd 在 Alpine 上不存在（是 Debian 的）')

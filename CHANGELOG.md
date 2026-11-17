@@ -20,6 +20,15 @@
 
 ---
 
+## [未发布]
+
+### 变更
+
+- **容器镜像改用 Alpine + 多阶段构建**：基础层从约 55MB 压到约 12MB，Python 依赖在独立阶段安装、只把 `site-packages` 拷进成品，`docker` CLI 与 compose 插件 `strip` 掉调试符号再拷入。同时移除了已无用的 `openssh-client`（容器内验签早已取消）。新增 `ALPINE_MIRROR` 构建参数，旧名 `DEBIAN_MIRROR` 继续可用。
+- **容器时区**：新增 `TZ` 构建参数（如 `TZ=Asia/Shanghai`）。设了它会自动装 `tzdata` 并落 `/etc/localtime`；不设则与过去一致按 UTC 跑。Alpine 的 busybox 不带时区数据，缺了它会让「按天」的统计与每日限额静默按 UTC 分天。
+
+---
+
 ## [2.11.19] - 2026-11-18
 
 ### 新增
