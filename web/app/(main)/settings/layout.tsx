@@ -32,6 +32,7 @@ import {RichText} from '@/lib/i18n/rich-text';
 import {settingsApi, upstreamApi, errText} from '@/lib/api';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {UpstreamEndpoints} from '@/components/settings/UpstreamEndpoints';
+import {AccountRiskWarnings} from '@/components/common/accounts/AccountRiskWarnings';
 import {scheduleDelayError} from '@/lib/schedule-validation';
 import {
   DEFAULT_SETTINGS_TAB,
@@ -1358,6 +1359,15 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
 
         {/* ═══ 上游配置 ═══ */}
         <TabsContent value="upstream" className="mt-3 space-y-3">
+          {/* 账号保护预警。原先挂在仪表盘与账号页的**页头正上方**，两页都是
+              「每天要看一眼」的页面，于是一条只在**真出事时**才有意义的提示，
+              把最显眼的位置长期占着 —— 而且它列的是历史异常记录（签到 500、
+              积分 429 之类），实测能堆到上百条，与「有没有账号被暂停」不是
+              一回事（issue #374 之后加了收起，仍然压着页头）。
+              挪到这里：这一页就是账号保护策略的配置处（连续失败自动暂停、
+              账号冷却、账号管理接口都在下面），预警与它解释的策略同处，
+              属于「要查的时候来找」而非「天天挡路」。 */}
+          <AccountRiskWarnings allGroups />
           {/* 多上游（账号池分组）：密钥绑定上游 = 请求只走那个池，见 server/upstreamsvc.py。
               放在 config.json 字段之前：它是「本端接了几个上游」的清单，
               而下面那批字段描述的是**默认上游自身**的配置。 */}
