@@ -354,7 +354,8 @@
     "costUnpriced": "ほかに {n} 件は未計算",
     "costNote": "各呼び出し時点の公式価格（ピーク/オフピーク、キャッシュ命中/未命中）で推定した参考値です。実際に差し引かれたクレジットは上の表示をご覧ください。",
     "colCost": "費用",
-    "costUnavailableHint": "このモデルは価格未収録のため「—」と表示します（0 ではありません）"
+    "costUnavailableHint": "このモデルは価格未収録のため「—」と表示します（0 ではありません）",
+    "realtimeUnlimited": "無制限"
   },
   "accounts": {
     "badgeBanned": "● アカウント利用禁止",

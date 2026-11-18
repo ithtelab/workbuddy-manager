@@ -902,13 +902,36 @@ def _per_account_limit() -> dict[str, int]:
     * `pool.max_in_flight_global` —— **国际版账号**的上限。名字里的 global 指的是
       realm（国际版），不是「整个池子」，与全池并发总数无关。
 
-    两个键的 0 都被上游归一化成 2（见 `server/services/wb2api.py` 里对应注释），
-    所以这里同样把非正数当 2。
+    ⚠️ 两个键的 0 **语义不同**（见 `server/services/wb2api.py` 的 `_INT_RANGES`
+    注释与上游 `cmd/server/config.go`）：
+      · `max_in_flight` 的 0 = **不限**（上游池子层 `if limit <= 0` 直接不限制）；
+      · 只有 `max_in_flight_global` 的 0/负数会被上游归一化成 2。
+    这里对 `cn` 用 0 表示「不限」——调用方据此把 capacity 视为未知；对 global
+    仍按 2 归一化。缺省（配置里没有该键）按上游默认：cn=3、global=2。
     """
+    default = {'cn': 3, 'global': 2}          # 上游 config.go 的默认值
     try:
-        pool = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8')).get('pool') or {}
+        raw = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
+        # 类型兜底：`pool` 被手改成字符串/数组时 `.get()` 会抛 AttributeError，
+        # 而它在 try 之外会让 /api/stats/realtime 变 500（实时条每秒轮询一次）。
+        pool = raw.get('pool') if isinstance(raw, dict) else None
+        if not isinstance(pool, dict):
+            pool = {}
     except Exception:  # noqa: BLE001 - 配置缺失 / 损坏都不该让整页 500
         pool = {}
+
+    def pick(name: str, fallback: int, *, zero_means_unlimited: bool) -> int:
+        try:
+            n = int(pool.get(name, fallback))
+        except (TypeError, ValueError):
+            return fallback
+        if n > 0:
+            return n
+        return 0 if zero_means_unlimited else 2
+
+    return {'cn': pick('max_in_flight', default['cn'], zero_means_unlimited=True),
+            'global': pick('max_in_flight_global', default['global'],
+                           zero_means_unlimited=False)}
 
     def pick(name: str) -> int:
         try:
@@ -931,7 +954,11 @@ def _request_spans(rows) -> list[tuple[float, float]]:
     for row in rows:
         ts = float(row['ts'] or 0)
         dur = max(0.0, float(row['latency_ms'] or 0) / 1000.0)
-        spans.append((ts - dur, ts))
+        # 零时长（`latency_ms` 为 0 或 NULL）按 1 毫秒处理，与 `_peaks` 同口径。
+        # 现实命中面不小：403 拦截、429、400、`/v1/models` 这些早退路径记的
+        # latency 就是 0。不补这一毫秒的话，同一批数据会出现「峰值卡显示 2、
+        # 曲线那一格显示 0」的自相矛盾。
+        spans.append((ts - max(dur, 0.001), ts))
     return spans
 
 
@@ -1164,6 +1191,9 @@ async def realtime(days: int | None = None,
     # 上限按 realm 算：国际版账号走 `max_in_flight_global`，国内版走 `max_in_flight`。
     # 用「账号数 × 单一上限」在混合池里会多算——本项目的默认池就是 cn + global 混合。
     capacity = 0
+    # `cn` 上限为 0 = 上游「不限」：只要有 cn 账号，总容量就是未知，不能用
+    # 「账号数 × 0 = 0」报出去（那会显示「上限 0」而实际不限）。
+    unbounded = False
     for account in accounts:
         try:
             n = int(account.get('in_flight') or 0)
@@ -1172,7 +1202,11 @@ async def realtime(days: int | None = None,
         upstream += n
         if n > 0:
             busy += 1
-        capacity += limits.get(str(account.get('realm') or 'cn'), limits['cn'])
+        realm = str(account.get('realm') or 'cn')
+        limit = limits.get(realm, limits['cn'])
+        if realm != 'global' and limit <= 0:
+            unbounded = True
+        capacity += limit
     out.update({
         'available': True,
         'inflight': upstream,
@@ -1180,7 +1214,8 @@ async def realtime(days: int | None = None,
         'accounts_total': len(accounts),
         'per_account_limit': limits['cn'],
         'per_account_limit_global': limits['global'],
-        'capacity': capacity,
+        # None = 不限（cn 的 max_in_flight 为 0）。前端据此显示「不限」而不是数字。
+        'capacity': None if unbounded else capacity,
         'full_accounts': int(status.get('in_flight_full') or 0),
         'healthy': int(status.get('healthy') or 0),
         'sticky': int(status.get('sticky_sessions') or 0),

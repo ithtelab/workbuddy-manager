@@ -219,10 +219,16 @@ class RealtimeEndpointTest(_DbCase):
         self.assertFalse(out['available'])
         self.assertIn('client_inflight', out, '上游挂了也要有客户端在途，界面小字不能空')
 
-    def test_limits_fall_back_to_2(self) -> None:
+    def test_limits_fall_back_to_upstream_defaults(self) -> None:
+        """配置缺失时按**上游默认值**回落：cn=3、global=2。
+
+        （上游 `cmd/server/config.go:214` 的默认 `MaxInFlight = 3`；global 的
+        默认/归一化值是 2。之前这里写 2/2 是错的 —— 会让界面报一个比真实
+        上限更小的容量。）
+        """
         with mock.patch.object(config, 'UPSTREAM_CONFIG',
                                Path(self._tmp.name) / 'missing.json'):
-            self.assertEqual(stats._per_account_limit(), {'cn': 2, 'global': 2})
+            self.assertEqual(stats._per_account_limit(), {'cn': 3, 'global': 2})
 
     def test_capacity_uses_global_limit_for_global_realm(self) -> None:
         """国际版账号走 `max_in_flight_global`：不是国内版那个键，也不是全池上限。"""
@@ -241,13 +247,31 @@ class RealtimeEndpointTest(_DbCase):
         self.assertEqual(out['per_account_limit_global'], 1)
         self.assertEqual(out['capacity'], 7, '2 个 cn×3 + 1 个 global×1')
 
-    def test_zero_limit_is_normalised_to_2(self) -> None:
-        """上游把 0（含负数）归一化成 2：不同口径的话界面会显示「上限 0」。"""
+    def test_zero_limit_semantics_differ_by_realm(self) -> None:
+        """两个键的 0 **语义不同**（上游 `config.go:437` / `pool.go:241`）：
+
+        · `max_in_flight: 0` = **不限**（池子层 `if limit <= 0` 直接不限制）；
+        · `max_in_flight_global: 0` 或负数 = 归一化成 **2**。
+
+        之前这里把两者都归一化成 2，是错的口径 —— 会让「不限」显示成「上限 2」。
+        """
         cfg = Path(self._tmp.name) / 'config.json'
         cfg.write_text(json.dumps({'pool': {'max_in_flight': 0,
                                             'max_in_flight_global': -5}}), encoding='utf-8')
         with mock.patch.object(config, 'UPSTREAM_CONFIG', cfg):
-            self.assertEqual(stats._per_account_limit(), {'cn': 2, 'global': 2})
+            self.assertEqual(stats._per_account_limit(), {'cn': 0, 'global': 2})
+
+    def test_unlimited_cn_reports_capacity_null(self) -> None:
+        """`max_in_flight: 0` 时 capacity 必须是 null（不限），不能是「账号数×0=0」。"""
+        cfg = Path(self._tmp.name) / 'config.json'
+        cfg.write_text(json.dumps({'pool': {'max_in_flight': 0}}), encoding='utf-8')
+        payload = self._upstream(accounts=[
+            {'realm': 'cn', 'in_flight': 1},
+            {'realm': 'cn', 'in_flight': 0},
+        ])
+        with mock.patch.object(config, 'UPSTREAM_CONFIG', cfg):
+            out = self._call(payload)
+        self.assertIsNone(out['capacity'], '不限时应报 null，前端显示「不限」')
 
     def test_rpm_windows(self) -> None:
         now = int(time.time())

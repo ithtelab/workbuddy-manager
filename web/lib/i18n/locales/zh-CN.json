@@ -354,7 +354,8 @@
     "costUnpriced": "另有 {n} 次未计价",
     "costNote": "按每次调用时刻的官方价目估算（分高峰/空闲、缓存命中/未命中），仅供参考。上游真实扣的积分见上面的「今日积分」。",
     "colCost": "费用",
-    "costUnavailableHint": "该模型未收录价目，显示「—」而不是 0"
+    "costUnavailableHint": "该模型未收录价目，显示「—」而不是 0",
+    "realtimeUnlimited": "不限"
   },
   "accounts": {
     "badgeBanned": "● 账号被封禁",

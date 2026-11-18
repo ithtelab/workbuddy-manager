@@ -145,7 +145,10 @@ export function RealtimeStatsStrip({days}: {days: number}) {
     }));
     if (available) {
       parts.push(t('stats.realtimePeak', {n: fmtNumber(peaks?.concurrency)}));
-      parts.push(t('stats.realtimeCapacity', {c: fmtNumber(data.capacity)}));
+      parts.push(t('stats.realtimeCapacity', {
+        // capacity 为 null = 上游「不限」；缺失（旧后端）时退回数字口径
+        c: data.capacity === null ? t('stats.realtimeUnlimited') : fmtNumber(data.capacity),
+      }));
     } else {
       // 没有 error 文本时也要说明「上游不可达」，否则只剩一行「客户端在途 N」，
       // 读者不知道主数字为什么是「—」。
