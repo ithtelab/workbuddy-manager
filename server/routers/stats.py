@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import datetime
+import json
 import time
 
 from fastapi import APIRouter, Depends
 
-from .. import db, security
+from .. import config, db, security
 from ..services import pricing, wb2api
 
 router = APIRouter(prefix='/api/stats', tags=['stats'])
@@ -875,3 +876,157 @@ async def upstream_stats(user: dict = Depends(security.current_user)) -> dict:
     api_key 不一致），界面据此说明，而不是显示一片空白让人以为「用量是 0」。
     """
     return await wb2api.get_upstream_stats()
+
+
+# ── 实时指标：当前并发 / RPM / 近 3 分钟走势 ──────────────────────────
+#
+# 这里的几个数字**各有口径**，混读会得出错误结论，所以先写清：
+#
+#   * `inflight` 来自上游 `/status` 的 `accounts[].in_flight`，是**此刻**的瞬时值，
+#     包含仍在途、还没落库的请求；
+#   * `rpm_*` / `peaks` / `series` 全部来自本库 `request_logs`，只含**已完成**的
+#     请求（`ts` 是开始时刻，`latency_ms` 是耗时）。所以这里算出来的峰值天然略低
+#     于真实瞬时峰值——正在跑的那几个还没写进库。
+#   * 与同页「今日 / 本周」那类累计值更是两回事：那些跟时段选择器走，这些永远只
+#     看「刚才」。
+
+# 峰值要扫整个时段的 `request_logs`，窗口越长越贵；同一时段的界面每 5 秒刷一次，
+# 不缓存就变成每 5 秒一次全窗口扫描。缓存 60 秒足够——峰值本来就是分钟级指标。
+_PEAK_CACHE: dict[int, tuple[float, dict]] = {}
+
+
+def _per_account_limit() -> int:
+    """上游 `pool.max_in_flight`（单账号在途上限）。读不到按官方默认 2。"""
+    try:
+        raw = config.UPSTREAM_CONFIG.read_text(encoding='utf-8')
+        limit = int((json.loads(raw).get('pool') or {}).get('max_in_flight') or 2)
+        return limit if limit > 0 else 2
+    except Exception:  # noqa: BLE001 - 配置缺失 / 损坏都不该让整页 500
+        return 2
+
+
+def _peaks(days: int) -> dict:
+    """窗口内的并发峰值与 RPM 峰值，结果缓存 60 秒。
+
+    并发用区间重叠扫描：每个请求占 `[ts, ts + latency)`，求最大重叠数。同一时刻
+    先结束后开始（事件排序里 -1 在 +1 之前），半开区间不会把首尾相接的两个请求
+    重复计成一个并发。
+    """
+    key = max(1, min(90, int(days)))
+    hit = _PEAK_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[0] < 60:
+        return hit[1]
+
+    rows = db.query('SELECT ts, latency_ms FROM request_logs WHERE ts >= ?',
+                    (_epoch_since(key),))
+    bucket: dict[int, int] = {}
+    events: list[tuple[float, int]] = []
+    for row in rows:
+        ts = int(row['ts'] or 0)
+        dur = max(0.0, float(row['latency_ms'] or 0) / 1000.0)
+        bucket[ts // 60] = bucket.get(ts // 60, 0) + 1
+        events.append((ts, 1))
+        events.append((ts + dur, -1))
+    events.sort()
+    current = 0
+    peak = 0
+    for _t, delta in events:
+        current += delta
+        if current > peak:
+            peak = current
+    out = {
+        'concurrency': peak,
+        'rpm': max(bucket.values()) if bucket else 0,
+        'samples': len(rows),
+    }
+    _PEAK_CACHE[key] = (now, out)
+    return out
+
+
+def _series(window: int = 180, step: int = 15) -> dict:
+    """近 `window` 秒的 RPM 与并发序列，每 `step` 秒一个桶。
+
+    桶边界必须对齐到**绝对时间**（`step` 的整数倍）。若用 `now - window` 当起点，
+    每次刷新 `now` 都在变，整条窗口跟着平移，同一批请求会被切进不同的桶——画出来
+    的曲线每一轮都不一样，看起来像「数据在乱跳」。
+    """
+    now = int(time.time())
+    end = (now // step + 1) * step
+    start = end - window
+    nb = max(1, window // step)
+    # 多取 60 秒：跨进窗口的长请求也要计入并发（它们的 ts 早于 start）
+    rows = db.query('SELECT ts, latency_ms FROM request_logs WHERE ts >= ?',
+                    (start - 60,))
+    rpm = [0] * nb
+    conc = [0] * nb
+    for row in rows:
+        ts = int(row['ts'] or 0)
+        dur = max(0, int((row['latency_ms'] or 0) / 1000.0))
+        if ts >= start:
+            rpm[min(nb - 1, (ts - start) // step)] += 1
+        first = max(0, (ts - start) // step)
+        last = min(nb - 1, (ts + dur - start) // step)
+        for i in range(first, last + 1):
+            conc[i] += 1
+    return {'window': window, 'step': step, 'start': start, 'end': end,
+            'rpm': rpm, 'concurrency': conc}
+
+
+@router.get('/realtime')
+async def realtime(days: int | None = None,
+                   user: dict = Depends(security.current_user)) -> dict:
+    """实时并发 / RPM / 峰值 / 近 3 分钟走势。
+
+    取上游 `/status` 失败时**不抛错**：`rpm_*` / `peaks` / `series` 只依赖本库，
+    上游挂了它们照样有效。这时返回 `available=False` 与原因，界面把「在途」和
+    「容量」标成未知，其余照常显示——比整块空白更有用（上游挂掉的时候，用户正是
+    最想知道「刚才还在处理多少请求」的时候）。
+    """
+    span = max(1, min(90, int(days or 1)))
+    now = int(time.time())
+    minute = db.query_one('SELECT COUNT(*) AS n FROM request_logs WHERE ts > ?',
+                          (now - 60,))
+    five = db.query_one('SELECT COUNT(*) AS n FROM request_logs WHERE ts > ?',
+                        (now - 300,))
+    three = db.query_one('SELECT COUNT(*) AS n FROM request_logs WHERE ts > ?',
+                         (now - 180,))
+    out: dict = {
+        'available': False,
+        'days': span,
+        'updated_at': now,
+        'rpm_60': int((minute or {'n': 0})['n'] or 0),
+        'rpm_5m': round(int((five or {'n': 0})['n'] or 0) / 5.0, 1),
+        'rpm_3m': round(int((three or {'n': 0})['n'] or 0) / 3.0, 1),
+        'peaks': _peaks(span),
+        'series': _series(),
+    }
+    status = await wb2api.get_status()
+    if not status.get('connected'):
+        out['error'] = str(status.get('error') or '上游不可达')
+        return out
+
+    accounts = status.get('accounts') or []
+    limit = _per_account_limit()
+    inflight = 0
+    busy = 0
+    for account in accounts:
+        try:
+            n = int(account.get('in_flight') or 0)
+        except (TypeError, ValueError):
+            n = 0
+        inflight += n
+        if n > 0:
+            busy += 1
+    out.update({
+        'available': True,
+        'inflight': inflight,
+        'busy_accounts': busy,
+        'accounts_total': len(accounts),
+        'per_account_limit': limit,
+        'capacity': len(accounts) * limit,
+        'full_accounts': int(status.get('in_flight_full') or 0),
+        'healthy': int(status.get('healthy') or 0),
+        'sticky': int(status.get('sticky_sessions') or 0),
+    })
+    return out

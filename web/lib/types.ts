@@ -872,6 +872,58 @@ export interface UsageBreakdown {
   throughput_samples?: number;
 }
 
+/**
+ * 实时指标（`GET /api/stats/realtime`）。
+ *
+ * 与 `StatsSummary` 那类累计值口径不同，界面上必须分组显示：
+ * `inflight` / `capacity` 是**此刻**的瞬时值（来自上游 `/status`），上游不可达时
+ * 整组缺失；`rpm_*` / `peaks` / `series` 来自本库 `request_logs`，只含已完成请求。
+ */
+export interface StatsRealtimeSeries {
+  /** 窗口长度（秒） */
+  window: number;
+  /** 每个桶多少秒 */
+  step: number;
+  /** 窗口起点（epoch 秒，已对齐到 step 的整数倍） */
+  start: number;
+  end: number;
+  /** 每个桶的请求数 */
+  rpm: number[];
+  /** 每个桶内的并发峰值 */
+  concurrency: number[];
+}
+
+export interface StatsRealtimePeaks {
+  concurrency: number;
+  rpm: number;
+  /** 参与计算的行数：0 表示这段时间没有任何已完成请求 */
+  samples: number;
+}
+
+export interface StatsRealtime {
+  /** 上游 `/status` 是否取到；false 时只有 rpm_* / peaks / series 有效 */
+  available: boolean;
+  /** 取不到上游时的原因（直接展示，服务端文案） */
+  error?: string;
+  days: number;
+  updated_at: number;
+  /** 最近 60 秒的请求数（即「此刻的 RPM」） */
+  rpm_60: number;
+  rpm_5m: number;
+  rpm_3m: number;
+  peaks: StatsRealtimePeaks;
+  series: StatsRealtimeSeries;
+  /** 以下仅在 available 时存在 */
+  inflight?: number;
+  busy_accounts?: number;
+  accounts_total?: number;
+  per_account_limit?: number;
+  /** 全池同时在途上限 = accounts_total × per_account_limit */
+  capacity?: number;
+  full_accounts?: number;
+  healthy?: number;
+  sticky?: number;
+}
 export interface StatsSummary {
   today_requests: number;
   today_tokens: number;

@@ -36,6 +36,7 @@ import {
 import {fmtCompact, fmtNumber, fmtCredit, fmtMoney } from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {StatCard} from '@/components/common/layout/StatCard';
+import {RealtimeStatsStrip} from '@/components/common/layout/RealtimeStatsStrip';
 import Link from 'next/link';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
@@ -383,6 +384,10 @@ export default function StatsPage() {
           </div>
         </div>
       )}
+
+      {/* 实时指标：口径与下面那排累计卡不同 —— 这两个数说的是「此刻」，由组件自己
+          每 5 秒心跳一次，不跟本页 60 秒的刷新节奏走。 */}
+      <RealtimeStatsStrip days={d} />
 
       <section className="grid grid-cols-2 gap-3 lg:grid-cols-4 md:gap-4">
         <StatCard
