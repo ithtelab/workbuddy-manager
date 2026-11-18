@@ -7,7 +7,7 @@ import time
 
 from fastapi import APIRouter, Depends
 
-from .. import config, db, security
+from .. import config, db, inflight, security
 from ..services import pricing, wb2api
 
 router = APIRouter(prefix='/api/stats', tags=['stats'])
@@ -1076,6 +1076,9 @@ async def realtime(days: int | None = None,
         'available': False,
         'days': span,
         'updated_at': now,
+        # 客户端在途：面板正在处理、还没把响应写完的条数（含流式全过程、含排队）。
+        # 与下面 available 时的 `inflight`（上游槽位占用）是两个视角，界面上分开展示。
+        'client_inflight': inflight.current(),
         'rpm_60': int((minute or {'n': 0})['n'] or 0),
         'rpm_5m': round(int((five or {'n': 0})['n'] or 0) / 5.0, 1),
         'rpm_3m': round(int((three or {'n': 0})['n'] or 0) / 3.0, 1),
@@ -1089,7 +1092,7 @@ async def realtime(days: int | None = None,
 
     accounts = status.get('accounts') or []
     limits = _per_account_limit()
-    inflight = 0
+    upstream = 0
     busy = 0
     # 上限按 realm 算：国际版账号走 `max_in_flight_global`，国内版走 `max_in_flight`。
     # 用「账号数 × 单一上限」在混合池里会多算——本项目的默认池就是 cn + global 混合。
@@ -1099,13 +1102,13 @@ async def realtime(days: int | None = None,
             n = int(account.get('in_flight') or 0)
         except (TypeError, ValueError):
             n = 0
-        inflight += n
+        upstream += n
         if n > 0:
             busy += 1
         capacity += limits.get(str(account.get('realm') or 'cn'), limits['cn'])
     out.update({
         'available': True,
-        'inflight': inflight,
+        'inflight': upstream,
         'busy_accounts': busy,
         'accounts_total': len(accounts),
         'per_account_limit': limits['cn'],

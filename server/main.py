@@ -14,7 +14,7 @@ from starlette.middleware.gzip import GZipMiddleware
 import json
 import logging
 
-from . import config, db, redpacket, security
+from . import config, db, inflight, redpacket, security
 from .iputil import client_ip
 from .stdio_utf8 import force_utf8_stdio
 from .routers import (
@@ -452,6 +452,39 @@ class ApiBodyLimitMiddleware:
             await response(scope, receive, send)
 
 
+# 计入「客户端在途」的路径前缀：只有网关调用算，面板自身的 /api/* 不算。
+GATEWAY_PATH_PREFIX = '/v1/'
+
+
+class GatewayInFlightMiddleware:
+    """统计「客户端在途」：`/v1/*` 从请求进来到**响应写完**（含整个流式传输）。
+
+    为什么按 `/v1/` 划：这些才是 agent 客户端的模型调用（chat / responses /
+    messages / models）。面板自己的 `/api/*` 是浏览器在翻页，算进来会把数字搅乱。
+
+    为什么要在中间件里数而不是从日志推：日志只有请求**结束**时才写，正在跑的那条
+    根本不在库里。要「此刻几条」，只能在进程内数。
+
+    注意 `await self.app(...)` 对 `StreamingResponse` 而言是等整个 body 发完才返回，
+    所以一条边吐 chunk 边跑的请求在这段时间里始终算 1。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = str(scope.get('path') or '')
+        if scope.get('type') != 'http' or not path.startswith(GATEWAY_PATH_PREFIX):
+            await self.app(scope, receive, send)
+            return
+        inflight.enter()
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            inflight.leave()
+
+
+app.add_middleware(GatewayInFlightMiddleware)
 app.add_middleware(ApiBodyLimitMiddleware)
 
 # 压缩静态资源（web/out 下的 JS/CSS，首屏 2 MB 的大头）。

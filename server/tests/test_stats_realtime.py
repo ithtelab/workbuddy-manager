@@ -184,6 +184,14 @@ class RealtimeEndpointTest(_DbCase):
         self.assertEqual(out['healthy'], 3)
         self.assertEqual(out['sticky'], 4)
         self.assertNotIn('error', out)
+        # 客户端在途与上游槽位是两个字段，界面一个当主数字、一个当小字
+        self.assertIn('client_inflight', out)
+        self.assertIsInstance(out['client_inflight'], int)
+
+    def test_client_inflight_is_reported_even_when_upstream_down(self) -> None:
+        out = self._call(None)
+        self.assertFalse(out['available'])
+        self.assertIn('client_inflight', out, '上游挂了也要有客户端在途，界面小字不能空')
 
     def test_limits_fall_back_to_2(self) -> None:
         with mock.patch.object(config, 'UPSTREAM_CONFIG',
@@ -246,6 +254,28 @@ class RealtimeEndpointTest(_DbCase):
             self.assertEqual(_run(stats.realtime(days=0,
                                                  user={'role': 'admin'}))['days'], 1)
 
+
+
+
+class ClientInflightCounterTest(unittest.TestCase):
+    """进程内计数器：enter/leave 成对，多减不会变负。"""
+
+    def test_enter_and_leave(self) -> None:
+        from server import inflight
+        base = inflight.current()
+        inflight.enter()
+        inflight.enter()
+        self.assertEqual(inflight.current(), base + 2)
+        inflight.leave()
+        inflight.leave()
+        self.assertEqual(inflight.current(), base)
+
+    def test_leave_below_zero_is_clamped(self) -> None:
+        from server import inflight
+        base = inflight.current()
+        inflight.leave()
+        inflight.leave()
+        self.assertEqual(inflight.current(), base, '减多了不能变负')
 
 if __name__ == '__main__':
     unittest.main()
