@@ -219,7 +219,17 @@ export function ModelWhitelistInput({
               {t('keys.modelPick')}
             </Button>
           </PopoverTrigger>
-          <PopoverContent align="end" container={portalContainer} className="w-[320px] p-2">
+          <PopoverContent
+            align="end"
+            container={portalContainer}
+            // 碰撞边界必须与 Portal 落点是同一个元素（issue #454）：只改落点时
+            // Popper 仍按视口算可用空间，浮层向下展开越过弹窗底边、被
+            // DialogContent 的 overflow-hidden 整段裁掉（模型字段恰在表单末尾，
+            // 下方永远不够）。把边界指到弹窗本身，空间不够时浮层会翻到上方。
+            collisionBoundary={portalContainer}
+            collisionPadding={8}
+            className="w-[320px] p-2"
+          >
             <div className="mb-2 flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-1">
               <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <input
