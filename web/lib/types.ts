@@ -917,8 +917,11 @@ export interface StatsRealtime {
   inflight?: number;
   busy_accounts?: number;
   accounts_total?: number;
+  /** 国内版（`cn`）账号的单账号在途上限（`pool.max_in_flight`） */
   per_account_limit?: number;
-  /** 全池同时在途上限 = accounts_total × per_account_limit */
+  /** 国际版账号的单账号在途上限（`pool.max_in_flight_global`，不是全池上限） */
+  per_account_limit_global?: number;
+  /** 全池同时在途上限 = 各账号按 realm 取上限后求和 */
   capacity?: number;
   full_accounts?: number;
   healthy?: number;
