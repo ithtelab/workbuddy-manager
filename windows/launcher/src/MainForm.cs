@@ -113,8 +113,8 @@ namespace WorkBuddyLauncher
             {
                 AppendLog("[INFO] 已按开机自启静默启动，驻留托盘（双击托盘图标打开窗口）。");
                 ShowTrayBalloonOnce();
-                // 自启时是否同时拉起项目（issue #388）：要在窗口句柄与 .env 都就绪后
-                // 再启动，走 Shown；quiet=true 不弹错误框、不打开浏览器。
+                // 自启时是否同时拉起项目（issue #388 / #449）：quiet=true 不弹
+                // 错误框、不打开浏览器。真正的启动点见构造函数末尾的 Load 注册。
                 _autoStartOnBoot = string.Equals(
                     _settings.Get("autostart_project", "0"), "1", StringComparison.Ordinal);
             }
@@ -122,13 +122,25 @@ namespace WorkBuddyLauncher
             Shown += delegate
             {
                 ProbeAsync();
-                if (_autoStartOnBoot)
+            };
+
+            // 开机自启时拉起项目**不能挂在 Shown 上**（issue #449）。
+            // 静默模式走 SetVisibleCore 拦下显示，窗口永远不「显示」→ Shown 永不触发
+            // → 托盘图标在、项目却没起；手动双击托盘（RestoreFromTray）才补触发一次，
+            // 看起来像「必须先打开控制窗口」。
+            //
+            // 用 Load 而不是构造函数里 BeginInvoke：构造期间句柄还没创建，
+            // BeginInvokeSafe 会静默返回（该辅助方法在没有句柄时直接 return）。
+            // Load 在 Application.Run 建立句柄后、首帧显示前触发，静默模式下同样会走到。
+            if (_autoStartOnBoot)
+            {
+                _autoStartOnBoot = false;
+                Load += delegate
                 {
-                    _autoStartOnBoot = false;
                     AppendLog("[RUN] 开机自启：按偏好自动启动项目。");
                     StartProject(true);
-                }
-            };
+                };
+            }
         }
 
         /// 开机静默启动：Application.Run 会请求显示窗口，这里拦下第一次，

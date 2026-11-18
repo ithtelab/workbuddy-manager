@@ -945,13 +945,25 @@ def key_usage(request: Request):
         _record(key, ip, '', '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
         return _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
-    def allowance(limit: int | None, used: int | None) -> dict:
-        used_n = int(used or 0)
-        limit_n = int(limit or 0)
+    def allowance(limit, used, *, integral: bool = True) -> dict:
+        """额度三元组。**积分是小数、token 是整数**，必须分开处理（issue #450）。
+
+        历史上这里对两者都用 `int()`：`quota_credit=0.5`、`used_credit=0.04`
+        被截成 `int(0.5)=0` / `int(0.04)=0`，于是 limit 变成 None（被当成「不限」）、
+        used 恒为 0 —— 面板上明明有额度与消耗，`/v1/usage` 却一路报空。
+        """
+        if integral:
+            used_n: int | float = int(used or 0)
+            limit_n: int | float = int(limit or 0)
+        else:
+            used_n = round(float(used or 0), 6)
+            limit_n = round(float(limit or 0), 6)
         return {
             'used': used_n,
             'limit': limit_n or None,          # None = 不限制
-            'remaining': max(0, limit_n - used_n) if limit_n else None,
+            'remaining': (max(0, limit_n - used_n) if limit_n else None)
+                         if integral else
+                         (round(max(0.0, limit_n - used_n), 6) if limit_n else None),
         }
 
     now = int(time.time())
@@ -973,7 +985,8 @@ def key_usage(request: Request):
             'models': list(key.get('models') or []),
         },
         'tokens': allowance(key.get('quota'), key.get('used_tokens')),
-        'credits': allowance(key.get('quota_credit'), key.get('used_credit')),
+        # 积分是**小数**（0.04 这类），按整数转型会被截成 0（issue #450）
+        'credits': allowance(key.get('quota_credit'), key.get('used_credit'), integral=False),
         # 今日 token（本地日期，次日 0 点恢复）；limit 为 None = 不限
         'daily_tokens': allowance(key.get('daily_quota'), key.get('daily_used_tokens')),
         'last_used_at': int(key.get('last_used_at') or 0),
