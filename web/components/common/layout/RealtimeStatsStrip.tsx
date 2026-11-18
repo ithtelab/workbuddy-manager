@@ -64,7 +64,18 @@ export function RealtimeStatsStrip({days}: {days: number}) {
    */
   const seq = useRef(0);
 
+  /**
+   * 同一时刻只允许一个请求在途（1 秒轮询 + 慢查询/慢网络时不堆积）。
+   *
+   * 心跳每 1 秒触发一次；如果某次 `/api/stats/realtime` 因为长时段扫描或网络
+   * 抖动花了 3 秒，不加这道门就会叠出 3 个在途请求，越拖越糟。丢弃的这一次
+   * 不影响正确性 —— 下一次心跳会再问。
+   */
+  const busy = useRef(false);
+
   const load = useCallback(() => {
+    if (busy.current) return;
+    busy.current = true;
     const ticket = ++seq.current;
     statsApi
       .realtime(days)
@@ -76,6 +87,9 @@ export function RealtimeStatsStrip({days}: {days: number}) {
       .catch(() => {
         if (ticket !== seq.current) return;
         setFailed(true);
+      })
+      .finally(() => {
+        busy.current = false;
       });
   }, [days]);
 
