@@ -48,6 +48,15 @@ class Rejection(str):
         return self
 
 
+class TokenConflict(ValueError):
+    """自定义 token 与已有密钥冲突（唯一索引兜底命中）。
+
+    单独一个类型是为了让路由层能**区分对待**：冲突是 409（换一个就好），
+    而 `_norm_custom_token` 抛的 ValueError 是格式/弱口令问题，应为 400。
+    两者混用会让「密码太短」也回 409，用户会以为是撞车而不是格式错。
+    """
+
+
 def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
@@ -370,10 +379,19 @@ def create_key(
         _norm_daily_quota(daily_quota),
     )
     if _conn is not None:
-        key_id = int(_conn.execute(sql, args).lastrowid or 0)
+        try:
+            key_id = int(_conn.execute(sql, args).lastrowid or 0)
+        except sqlite3.IntegrityError as exc:
+            raise TokenConflict('这个密钥已被占用，请换一个') from exc
         row = _conn.execute('SELECT * FROM api_keys WHERE id = ?', (key_id,)).fetchone()
     else:
-        key_id = db.execute(sql, args)
+        # 唯一索引（idx_keys_hash）兜住并发创建同一 token：路由层的「先查再插」
+        # 之间存在竞态窗口，实测 8 个线程能落下 8 行同 hash。转成 ValueError，
+        # 由路由层统一成 409 —— 与「检查时就已经存在」给用户同一个提示。
+        try:
+            key_id = db.execute(sql, args)
+        except sqlite3.IntegrityError as exc:
+            raise TokenConflict('这个密钥已被占用，请换一个') from exc
         row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
     out = _parse(row)
     out['key'] = token  # 创建响应里直接给出，界面不必再调一次 reveal

@@ -114,7 +114,7 @@ namespace WorkBuddyLauncher
                 AppendLog("[INFO] 已按开机自启静默启动，驻留托盘（双击托盘图标打开窗口）。");
                 ShowTrayBalloonOnce();
                 // 自启时是否同时拉起项目（issue #388 / #449）：quiet=true 不弹
-                // 错误框、不打开浏览器。真正的启动点见构造函数末尾的 Load 注册。
+                // 错误框、不打开浏览器。真正的启动点见构造函数末尾的 HandleCreated 注册。
                 _autoStartOnBoot = string.Equals(
                     _settings.Get("autostart_project", "0"), "1", StringComparison.Ordinal);
             }
@@ -124,21 +124,27 @@ namespace WorkBuddyLauncher
                 ProbeAsync();
             };
 
-            // 开机自启时拉起项目**不能挂在 Shown 上**（issue #449）。
-            // 静默模式走 SetVisibleCore 拦下显示，窗口永远不「显示」→ Shown 永不触发
-            // → 托盘图标在、项目却没起；手动双击托盘（RestoreFromTray）才补触发一次，
-            // 看起来像「必须先打开控制窗口」。
+            // 开机自启时拉起项目**不能挂在 Shown / Load 上**（issue #449）。
             //
-            // 用 Load 而不是构造函数里 BeginInvoke：构造期间句柄还没创建，
-            // BeginInvokeSafe 会静默返回（该辅助方法在没有句柄时直接 return）。
-            // Load 在 Application.Run 建立句柄后、首帧显示前触发，静默模式下同样会走到。
+            // 静默模式走 SetVisibleCore 拦下显示。实测（最小 WinForms 复现）：
+            // 拦下显示后 **`Load` 与 `Shown` 都不会触发** —— 两者都由
+            // `SetVisibleCore(true)` 内部驱动。所以原实现（挂 Shown）与第一版修复
+            // （改挂 Load）都会「托盘图标在、项目没起」，只有手动双击托盘
+            // （RestoreFromTray → 真正显示一次）才补触发。
+            //
+            // 正确的触发点是 `HandleCreated`：它在 `CreateHandle()` 之后触发，
+            // 静默路径同样会走到，且此时句柄已存在、`BeginInvoke` 可以安全排队
+            // （构造函数里直接 BeginInvoke 会因无句柄而静默失败）。
             if (_autoStartOnBoot)
             {
                 _autoStartOnBoot = false;
-                Load += delegate
+                HandleCreated += delegate
                 {
-                    AppendLog("[RUN] 开机自启：按偏好自动启动项目。");
-                    StartProject(true);
+                    BeginInvokeSafe(delegate
+                    {
+                        AppendLog("[RUN] 开机自启：按偏好自动启动项目。");
+                        StartProject(true);
+                    });
                 };
             }
         }

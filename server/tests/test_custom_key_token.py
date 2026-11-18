@@ -153,3 +153,84 @@ class ResolveTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class TokenUniquenessRaceTest(unittest.TestCase):
+    """并发创建同一 token 只能落一行（唯一索引兜底）。
+
+    发现过程：路由层的「先查是否已存在」与 INSERT 之间有竞态窗口，实测 8 个线程
+    同时创建会落下 **8 行同 hash** 的密钥。那时鉴权随机命中任意一行，额度与日志
+    归属全部错乱 —— 而界面上看不出任何异常（每把看起来都是正常密钥）。
+
+    应用层的 409 只负责友好提示，真正防重的是 `idx_keys_hash` 唯一索引。
+    """
+
+    def setUp(self) -> None:
+        db.connect()
+        # 迁移阶段应该已经把索引建好
+        idx = db.query("SELECT name FROM sqlite_master WHERE type='index' "
+                       "AND name='idx_keys_hash'")
+        self.assertTrue(idx, 'idx_keys_hash 没建起来 —— 并发兜底失效')
+
+    def test_concurrent_creates_land_one_row(self) -> None:
+        import threading
+        token = 'sk-race-2026-abcd-efgh'
+        results: list[str] = []
+
+        def worker() -> None:
+            try:
+                keysvc.create_key('race', custom_token=token)
+                results.append('ok')
+            except keysvc.TokenConflict:
+                results.append('conflict')
+            except Exception as exc:      # noqa: BLE001
+                results.append(type(exc).__name__)
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results.count('ok'), 1, f'只应成功一次，实得 {sorted(results)}')
+        self.assertEqual(results.count('conflict'), len(threads) - 1,
+                         f'其余都应是 TokenConflict，实得 {sorted(results)}')
+        rows = db.query('SELECT 1 FROM api_keys WHERE key_hash = ?',
+                        (keysvc._hash(token),))
+        self.assertEqual(len(rows), 1, '数据库里只能有一行')
+
+    def test_conflict_is_a_value_error_subclass(self) -> None:
+        """保持 ValueError 的子类：既有 `except ValueError` 调用点不会漏接。"""
+        self.assertTrue(issubclass(keysvc.TokenConflict, ValueError))
+
+
+class ExistingDuplicateCleanupTest(unittest.TestCase):
+    """存量库若已有重复 hash，迁移要能清掉并建索引，而不是启动失败。"""
+
+    def test_migration_cleans_duplicates(self) -> None:
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        # 造一个「已经存在、且含重复 hash」的最小表
+        conn.executescript("""
+            CREATE TABLE api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, key_hash TEXT NOT NULL,
+                key_plain TEXT NOT NULL DEFAULT '', prefix TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1, expires_at INTEGER, max_ips INTEGER,
+                ip_allowlist TEXT, models TEXT, realm TEXT, quota INTEGER,
+                used_tokens INTEGER, quota_credit REAL, used_credit REAL,
+                created_at INTEGER, upstream_id INTEGER, daily_quota INTEGER,
+                daily_used_tokens INTEGER, daily_used_day TEXT
+            );
+        """)
+        same = keysvc._hash('sk-dup-2026-abcd-efgh')
+        for i in range(3):
+            conn.execute('INSERT INTO api_keys(name, key_hash, prefix) VALUES(?,?,?)',
+                         (f'n{i}', same, 'sk-dup-2026'))
+        conn.commit()
+        db._ensure_keys_hash_unique(conn)
+        rows = conn.execute('SELECT id FROM api_keys WHERE key_hash = ?', (same,)).fetchall()
+        self.assertEqual(len(rows), 1, '重复行应被清理到只剩一行')
+        self.assertEqual(rows[0]['id'], 1, '保留的应是最早创建的那一行')
+        idx = conn.execute("SELECT name FROM sqlite_master WHERE type='index' "
+                           "AND name='idx_keys_hash'").fetchone()
+        self.assertIsNotNone(idx, '清理后应当建上唯一索引')
+        conn.close()

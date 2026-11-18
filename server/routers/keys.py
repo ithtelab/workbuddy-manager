@@ -178,19 +178,26 @@ def create_key(body: KeyIn, request: Request,
     _check_upstream(body.upstream_id)
     if body.custom_token:
         _check_custom_token_allowed(body.custom_token)
-    created = keysvc.create_key(
-        name=body.name,
-        expires_at=body.expires_at,
-        max_ips=body.max_ips,
-        ip_allowlist=body.ip_allowlist,
-        models=body.models,
-        quota=body.quota,
-        realm=body.realm,
-        quota_credit=body.quota_credit,
-        daily_quota=body.daily_quota,
-        upstream_id=body.upstream_id,
-        custom_token=body.custom_token,
-    )
+    try:
+        created = keysvc.create_key(
+            name=body.name,
+            expires_at=body.expires_at,
+            max_ips=body.max_ips,
+            ip_allowlist=body.ip_allowlist,
+            models=body.models,
+            quota=body.quota,
+            realm=body.realm,
+            quota_credit=body.quota_credit,
+            daily_quota=body.daily_quota,
+            upstream_id=body.upstream_id,
+            custom_token=body.custom_token,
+        )
+    except keysvc.TokenConflict as exc:
+        # 唯一索引兜底命中（并发创建同一 token）：与预检查同样是 409
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        # 形态/弱口令问题（含绕过路由直接调用 keysvc 的内部路径）
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # 密钥是拿额度用的凭证，发放必须留痕（含来源 IP）
     upstream_name = '默认上游'
     if created.get('upstream_id'):

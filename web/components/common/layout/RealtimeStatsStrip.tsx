@@ -14,7 +14,7 @@
  * 两条线共用一根纵轴并各自带峰值（`YAxis` 由两条曲线的最大值决定），所以数值
  * 更大的那条自然浮在上面，不需要第二条轴去「编」出一个高度关系。
  */
-import {useCallback, useEffect, useMemo, useState} from 'react';
+import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {Gauge, Zap} from 'lucide-react';
 import {Area, ComposedChart, Line, ResponsiveContainer, Tooltip, YAxis} from 'recharts';
 
@@ -49,14 +49,28 @@ export function RealtimeStatsStrip({days}: {days: number}) {
   const [data, setData] = useState<StatsRealtime | null>(null);
   const [failed, setFailed] = useState(false);
 
+  /**
+   * 请求序号：只接受「最新一次」的响应。
+   *
+   * 换时段（`days` 变）会同时触发 `useEffect` 与心跳，两个请求在途时**先发的
+   * 未必先回**；不带序号的话旧时段的数据会盖掉新时段的，界面上的峰值与下面的表
+   * 就对不上，而且看起来像「数据在跳」。
+   */
+  const seq = useRef(0);
+
   const load = useCallback(() => {
+    const ticket = ++seq.current;
     statsApi
       .realtime(days)
       .then((next) => {
+        if (ticket !== seq.current) return;
         setData(next);
         setFailed(false);
       })
-      .catch(() => setFailed(true));
+      .catch(() => {
+        if (ticket !== seq.current) return;
+        setFailed(true);
+      });
   }, [days]);
 
   // 换时段要立刻重取：留着上一个时段的峰值会和下面的表对不上

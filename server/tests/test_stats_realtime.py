@@ -23,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from server import config, db  # noqa: E402
+from server import db as db_mod  # noqa: E402  （等价性测试里显式叫 db_mod）
 from server.routers import stats  # noqa: E402
 from server.services import wb2api  # noqa: E402
 
@@ -208,3 +209,101 @@ class RealtimeEndpointTest(_DbCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class PeakEquivalenceTest(unittest.TestCase):
+    """`_peaks` 的并发峰值必须等于「朴素区间扫描」的结果。
+
+    为什么要钉这条：第一版是把整段窗口的行拉进 Python 拼事件排序，20 万行 / 90 天
+    实测 74 MB 内存 —— 日志表只增不减，那写法迟早把面板拖死。改成 SQL 窗口函数后
+    内存归零，但**算法换了，语义必须一样**。这里用穷举式参考实现逐例比对：随机
+    数据、首尾相接、同时刻多条、零/亚秒耗时、跨分钟的长请求。
+    """
+
+    @staticmethod
+    def _reference(pairs: list[tuple[int, int]]) -> int:
+        """朴素参考实现：枚举所有端点，按 (时刻, -1 先) 扫一遍。"""
+        events: list[tuple[float, int]] = []
+        for ts, ms in pairs:
+            events.append((float(ts), 1))
+            # 与 `_peaks` 同口径：零/负/NULL 时长按 1 毫秒算（一条正在处理的请求
+            # 至少要占一瞬，否则同刻的开始与结束相消、峰值数不到它）
+            dur = max(0, ms or 0) or 1
+            events.append((ts + dur / 1000.0, -1))
+        events.sort(key=lambda e: (e[0], e[1]))
+        cur = peak = 0
+        for _t, d in events:
+            cur += d
+            peak = max(peak, cur)
+        return peak
+
+    def test_matches_reference_on_random_data(self) -> None:
+        import random as _random
+        rng = _random.Random(20261118)
+        for round_no in range(12):
+            db_mod.execute('DELETE FROM request_logs')
+            pairs = [(1794970000 + rng.randint(0, 3000), rng.choice([0, 1, 50, 800, 2500, 6000]))
+                     for _ in range(rng.randint(1, 60))]
+            for ts, ms in pairs:
+                db_mod.execute(
+                    'INSERT INTO request_logs(ts, model, status, prompt_tokens, '
+                    'completion_tokens, latency_ms, stream) VALUES(?,?,?,?,?,?,?)',
+                    (ts, 'm', 200, 0, 0, ms, 1))
+            stats._PEAK_CACHE.clear()
+            got = stats._peaks(90)['concurrency']
+            want = self._reference(pairs)
+            self.assertEqual(got, want, f'第 {round_no} 轮不一致（{len(pairs)} 条）')
+
+    def test_touching_requests_do_not_stack(self) -> None:
+        """先结束后开始（半开区间）→ 峰值 1，不是 2。"""
+        db_mod.execute('DELETE FROM request_logs')
+        for ts, ms in ((1794970000, 1000), (1794970001, 1000)):
+            db_mod.execute(
+                'INSERT INTO request_logs(ts, model, status, prompt_tokens, '
+                'completion_tokens, latency_ms, stream) VALUES(?,?,?,?,?,?,?)',
+                (ts, 'm', 200, 0, 0, ms, 1))
+        stats._PEAK_CACHE.clear()
+        self.assertEqual(stats._peaks(90)['concurrency'], 1)
+
+class PeakSqlPitfallsTest(unittest.TestCase):
+    """`_peaks` 的 SQL 实现里那三个坑，各钉一条（它们都会让峰值恒为 0）。
+
+    改写成 SQL 窗口函数之后踩到的顺序：
+
+      1. `latency_ms` 为 NULL → `ts + NULL` 是 NULL，那行永不结束；
+      2. `ts` 整数 vs 结束时刻浮点 → SQLite 的 `ORDER BY` **先按类型**，
+         同一时刻的开始会排到结束之后，前缀和先加后减；
+      3. 零时长请求 → 开始与结束同刻，`-1` 排在 `+1` 前，前缀和看不到它。
+
+    三条都表现为「并发峰值 = 0」，界面上只是数字不对、不报错 —— 必须逐条钉住。
+    """
+
+    def _peak(self, pairs: list[tuple[int, int | None]]) -> int:
+        db.execute('DELETE FROM request_logs')
+        for ts, ms in pairs:
+            db.execute(
+                'INSERT INTO request_logs(ts, model, status, latency_ms, stream) '
+                'VALUES(?,?,?,?,?)', (ts, 'm', 200, ms, 1))
+        stats._PEAK_CACHE.clear()
+        return stats._peaks(90)['concurrency']
+
+    def test_null_latency_still_counts(self) -> None:
+        """坑 1：latency_ms 为 NULL（历史记录/非流式）也必须算一条。"""
+        self.assertEqual(self._peak([(1794970000, None)]), 1)
+
+    def test_zero_latency_counts(self) -> None:
+        """坑 3：零时长请求算 1，不是 0。"""
+        self.assertEqual(self._peak([(1794970000, 0)]), 1)
+
+    def test_two_zero_duration_at_same_second(self) -> None:
+        """同一秒两条零时长：都在处理中，峰值 2。"""
+        self.assertEqual(self._peak([(1794970000, 0), (1794970000, 0)]), 2)
+
+    def test_overlap_detected(self) -> None:
+        """坑 2：整数 ts 与浮点结束时刻不能因类型排序错位。"""
+        self.assertEqual(self._peak([(1794970000, 5000), (1794970001, 5000)]), 2)
+
+    def test_touching_requests_are_not_concurrent(self) -> None:
+        self.assertEqual(self._peak([(1794970000, 1000), (1794970001, 1000)]), 1)
+
+    def test_no_overlap(self) -> None:
+        self.assertEqual(self._peak([(1794970000, 100), (1794970100, 100)]), 1)

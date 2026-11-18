@@ -24,6 +24,22 @@ from server import keysvc  # noqa: E402
 from server.routers import gateway  # noqa: E402
 
 
+_HASH_SEQ = 0
+
+
+def _uniq_hash() -> str:
+    """每次调用返回唯一 hash。
+
+    `api_keys.key_hash` 有唯一索引（issue #447 防并发重复），而下面这些测试辅助
+    会被同一用例调用多次、每次都插一行 —— 写死同一个字面量会撞索引。测试并不
+    关心 hash 取什么值，唯一即可。
+    """
+    global _HASH_SEQ
+    _HASH_SEQ += 1
+    return f'h{int(__import__("time").time() * 1e6)}-{_HASH_SEQ}'
+
+
+
 class KeyCreditQuotaTest(unittest.TestCase):
     """密钥的积分额度（issue #27）。
 
@@ -299,7 +315,7 @@ class CreditRecording(unittest.TestCase):
         db.execute(
             'INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, '
             'ip_allowlist, models, quota, used_tokens, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-            ('k', 'h', 'wbk_abc', 1, None, 0, '[]', '[]', 0, 0, int(time.time())),
+            ('k', _uniq_hash(), 'wbk_abc', 1, None, 0, '[]', '[]', 0, 0, int(time.time())),
         )
         self.key = {'id': 1}
 
