@@ -277,6 +277,13 @@
     "creditsExpiryDaily": "가장 가까운 만료일({time})에 {amount} 포인트 만료"
   },
   "stats": {
+    "realtimeConcurrency": "동시 실행 중",
+    "realtimeRpm": "RPM",
+    "realtimeTrend": "최근 3분",
+    "realtimePeak": "최대 {n}",
+    "realtimeCapacity": "한도 {c}",
+    "realtimeAverage": "3분 평균 {v}",
+    "realtimeUnavailable": "업스트림에 연결할 수 없음",
     "customRange": "사용자 지정",
     "startDate": "시작일",
     "endDate": "종료일",

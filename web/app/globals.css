@@ -386,3 +386,26 @@ button {
 .big-objview-root .popover-content {
   display: none !important;
 }
+
+/**
+ * 用量统计页顶部实时指标条（RealtimeStatsStrip）的两条曲线色。
+ *
+ * 必须与同页 StatCard 的语义档一致：并发 = warning（橙）、RPM = success（绿）。
+ * Recharts 的 stroke / fill 只认具体颜色，而 Tailwind 那套是类名
+ * （`text-amber-600 dark:text-amber-400`）—— 所以把两档色值提成变量，让 SVG 与
+ * 卡片文案共用同一套，深浅色切换也跟着走。
+ */
+.wb-rt-strip {
+  --wb-rt-conc: var(--color-amber-600);
+  --wb-rt-rpm: var(--color-emerald-600);
+}
+
+.dark .wb-rt-strip {
+  --wb-rt-conc: var(--color-amber-400);
+  --wb-rt-rpm: var(--color-emerald-400);
+}
+
+/* 卡片右上角图标跟着并发那条线的颜色走，与 StatCard 的 tone 行为一致 */
+.wb-rt-conc {
+  color: var(--wb-rt-conc);
+}

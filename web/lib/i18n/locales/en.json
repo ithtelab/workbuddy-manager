@@ -304,6 +304,13 @@
     "creditsExpiryDaily": "{amount} credits expire on the nearest day ({time})"
   },
   "stats": {
+    "realtimeConcurrency": "In flight",
+    "realtimeRpm": "RPM",
+    "realtimeTrend": "Last 3 minutes",
+    "realtimePeak": "Peak {n}",
+    "realtimeCapacity": "Capacity {c}",
+    "realtimeAverage": "3-min avg {v}",
+    "realtimeUnavailable": "Upstream unreachable",
     "customRange": "Custom",
     "startDate": "Start date",
     "endDate": "End date",

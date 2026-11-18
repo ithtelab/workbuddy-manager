@@ -277,6 +277,13 @@
     "creditsExpiryDaily": "最近一天（{time}）共 {amount} 积分到期"
   },
   "stats": {
+    "realtimeConcurrency": "当前并发",
+    "realtimeRpm": "RPM",
+    "realtimeTrend": "近 3 分钟",
+    "realtimePeak": "峰值 {n}",
+    "realtimeCapacity": "上限 {c}",
+    "realtimeAverage": "3 分钟均 {v}",
+    "realtimeUnavailable": "上游不可达",
     "customRange": "自定义",
     "startDate": "开始日期",
     "endDate": "结束日期",
