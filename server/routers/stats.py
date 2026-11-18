@@ -895,22 +895,68 @@ async def upstream_stats(user: dict = Depends(security.current_user)) -> dict:
 _PEAK_CACHE: dict[int, tuple[float, dict]] = {}
 
 
-def _per_account_limit() -> int:
-    """上游 `pool.max_in_flight`（单账号在途上限）。读不到按官方默认 2。"""
+def _per_account_limit() -> dict[str, int]:
+    """上游「每个账号的在途上限」，按 realm 取不同的键。
+
+    * `pool.max_in_flight` —— 国内版（`cn`）单账号上限；
+    * `pool.max_in_flight_global` —— **国际版账号**的上限。名字里的 global 指的是
+      realm（国际版），不是「整个池子」，与全池并发总数无关。
+
+    两个键的 0 都被上游归一化成 2（见 `server/services/wb2api.py` 里对应注释），
+    所以这里同样把非正数当 2。
+    """
     try:
-        raw = config.UPSTREAM_CONFIG.read_text(encoding='utf-8')
-        limit = int((json.loads(raw).get('pool') or {}).get('max_in_flight') or 2)
-        return limit if limit > 0 else 2
+        pool = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8')).get('pool') or {}
     except Exception:  # noqa: BLE001 - 配置缺失 / 损坏都不该让整页 500
-        return 2
+        pool = {}
+
+    def pick(name: str) -> int:
+        try:
+            n = int(pool.get(name) or 2)
+        except (TypeError, ValueError):
+            n = 2
+        return n if n > 0 else 2
+
+    return {'cn': pick('max_in_flight'), 'global': pick('max_in_flight_global')}
+
+
+def _request_spans(rows) -> list[tuple[float, float]]:
+    """把日志行还原成请求**真正占用的时间区间** `[ts - latency, ts)`。
+
+    `request_logs.ts` 是写完日志那一刻（≈请求结束），`latency_ms` 是从请求进来
+    到结束的耗时——`gateway._record()` 里这两行挨着算。方向搞反的代价不是「差
+    一点」：一条 30 秒的流式请求会被画到它结束之后的两个桶里。
+    """
+    spans: list[tuple[float, float]] = []
+    for row in rows:
+        ts = float(row['ts'] or 0)
+        dur = max(0.0, float(row['latency_ms'] or 0) / 1000.0)
+        spans.append((ts - dur, ts))
+    return spans
+
+
+def _max_overlap(spans) -> int:
+    """区间最大重叠数（半开区间：同一时刻先结束后开始，首尾相接不算并发）。"""
+    events: list[tuple[float, int]] = []
+    for begin, end in spans:
+        events.append((begin, 1))
+        events.append((end, -1))
+    events.sort(key=lambda e: (e[0], e[1]))
+    current = 0
+    peak = 0
+    for _t, delta in events:
+        current += delta
+        if current > peak:
+            peak = current
+    return peak
 
 
 def _peaks(days: int) -> dict:
     """窗口内的并发峰值与 RPM 峰值，结果缓存 60 秒。
 
-    并发用区间重叠扫描：每个请求占 `[ts, ts + latency)`，求最大重叠数。同一时刻
+    并发用区间重叠扫描：每个请求占 `[ts - latency, ts)`，求最大重叠数。同一时刻
     先结束后开始（事件排序里 -1 在 +1 之前），半开区间不会把首尾相接的两个请求
-    重复计成一个并发。
+    重复计成一个并发。方向见下面 SQL 里的注释——`ts` 是结束时刻。
 
     **为什么不用 Python 排序事件**：第一版是把整段窗口的 `(ts, latency_ms)` 全拉进
     内存再拼 2N 个事件排序。20 万行日志时实测 90 天窗口要 **1.8 秒 / 74 MB**，而
@@ -929,23 +975,28 @@ def _peaks(days: int) -> dict:
     since = _epoch_since(key)
     # 并发峰值：开始 +1 / 结束 -1，按时刻排序后求前缀和的最大值（区间最大重叠）。
     #
+    # 区间是 `[ts - latency, ts)`：`ts` 是请求**结束**的时刻（见 `gateway._record()`
+    # 里 `log_ts` 与 `latency` 那两行），所以开始端要往前推 latency，而不是往后——按
+    # `[ts, ts + latency)` 铺会把每条请求推到它结束之后，一条 30 秒的流式请求会在图上
+    # 「再忙半分钟」。
+    #
     # 三个坑都在下面这条 SQL 里，改之前先读：
     #   1. `COALESCE(latency_ms, 0)`：历史记录与非流式请求的 latency_ms 可能是
-    #      NULL，`ts + NULL` 是 NULL，那行就永远不结束。
-    #   2. `ts * 1.0`：`ts` 是整数、`ts + ms/1000.0` 是浮点，而 SQLite 的
+    #      NULL，`ts - NULL` 是 NULL，那行就永远不会开始。
+    #   2. `ts * 1.0`：`ts` 是整数、`ts - ms/1000.0` 是浮点，而 SQLite 的
     #      `ORDER BY` **先按类型再按值**（整数整体排在浮点之前）。不统一类型的话
-    #      同一时刻的「开始」会排在「结束」之后，峰值恒为 0。
-    #   3. 零时长请求（latency_ms 为 NULL / 0）的结束时刻与开始**相同**。此时
+    #      同一时刻的「开始」会排到「结束」之后，前缀和先减后加、峰值恒为 0。
+    #   3. 零时长请求（latency_ms 为 NULL / 0）的开始与结束是**同一时刻**。此时
     #      `ORDER BY t, d` 让 -1 排在 +1 之前，前缀和先减后加、峰值看不到它。
     #      所以零时长按「极小但非零」的时长处理（1 毫秒）：并发峰值是「同一时刻
     #      最多几条请求在处理」，一条已经在跑的请求至少要算 1。
     row = db.query_one(
         """
         WITH ev AS (
-            SELECT ts * 1.0 AS t, 1 AS d FROM request_logs WHERE ts >= ?
-            UNION ALL
-            SELECT ts * 1.0 + MAX(COALESCE(latency_ms, 0), 1) / 1000.0, -1
+            SELECT ts * 1.0 - MAX(COALESCE(latency_ms, 0), 1) / 1000.0 AS t, 1 AS d
               FROM request_logs WHERE ts >= ?
+            UNION ALL
+            SELECT ts * 1.0 AS t, -1 FROM request_logs WHERE ts >= ?
         ),
         running AS (
             SELECT d, SUM(d) OVER (ORDER BY t, d) AS cur FROM ev
@@ -968,30 +1019,37 @@ def _peaks(days: int) -> dict:
 
 
 def _series(window: int = 180, step: int = 15) -> dict:
-    """近 `window` 秒的 RPM 与并发序列，每 `step` 秒一个桶。
+    """近 `window` 秒的「每分钟完成数」与**并发**序列，每 `step` 秒一个桶。
 
-    桶边界必须对齐到**绝对时间**（`step` 的整数倍）。若用 `now - window` 当起点，
-    每次刷新 `now` 都在变，整条窗口跟着平移，同一批请求会被切进不同的桶——画出来
-    的曲线每一轮都不一样，看起来像「数据在乱跳」。
+    三处刻意的算法选择：
+
+    1. 桶边界对齐到**绝对时间**（`step` 的整数倍）。若用 `now - window` 当起点，
+       每次刷新 `now` 都在变，整条窗口跟着平移，同一批请求被切进不同桶——画出来
+       的曲线每一轮都不一样，看起来像「数据在乱跳」。
+    2. 并发取**桶内最大重叠**（同时最多几条），不是「有几条请求碰过这一格」。后者
+       会把同一格里先后完成的两条算成 2，哪怕它们从不同时在跑。
+    3. `rpm` 按**完成时刻**落桶：它回答的是「这一格完成了多少条」，与并发不是同一
+       量纲，别把它当「请求数」和并发相加。
     """
     now = int(time.time())
     end = (now // step + 1) * step
     start = end - window
     nb = max(1, window // step)
-    # 多取 60 秒：跨进窗口的长请求也要计入并发（它们的 ts 早于 start）
+    # 多取一个窗口：长请求可能早于 start 开始（它的 ts 是结束时刻）
     rows = db.query('SELECT ts, latency_ms FROM request_logs WHERE ts >= ?',
-                    (start - 60,))
+                    (start - max(60, window),))
+    spans = _request_spans(rows)
     rpm = [0] * nb
     conc = [0] * nb
     for row in rows:
-        ts = int(row['ts'] or 0)
-        dur = max(0, int((row['latency_ms'] or 0) / 1000.0))
+        ts = float(row['ts'] or 0)
         if ts >= start:
-            rpm[min(nb - 1, (ts - start) // step)] += 1
-        first = max(0, (ts - start) // step)
-        last = min(nb - 1, (ts + dur - start) // step)
-        for i in range(first, last + 1):
-            conc[i] += 1
+            rpm[min(nb - 1, int((ts - start) // step))] += 1
+    for i in range(nb):
+        b0 = float(start + i * step)
+        clipped = [(max(begin, b0), min(finish, b0 + step))
+                   for begin, finish in spans]
+        conc[i] = _max_overlap([(b, e) for b, e in clipped if e > b])
     return {'window': window, 'step': step, 'start': start, 'end': end,
             'rpm': rpm, 'concurrency': conc}
 
@@ -1030,9 +1088,12 @@ async def realtime(days: int | None = None,
         return out
 
     accounts = status.get('accounts') or []
-    limit = _per_account_limit()
+    limits = _per_account_limit()
     inflight = 0
     busy = 0
+    # 上限按 realm 算：国际版账号走 `max_in_flight_global`，国内版走 `max_in_flight`。
+    # 用「账号数 × 单一上限」在混合池里会多算——本项目的默认池就是 cn + global 混合。
+    capacity = 0
     for account in accounts:
         try:
             n = int(account.get('in_flight') or 0)
@@ -1041,13 +1102,15 @@ async def realtime(days: int | None = None,
         inflight += n
         if n > 0:
             busy += 1
+        capacity += limits.get(str(account.get('realm') or 'cn'), limits['cn'])
     out.update({
         'available': True,
         'inflight': inflight,
         'busy_accounts': busy,
         'accounts_total': len(accounts),
-        'per_account_limit': limit,
-        'capacity': len(accounts) * limit,
+        'per_account_limit': limits['cn'],
+        'per_account_limit_global': limits['global'],
+        'capacity': capacity,
         'full_accounts': int(status.get('in_flight_full') or 0),
         'healthy': int(status.get('healthy') or 0),
         'sticky': int(status.get('sticky_sessions') or 0),

@@ -2,8 +2,8 @@
 
 `/api/stats/realtime` 的三个数字各有口径，这里钉住容易算错的几处：
 
-  · **并发峰值**来自区间重叠扫描（`[ts, ts + latency)`），不是「每分钟多少条」。
-    首尾相接（A 在 t+2 结束、B 在 t+2 开始）算 1 个并发，不能算成 2；
+  · **并发峰值**来自区间重叠扫描（`[ts - latency, ts)`；`ts` 是请求**结束**时刻），
+    不是「每分钟多少条」。首尾相接算 1 个并发，不能算成 2；
   · **桶边界**对齐到 `step` 的整数倍。用 `now - window` 当起点的话，每次刷新窗口
     都会平移，同一批请求被切进不同的桶——曲线每轮都不一样；
   · **上游 `/status` 取不到**时不能整块返回失败：`rpm_*` / `peaks` / `series` 只
@@ -29,6 +29,8 @@ from server.services import wb2api  # noqa: E402
 
 
 def _log(ts: int, latency_ms: int, status: int = 200, model: str = 'm1') -> None:
+    """写入一条**已在 ts 结束**的请求（`ts` 是结束时刻，不是开始时刻）。"""
+
     db.execute(
         'INSERT INTO request_logs(ts,key_id,ip,model,mapped_model,status,'
         'prompt_tokens,completion_tokens,latency_ms,first_token_ms,ua,error,stream,realm) '
@@ -119,16 +121,24 @@ class SeriesTest(_DbCase):
         self.assertEqual(out['rpm'][5], 1)
         self.assertEqual(sum(out['rpm']), 2)
 
-    def test_long_request_spans_concurrency_buckets(self) -> None:
+    def test_long_request_spans_buckets_backwards(self) -> None:
+        """45 秒的请求向前铺 3 格，而不是它结束之后的 3 格。"""
+        start = stats._series()['start']
+        _log(start + 45, 45_000)        # 占用 [start, start+45) → 第 0/1/2 格
         out = stats._series()
-        start = out['start']
-        _log(start + 1, 46_000)   # 覆盖 bucket 0..3
-        out = stats._series()
-        for i in range(4):
+        for i in range(3):
             self.assertGreaterEqual(out['concurrency'][i], 1, f'bucket {i} 没算到并发')
-        self.assertEqual(out['concurrency'][4], 0)
-        # RPM 只在开始的那个桶里计一次
+        self.assertEqual(out['concurrency'][3], 0, '请求结束后的桶不该再有并发')
         self.assertEqual(sum(out['rpm']), 1)
+
+    def test_concurrency_is_max_overlap_not_hit_count(self) -> None:
+        """同一格内先后完成的两条：命中数 2，但同时只有 1 条 → 必须报 1。"""
+        start = stats._series()['start']
+        _log(start + 3, 2_000)          # [start+1, start+3)
+        _log(start + 6, 2_000)          # [start+4, start+6)
+        out = stats._series()
+        self.assertEqual(out['rpm'][0], 2)
+        self.assertEqual(out['concurrency'][0], 1)
 
     def test_empty_window_is_all_zero(self) -> None:
         out = stats._series()
@@ -140,7 +150,11 @@ class RealtimeEndpointTest(_DbCase):
     def _upstream(self, **overrides) -> dict:
         payload = {
             'connected': True,
-            'accounts': [{'in_flight': 1}, {'in_flight': 0}, {'in_flight': 2}],
+            'accounts': [
+                {'realm': 'cn', 'in_flight': 1},
+                {'realm': 'cn', 'in_flight': 0},
+                {'realm': 'cn', 'in_flight': 2},
+            ],
             'in_flight_full': 0,
             'healthy': 3,
             'sticky_sessions': 4,
@@ -165,15 +179,41 @@ class RealtimeEndpointTest(_DbCase):
         self.assertEqual(out['busy_accounts'], 2)
         self.assertEqual(out['accounts_total'], 3)
         self.assertEqual(out['per_account_limit'], 3)
-        self.assertEqual(out['capacity'], 9)
+        self.assertEqual(out['per_account_limit_global'], 2, '未配置时按默认 2')
+        self.assertEqual(out['capacity'], 9)       # 3 个 cn 账号 × 3
         self.assertEqual(out['healthy'], 3)
         self.assertEqual(out['sticky'], 4)
         self.assertNotIn('error', out)
 
-    def test_per_account_limit_falls_back_to_2(self) -> None:
+    def test_limits_fall_back_to_2(self) -> None:
         with mock.patch.object(config, 'UPSTREAM_CONFIG',
                                Path(self._tmp.name) / 'missing.json'):
-            self.assertEqual(stats._per_account_limit(), 2)
+            self.assertEqual(stats._per_account_limit(), {'cn': 2, 'global': 2})
+
+    def test_capacity_uses_global_limit_for_global_realm(self) -> None:
+        """国际版账号走 `max_in_flight_global`：不是国内版那个键，也不是全池上限。"""
+        cfg = Path(self._tmp.name) / 'config.json'
+        cfg.write_text(json.dumps({
+            'pool': {'max_in_flight': 3, 'max_in_flight_global': 1},
+        }), encoding='utf-8')
+        payload = self._upstream(accounts=[
+            {'realm': 'cn', 'in_flight': 1},
+            {'realm': 'cn', 'in_flight': 1},
+            {'realm': 'global', 'in_flight': 1},
+        ])
+        with mock.patch.object(config, 'UPSTREAM_CONFIG', cfg):
+            out = self._call(payload)
+        self.assertEqual(out['per_account_limit'], 3)
+        self.assertEqual(out['per_account_limit_global'], 1)
+        self.assertEqual(out['capacity'], 7, '2 个 cn×3 + 1 个 global×1')
+
+    def test_zero_limit_is_normalised_to_2(self) -> None:
+        """上游把 0（含负数）归一化成 2：不同口径的话界面会显示「上限 0」。"""
+        cfg = Path(self._tmp.name) / 'config.json'
+        cfg.write_text(json.dumps({'pool': {'max_in_flight': 0,
+                                            'max_in_flight_global': -5}}), encoding='utf-8')
+        with mock.patch.object(config, 'UPSTREAM_CONFIG', cfg):
+            self.assertEqual(stats._per_account_limit(), {'cn': 2, 'global': 2})
 
     def test_rpm_windows(self) -> None:
         now = int(time.time())
@@ -224,11 +264,12 @@ class PeakEquivalenceTest(unittest.TestCase):
         """朴素参考实现：枚举所有端点，按 (时刻, -1 先) 扫一遍。"""
         events: list[tuple[float, int]] = []
         for ts, ms in pairs:
-            events.append((float(ts), 1))
-            # 与 `_peaks` 同口径：零/负/NULL 时长按 1 毫秒算（一条正在处理的请求
-            # 至少要占一瞬，否则同刻的开始与结束相消、峰值数不到它）
+            # 与 `_peaks` 同口径：`ts` 是**结束**时刻，区间是 `[ts - dur, ts)`；
+            # 零/负/NULL 时长按 1 毫秒算（一条正在处理的请求至少要占一瞬，
+            # 否则同刻的开始与结束相消、峰值数不到它）
             dur = max(0, ms or 0) or 1
-            events.append((ts + dur / 1000.0, -1))
+            events.append((ts - dur / 1000.0, 1))
+            events.append((float(ts), -1))
         events.sort(key=lambda e: (e[0], e[1]))
         cur = peak = 0
         for _t, d in events:
