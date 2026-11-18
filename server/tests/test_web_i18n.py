@@ -472,3 +472,24 @@ class PopoverInDialogScrollTest(unittest.TestCase):
                       '浮层落点必须找 dialog-content 子树')
         self.assertIn('container={portalContainer}', self.whitelist,
                       'PopoverContent 必须接收算出来的落点')
+
+
+class PopoverInDialogCollisionTest(unittest.TestCase):
+    """弹窗内浮层不能越过弹窗边缘被裁掉（issue #454）。
+
+    源码级守卫：#438 把 Popover 的 Portal 落点改到 dialog-content 子树修好
+    滚轮后，Popper 的碰撞检测默认仍按视口算可用空间——密钥弹窗里模型字段
+    在表单末尾，浮层向下展开必然越过弹窗底边，被 DialogContent 的
+    overflow-hidden 裁掉大半（见 #454 截图）。修法是把 collisionBoundary
+    指到与 Portal 落点同一个 dialog-content 元素：落点与边界任何一处
+    对不上，这个 bug 都会回来。
+    """
+
+    def setUp(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.whitelist = (root / 'web' / 'components' / 'common' / 'keys'
+                          / 'ModelWhitelistInput.tsx').read_text(encoding='utf-8')
+
+    def test_collision_boundary_matches_portal_container(self) -> None:
+        self.assertIn('collisionBoundary={portalContainer}', self.whitelist,
+                      '浮层的碰撞边界必须与 Portal 落点是同一个弹窗元素')

@@ -19,6 +19,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -255,6 +256,59 @@ class SourceIntrospectionTest(_Case):
         for secret in ('github_token', 'update_proxy', 'http_proxy',
                        'credits_snapshot'):
             self.assertNotIn(secret, [row[0] for row in rows])
+
+
+class BatchByteBudgetTest(_Case):
+    """按字节预算装批：行数不是内存的上界（issue #457）。
+
+    真实事故：`tap_turns` 744 行 / 553 MB，`BATCH = 1000` 让 `fetchmany(1000)`
+    一次把整张表读进内存（anon 494 MB），`mem_limit: 512m` 的容器被内核 OOM
+    kill，网关随后 504。这里的用例用「少量大行」在几 MB 的量级复现同一个形态。
+    """
+
+    def _make(self, name: str, rows: int, size: int) -> Path:
+        path = Path(self._tmp.name) / name
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute('CREATE TABLE wide (id INTEGER PRIMARY KEY, payload TEXT)')
+            blob = 'x' * size
+            conn.executemany('INSERT INTO wide(id, payload) VALUES(?, ?)',
+                             [(i, blob) for i in range(1, rows + 1)])
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_byte_budget_splits_wide_rows(self) -> None:
+        """大行不能攒成一批：一批的字节数必须落在预算附近。"""
+        path = self._make('wide.db', 40, 200 * 1024)      # 40 行 × 200KB ≈ 8MB
+        orig = pgsync.BATCH_BYTES
+        pgsync.BATCH_BYTES = 300 * 1024
+        try:
+            src = pgsync._SqliteSource(path)
+            try:
+                # 行数上限给 1000（远大于总行数）：只有字节预算能拦住它
+                chunks = list(src.rows('wide', ['id', 'payload'], 1000))
+            finally:
+                src.close()
+        finally:
+            pgsync.BATCH_BYTES = orig
+
+        self.assertEqual(sum(len(c) for c in chunks), 40)     # 一行都不能少
+        for chunk in chunks:
+            # 200KB/行 + 300KB 预算 → 一批最多两行；旧实现会是「一批 40 行」
+            self.assertLessEqual(len(chunk), 2)
+            self.assertLessEqual(sum(len(r[1]) for r in chunk), 400 * 1024)
+
+    def test_row_count_still_batches_small_rows(self) -> None:
+        """小行不受字节预算影响，仍按行数切 —— 别把常规表拖成一行一批。"""
+        path = self._make('small.db', 7, 8)
+        src = pgsync._SqliteSource(path)
+        try:
+            chunks = list(src.rows('wide', ['id', 'payload'], 3))
+        finally:
+            src.close()
+        self.assertEqual([len(c) for c in chunks], [3, 3, 1])
 
 
 class CopyTest(_Case):
@@ -623,3 +677,52 @@ class RealPgTest(_Case):  # pragma: no cover - 只在有 PG 的环境跑
 
 if __name__ == '__main__':
     unittest.main()
+
+class AutoExportBackoffTest(unittest.TestCase):
+    """自动导出失败后的退避（issue #457 的第二个遗留）。
+
+    事故形态：`tap_turns` 一次导出吃 500MB 被内核 OOM kill。进程直接消失，
+    连 `except` 都跑不到；而「上次导出时间」只在**成功**时写，于是 60 秒巡检
+    立刻再试 → 「OOM → 容器重启 → 仍逾期 → 再导出 → 再 OOM」的自持循环，
+    用户只能关掉功能才能让容器稳定。
+
+    修法：另记「上次尝试时刻」与「连续失败次数」，调度器按次数指数退避。
+    """
+
+    def setUp(self) -> None:
+        db.connect()
+        db.set_setting(pgsync.LAST_ATTEMPT_KEY, 0)
+        db.set_setting(pgsync.FAIL_COUNT_KEY, 0)
+
+    def tearDown(self) -> None:
+        db.set_setting(pgsync.LAST_ATTEMPT_KEY, 0)
+        db.set_setting(pgsync.FAIL_COUNT_KEY, 0)
+
+    def test_backoff_grows_then_caps(self) -> None:
+        expect = {0: 1, 1: 1, 2: 2, 3: 4, 4: 8, 5: 8, 20: 8}
+        for fails, want in expect.items():
+            db.set_setting(pgsync.FAIL_COUNT_KEY, fails)
+            self.assertEqual(pgsync._backoff_factor(), want, f'fails={fails}')
+
+    def test_success_resets_counter(self) -> None:
+        db.set_setting(pgsync.FAIL_COUNT_KEY, 5)
+        pgsync._note_attempt('export', ok=True)
+        self.assertEqual(db.get_setting(pgsync.FAIL_COUNT_KEY), 0)
+        self.assertEqual(pgsync._backoff_factor(), 1)
+
+    def test_failure_increments_and_stamps_attempt(self) -> None:
+        before = int(time.time())
+        pgsync._note_attempt('export', ok=False)
+        self.assertEqual(db.get_setting(pgsync.FAIL_COUNT_KEY), 1)
+        self.assertGreaterEqual(db.get_setting(pgsync.LAST_ATTEMPT_KEY), before)
+
+    def test_attempt_stamp_written_even_when_failed(self) -> None:
+        """核心保证：失败也要推进「尝试时间」，否则会被立刻重试。"""
+        pgsync._note_attempt('export', ok=False)
+        attempt = pgsync._as_int(db.get_setting(pgsync.LAST_ATTEMPT_KEY, 0), 0)
+        self.assertGreater(attempt, 0, '失败后必须记下尝试时刻，否则 60 秒后立刻重试')
+
+    def test_import_does_not_touch_export_state(self) -> None:
+        """恢复任务不该影响导出的退避状态。"""
+        pgsync._note_attempt('import', ok=False)
+        self.assertEqual(db.get_setting(pgsync.FAIL_COUNT_KEY), 0)

@@ -304,6 +304,14 @@
     "creditsExpiryDaily": "{amount} credits expire on the nearest day ({time})"
   },
   "stats": {
+    "realtimeClientInflight": "Client in flight {n}",
+    "realtimeConcurrency": "In flight",
+    "realtimeRpm": "RPM",
+    "realtimeTrend": "Last 3 minutes",
+    "realtimePeak": "Peak {n}",
+    "realtimeCapacity": "Capacity {c}",
+    "realtimeAverage": "3-min avg {v}",
+    "realtimeUnavailable": "Upstream unreachable",
     "customRange": "Custom",
     "startDate": "Start date",
     "endDate": "End date",
@@ -799,7 +807,10 @@
     "upstreamHint": "Once bound, this key only uses that upstream account pool; unbound = default upstream",
     "upstreamTag": "Upstream: {name}",
     "upstreamDisabledSuffix": " (disabled)",
-    "upstreamsFailed": "Could not load the upstream list — new keys will only offer the default upstream. Retry before creating one."
+    "upstreamsFailed": "Could not load the upstream list — new keys will only offer the default upstream. Retry before creating one.",
+    "customTokenLabel": "Custom key (optional)",
+    "customTokenPlaceholder": "Leave blank to auto-generate a random wbk_ key",
+    "customTokenHint": "When migrating from another gateway, reuse your existing key (e.g. sk-xxx) so clients need no reconfiguration. At least 16 characters; only letters, digits, underscore, dot and hyphen are allowed. Easily guessed keys are rejected. Requires WB_KEY_CUSTOM_ENABLED=1 in the deployment environment."
   },
   "upstreams": {
     "title": "Multiple upstreams (account pool groups)",
@@ -2119,7 +2130,8 @@
     "账号最短间隔不能大于最长间隔": "Minimum account gap cannot exceed maximum account gap",
     "秒": "sec",
     "分钟": "min",
-    "请求上限（旧版上游）": "Request limit (legacy upstream)"
+    "请求上限（旧版上游）": "Request limit (legacy upstream)",
+    "自定义密钥形态未启用：请设置环境变量 WB_KEY_CUSTOM_ENABLED=1 后重启": "Custom key format is disabled: set the WB_KEY_CUSTOM_ENABLED=1 environment variable and restart"
   },
   "redPacket": {
     "title": "Red packets",

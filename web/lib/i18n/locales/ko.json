@@ -277,6 +277,14 @@
     "creditsExpiryDaily": "가장 가까운 만료일({time})에 {amount} 포인트 만료"
   },
   "stats": {
+    "realtimeClientInflight": "클라이언트 처리 중 {n}",
+    "realtimeConcurrency": "동시 실행 중",
+    "realtimeRpm": "RPM",
+    "realtimeTrend": "최근 3분",
+    "realtimePeak": "최대 {n}",
+    "realtimeCapacity": "한도 {c}",
+    "realtimeAverage": "3분 평균 {v}",
+    "realtimeUnavailable": "업스트림에 연결할 수 없음",
     "customRange": "사용자 지정",
     "startDate": "시작일",
     "endDate": "종료일",
@@ -772,7 +780,10 @@
     "upstreamHint": "연결하면 이 키의 요청은 해당 업스트림 풀만 사용합니다. 연결하지 않으면 기본 업스트림입니다",
     "upstreamTag": "업스트림: {name}",
     "upstreamDisabledSuffix": "(중지됨)",
-    "upstreamsFailed": "업스트림 목록을 불러오지 못했습니다. 새 키의 \"업스트림 연결\"에는 기본 항목만 표시됩니다. 다시 시도한 뒤 생성하세요."
+    "upstreamsFailed": "업스트림 목록을 불러오지 못했습니다. 새 키의 \"업스트림 연결\"에는 기본 항목만 표시됩니다. 다시 시도한 뒤 생성하세요.",
+    "customTokenLabel": "사용자 지정 키(선택)",
+    "customTokenPlaceholder": "비워 두면 wbk_ 로 시작하는 무작위 키를 자동 생성합니다",
+    "customTokenHint": "다른 게이트웨이에서 이전할 때 기존 키(sk-xxx 등)를 그대로 쓸 수 있어 클라이언트 설정을 바꿀 필요가 없습니다. 16자 이상, 영문·숫자·밑줄·점·하이픈만 사용할 수 있으며 추측하기 쉬운 키는 거부됩니다. 배포 환경 변수 WB_KEY_CUSTOM_ENABLED=1 이 필요합니다."
   },
   "upstreams": {
     "title": "다중 업스트림(계정 풀 그룹)",
@@ -2092,7 +2103,8 @@
     "账号最短间隔不能大于最长间隔": "최소 계정 간격은 최대 계정 간격을 초과할 수 없습니다",
     "秒": "초",
     "分钟": "분",
-    "请求上限（旧版上游）": "요청 한도(구버전 업스트림)"
+    "请求上限（旧版上游）": "요청 한도(구버전 업스트림)",
+    "自定义密钥形态未启用：请设置环境变量 WB_KEY_CUSTOM_ENABLED=1 后重启": "사용자 지정 키 형식이 비활성화되어 있습니다: 환경 변수 WB_KEY_CUSTOM_ENABLED=1 을 설정한 뒤 재시작하세요"
   },
   "redPacket": {
     "title": "빨간 봉투",

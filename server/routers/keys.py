@@ -61,6 +61,30 @@ def _check_name(name: str | None) -> None:
         raise HTTPException(status_code=400, detail='密钥名称不能只有空格')
 
 
+def _check_custom_token_allowed(token: str) -> None:
+    """自定义密钥形态的入口闸门（issue #447）。
+
+    两道关：
+      1. **部署级开关** `WB_KEY_CUSTOM_ENABLED`（默认关闭）。默认部署只有 `wbk_`
+         随机串 —— 这是既有安全预期，自定义形态是显式选择加入的能力。
+      2. **唯一性**：撞了已有密钥直接 409。按哈希判（明文不参与比对）。
+
+    形态本身（长度 / 字符集 / 弱口令）的校验在 `keysvc._norm_custom_token`，
+    那里同时被 `create_key` 直接调用 —— 即使绕过本路由，也跳不过校验。
+    """
+    if not config.KEY_CUSTOM_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail='自定义密钥形态未启用：请设置环境变量 WB_KEY_CUSTOM_ENABLED=1 后重启',
+        )
+    try:
+        normalized = keysvc._norm_custom_token(token)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if keysvc.token_exists(normalized):
+        raise HTTPException(status_code=409, detail='这个密钥已被占用，请换一个')
+
+
 class KeyIn(BaseModel):
     name: str = Field(min_length=1, max_length=64)
     # 绑定的上游（多上游 / 分组隔离）：null / 0 / 省略 = 默认上游。
@@ -79,6 +103,9 @@ class KeyIn(BaseModel):
     # 版本归属：'' = 不限制（存量密钥的形态）。非 cn/global 的值由
     # keysvc._norm_realm 归一化成 ''——不报错，免得旧前端（不带该字段）被拒。
     realm: str = Field(default='', max_length=16)
+    # 自定义密钥形态（issue #447）：填了就原样使用（仍过归一化 + 弱密钥拦截），
+    # 不填 = 默认 `wbk_` + 随机串。需要一个部署级开关才生效（见 WB_KEY_CUSTOM_ENABLED）。
+    custom_token: str | None = None
 
 
 class KeyPatch(BaseModel):
@@ -149,18 +176,28 @@ def create_key(body: KeyIn, request: Request,
     _check_name(body.name)
     _check_ip_allowlist(body.ip_allowlist)
     _check_upstream(body.upstream_id)
-    created = keysvc.create_key(
-        name=body.name,
-        expires_at=body.expires_at,
-        max_ips=body.max_ips,
-        ip_allowlist=body.ip_allowlist,
-        models=body.models,
-        quota=body.quota,
-        realm=body.realm,
-        quota_credit=body.quota_credit,
-        daily_quota=body.daily_quota,
-        upstream_id=body.upstream_id,
-    )
+    if body.custom_token:
+        _check_custom_token_allowed(body.custom_token)
+    try:
+        created = keysvc.create_key(
+            name=body.name,
+            expires_at=body.expires_at,
+            max_ips=body.max_ips,
+            ip_allowlist=body.ip_allowlist,
+            models=body.models,
+            quota=body.quota,
+            realm=body.realm,
+            quota_credit=body.quota_credit,
+            daily_quota=body.daily_quota,
+            upstream_id=body.upstream_id,
+            custom_token=body.custom_token,
+        )
+    except keysvc.TokenConflict as exc:
+        # 唯一索引兜底命中（并发创建同一 token）：与预检查同样是 409
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        # 形态/弱口令问题（含绕过路由直接调用 keysvc 的内部路径）
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # 密钥是拿额度用的凭证，发放必须留痕（含来源 IP）
     upstream_name = '默认上游'
     if created.get('upstream_id'):

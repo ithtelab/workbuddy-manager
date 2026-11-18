@@ -143,6 +143,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
   key_plain     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_keys_prefix ON api_keys(prefix);
+-- 注意：`key_hash` 的**唯一索引不在这里建**，而在 `_migrate()` 里（先清存量重复
+-- 再建）。写进 SCHEMA 会让「升级前就有重复 hash 的库」在建索引这一步抛错、
+-- 进而起不来 —— 而那种重复恰恰是最需要启动起来处理的情形。
 
 CREATE TABLE IF NOT EXISTS api_key_ips (
   key_id     INTEGER NOT NULL,
@@ -899,6 +902,48 @@ def _migrate(conn: sqlite3.Connection) -> None:
             # 并发启动时可能已被另一进程加过，忽略即可
             pass
     _rebuild_usage_daily_pk(conn)
+    _ensure_keys_hash_unique(conn)
+
+
+def _ensure_keys_hash_unique(conn: sqlite3.Connection) -> None:
+    """给 `api_keys.key_hash` 建唯一索引（issue #447）。
+
+    为什么需要：放开自定义密钥形态后，"检查是否已存在"（路由层）与 "INSERT"
+    之间有竞态窗口。实测 8 个线程并发用同一个 token 创建，会落下 **8 行同 hash**
+    的密钥 —— 之后鉴权随机命中任意一行，额度与日志归属全部错乱。应用层的 409
+    只负责友好提示，真正防重的必须是数据库约束。
+
+    为什么放在迁移里而不是 SCHEMA：默认的 `wbk_` 随机串撞车可忽略，但**手工
+    改过库**或旧版本遗留的数据可能有重复。若把唯一索引写进 SCHEMA，
+    `executescript` 会在启动时直接抛错、服务起不来 —— 而那种库恰恰最需要能
+    启动起来处理。
+
+    处理策略：先删重复**只保留 id 最小的一行**（最早创建的那把），再建索引。
+    删掉的重复行在功能上本来就等价于「同一个 token 的多份副本」，保留最早一份
+    不会让任何调用方失效。
+    """
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_keys_hash'"
+        ).fetchone()
+        if exists:
+            return
+        dup = conn.execute(
+            'SELECT key_hash FROM api_keys GROUP BY key_hash HAVING COUNT(*) > 1 LIMIT 1'
+        ).fetchone()
+        if dup:
+            conn.execute(
+                'DELETE FROM api_keys WHERE key_hash = ? AND id NOT IN '
+                '(SELECT MIN(id) FROM api_keys WHERE key_hash = ?)',
+                (dup[0], dup[0]))
+            conn.commit()
+            logger.warning('清理了重复的密钥哈希（保留最早一行）：%s…', str(dup[0])[:12])
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_keys_hash ON api_keys(key_hash)')
+        conn.commit()
+    except sqlite3.Error as exc:
+        # 建不上也不该让服务起不来：应用层的检查仍然在，只是没有数据库兜底。
+        logger.warning('未能建立 api_keys.key_hash 唯一索引（%s）；并发创建同名密钥'
+                       '可能产生重复，请检查表中是否有重复 key_hash', exc)
 
 
 def _rebuild_usage_daily_pk(conn: sqlite3.Connection) -> bool:
@@ -1018,7 +1063,18 @@ def query_one(sql: str, args: Iterable[Any] = ()) -> sqlite3.Row | None:
 def execute(sql: str, args: Iterable[Any] = ()) -> int:
     with _lock:
         conn = connect()
-        cur = conn.execute(sql, tuple(args))
+        try:
+            cur = conn.execute(sql, tuple(args))
+        except Exception:
+            # 失败必须回滚：sqlite3 在 execute 抛错时**不会**自动结束隐式事务，
+            # 连接上会留着写锁 —— 之后所有写操作都变成 "database is locked"
+            # （实测：一个 UNIQUE 冲突就能让整个进程的后续写入卡死）。
+            # 这条是既有缺陷，唯一索引只是让它变得容易复现。
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         conn.commit()
         return int(cur.lastrowid or 0)
 
@@ -1026,7 +1082,15 @@ def execute(sql: str, args: Iterable[Any] = ()) -> int:
 def executemany(sql: str, seq: Iterable[Iterable[Any]]) -> None:
     with _lock:
         conn = connect()
-        conn.executemany(sql, [tuple(x) for x in seq])
+        try:
+            conn.executemany(sql, [tuple(x) for x in seq])
+        except Exception:
+            # 同 execute：失败不回滚会让写锁挂在连接上
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         conn.commit()
 
 

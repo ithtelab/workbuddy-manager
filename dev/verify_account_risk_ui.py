@@ -43,6 +43,14 @@ with sync_playwright() as pw:
         elif path == '/api/stats/daily': data = []
         elif path == '/api/stats/credits': data = dict(today={},week={},total={},daily=[])
         elif path == '/api/accounts/admin-api-status': data = dict(enabled=True)
+        # 预警现在挂在「设置 → 上游」，那一页要先把配置取回来才渲染表单
+        elif path == '/api/settings/upstream':
+            data = dict(available=True, config_path='/opt/workbuddy2api/config.json', listen=':7863',
+                        api_key_masked='wbk_****', auth_dir='/opt/workbuddy2api/auths',
+                        schedule={}, pool={}, cooldown={}, features={}, session_sticky={},
+                        prompt={}, server={}, upstream={}, global={}, admin={})
+        elif path == '/api/settings/model-map': data = {}
+        elif path == '/api/users': data = []
         elif path.startswith('/api/account-risk/'):
             assert route.request.method == 'POST'
             if path.endswith('/resume'):
@@ -60,7 +68,10 @@ with sync_playwright() as pw:
             data = dict(items=[warning] + ([history] if not state['ack'] or 'include_acknowledged=true' in route.request.url else []),failed_groups=['测试分组'] if state['unknown'] else [],total=2)
         route.fulfill(status=200, content_type='application/json', body=json.dumps(data))
     context.route('**/api/**', api)
-    page.goto(base+'/dashboard', wait_until='networkidle')
+    # 预警的位置是「设置 → 上游」：那一页就是账号保护策略（连续失败自动暂停、
+    # 账号冷却）的配置处。仪表盘与账号页不再显示它 —— 两页都是「每天看一眼」的
+    # 页面，而这条提示只在真出事时才有意义。
+    page.goto(base+'/settings/upstream/', wait_until='networkidle')
     panel = page.get_by_role('region', name='账号保护预警')
     panel.wait_for()
     assert '暂停·需人工复核' in panel.inner_text()
@@ -69,7 +80,7 @@ with sync_playwright() as pw:
     for width in (1440, 390):
         page.set_viewport_size({'width':width,'height':900})
         assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
-        page.screenshot(path=str(shots/f'risk-dashboard-{width}.png'))
+        page.screenshot(path=str(shots/f'risk-settings-{width}.png'))
     page.get_by_role('button',name='确认当前预警',exact=True).click()
     page.get_by_role('button',name='确认当前预警',exact=True).wait_for(state='hidden')
     assert '暂停·需人工复核' in panel.inner_text(), 'Acknowledging must not resume the account'
@@ -82,7 +93,9 @@ with sync_playwright() as pw:
     page.set_viewport_size({'width':1440,'height':1000})
     page.goto(base+'/accounts',wait_until='networkidle')
     page.locator('tbody tr').first.wait_for()
-    assert page.get_by_role('region', name='账号保护预警').count() == 1
+    # 账号页不再挂这条预警（位置已改到「设置 → 上游」）：页头是每天都要看的区域，
+    # 不该被一条只在真出事时才有意义的提示长期占着。
+    assert page.get_by_role('region', name='账号保护预警').count() == 0
     good = page.locator('tbody tr').filter(has_text='正常账号')
     assert '在线' in good.inner_text(), 'Healthy account must remain usable'
     assert '冷却中' in page.locator('tbody tr').filter(has_text='11140软冷却账号').inner_text()
@@ -90,8 +103,12 @@ with sync_playwright() as pw:
     assert '刷新限流暂停' in page.locator('tbody tr').filter(has_text='自动到期账号').inner_text()
     page.screenshot(path=str(shots/'risk-accounts.png'))
     state['unknown'] = True
-    page.reload(wait_until='networkidle')
+    page.goto(base+'/settings/upstream/', wait_until='networkidle')
     panel = page.get_by_role('region', name='账号保护预警')
+    panel.wait_for()
+    # 暂停状态未知时 pausedCount 为 0 → 预警默认收起，先展开
+    expand = panel.get_by_role('button', name='展开', exact=True)
+    if expand.count(): expand.click()
     panel.locator('summary').click()
     assert '暂停状态待确认' in panel.inner_text()
     assert '暂时无法确认' in panel.inner_text()
@@ -106,4 +123,5 @@ with sync_playwright() as pw:
     assert state['resumed']
     assert not errors, errors
     browser.close()
-    print('PASS: persistent risk warnings on dashboard/accounts, acknowledgement does not resume, historical/active/unknown states, healthy account unaffected, desktop/mobile layout, no browser errors')
+    print('PASS: risk warnings live on settings/upstream (not dashboard/accounts), acknowledgement does not resume, '
+          'historical/active/unknown states, healthy account unaffected, desktop/mobile layout, no browser errors')

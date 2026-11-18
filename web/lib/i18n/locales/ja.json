@@ -277,6 +277,14 @@
     "creditsExpiryDaily": "直近の期限日（{time}）に {amount} ポイントが失効"
   },
   "stats": {
+    "realtimeClientInflight": "クライアント実行中 {n}",
+    "realtimeConcurrency": "同時実行中",
+    "realtimeRpm": "RPM",
+    "realtimeTrend": "直近 3 分",
+    "realtimePeak": "ピーク {n}",
+    "realtimeCapacity": "上限 {c}",
+    "realtimeAverage": "3 分平均 {v}",
+    "realtimeUnavailable": "上流に接続できません",
     "customRange": "カスタム",
     "startDate": "開始日",
     "endDate": "終了日",
@@ -772,7 +780,10 @@
     "upstreamHint": "紐付けると、このキーのリクエストはそのプールだけを使います。未設定なら既定のアップストリームです",
     "upstreamTag": "アップストリーム：{name}",
     "upstreamDisabledSuffix": "（停止中）",
-    "upstreamsFailed": "上流一覧を取得できませんでした。新しいキーの「上流の紐付け」には既定の上流しか出ません。再試行してから作成してください。"
+    "upstreamsFailed": "上流一覧を取得できませんでした。新しいキーの「上流の紐付け」には既定の上流しか出ません。再試行してから作成してください。",
+    "customTokenLabel": "カスタムキー（任意）",
+    "customTokenPlaceholder": "空欄 = wbk_ で始まるランダムキーを自動生成",
+    "customTokenHint": "他のゲートウェイから移行する場合、既存のキー（sk-xxx など）をそのまま使えるため、クライアント側の設定変更は不要です。16 文字以上、使用できるのは英数字・アンダースコア・ドット・ハイフンのみ。推測されやすいキーは拒否されます。デプロイ環境変数 WB_KEY_CUSTOM_ENABLED=1 が必要です。"
   },
   "upstreams": {
     "title": "複数アップストリーム（アカウントプールのグループ）",
@@ -2092,7 +2103,8 @@
     "账号最短间隔不能大于最长间隔": "アカウントの最小間隔は最大間隔以下にしてください",
     "秒": "秒",
     "分钟": "分",
-    "请求上限（旧版上游）": "リクエスト上限（旧版上流）"
+    "请求上限（旧版上游）": "リクエスト上限（旧版上流）",
+    "自定义密钥形态未启用：请设置环境变量 WB_KEY_CUSTOM_ENABLED=1 后重启": "カスタムキー形式は無効です：環境変数 WB_KEY_CUSTOM_ENABLED=1 を設定して再起動してください"
   },
   "redPacket": {
     "title": "紅包（レッドパケット）",

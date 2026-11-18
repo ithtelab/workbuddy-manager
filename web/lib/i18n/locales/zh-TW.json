@@ -277,6 +277,14 @@
     "creditsExpiryDaily": "最近一天（{time}）共 {amount} 積分到期"
   },
   "stats": {
+    "realtimeClientInflight": "用戶端在途 {n}",
+    "realtimeConcurrency": "當前併發",
+    "realtimeRpm": "RPM",
+    "realtimeTrend": "近 3 分鐘",
+    "realtimePeak": "峰值 {n}",
+    "realtimeCapacity": "上限 {c}",
+    "realtimeAverage": "3 分鐘均 {v}",
+    "realtimeUnavailable": "上游無法連線",
     "customRange": "自訂",
     "startDate": "開始日期",
     "endDate": "結束日期",
@@ -772,7 +780,10 @@
     "upstreamHint": "綁定後，這把密鑰的請求只走該上游的帳號池；未綁定 = 預設上游",
     "upstreamTag": "上游：{name}",
     "upstreamDisabledSuffix": "（已停用）",
-    "upstreamsFailed": "上游清單沒取到 —— 新建金鑰的「綁定上游」只會顯示預設項，先重試再建立。"
+    "upstreamsFailed": "上游清單沒取到 —— 新建金鑰的「綁定上游」只會顯示預設項，先重試再建立。",
+    "customTokenLabel": "自訂金鑰（選填）",
+    "customTokenPlaceholder": "留空 = 自動產生 wbk_ 開頭的隨機金鑰",
+    "customTokenHint": "從其他閘道遷移時，可直接沿用原本的金鑰（如 sk-xxx），用戶端無需改設定。至少 16 個字元，只能用字母、數字、底線、點與連字號；太容易猜的會被拒絕。需在部署環境變數中設定 WB_KEY_CUSTOM_ENABLED=1 才可用。"
   },
   "upstreams": {
     "title": "多上游（帳號池分組）",
@@ -2092,7 +2103,8 @@
     "账号最短间隔不能大于最长间隔": "帳號最短間隔不能大於最長間隔",
     "秒": "秒",
     "分钟": "分鐘",
-    "请求上限（旧版上游）": "請求上限（舊版上游）"
+    "请求上限（旧版上游）": "請求上限（舊版上游）",
+    "自定义密钥形态未启用：请设置环境变量 WB_KEY_CUSTOM_ENABLED=1 后重启": "自訂金鑰形態未啟用：請設定環境變數 WB_KEY_CUSTOM_ENABLED=1 後重新啟動"
   },
   "redPacket": {
     "title": "紅包",

@@ -277,6 +277,14 @@
     "creditsExpiryDaily": "最近一天（{time}）共 {amount} 积分到期"
   },
   "stats": {
+    "realtimeClientInflight": "客户端在途 {n}",
+    "realtimeConcurrency": "当前并发",
+    "realtimeRpm": "RPM",
+    "realtimeTrend": "近 3 分钟",
+    "realtimePeak": "峰值 {n}",
+    "realtimeCapacity": "上限 {c}",
+    "realtimeAverage": "3 分钟均 {v}",
+    "realtimeUnavailable": "上游不可达",
     "customRange": "自定义",
     "startDate": "开始日期",
     "endDate": "结束日期",
@@ -772,7 +780,10 @@
     "upstreamHint": "绑定后，这把密钥的请求只走该上游的账号池；未绑定 = 默认上游",
     "upstreamTag": "上游：{name}",
     "upstreamDisabledSuffix": "（已停用）",
-    "upstreamsFailed": "上游列表没取到 —— 新建密钥的「绑定上游」只会显示默认项，先重试再建。"
+    "upstreamsFailed": "上游列表没取到 —— 新建密钥的「绑定上游」只会显示默认项，先重试再建。",
+    "customTokenLabel": "自定义密钥（可选）",
+    "customTokenPlaceholder": "留空 = 自动生成 wbk_ 开头的随机密钥",
+    "customTokenHint": "从其他网关迁移时，可直接沿用原来的密钥（如 sk-xxx），客户端无需改配置。至少 16 个字符，只能用字母、数字、下划线、点与连字符；太容易猜的会被拒绝。需在部署环境变量中设置 WB_KEY_CUSTOM_ENABLED=1 才可用。"
   },
   "upstreams": {
     "title": "多上游（账号池分组）",

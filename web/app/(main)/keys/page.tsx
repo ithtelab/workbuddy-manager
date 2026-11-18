@@ -71,6 +71,13 @@ interface FormState {
   realm: Realm | '';
   /** 绑定的上游（账号池分组）：null = 默认上游。见 server/upstreamsvc.py */
   upstream_id: number | null;
+  /**
+   * 自定义密钥形态（issue #447）：空串 = 默认 `wbk_` + 随机串。
+   *
+   * 只在**新建**时有效（密钥创建后不可改名 —— 换 token 等于换一把密钥，
+   * 已有客户端的配置会立刻失效）。需要部署开启 WB_KEY_CUSTOM_ENABLED。
+   */
+  customToken: string;
 }
 
 const emptyForm: FormState = {
@@ -85,6 +92,7 @@ const emptyForm: FormState = {
   dailyQuota: '0',
   realm: 'cn',
   upstream_id: null,
+  customToken: '',
 };
 
 function toLines(v: string): string[] {
@@ -253,6 +261,8 @@ export default function KeysPage() {
       dailyQuota: String(k.daily_quota ?? 0),
       realm: k.realm || '',
       upstream_id: k.upstream_id ?? null,
+      // 编辑时不可自定义（换 token 等于换一把密钥，已有客户端会立刻失效）
+      customToken: '',
     });
     setUnknownModels(null);
     setFormOpen(true);
@@ -291,6 +301,10 @@ export default function KeysPage() {
         // 后端以它区分「显式改回默认上游」与「本次没提交该字段」（PATCH 语义）。
         upstream_id: form.upstream_id,
       };
+      // 只在新建设置：编辑不提交该字段（后端也没有对应 PATCH 语义）
+      if (!editing && form.customToken.trim()) {
+        payload.custom_token = form.customToken.trim();
+      }
 
       // 新建：填了天数才设过期（0 = 永不过期，不下发 expires_at）
       // 编辑：按显式选择处理，避免「打开就保存」把有效期重置
@@ -1076,6 +1090,25 @@ export default function KeysPage() {
                   {t('keys.upstreamHint')}
                 </p>
               </div>
+              {/* 密钥形态（issue #447）：只在新建时出现 —— 创建后换 token 等于换
+                  一把密钥，已有客户端的配置会立刻失效，不该提供入口。
+                  不填 = 默认 wbk_ 随机串；填了需要部署开启 WB_KEY_CUSTOM_ENABLED，
+                  否则后端 403 并在提示里说明要设哪个环境变量。 */}
+              {!editing && (
+                <div className="space-y-1.5">
+                  <Label className="text-[11px] text-muted-foreground">
+                    {t('keys.customTokenLabel')}
+                  </Label>
+                  <Input
+                    value={form.customToken}
+                    placeholder={t('keys.customTokenPlaceholder')}
+                    onChange={(e) => setForm({...form, customToken: e.target.value})}
+                  />
+                  <p className="text-[11px] leading-4 text-muted-foreground">
+                    {t('keys.customTokenHint')}
+                  </p>
+                </div>
+              )}
               <div className="space-y-1.5">
                 <Label className="text-[11px] text-muted-foreground">{t('keys.modelWhitelist')}</Label>
                 {/* 手输保留（清单里暂时没有的模型仍要能填），旁边给「从清单选择」：

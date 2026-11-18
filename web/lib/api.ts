@@ -60,6 +60,7 @@ import type {
   RequestLog,
   SecurityConfig,
   StatsSummary,
+  StatsRealtime,
   TapConfigResponse,
   TapDiff,
   TapSession,
@@ -782,6 +783,14 @@ export const statsApi = {
     ),
   repairUsage: () =>
     post<{repaired: number; requests: number; tokens: number}>('/api/stats/repair-usage'),
+  /**
+   * 实时并发 / RPM / 近 3 分钟走势。
+   *
+   * 与上面那些「按天聚合」的不是一回事：`inflight`/`capacity` 是**此刻**的瞬时值
+   * （来自上游 /status），`rpm_*`/`peaks`/`series` 来自本库、只含已完成请求。所以
+   * 它们的刷新节奏也不同（界面每 5 秒拉一次），也不跟 `range` 自定义区间走。
+   */
+  realtime: (days = 1) => get<StatsRealtime>('/api/stats/realtime', {days}),
 };
 
 /* ── 安全 / IP ──────────────────────────────────────── */

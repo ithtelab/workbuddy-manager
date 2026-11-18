@@ -34,7 +34,10 @@ export function AccountRiskWarnings({upstreamId = null, allGroups = false}: {
   const items = data?.items ?? [];
   const pausedCount = new Set(items.filter(x => x.paused === true).map(x => `${x.group}:${x.uid}`)).size;
   if (!items.length && !data?.total && !failed) return null;
-  const fold = foldPref === '1';
+  /** 没被暂停时默认收起：列表里绝大多数是历史异常记录（签到 500、积分 429…），
+   *  展开着读不出「现在有没有事」，只把页面撑长。真有账号被暂停才默认展开——
+   *  那时它才是一条需要立刻处理的信息。用户手动选过就一切照偏好来。 */
+  const fold = foldPref === null ? pausedCount === 0 : foldPref === '1';
   function toggleFold() {
     const next = !fold;
     setFoldPref(next ? '1' : '0');

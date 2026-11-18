@@ -124,8 +124,10 @@ class BothPathsRestoreNamesTest(unittest.TestCase):
         """调用点必须把 bridge 传给 to_responses_object。"""
         src = (Path(__file__).resolve().parents[1]
                / 'routers' / 'responses.py').read_text(encoding='utf-8')
+        # 参数表在 issue #450 之后多了 parallel_tool_calls（PR #451），这里只锚
+        # **前五个位置参数**仍然按序传对，避免每加一个可选参数就要改一次断言。
         self.assertIn(
-            'to_responses_object(data, model, resp_id, custom_tool_names, bridge)',
+            'to_responses_object(data, model, resp_id, custom_tool_names, bridge,',
             src,
             '非流式出口漏传 bridge —— 改名后的工具名会原样发给客户端，'
             '而流式路径会还原，两条路径不一致',

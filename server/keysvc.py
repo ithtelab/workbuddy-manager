@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -11,6 +12,8 @@ from . import db
 from .iputil import ip_matches
 
 TOKEN_PREFIX = 'wbk_'
+# `api_keys.prefix` 列存的长度（= token 前 N 个字符）。创建与解析必须同口径。
+TOKEN_PREFIX_LEN = 12
 
 
 class Rejection(str):
@@ -45,8 +48,95 @@ class Rejection(str):
         return self
 
 
+class TokenConflict(ValueError):
+    """自定义 token 与已有密钥冲突（唯一索引兜底命中）。
+
+    单独一个类型是为了让路由层能**区分对待**：冲突是 409（换一个就好），
+    而 `_norm_custom_token` 抛的 ValueError 是格式/弱口令问题，应为 400。
+    两者混用会让「密码太短」也回 409，用户会以为是撞车而不是格式错。
+    """
+
+
 def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+# ── 自定义密钥形态（issue #447）─────────────────────────────
+#
+# 为什么允许自定义：从 one-api / new-api 迁过来的部署里，客户端配置、脚本、
+# `.env` 遍地是 `sk-xxx` 形态；强制改成 `wbk_` 等于让用户改一大片。而鉴权本来就
+# 是「按 prefix 定位 + 哈希比对」，前缀只是**快速筛**，不是安全边界。
+#
+# 代价是弱口令：随机 43 字符猜不到，`sk-test` 一猜就中。所以这里不是「原样收下」，
+# 而是三条硬约束 + 一次弱密钥拦截：
+#   · 长度 16–96（太短易猜，太长会撑爆 header 且不像任何真实网关的形态）
+#   · 字符集 `[A-Za-z0-9_.\-]`（冒号/空格/换行会破坏 `Authorization: Bearer` 解析，
+#     也可能被当成额外的头注入）
+#   · 全局唯一（撞了已有密钥直接拒绝，而不是让两把密钥指向同一行）
+CUSTOM_TOKEN_MIN = 16
+CUSTOM_TOKEN_MAX = 96
+_CUSTOM_TOKEN_RE = re.compile(r'^[A-Za-z0-9_.\-]+$')
+
+# 明显是弱口令/占位符的**整段**（按分隔符切开后逐段比对，小写）。
+#
+# 为什么按段而不是子串：子串会把 `sk-valid-token-2026-prod-x` 这类正常密钥
+# 判成弱口令（它含 `token` 这个词），而用户恰恰是想要 `sk-xxx` 这种形态。
+# 按段比对只拦「整段就叫 test / admin」的那种。
+# 注意**不**包含 `token` / `key` / `api`：它们是密钥里极常见的命名片段
+# （`sk-token-2026-...`、`team-key-prod-...`），当成弱词会把正常形态误杀。
+# 真正的弱口令是「整段就叫 password / test / admin」那种。
+_WEAK_TOKEN_SEGMENTS = frozenset({
+    'password', 'passwd', 'secret', 'apikey', 'test', 'example', 'sample',
+    'demo', 'changeme', 'default', 'admin', 'qwerty', 'letmein',
+    'null', 'none', 'undefined',
+})
+_SEGMENT_SPLIT = re.compile(r'[^A-Za-z0-9]+')
+
+
+def _looks_weak(text: str) -> bool:
+    """是否像「一眼能猜到」的密钥。
+
+    三条判据：
+      · 有整段命中常见弱词（`sk-test-xyz...` 里的 `test`）；
+      · 字符种类太少（`aaaa...`、`0000...`）；
+      · 纯十进制数字（`1234567890123456` 这类的变体太多，整段比对拦不全）。
+    """
+    lowered = text.lower()
+    # 去掉 `sk-` / `wbk_` 这类形态前缀后再切段：前缀是约定，不是弱词
+    bare = lowered
+    for prefix in ('sk-', 'wbk_', 'sk_', 'key-', 'key_'):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+    segments = [s for s in _SEGMENT_SPLIT.split(bare) if s]
+    if any(s in _WEAK_TOKEN_SEGMENTS for s in segments):
+        return True
+    if text.isdigit():
+        return True
+    return len(set(text)) <= 3
+
+
+def _norm_custom_token(value: object) -> str:
+    """校验并归一化自定义 token。不合法直接抛 `ValueError`（路由层转 400）。
+
+    不做大小写转换、不裁剪中间字符 —— 密钥是**逐字节**比对的凭证，替用户
+    「顺手规整」会让他在别处粘贴的原值失效。
+    """
+    # 只 strip 首尾空白：从聊天工具/终端复制时常带进去，那不是密钥的一部分
+    text = str(value or '').strip()
+    if not text:
+        raise ValueError('密钥不能为空')
+    if len(text) < CUSTOM_TOKEN_MIN:
+        raise ValueError(f'密钥至少 {CUSTOM_TOKEN_MIN} 个字符（太短容易被猜到）')
+    if len(text) > CUSTOM_TOKEN_MAX:
+        raise ValueError(f'密钥最多 {CUSTOM_TOKEN_MAX} 个字符')
+    if not _CUSTOM_TOKEN_RE.match(text):
+        raise ValueError(
+            '密钥只能包含字母、数字、下划线、点与连字符'
+            '（空格、冒号、换行会破坏 Authorization 头解析）')
+    if _looks_weak(text):
+        raise ValueError('这个密钥太容易被猜到（含常见弱词、纯数字或字符种类太少），请换一个')
+    return text
 
 
 def _norm_realm(value: object) -> str:
@@ -243,6 +333,7 @@ def create_key(
     quota_credit: float = 0,
     upstream_id: int | None = None,
     daily_quota: int = 0,
+    custom_token: str | None = None,
     *,
     _conn: sqlite3.Connection | None = None,
 ) -> dict:
@@ -259,8 +350,14 @@ def create_key(
 
     之所以做成参数而不是让红包自己写一份 INSERT：SQL 抄第二遍就是第二份事实，
     改一处漏一处——本项目在 count_tokens 的鉴权上正是这么漂移出真漏洞的。
+
+    `custom_token`（issue #447）：自定义完整 token。默认 None = 走 `wbk_` + 随机。
+    传了就**原样**使用，但仍要过与默认路径同样的归一化与弱密钥拦截
+    （见 `_norm_custom_token`）——那条路径的成本是把「生成随机串」换成「接受输入」，
+    安全性不能跟着降级。
     """
-    token = TOKEN_PREFIX + secrets.token_urlsafe(32)
+    token = _norm_custom_token(custom_token) if custom_token is not None \
+        else TOKEN_PREFIX + secrets.token_urlsafe(32)
     sql = ('INSERT INTO api_keys(name, key_hash, key_plain, prefix, enabled, expires_at, '
            'max_ips, ip_allowlist, models, realm, quota, used_tokens, quota_credit, '
            'used_credit, created_at, upstream_id, daily_quota) '
@@ -269,7 +366,7 @@ def create_key(
         name,
         _hash(token),
         token,
-        token[:12],
+        token[:TOKEN_PREFIX_LEN],
         expires_at,
         max_ips,
         json.dumps(_norm_cidrs(ip_allowlist)),
@@ -282,10 +379,19 @@ def create_key(
         _norm_daily_quota(daily_quota),
     )
     if _conn is not None:
-        key_id = int(_conn.execute(sql, args).lastrowid or 0)
+        try:
+            key_id = int(_conn.execute(sql, args).lastrowid or 0)
+        except sqlite3.IntegrityError as exc:
+            raise TokenConflict('这个密钥已被占用，请换一个') from exc
         row = _conn.execute('SELECT * FROM api_keys WHERE id = ?', (key_id,)).fetchone()
     else:
-        key_id = db.execute(sql, args)
+        # 唯一索引（idx_keys_hash）兜住并发创建同一 token：路由层的「先查再插」
+        # 之间存在竞态窗口，实测 8 个线程能落下 8 行同 hash。转成 ValueError，
+        # 由路由层统一成 409 —— 与「检查时就已经存在」给用户同一个提示。
+        try:
+            key_id = db.execute(sql, args)
+        except sqlite3.IntegrityError as exc:
+            raise TokenConflict('这个密钥已被占用，请换一个') from exc
         row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
     out = _parse(row)
     out['key'] = token  # 创建响应里直接给出，界面不必再调一次 reveal
@@ -381,15 +487,47 @@ def reset_usage(key_id: int) -> bool:
 
 
 def resolve(token: str) -> dict | None:
-    """按前缀定位后比对哈希，避免全表扫描。"""
-    if not token or not token.startswith(TOKEN_PREFIX):
+    """按前缀定位后比对哈希，避免全表扫描。
+
+    **不再要求 `wbk_` 开头**（issue #447）：前缀只是定位用的索引键，不是安全
+    边界。放开它是为了让自定义形态（`sk-xxx` 这类从别的网关迁过来的存量密钥）
+    能直接用 —— 真正的校验一直是 `secrets.compare_digest(哈希)`，与形态无关。
+
+    代价：任何字符串都会触发一次带索引的查询。这里是热路径（每个请求一次），
+    所以先做**廉价预筛**（长度/字符集）把明显无效的输入挡在查库之前 —— 与
+    `_norm_custom_token` 同一套字符集，但**不**做弱口令判断（那会让「方案正确、
+    只是恰好含弱词」的存量密钥突然失效）。
+    """
+    if not token:
         return None
-    rows = db.query('SELECT * FROM api_keys WHERE prefix = ?', (token[:12],))
+    # 廉价预筛：长度与字符集。长度用与创建时同一对边界 —— 默认生成的
+    # `wbk_`+43 字符（共 47）与自定义的都在区间内，区间外的不可能是本系统签出的。
+    if not (CUSTOM_TOKEN_MIN <= len(token) <= CUSTOM_TOKEN_MAX):
+        return None
+    if not _CUSTOM_TOKEN_RE.match(token):
+        return None
+    # `prefix` 列存 `token[:12]`（创建时写入），这里必须用同一个口径查，否则
+    # 存量密钥一把都匹配不上。
+    rows = db.query('SELECT * FROM api_keys WHERE prefix = ?', (token[:TOKEN_PREFIX_LEN],))
     digest = _hash(token)
     for row in rows:
         if secrets.compare_digest(row['key_hash'], digest):
             return _parse(row)
     return None
+
+
+def token_exists(token: str) -> bool:
+    """该明文 token 是否已经存在（按哈希判，不比对明文）。
+
+    只用于创建时的唯一性检查：两把密钥若能指向同一个 token，鉴权会命中
+    先查到的任意一行，额度与日志归属都会变得不可预测。
+    """
+    try:
+        row = db.query_one('SELECT 1 FROM api_keys WHERE key_hash = ? LIMIT 1',
+                           (_hash(token),))
+    except Exception:  # noqa: BLE001
+        return False
+    return row is not None
 
 
 def model_allowed(key: dict, model: object) -> bool:
