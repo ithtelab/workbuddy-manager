@@ -257,6 +257,59 @@ class SourceIntrospectionTest(_Case):
             self.assertNotIn(secret, [row[0] for row in rows])
 
 
+class BatchByteBudgetTest(_Case):
+    """按字节预算装批：行数不是内存的上界（issue #457）。
+
+    真实事故：`tap_turns` 744 行 / 553 MB，`BATCH = 1000` 让 `fetchmany(1000)`
+    一次把整张表读进内存（anon 494 MB），`mem_limit: 512m` 的容器被内核 OOM
+    kill，网关随后 504。这里的用例用「少量大行」在几 MB 的量级复现同一个形态。
+    """
+
+    def _make(self, name: str, rows: int, size: int) -> Path:
+        path = Path(self._tmp.name) / name
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute('CREATE TABLE wide (id INTEGER PRIMARY KEY, payload TEXT)')
+            blob = 'x' * size
+            conn.executemany('INSERT INTO wide(id, payload) VALUES(?, ?)',
+                             [(i, blob) for i in range(1, rows + 1)])
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_byte_budget_splits_wide_rows(self) -> None:
+        """大行不能攒成一批：一批的字节数必须落在预算附近。"""
+        path = self._make('wide.db', 40, 200 * 1024)      # 40 行 × 200KB ≈ 8MB
+        orig = pgsync.BATCH_BYTES
+        pgsync.BATCH_BYTES = 300 * 1024
+        try:
+            src = pgsync._SqliteSource(path)
+            try:
+                # 行数上限给 1000（远大于总行数）：只有字节预算能拦住它
+                chunks = list(src.rows('wide', ['id', 'payload'], 1000))
+            finally:
+                src.close()
+        finally:
+            pgsync.BATCH_BYTES = orig
+
+        self.assertEqual(sum(len(c) for c in chunks), 40)     # 一行都不能少
+        for chunk in chunks:
+            # 200KB/行 + 300KB 预算 → 一批最多两行；旧实现会是「一批 40 行」
+            self.assertLessEqual(len(chunk), 2)
+            self.assertLessEqual(sum(len(r[1]) for r in chunk), 400 * 1024)
+
+    def test_row_count_still_batches_small_rows(self) -> None:
+        """小行不受字节预算影响，仍按行数切 —— 别把常规表拖成一行一批。"""
+        path = self._make('small.db', 7, 8)
+        src = pgsync._SqliteSource(path)
+        try:
+            chunks = list(src.rows('wide', ['id', 'payload'], 3))
+        finally:
+            src.close()
+        self.assertEqual([len(c) for c in chunks], [3, 3, 1])
+
+
 class CopyTest(_Case):
     """搬运语义：全量覆盖、列交集、行数精确。"""
 
