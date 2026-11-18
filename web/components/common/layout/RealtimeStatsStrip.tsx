@@ -25,8 +25,14 @@ import {fmtNumber} from '@/lib/format';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useT} from '@/lib/i18n/provider';
 
-/** 实时条的刷新间隔：比页面的 60 秒心跳密，因为这两个数是「此刻」的值 */
-const POLL_MS = 5000;
+/**
+ * 实时条的刷新间隔：1 秒。
+ *
+ * 这两个数是「此刻」的值：5 秒的间隔会让一条 0.4 秒的短请求整段落在两次采样之间，
+ * 从头到尾看不见。1 秒足够跟上，单次请求也很轻（一条 /api/stats/realtime，库内三条
+ * COUNT 加一次 4 分钟窗口扫描，毫秒级）。
+ */
+const POLL_MS = 1000;
 
 /** 图区高度（px）。与 `StatCard` 的 96px 一起把卡片撑到与同行卡片等高 */
 const CHART_H = 64;
@@ -103,14 +109,20 @@ export function RealtimeStatsStrip({days}: {days: number}) {
   const available = Boolean(data?.available);
   const peaks = data?.peaks;
 
-  const concHint = !data
-    ? ''
-    : available
-      ? `${t('stats.realtimePeak', {n: fmtNumber(peaks?.concurrency)})} · ${t(
-          'stats.realtimeCapacity',
-          {c: fmtNumber(data.capacity)},
-        )}`
-      : (data.error || t('stats.realtimeUnavailable'));
+  // 主数字是「上游槽位占用」，小字里带一个「客户端在途」：
+  // 前者不含排队等槽的、也不含上游答完但尾巴还在写回客户端的；后者含。两者差得多
+  // 就说明池子在排队或回传积压——那正是需要看见的时刻。
+  const parts: string[] = [];
+  if (data) {
+    parts.push(t('stats.realtimeClientInflight', {n: fmtNumber(data.client_inflight)}));
+    if (available) {
+      parts.push(t('stats.realtimePeak', {n: fmtNumber(peaks?.concurrency)}));
+      parts.push(t('stats.realtimeCapacity', {c: fmtNumber(data.capacity)}));
+    } else if (data.error) {
+      parts.push(data.error);
+    }
+  }
+  const concHint = parts.join(' · ');
 
   const rpmHint = !data
     ? ''

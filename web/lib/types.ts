@@ -903,6 +903,11 @@ export interface StatsRealtimePeaks {
 export interface StatsRealtime {
   /** 上游 `/status` 是否取到；false 时只有 rpm_* / peaks / series 有效 */
   available: boolean;
+  /**
+   * 客户端在途：面板正在处理、还没把响应写完的条数（含流式全过程、含排队）。
+   * 与 `inflight`（上游槽位占用）是两个视角，界面上一个当主数字、一个当小字。
+   */
+  client_inflight?: number;
   /** 取不到上游时的原因（直接展示，服务端文案） */
   error?: string;
   days: number;

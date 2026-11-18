@@ -277,6 +277,7 @@
     "creditsExpiryDaily": "가장 가까운 만료일({time})에 {amount} 포인트 만료"
   },
   "stats": {
+    "realtimeClientInflight": "클라이언트 처리 중 {n}",
     "realtimeConcurrency": "동시 실행 중",
     "realtimeRpm": "RPM",
     "realtimeTrend": "최근 3분",

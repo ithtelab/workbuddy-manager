@@ -277,6 +277,7 @@
     "creditsExpiryDaily": "最近一天（{time}）共 {amount} 積分到期"
   },
   "stats": {
+    "realtimeClientInflight": "用戶端在途 {n}",
     "realtimeConcurrency": "當前併發",
     "realtimeRpm": "RPM",
     "realtimeTrend": "近 3 分鐘",

@@ -304,6 +304,7 @@
     "creditsExpiryDaily": "{amount} credits expire on the nearest day ({time})"
   },
   "stats": {
+    "realtimeClientInflight": "Client in flight {n}",
     "realtimeConcurrency": "In flight",
     "realtimeRpm": "RPM",
     "realtimeTrend": "Last 3 minutes",
