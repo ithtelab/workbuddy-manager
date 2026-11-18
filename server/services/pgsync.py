@@ -67,9 +67,19 @@ LAST_IMPORT_KEY = 'pg_sync_last_import_at'
 META_TABLE = '_wb_mirror_meta'
 _MIRROR_PREFIX = '_wb_'
 
-# 每批搬运的行数。太小则往返次数多（每次 round-trip 有固定开销），太大则
-# 单事务内存与体积上去、进度更新也变粗。1000 行 × 十几列对本项目约几百 KB。
+# 每批搬运的行数上限。太小则往返次数多（每次 round-trip 有固定开销），太大则
+# 单事务内存与体积上去、进度更新也变粗。
+#
+# **行数不能单独作为内存的上界。** 这里原本的假设是「1000 行 × 十几列约几百
+# KB」，但 `tap_turns` 每行最多有 4 个大正文字段（各按 `max_body` 截断，默认
+# 512 KB），实测 744 行就有 553 MB —— 一次 `fetchmany(1000)` 直接把整张表
+# 物化成 500 MB 的 Python 对象，在 `mem_limit: 512m` 的容器里被内核 OOM kill，
+# 网关跟着 504（issue #457）。所以另设字节预算，见 `BATCH_BYTES`。
 BATCH = 1000
+
+# 单批的字节预算。行数达标或字节达标，任一满足就吐出一批：小行照旧上千行
+# 一批，大行自动退化成一行一批 —— 与表里存的是什么无关。
+BATCH_BYTES = 4 * 1024 * 1024
 
 # 连接超时（秒）：见导出/恢复里的说明。探测接口用的是同一个值。
 CONNECT_TIMEOUT = 8
@@ -339,6 +349,53 @@ def _filter_rows(table: str, columns: list[str], rows: list) -> list:
             if str(row[index]) in _SETTING_ALLOWLIST]
 
 
+def _row_size(row) -> int:
+    """估算一行在 Python 里的字节占用（只关心量级，不追求精确）。
+
+    非字符串按 8 字节算：一个整数/None 的对象头就这个量级，而真正会把内存吃
+    爆的永远是 TEXT 列 —— 把它们算准就够了。
+    """
+    total = 0
+    for value in row:
+        if isinstance(value, (str, bytes, bytearray, memoryview)):
+            total += len(value)
+        else:
+            total += 8
+    return total
+
+
+def _row_batches(cur, table: str, columns: list[str],
+                 batch: int = BATCH) -> Iterator[list]:
+    """按「行数 + 字节」双上限从游标装批。
+
+    逐行 `fetchone()` 而不是 `fetchmany(batch)`：先知道这一行多大，才能保证
+    一个批次不超预算。代价是每行多一次 Python 层的取行调用，本地游标下可以
+    忽略（十万行量级仍在亚秒级），换来的是「无论表里存的是什么」都不会一次
+    吃爆内存 —— 这正是 issue #457 里容器被 OOM kill 的直接原因。
+
+    注意：预算约束的是**交给调用方的那一批**。如果源端是 psycopg 的客户端
+    游标，`execute()` 时服务端结果已经整份落在客户端库里，这里的逐行读只
+    能避免再复制一份；要连那一份也省掉，得改用 named cursor（服务端游标）。
+    """
+    buf: list = []
+    size = 0
+    while True:
+        row = cur.fetchone()
+        if row is None:
+            break
+        buf.append(tuple(row))
+        size += _row_size(row)
+        if len(buf) >= batch or size >= BATCH_BYTES:
+            filtered = _filter_rows(table, columns, buf)
+            if filtered:
+                yield filtered
+            buf, size = [], 0
+    if buf:
+        filtered = _filter_rows(table, columns, buf)
+        if filtered:
+            yield filtered
+
+
 # ── 数据源 / 目标（搬运的两端）──────────────────────────
 #
 # 抽出这一层是为了**可测**：导出与恢复的差别只是「谁当源、谁当目标」，
@@ -375,14 +432,10 @@ class _SqliteSource:
     def rows(self, table: str, columns: list[str], batch: int = BATCH) -> Iterator[list]:
         collist = ', '.join(f'"{c}"' for c in columns)
         cur = self._conn.execute(f'SELECT {collist} FROM "{table}"')
-        while True:
-            chunk = cur.fetchmany(batch)
-            if not chunk:
-                break
-            filtered = _filter_rows(
-                table, columns, [tuple(r) for r in chunk])
-            if filtered:
-                yield filtered
+        try:
+            yield from _row_batches(cur, table, columns, batch)
+        finally:
+            cur.close()
 
     def close(self) -> None:
         self._conn.close()
@@ -421,14 +474,7 @@ class _PgSource:
         cur = self._conn.cursor()
         try:
             cur.execute(f'SELECT {collist} FROM "{table}"')
-            while True:
-                chunk = cur.fetchmany(batch)
-                if not chunk:
-                    break
-                filtered = _filter_rows(
-                    table, columns, [tuple(r) for r in chunk])
-                if filtered:
-                    yield filtered
+            yield from _row_batches(cur, table, columns, batch)
         finally:
             cur.close()
 
