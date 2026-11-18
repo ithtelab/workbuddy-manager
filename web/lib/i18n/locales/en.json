@@ -325,6 +325,7 @@
     "title": "Usage",
     "description": "Token consumption and request volume by time, model and key (auto-refresh every 60s; currently {realm} only)",
     "today": "Today",
+    "yesterday": "Yesterday",
     "last7": "Last 7 days",
     "last30": "Last 30 days",
     "last3": "Last 3 days",
