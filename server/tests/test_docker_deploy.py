@@ -1380,3 +1380,31 @@ class AlpineTimezoneTest(unittest.TestCase):
         self.assertIn('adduser', self.src, 'Alpine 用 busybox 的 adduser')
         self.assertNotRegex(self.src, r'useradd(?![a-z])',
                             'useradd 在 Alpine 上不存在（是 Debian 的）')
+
+class ComposeTimezoneWiringTest(unittest.TestCase):
+    """compose 的 TZ 必须在**构建期**与**运行期**两处都给（审计发现的缺口）。
+
+    `environment.TZ` 只影响进程环境；镜像里没有 tzdata、`/etc/localtime` 没指向
+    目标时区的话，musl 的 `localtime()` 会静默退回 UTC。而本项目的按日统计与
+    每日 Token 限额复位都按本地时区 —— 两处不一致的表现是「时区写着 +8、
+    数字按 UTC 分天」，不报任何错。
+    """
+
+    COMPOSE = _ROOT / 'docker-compose.yml'
+
+    def setUp(self) -> None:
+        self.src = self.COMPOSE.read_text(encoding='utf-8')
+
+    def test_build_arg_tz_exists(self) -> None:
+        head = self.src[: self.src.index('environment:')]
+        self.assertIn('TZ:', head, '必须在 build.args 里传 TZ（决定装不装 tzdata）')
+
+    def test_runtime_and_build_tz_agree(self) -> None:
+        head = self.src[: self.src.index('environment:')]
+        tail = self.src[self.src.index('environment:'):]
+        build_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', head, re.M)
+        run_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', tail, re.M)
+        self.assertIsNotNone(build_tz, 'build.args 缺 TZ')
+        self.assertIsNotNone(run_tz, 'environment 缺 TZ')
+        self.assertEqual(build_tz.group(1).strip(), run_tz.group(1).strip(),
+                         'build 与 runtime 的 TZ 必须一致，否则会按错误时区分天')

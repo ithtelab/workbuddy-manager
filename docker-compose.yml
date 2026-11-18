@@ -27,6 +27,13 @@ services:
       args:
         ALPINE_MIRROR: ""
         DEBIAN_MIRROR: ""
+        # 容器时区。**必须与下面 environment 里的 TZ 一致**：
+        #   · 构建期（这里）决定镜像里装不装 tzdata、/etc/localtime 指向哪；
+        #   · 运行期（environment）只是把 TZ 传进进程环境。
+        # 只设运行期而没装 tzdata 的话，Alpine 会让 localtime 静默退回 UTC ——
+        # 按日统计与每日限额会按 UTC 分天，且不报错。
+        #   docker compose build --build-arg TZ=Asia/Shanghai
+        TZ: "Asia/Shanghai"
         # 可选：PyPI 镜像（成因同上——官方源走国际 CDN，国内会抖动/失败）。
         # 留空 = 官方源，失败时 Dockerfile 会自动降级到清华镜像重试。
         # 可选镜像：https://pypi.tuna.tsinghua.edu.cn/simple / https://mirrors.aliyun.com/pypi/simple
