@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+_ROOT = Path(__file__).resolve().parents[2]
 
 from server import config, db  # noqa: E402
 from server import db as db_mod  # noqa: E402  （等价性测试里显式叫 db_mod）
@@ -44,6 +45,18 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def setUpModule() -> None:
+    """每个用例前清掉模块级缓存。
+
+    `_status_cache`（上游 /status 短缓存）与 `_PEAK_CACHE` 都是**模块级全局**，
+    不清的话一个用例 mock 出「上游可达」，下一个用例就会读到那份缓存、看到
+    `available=True` —— 而它本来在测「上游不可达时本地指标照常」。这种失败
+    取决于执行顺序，最难定位。
+    """
+    stats._PEAK_CACHE.clear()
+    stats._status_cache = None
+
+
 class _DbCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -52,6 +65,7 @@ class _DbCase(unittest.TestCase):
         db._conn = None
         db.connect()
         stats._PEAK_CACHE.clear()
+        stats._status_cache = None      # 上游 /status 短缓存：类间必须隔开
 
     def tearDown(self) -> None:
         try:
@@ -378,3 +392,72 @@ class PeakSqlPitfallsTest(unittest.TestCase):
 
     def test_no_overlap(self) -> None:
         self.assertEqual(self._peak([(1794970000, 100), (1794970100, 100)]), 1)
+
+class UpstreamStatusCacheTest(unittest.TestCase):
+    """实时指标的 `/status` 短缓存（1 秒轮询下的必要保护）。
+
+    发现过程：前端改成 1 秒轮询后用 30 个并发请求压了一遍，耗时 3.7 秒 ——
+    因为 `wb2api.get_status()` 每次都新建 HTTP 往返（连接超时 3 秒 / 读超时
+    10 秒），上游不可达时**每个轮询都要等满超时**，worker 全被占住，面板其他
+    操作也跟着卡。
+
+    修法：成功缓存 2 秒（`in_flight` 是「此刻」的量，不能缓存太久）、失败缓存
+    15 秒（挡住轮询风暴，又能在上游恢复后及时反映）。
+    """
+
+    def setUp(self) -> None:
+        stats._status_cache = None
+
+    def tearDown(self) -> None:
+        stats._status_cache = None
+
+    def test_failure_is_cached(self) -> None:
+        calls = []
+
+        async def fake():
+            calls.append(1)
+            return {'connected': False, 'error': 'boom'}
+
+        orig = wb2api.get_status
+        wb2api.get_status = fake
+        try:
+            for _ in range(5):
+                got = asyncio.run(stats._upstream_status_cached())
+            self.assertEqual(len(calls), 1, '失败应被缓存，5 次调用只应打一次上游')
+            self.assertFalse(got['connected'])
+        finally:
+            wb2api.get_status = orig
+
+    def test_success_ttl_is_short(self) -> None:
+        """成功缓存 2 秒：`in_flight` 是瞬时值，缓存太久数字会明显滞后。"""
+        self.assertLessEqual(stats._STATUS_OK_TTL, 2.0)
+        self.assertGreater(stats._STATUS_FAIL_TTL, stats._STATUS_OK_TTL,
+                           '失败缓存必须比成功缓存久，否则挡不住轮询风暴')
+
+    def test_cache_expires(self) -> None:
+        calls = []
+
+        async def fake():
+            calls.append(1)
+            return {'connected': True, 'accounts': []}
+
+        orig = wb2api.get_status
+        wb2api.get_status = fake
+        try:
+            asyncio.run(stats._upstream_status_cached())
+            # 手工把时间戳推老，模拟过期
+            at, payload = stats._status_cache
+            stats._status_cache = (at - 100, payload)
+            asyncio.run(stats._upstream_status_cached())
+            self.assertEqual(len(calls), 2, '过期后应重新取一次')
+        finally:
+            wb2api.get_status = orig
+            stats._status_cache = None
+
+    def test_realtime_uses_the_cache(self) -> None:
+        """端点必须走缓存版，否则 1 秒轮询仍会把上游打满。"""
+        src = (_ROOT / 'server' / 'routers' / 'stats.py').read_text(encoding='utf-8')
+        body = src[src.find('async def realtime'):]
+        self.assertIn('_upstream_status_cached()', body,
+                      'realtime() 应当用缓存版 /status —— 直接调 wb2api.get_status() '
+                      '会让上游不可达时每个轮询都等满超时')

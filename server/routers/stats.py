@@ -1054,6 +1054,40 @@ def _series(window: int = 180, step: int = 15) -> dict:
             'rpm': rpm, 'concurrency': conc}
 
 
+# 上游 `/status` 的短缓存（只给实时指标用）。
+#
+# 为什么必须缓存：前端每 **1 秒**拉一次这个接口，而 `wb2api.get_status()` 每次都
+# 新建一次 HTTP 往返（连接超时 3 秒 / 读超时 10 秒）。上游挂掉时，每一次轮询都要
+# 等满超时才返回 —— 实测 30 个并发请求耗时 3.7 秒，期间 worker 全被占住，面板其他
+# 操作也跟着卡。上游正常时这个往返只有几毫秒，缓存同样省下不必要的连接。
+#
+# 取值取舍：
+#   · **成功**缓存 2 秒：`in_flight` 是「此刻」的量，缓存太久会让数字明显滞后；
+#     1 秒轮询 + 2 秒缓存，最坏滞后 2 秒，肉眼无感。
+#   · **失败**缓存 15 秒：上游挂掉时最该避免的是「每个轮询都等满超时」。15 秒足够
+#     挡住轮询风暴，又能在上游恢复后及时反映出来（用户也会看到它自己恢复）。
+#
+# 注意只在这个端点内用：其它调用点（账号页、多分组查询）需要各自口径的实时值，
+# 不能被这里的缓存影响。
+_STATUS_OK_TTL = 2.0
+_STATUS_FAIL_TTL = 15.0
+_status_cache: tuple[float, dict] | None = None
+
+
+async def _upstream_status_cached() -> dict:
+    """带短缓存的上游 `/status`（失败缓存更久）。"""
+    global _status_cache
+    now = time.time()
+    if _status_cache is not None:
+        at, payload = _status_cache
+        ttl = _STATUS_OK_TTL if payload.get('connected') else _STATUS_FAIL_TTL
+        if now - at < ttl:
+            return payload
+    payload = await wb2api.get_status()
+    _status_cache = (now, payload)
+    return payload
+
+
 @router.get('/realtime')
 async def realtime(days: int | None = None,
                    user: dict = Depends(security.current_user)) -> dict:
@@ -1085,7 +1119,7 @@ async def realtime(days: int | None = None,
         'peaks': _peaks(span),
         'series': _series(),
     }
-    status = await wb2api.get_status()
+    status = await _upstream_status_cached()
     if not status.get('connected'):
         out['error'] = str(status.get('error') or '上游不可达')
         return out
