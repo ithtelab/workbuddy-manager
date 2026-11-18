@@ -1018,6 +1018,15 @@ def _peaks(days: int) -> dict:
     return out
 
 
+# `_series` 的结果缓存。实时条每 1 秒刷一次，而这段是同步 CPU + 同步 sqlite
+# （持全局 `db._lock`），高流量下单次可达几十毫秒 —— 每秒重算会与同进程的
+# `/v1` 转发抢锁。缓存 1 秒：前端本来就 1 秒一取，等于同一秒内的重复调用免费。
+#
+# 键里带 (window, step)：将来若别处用不同参数调，不会互相串味。
+_SERIES_TTL = 1.0
+_series_cache: dict[tuple[int, int], tuple[float, dict]] = {}
+
+
 def _series(window: int = 180, step: int = 15) -> dict:
     """近 `window` 秒的「每分钟完成数」与**并发**序列，每 `step` 秒一个桶。
 
@@ -1031,6 +1040,11 @@ def _series(window: int = 180, step: int = 15) -> dict:
     3. `rpm` 按**完成时刻**落桶：它回答的是「这一格完成了多少条」，与并发不是同一
        量纲，别把它当「请求数」和并发相加。
     """
+    cache_key = (window, step)
+    cached = _series_cache.get(cache_key)
+    if cached is not None and time.time() - cached[0] < _SERIES_TTL:
+        return cached[1]
+
     now = int(time.time())
     end = (now // step + 1) * step
     start = end - window
@@ -1039,19 +1053,38 @@ def _series(window: int = 180, step: int = 15) -> dict:
     rows = db.query('SELECT ts, latency_ms FROM request_logs WHERE ts >= ?',
                     (start - max(60, window),))
     spans = _request_spans(rows)
+
     rpm = [0] * nb
-    conc = [0] * nb
     for row in rows:
         ts = float(row['ts'] or 0)
         if ts >= start:
             rpm[min(nb - 1, int((ts - start) // step))] += 1
-    for i in range(nb):
-        b0 = float(start + i * step)
-        clipped = [(max(begin, b0), min(finish, b0 + step))
-                   for begin, finish in spans]
-        conc[i] = _max_overlap([(b, e) for b, e in clipped if e > b])
-    return {'window': window, 'step': step, 'start': start, 'end': end,
-            'rpm': rpm, 'concurrency': conc}
+
+    # 并发：每个桶取「桶内区间最大重叠」（同一格里先后完成的两条不算并发）。
+    #
+    # 旧写法对**每个桶**都把全部 spans 裁剪一遍再重新排序 —— O(桶数 × N log N)，
+    # 而 N 是「整个取数窗口的请求数」。12 个桶、100 rps 时实测 95 ms/秒；这段是
+    # 同步 CPU + 同步 sqlite（持全局 `db._lock`），跑在 async 端点里会卡住事件
+    # 循环、连带拖慢同进程的 /v1 转发。
+    #
+    # 优化：**先按桶归拢**（每条 span 只进入它真正覆盖的那些桶），再在每桶内部
+    # 排序求最大重叠。桶内条数远小于全局 N，总代价 ≈ O(N + Σ nᵢ log nᵢ)。
+    # 跨桶的长请求会被放进多个桶，但那是它真实占用的时间，不是重复计算。
+    buckets: list[list[tuple[float, float]]] = [[] for _ in range(nb)]
+    for begin, finish in spans:
+        if finish <= start or begin >= end:
+            continue
+        lo = max(0, int((begin - start) // step))
+        # `finish` 落在桶边界上时，那个桶不含它（半开区间）
+        hi = min(nb - 1, int((finish - start - 1e-9) // step))
+        for i in range(lo, hi + 1):
+            b0 = float(start + i * step)
+            buckets[i].append((max(begin, b0), min(finish, b0 + step)))
+    conc = [_max_overlap(b) if b else 0 for b in buckets]
+    out = {'window': window, 'step': step, 'start': start, 'end': end,
+           'rpm': rpm, 'concurrency': conc}
+    _series_cache[cache_key] = (time.time(), out)
+    return out
 
 
 # 上游 `/status` 的短缓存（只给实时指标用）。

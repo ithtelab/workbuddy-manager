@@ -386,7 +386,7 @@ export default function StatsPage() {
       )}
 
       {/* 实时指标：口径与下面那排累计卡不同 —— 这两个数说的是「此刻」，由组件自己
-          每 5 秒心跳一次，不跟本页 60 秒的刷新节奏走。 */}
+          每 1 秒心跳一次，不跟本页 60 秒的刷新节奏走（标签页不可见时跳过）。 */}
       <RealtimeStatsStrip days={d} />
 
       <section className="grid grid-cols-2 gap-3 lg:grid-cols-4 md:gap-4">

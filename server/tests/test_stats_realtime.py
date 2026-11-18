@@ -55,6 +55,7 @@ def setUpModule() -> None:
     """
     stats._PEAK_CACHE.clear()
     stats._status_cache = None
+    stats._series_cache.clear()
 
 
 class _DbCase(unittest.TestCase):
@@ -66,6 +67,7 @@ class _DbCase(unittest.TestCase):
         db.connect()
         stats._PEAK_CACHE.clear()
         stats._status_cache = None      # 上游 /status 短缓存：类间必须隔开
+        stats._series_cache.clear()     # _series 结果缓存：同理
 
     def tearDown(self) -> None:
         try:
@@ -74,6 +76,7 @@ class _DbCase(unittest.TestCase):
             db._conn = None
             config.DB_PATH = self._orig_db
             stats._PEAK_CACHE.clear()
+            stats._series_cache.clear()
             self._tmp.cleanup()
 
 
@@ -116,8 +119,17 @@ class PeaksTest(_DbCase):
 
 
 class SeriesTest(_DbCase):
+    def series(self, **kw):
+        """取一份**新鲜**的序列。
+
+        `_series` 有 1 秒结果缓存（实时条每 1 秒刷一次，同一秒内的重复调用免费）。
+        测试在同一秒内连续造不同数据，必须绕过缓存，否则读到的是上一例的结果。
+        """
+        stats._series_cache.clear()
+        return stats._series(**kw)
+
     def test_buckets_align_to_absolute_grid(self) -> None:
-        out = stats._series()
+        out = self.series()
         self.assertEqual(out['step'], 15)
         self.assertEqual(out['window'], 180)
         self.assertEqual(out['start'] % 15, 0, '桶边界没对齐到 step 的整数倍')
@@ -126,20 +138,20 @@ class SeriesTest(_DbCase):
         self.assertEqual(len(out['concurrency']), 12)
 
     def test_request_lands_in_expected_bucket(self) -> None:
-        out = stats._series()
+        out = self.series()
         start = out['start']
         _log(start + 7, 100)
         _log(start + 15 * 5 + 3, 100)
-        out = stats._series()
+        out = self.series()
         self.assertEqual(out['rpm'][0], 1)
         self.assertEqual(out['rpm'][5], 1)
         self.assertEqual(sum(out['rpm']), 2)
 
     def test_long_request_spans_buckets_backwards(self) -> None:
         """45 秒的请求向前铺 3 格，而不是它结束之后的 3 格。"""
-        start = stats._series()['start']
+        start = self.series()['start']
         _log(start + 45, 45_000)        # 占用 [start, start+45) → 第 0/1/2 格
-        out = stats._series()
+        out = self.series()
         for i in range(3):
             self.assertGreaterEqual(out['concurrency'][i], 1, f'bucket {i} 没算到并发')
         self.assertEqual(out['concurrency'][3], 0, '请求结束后的桶不该再有并发')
@@ -147,15 +159,15 @@ class SeriesTest(_DbCase):
 
     def test_concurrency_is_max_overlap_not_hit_count(self) -> None:
         """同一格内先后完成的两条：命中数 2，但同时只有 1 条 → 必须报 1。"""
-        start = stats._series()['start']
+        start = self.series()['start']
         _log(start + 3, 2_000)          # [start+1, start+3)
         _log(start + 6, 2_000)          # [start+4, start+6)
-        out = stats._series()
+        out = self.series()
         self.assertEqual(out['rpm'][0], 2)
         self.assertEqual(out['concurrency'][0], 1)
 
     def test_empty_window_is_all_zero(self) -> None:
-        out = stats._series()
+        out = self.series()
         self.assertEqual(set(out['rpm']), {0})
         self.assertEqual(set(out['concurrency']), {0})
 
@@ -461,3 +473,28 @@ class UpstreamStatusCacheTest(unittest.TestCase):
         self.assertIn('_upstream_status_cached()', body,
                       'realtime() 应当用缓存版 /status —— 直接调 wb2api.get_status() '
                       '会让上游不可达时每个轮询都等满超时')
+
+class GatewayPathCoverageTest(unittest.TestCase):
+    """「客户端在途」必须覆盖**所有**模型调用入口（审计发现漏了两条）。
+
+    原来只认 `/v1/`，于是：
+      · `POST /responses`（OpenAI SDK 的 `responses.create`，baseURL 不含 /v1 时走它）；
+      · `POST /v2/chat/completions`；
+    这两条真实调用的在途数**完全不计入**，而「客户端在途」正是用来和上游槽位
+    占用比对「是否在排队」的 —— 漏计会让这个数字结构性偏小，恰好在多协议混跑
+    时失真。
+    """
+
+    def test_covers_all_gateway_entries(self) -> None:
+        from server.main import _is_gateway_path
+        for path in ('/v1/chat/completions', '/v1/messages', '/v1/models',
+                     '/v2/chat/completions', '/responses'):
+            self.assertTrue(_is_gateway_path(path), path)
+
+    def test_does_not_catch_admin_or_lookalikes(self) -> None:
+        from server.main import _is_gateway_path
+        # `/responses/x` 也不算：网关只有精确的 `/responses` 一条路由，
+        # 按前缀匹配会误吃将来可能出现的 `/responses-admin` 之类
+        for path in ('/api/status', '/api/accounts', '/v1foo', '/v10/x',
+                     '/responses-admin', '/responses/x', '/v1', '/'):
+            self.assertFalse(_is_gateway_path(path), path)
