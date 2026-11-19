@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import logging
 import threading
 
 _LOCK = threading.Lock()
@@ -31,6 +32,13 @@ def leave() -> None:
     with _LOCK:
         if _COUNT > 0:
             _COUNT -= 1
+        else:
+            # 不配对必须能看见：静默吞掉下溢会让计数**永久少 1**，之后所有
+            # 「客户端在途」都偏低，而界面上完全看不出异常。走到这里说明
+            # enter/leave 没有配对（正常路径由中间件的 try/finally 保证）。
+            logging.getLogger('workbuddy.inflight').warning(
+                'inflight.leave() 在计数为 0 时被调用 —— enter/leave 不配对，'
+                '统计值会偏低')
 
 
 def current() -> int:

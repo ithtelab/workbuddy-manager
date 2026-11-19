@@ -150,7 +150,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='2.11.18',
+    version='2.11.19',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -452,14 +452,29 @@ class ApiBodyLimitMiddleware:
             await response(scope, receive, send)
 
 
-# 计入「客户端在途」的路径前缀：只有网关调用算，面板自身的 /api/* 不算。
-GATEWAY_PATH_PREFIX = '/v1/'
+# 计入「客户端在途」的路径：只有网关调用算，面板自身的 /api/* 不算。
+#
+# 必须覆盖**所有**模型调用入口，漏一条就会让这个数字结构性偏小 —— 而它存在的
+# 意义正是「与上游槽位占用比对，看出是否在排队」：
+#   · `/v1/`   OpenAI / Anthropic 兼容层（chat / messages / models / tools…）
+#   · `/v2/`   `/v2/chat/completions`（部分客户端直接打这个路径）
+#   · `/responses` OpenAI SDK 的 `responses.create` 在 baseURL 不含 `/v1` 时走的
+#                 就是这条（见 routers/responses.py 的注释）
+# 用**按路径段**判定而不是 `startswith('/v1')`：后者会把 `/v1foo` 也吃进来。
+GATEWAY_PATH_PREFIXES = ('/v1/', '/v2/')
+# 不带前缀的网关端点（精确匹配，避免误吃 `/responses-admin` 之类）
+GATEWAY_BARE_PATHS = ('/responses',)
+
+
+def _is_gateway_path(path: str) -> bool:
+    return path in GATEWAY_BARE_PATHS or path.startswith(GATEWAY_PATH_PREFIXES)
 
 
 class GatewayInFlightMiddleware:
-    """统计「客户端在途」：`/v1/*` 从请求进来到**响应写完**（含整个流式传输）。
+    """统计「客户端在途」：`/v1/*`、`/v2/*`、`/responses` 从请求进来到**响应写完**
+    （含整个流式传输）。
 
-    为什么按 `/v1/` 划：这些才是 agent 客户端的模型调用（chat / responses /
+    为什么按这几条路径划：这些才是 agent 客户端的模型调用（chat / responses /
     messages / models）。面板自己的 `/api/*` 是浏览器在翻页，算进来会把数字搅乱。
 
     为什么要在中间件里数而不是从日志推：日志只有请求**结束**时才写，正在跑的那条
@@ -474,7 +489,7 @@ class GatewayInFlightMiddleware:
 
     async def __call__(self, scope, receive, send):
         path = str(scope.get('path') or '')
-        if scope.get('type') != 'http' or not path.startswith(GATEWAY_PATH_PREFIX):
+        if scope.get('type') != 'http' or not _is_gateway_path(path):
             await self.app(scope, receive, send)
             return
         inflight.enter()

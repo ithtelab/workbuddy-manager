@@ -1345,3 +1345,66 @@ class UpstreamHealthProbeAddressTest(unittest.TestCase):
                          f'现在有 {src.count(literal)} 处')
         self.assertIn('wait_health(upstream_health_url()', src,
                       '就绪等待要传派生地址')
+
+class AlpineTimezoneTest(unittest.TestCase):
+    """Alpine 基础镜像必须能按本地时区统计（审计发现 PR #459 漏了 tzdata）。
+
+    本项目的「按天」口径全部依赖本地时区：
+      · `db.day_of()` 用 `time.localtime()`；
+      · SQL 里用 `'localtime'` 修饰符分桶；
+      · 密钥每日 Token 限额按本地日期零点复位。
+    Debian slim 也没装 tzdata，但它自带 `/etc/localtime`（UTC），行为一致。
+    **Alpine 的 busybox 不带 tzdata**，若不显式处理，设了时区也只会静默退回 UTC
+    —— 表现是「时区 +8、统计按 UTC 分天」，且不报任何错。
+    """
+
+    DOCKERFILE = _ROOT / 'Dockerfile'
+
+    def setUp(self) -> None:
+        self.src = self.DOCKERFILE.read_text(encoding='utf-8')
+
+    def test_tz_arg_installs_tzdata(self) -> None:
+        """设了 TZ 就必须装 tzdata 并落 /etc/localtime，不能只写环境变量。"""
+        self.assertIn('ARG TZ=', self.src, '缺少 TZ 构建参数')
+        self.assertIn('apk add --no-cache tzdata', self.src,
+                      'Alpine 必须显式装 tzdata，否则 localtime 静默退回 UTC')
+        self.assertIn('/usr/share/zoneinfo/', self.src, '必须从 zoneinfo 取时区文件')
+        self.assertIn('/etc/localtime', self.src, '必须落 /etc/localtime（musl 优先读它）')
+
+    def test_no_bash_dependency(self) -> None:
+        """Alpine 没有 bash：脚本只能靠 /bin/sh。"""
+        for m in re.finditer(r'^RUN .*', self.src, re.M):
+            self.assertNotIn('/bin/bash', m.group(0), 'Alpine 里没有 /bin/bash')
+
+    def test_uses_busybox_adduser_not_useradd(self) -> None:
+        self.assertIn('adduser', self.src, 'Alpine 用 busybox 的 adduser')
+        self.assertNotRegex(self.src, r'useradd(?![a-z])',
+                            'useradd 在 Alpine 上不存在（是 Debian 的）')
+
+class ComposeTimezoneWiringTest(unittest.TestCase):
+    """compose 的 TZ 必须在**构建期**与**运行期**两处都给（审计发现的缺口）。
+
+    `environment.TZ` 只影响进程环境；镜像里没有 tzdata、`/etc/localtime` 没指向
+    目标时区的话，musl 的 `localtime()` 会静默退回 UTC。而本项目的按日统计与
+    每日 Token 限额复位都按本地时区 —— 两处不一致的表现是「时区写着 +8、
+    数字按 UTC 分天」，不报任何错。
+    """
+
+    COMPOSE = _ROOT / 'docker-compose.yml'
+
+    def setUp(self) -> None:
+        self.src = self.COMPOSE.read_text(encoding='utf-8')
+
+    def test_build_arg_tz_exists(self) -> None:
+        head = self.src[: self.src.index('environment:')]
+        self.assertIn('TZ:', head, '必须在 build.args 里传 TZ（决定装不装 tzdata）')
+
+    def test_runtime_and_build_tz_agree(self) -> None:
+        head = self.src[: self.src.index('environment:')]
+        tail = self.src[self.src.index('environment:'):]
+        build_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', head, re.M)
+        run_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', tail, re.M)
+        self.assertIsNotNone(build_tz, 'build.args 缺 TZ')
+        self.assertIsNotNone(run_tz, 'environment 缺 TZ')
+        self.assertEqual(build_tz.group(1).strip(), run_tz.group(1).strip(),
+                         'build 与 runtime 的 TZ 必须一致，否则会按错误时区分天')

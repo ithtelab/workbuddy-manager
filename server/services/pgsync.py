@@ -44,6 +44,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -95,17 +96,27 @@ BATCH_BYTES = 4 * 1024 * 1024
 # 连接超时（秒）：见导出/恢复里的说明。探测接口用的是同一个值。
 CONNECT_TIMEOUT = 8
 
-# socket 读超时（秒）。`connect_timeout` **只覆盖建连**，覆盖不到建连之后的读写
-# —— issue #457 里那台机器经 frp 隧道到 PG 有一条「ESTABLISHED 但对端永不应答」
-# 的连接，导出线程在 `copy_data` 的某次读上无限阻塞：
+# TCP keepalive 探测（秒）：`connect_timeout` **只覆盖建连**，覆盖不到建连之后的读。
+# issue #457 里那台机器经 frp 隧道到 PG 有一条「ESTABLISHED 但对端永不应答」的
+# 连接，导出线程在 `copy_data` 的某次读上无限阻塞：
 #   · `_job_lock` 34 分钟不释放，界面一直显示「任务进行中」，手动导出也点不动；
 #   · `finally` 里的快照清理等不到执行，data/ 下留下 518MB 孤儿文件。
-# 设 `socket_timeout` 后，这类读最终会抛 OperationalError，走正常的失败路径
-# （记日志 + reporter.finish(False) + finally 清理）。
 #
-# 取 300 秒而不是更小：正常的大表批量往返不该被误杀，300 秒已经远超任何
-# 「网络还活着」的单次往返。
-SOCKET_TIMEOUT = 300
+# ⚠️ **不能用 `socket_timeout`**：那是 psycopg2 的参数，psycopg3 的
+# `connect()` 会把它当 libpq 连接选项交给 `PQconninfoParse`，未知键直接抛
+# `ProgrammingError: invalid connection option "socket_timeout"` —— 而这发生在
+# **建连之前**，于是每一次导出/恢复都必然失败（实测 psycopg 3.3.9 确认）。
+#
+# 改用 libpq 原生参数：`tcp_user_timeout` 覆盖「已发出但长期没被 ACK」的数据，
+# keepalive 三件套负责探测「对端还活着吗」。两者合起来让死连接在分钟级内被内核
+# 回收，读操作随之返回错误。这些参数**全部经过实测确认被 psycopg3 接受**。
+#
+# 取值：`tcp_user_timeout=300000`（5 分钟）、keepalive 空闲 60s / 间隔 20s / 3 次，
+# 即最迟约 60+20×3=120 秒判定对端失联，远小于「34 分钟」那种卡死。
+TCP_USER_TIMEOUT_MS = 300_000
+KEEPALIVES_IDLE = 60
+KEEPALIVES_INTERVAL = 20
+KEEPALIVES_COUNT = 3
 
 # 状态文件里的日志上限：备份会逐表写日志，大库几十条就够，不必无限增长。
 MAX_LOGS = 200
@@ -373,15 +384,21 @@ def _filter_rows(table: str, columns: list[str], rows: list) -> list:
 
 
 def _row_size(row) -> int:
-    """估算一行在 Python 里的字节占用（只关心量级，不追求精确）。
+    """估算一行在内存里的字节占用（只关心量级）。
 
-    非字符串按 8 字节算：一个整数/None 的对象头就这个量级，而真正会把内存吃
-    爆的永远是 TEXT 列 —— 把它们算准就够了。
+    **`str` 要按 UTF-8 字节算，不能按字符数**：Python 的 str 用 1/2/4 字节
+    存一个字符（latin-1 / BMP / astral），所以 `len(value)` 对中文少算一半、
+    对 emoji 少算四分之三 —— 4MiB 的预算会变成实际 8~16 MiB 一批。
+    相对 553MB 的事故仍是两三个数量级改善，但预算名不副实。
+
+    `encode()` 会产生一个临时 bytes 副本（额外峰值），所以用 `sys.getsizeof`
+    更省：它直接给出对象驻留大小，且对 str 已按真实存储宽度计。非字符串按
+    `getsizeof` 记（int/None/float 几十字节，远小于 TEXT）。
     """
     total = 0
     for value in row:
         if isinstance(value, (str, bytes, bytearray, memoryview)):
-            total += len(value)
+            total += sys.getsizeof(value)
         else:
             total += 8
     return total
@@ -707,7 +724,10 @@ def export_to_pg(cfg: dict, reporter: _Reporter) -> dict:
         # connect_timeout：黑洞地址（SYN 被丢）下 libpq 会挂到 OS 默认超时（分钟级），
         # 期间任务锁一直占着、界面「进行中」不动。8 秒足够建立内网/公网连接。
         with psycopg.connect(dsn, connect_timeout=CONNECT_TIMEOUT,
-                     socket_timeout=SOCKET_TIMEOUT) as pg:
+                     tcp_user_timeout=TCP_USER_TIMEOUT_MS,
+                     keepalives=1, keepalives_idle=KEEPALIVES_IDLE,
+                     keepalives_interval=KEEPALIVES_INTERVAL,
+                     keepalives_count=KEEPALIVES_COUNT) as pg:
             sink = _PgSink(pg)
             tables = src.tables()
             reporter.data['tables_total'] = len(tables)
@@ -813,7 +833,10 @@ def import_from_pg(cfg: dict, reporter: _Reporter) -> dict:
     # 同导出：连接阶段也要有超时（见上面的说明）。这里刻意**在取 db._lock 之前**连接，
     # 所以连不上时面板不会跟着卡住。
     with psycopg.connect(dsn, connect_timeout=CONNECT_TIMEOUT,
-                     socket_timeout=SOCKET_TIMEOUT) as pg:
+                     tcp_user_timeout=TCP_USER_TIMEOUT_MS,
+                     keepalives=1, keepalives_idle=KEEPALIVES_IDLE,
+                     keepalives_interval=KEEPALIVES_INTERVAL,
+                     keepalives_count=KEEPALIVES_COUNT) as pg:
         src = _PgSource(pg)
         available = set(src.tables())
 
@@ -934,6 +957,16 @@ def start_job(kind: str) -> tuple[bool, str]:
         if not str(cfg.get('host') or '').strip():
             _job_lock.release()
             return False, '请先填写 PostgreSQL 地址并保存'
+        # **尝试时刻必须在启动线程之前写**（issue #457）：若等任务结束再写，
+        # 被内核 OOM kill / SIGKILL 时进程直接消失 —— `except` 与 `finally`
+        # 都不会跑，`last_attempt_at` 永远是 0，于是重启后 60 秒巡检立刻再导一次、
+        # 再被 kill，形成「OOM → 重启 → 再 OOM」的自持循环（这正是要修的问题）。
+        # 写在启动线程之前，代价是「刚点就被杀」也会记一次尝试（正确方向）。
+        if kind == 'export':
+            try:
+                db.set_setting(LAST_ATTEMPT_KEY, int(time.time()))
+            except Exception:  # noqa: BLE001 —— 记账失败不该拦住任务本身
+                logger.warning('写入 PG 备份尝试时刻失败（不影响本次任务）', exc_info=True)
         thread = threading.Thread(target=_run_job, args=(kind, cfg),
                                   name=f'pgsync-{kind}', daemon=True)
         thread.start()
@@ -964,12 +997,16 @@ def _run_job(kind: str, cfg: dict) -> None:
 
 
 def _note_attempt(kind: str, *, ok: bool) -> None:
-    """记录「刚尝试过一次」。导出成功才推进 `last_export_at`（那是给界面看的
-    「上次成功备份」），但**尝试时间**每次都要写，否则失败后会被立刻重试。"""
+    """任务收尾时更新**结果**状态：成功清零失败计数，失败则 +1。
+
+    「尝试时刻」不在这里写 —— 它在 `start_job` 里、启动线程**之前**就写了。
+    原因：`_note_attempt` 只在 `_run_job` 的 `finally` 里调用，而 OOM/SIGKILL
+    时 `finally` 根本不执行；那时若还靠这里记时刻，失败就永远不会被记下，
+    重启后立刻重试 → 再 OOM（issue #457 说的自持循环）。
+    """
     if kind != 'export':
         return
     try:
-        db.set_setting(LAST_ATTEMPT_KEY, int(time.time()))
         if ok:
             db.set_setting(FAIL_COUNT_KEY, 0)
         else:

@@ -243,13 +243,28 @@ ENV PYTHONUNBUFFERED=1 \
 # 可选：Alpine 软件源镜像（留空 = 官方源）。兼容旧名 DEBIAN_MIRROR。
 ARG ALPINE_MIRROR=""
 ARG DEBIAN_MIRROR=""
+# 容器时区（构建参数）。留空 = 不装 tzdata、系统按 UTC 跑，与 Debian slim 的
+# 老行为一致（那边也没装 tzdata）。
+#
+# ⚠️ **一旦设了 TZ 就必须装 tzdata**：本项目的按日统计（`db.day_of()` 的
+# `time.localtime`、SQL 里的 `'localtime'` 修饰符）、密钥每日 Token 限额的
+# 复位时刻、任务日报的分桶全都取**本地时区**。Alpine 的 busybox 不带 tzdata，
+# 缺了它 `/etc/localtime` 设不上、`localtime` 会静默退回 UTC —— 表现是
+# 「时区明明是 +8，统计却按 UTC 分天」，而且不报任何错。
+ARG TZ=""
 RUN set -eu; \
     MIRROR="${ALPINE_MIRROR:-$DEBIAN_MIRROR}"; \
     if [ -n "${MIRROR}" ]; then \
         echo "apk: 使用指定软件源 ${MIRROR}"; \
         sed -i -E "s#(https?://)[^/]+#\1${MIRROR}#g" /etc/apk/repositories; \
     fi; \
-    apk add --no-cache git curl ca-certificates
+    apk add --no-cache git curl ca-certificates; \
+    if [ -n "${TZ}" ]; then \
+        echo "时区：${TZ}"; \
+        apk add --no-cache tzdata; \
+        cp "/usr/share/zoneinfo/${TZ}" /etc/localtime; \
+        echo "${TZ}" > /etc/timezone; \
+    fi
 
 WORKDIR /app
 

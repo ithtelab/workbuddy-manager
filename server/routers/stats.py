@@ -902,13 +902,36 @@ def _per_account_limit() -> dict[str, int]:
     * `pool.max_in_flight_global` —— **国际版账号**的上限。名字里的 global 指的是
       realm（国际版），不是「整个池子」，与全池并发总数无关。
 
-    两个键的 0 都被上游归一化成 2（见 `server/services/wb2api.py` 里对应注释），
-    所以这里同样把非正数当 2。
+    ⚠️ 两个键的 0 **语义不同**（见 `server/services/wb2api.py` 的 `_INT_RANGES`
+    注释与上游 `cmd/server/config.go`）：
+      · `max_in_flight` 的 0 = **不限**（上游池子层 `if limit <= 0` 直接不限制）；
+      · 只有 `max_in_flight_global` 的 0/负数会被上游归一化成 2。
+    这里对 `cn` 用 0 表示「不限」——调用方据此把 capacity 视为未知；对 global
+    仍按 2 归一化。缺省（配置里没有该键）按上游默认：cn=3、global=2。
     """
+    default = {'cn': 3, 'global': 2}          # 上游 config.go 的默认值
     try:
-        pool = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8')).get('pool') or {}
+        raw = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
+        # 类型兜底：`pool` 被手改成字符串/数组时 `.get()` 会抛 AttributeError，
+        # 而它在 try 之外会让 /api/stats/realtime 变 500（实时条每秒轮询一次）。
+        pool = raw.get('pool') if isinstance(raw, dict) else None
+        if not isinstance(pool, dict):
+            pool = {}
     except Exception:  # noqa: BLE001 - 配置缺失 / 损坏都不该让整页 500
         pool = {}
+
+    def pick(name: str, fallback: int, *, zero_means_unlimited: bool) -> int:
+        try:
+            n = int(pool.get(name, fallback))
+        except (TypeError, ValueError):
+            return fallback
+        if n > 0:
+            return n
+        return 0 if zero_means_unlimited else 2
+
+    return {'cn': pick('max_in_flight', default['cn'], zero_means_unlimited=True),
+            'global': pick('max_in_flight_global', default['global'],
+                           zero_means_unlimited=False)}
 
     def pick(name: str) -> int:
         try:
@@ -931,7 +954,11 @@ def _request_spans(rows) -> list[tuple[float, float]]:
     for row in rows:
         ts = float(row['ts'] or 0)
         dur = max(0.0, float(row['latency_ms'] or 0) / 1000.0)
-        spans.append((ts - dur, ts))
+        # 零时长（`latency_ms` 为 0 或 NULL）按 1 毫秒处理，与 `_peaks` 同口径。
+        # 现实命中面不小：403 拦截、429、400、`/v1/models` 这些早退路径记的
+        # latency 就是 0。不补这一毫秒的话，同一批数据会出现「峰值卡显示 2、
+        # 曲线那一格显示 0」的自相矛盾。
+        spans.append((ts - max(dur, 0.001), ts))
     return spans
 
 
@@ -1018,6 +1045,15 @@ def _peaks(days: int) -> dict:
     return out
 
 
+# `_series` 的结果缓存。实时条每 1 秒刷一次，而这段是同步 CPU + 同步 sqlite
+# （持全局 `db._lock`），高流量下单次可达几十毫秒 —— 每秒重算会与同进程的
+# `/v1` 转发抢锁。缓存 1 秒：前端本来就 1 秒一取，等于同一秒内的重复调用免费。
+#
+# 键里带 (window, step)：将来若别处用不同参数调，不会互相串味。
+_SERIES_TTL = 1.0
+_series_cache: dict[tuple[int, int], tuple[float, dict]] = {}
+
+
 def _series(window: int = 180, step: int = 15) -> dict:
     """近 `window` 秒的「每分钟完成数」与**并发**序列，每 `step` 秒一个桶。
 
@@ -1031,6 +1067,11 @@ def _series(window: int = 180, step: int = 15) -> dict:
     3. `rpm` 按**完成时刻**落桶：它回答的是「这一格完成了多少条」，与并发不是同一
        量纲，别把它当「请求数」和并发相加。
     """
+    cache_key = (window, step)
+    cached = _series_cache.get(cache_key)
+    if cached is not None and time.time() - cached[0] < _SERIES_TTL:
+        return cached[1]
+
     now = int(time.time())
     end = (now // step + 1) * step
     start = end - window
@@ -1039,19 +1080,72 @@ def _series(window: int = 180, step: int = 15) -> dict:
     rows = db.query('SELECT ts, latency_ms FROM request_logs WHERE ts >= ?',
                     (start - max(60, window),))
     spans = _request_spans(rows)
+
     rpm = [0] * nb
-    conc = [0] * nb
     for row in rows:
         ts = float(row['ts'] or 0)
         if ts >= start:
             rpm[min(nb - 1, int((ts - start) // step))] += 1
-    for i in range(nb):
-        b0 = float(start + i * step)
-        clipped = [(max(begin, b0), min(finish, b0 + step))
-                   for begin, finish in spans]
-        conc[i] = _max_overlap([(b, e) for b, e in clipped if e > b])
-    return {'window': window, 'step': step, 'start': start, 'end': end,
-            'rpm': rpm, 'concurrency': conc}
+
+    # 并发：每个桶取「桶内区间最大重叠」（同一格里先后完成的两条不算并发）。
+    #
+    # 旧写法对**每个桶**都把全部 spans 裁剪一遍再重新排序 —— O(桶数 × N log N)，
+    # 而 N 是「整个取数窗口的请求数」。12 个桶、100 rps 时实测 95 ms/秒；这段是
+    # 同步 CPU + 同步 sqlite（持全局 `db._lock`），跑在 async 端点里会卡住事件
+    # 循环、连带拖慢同进程的 /v1 转发。
+    #
+    # 优化：**先按桶归拢**（每条 span 只进入它真正覆盖的那些桶），再在每桶内部
+    # 排序求最大重叠。桶内条数远小于全局 N，总代价 ≈ O(N + Σ nᵢ log nᵢ)。
+    # 跨桶的长请求会被放进多个桶，但那是它真实占用的时间，不是重复计算。
+    buckets: list[list[tuple[float, float]]] = [[] for _ in range(nb)]
+    for begin, finish in spans:
+        if finish <= start or begin >= end:
+            continue
+        lo = max(0, int((begin - start) // step))
+        # `finish` 落在桶边界上时，那个桶不含它（半开区间）
+        hi = min(nb - 1, int((finish - start - 1e-9) // step))
+        for i in range(lo, hi + 1):
+            b0 = float(start + i * step)
+            buckets[i].append((max(begin, b0), min(finish, b0 + step)))
+    conc = [_max_overlap(b) if b else 0 for b in buckets]
+    out = {'window': window, 'step': step, 'start': start, 'end': end,
+           'rpm': rpm, 'concurrency': conc}
+    _series_cache[cache_key] = (time.time(), out)
+    return out
+
+
+# 上游 `/status` 的短缓存（只给实时指标用）。
+#
+# 为什么必须缓存：前端每 **1 秒**拉一次这个接口，而 `wb2api.get_status()` 每次都
+# 新建一次 HTTP 往返（连接超时 3 秒 / 读超时 10 秒）。上游挂掉时，每一次轮询都要
+# 等满超时才返回 —— 实测 30 个并发请求耗时 3.7 秒，期间 worker 全被占住，面板其他
+# 操作也跟着卡。上游正常时这个往返只有几毫秒，缓存同样省下不必要的连接。
+#
+# 取值取舍：
+#   · **成功**缓存 2 秒：`in_flight` 是「此刻」的量，缓存太久会让数字明显滞后；
+#     1 秒轮询 + 2 秒缓存，最坏滞后 2 秒，肉眼无感。
+#   · **失败**缓存 15 秒：上游挂掉时最该避免的是「每个轮询都等满超时」。15 秒足够
+#     挡住轮询风暴，又能在上游恢复后及时反映出来（用户也会看到它自己恢复）。
+#
+# 注意只在这个端点内用：其它调用点（账号页、多分组查询）需要各自口径的实时值，
+# 不能被这里的缓存影响。
+_STATUS_OK_TTL = 2.0
+_STATUS_FAIL_TTL = 15.0
+_status_cache: tuple[float, dict] | None = None
+
+
+async def _upstream_status_cached() -> dict:
+    """带短缓存的上游 `/status`（失败缓存更久）。"""
+    global _status_cache
+    now = time.time()
+    if _status_cache is not None:
+        at, payload = _status_cache
+        ttl = _STATUS_OK_TTL if payload.get('connected') else _STATUS_FAIL_TTL
+        if now - at < ttl:
+            return payload
+    payload = await wb2api.get_status()
+    _status_cache = (now, payload)
+    return payload
 
 
 @router.get('/realtime')
@@ -1085,7 +1179,7 @@ async def realtime(days: int | None = None,
         'peaks': _peaks(span),
         'series': _series(),
     }
-    status = await wb2api.get_status()
+    status = await _upstream_status_cached()
     if not status.get('connected'):
         out['error'] = str(status.get('error') or '上游不可达')
         return out
@@ -1097,6 +1191,9 @@ async def realtime(days: int | None = None,
     # 上限按 realm 算：国际版账号走 `max_in_flight_global`，国内版走 `max_in_flight`。
     # 用「账号数 × 单一上限」在混合池里会多算——本项目的默认池就是 cn + global 混合。
     capacity = 0
+    # `cn` 上限为 0 = 上游「不限」：只要有 cn 账号，总容量就是未知，不能用
+    # 「账号数 × 0 = 0」报出去（那会显示「上限 0」而实际不限）。
+    unbounded = False
     for account in accounts:
         try:
             n = int(account.get('in_flight') or 0)
@@ -1105,7 +1202,11 @@ async def realtime(days: int | None = None,
         upstream += n
         if n > 0:
             busy += 1
-        capacity += limits.get(str(account.get('realm') or 'cn'), limits['cn'])
+        realm = str(account.get('realm') or 'cn')
+        limit = limits.get(realm, limits['cn'])
+        if realm != 'global' and limit <= 0:
+            unbounded = True
+        capacity += limit
     out.update({
         'available': True,
         'inflight': upstream,
@@ -1113,7 +1214,8 @@ async def realtime(days: int | None = None,
         'accounts_total': len(accounts),
         'per_account_limit': limits['cn'],
         'per_account_limit_global': limits['global'],
-        'capacity': capacity,
+        # None = 不限（cn 的 max_in_flight 为 0）。前端据此显示「不限」而不是数字。
+        'capacity': None if unbounded else capacity,
         'full_accounts': int(status.get('in_flight_full') or 0),
         'healthy': int(status.get('healthy') or 0),
         'sticky': int(status.get('sticky_sessions') or 0),

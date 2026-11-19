@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+_ROOT = Path(__file__).resolve().parents[2]
 
 from server import config, db  # noqa: E402
 from server import db as db_mod  # noqa: E402  （等价性测试里显式叫 db_mod）
@@ -44,6 +45,19 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def setUpModule() -> None:
+    """每个用例前清掉模块级缓存。
+
+    `_status_cache`（上游 /status 短缓存）与 `_PEAK_CACHE` 都是**模块级全局**，
+    不清的话一个用例 mock 出「上游可达」，下一个用例就会读到那份缓存、看到
+    `available=True` —— 而它本来在测「上游不可达时本地指标照常」。这种失败
+    取决于执行顺序，最难定位。
+    """
+    stats._PEAK_CACHE.clear()
+    stats._status_cache = None
+    stats._series_cache.clear()
+
+
 class _DbCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -52,6 +66,8 @@ class _DbCase(unittest.TestCase):
         db._conn = None
         db.connect()
         stats._PEAK_CACHE.clear()
+        stats._status_cache = None      # 上游 /status 短缓存：类间必须隔开
+        stats._series_cache.clear()     # _series 结果缓存：同理
 
     def tearDown(self) -> None:
         try:
@@ -60,6 +76,7 @@ class _DbCase(unittest.TestCase):
             db._conn = None
             config.DB_PATH = self._orig_db
             stats._PEAK_CACHE.clear()
+            stats._series_cache.clear()
             self._tmp.cleanup()
 
 
@@ -102,8 +119,17 @@ class PeaksTest(_DbCase):
 
 
 class SeriesTest(_DbCase):
+    def series(self, **kw):
+        """取一份**新鲜**的序列。
+
+        `_series` 有 1 秒结果缓存（实时条每 1 秒刷一次，同一秒内的重复调用免费）。
+        测试在同一秒内连续造不同数据，必须绕过缓存，否则读到的是上一例的结果。
+        """
+        stats._series_cache.clear()
+        return stats._series(**kw)
+
     def test_buckets_align_to_absolute_grid(self) -> None:
-        out = stats._series()
+        out = self.series()
         self.assertEqual(out['step'], 15)
         self.assertEqual(out['window'], 180)
         self.assertEqual(out['start'] % 15, 0, '桶边界没对齐到 step 的整数倍')
@@ -112,20 +138,20 @@ class SeriesTest(_DbCase):
         self.assertEqual(len(out['concurrency']), 12)
 
     def test_request_lands_in_expected_bucket(self) -> None:
-        out = stats._series()
+        out = self.series()
         start = out['start']
         _log(start + 7, 100)
         _log(start + 15 * 5 + 3, 100)
-        out = stats._series()
+        out = self.series()
         self.assertEqual(out['rpm'][0], 1)
         self.assertEqual(out['rpm'][5], 1)
         self.assertEqual(sum(out['rpm']), 2)
 
     def test_long_request_spans_buckets_backwards(self) -> None:
         """45 秒的请求向前铺 3 格，而不是它结束之后的 3 格。"""
-        start = stats._series()['start']
+        start = self.series()['start']
         _log(start + 45, 45_000)        # 占用 [start, start+45) → 第 0/1/2 格
-        out = stats._series()
+        out = self.series()
         for i in range(3):
             self.assertGreaterEqual(out['concurrency'][i], 1, f'bucket {i} 没算到并发')
         self.assertEqual(out['concurrency'][3], 0, '请求结束后的桶不该再有并发')
@@ -133,15 +159,15 @@ class SeriesTest(_DbCase):
 
     def test_concurrency_is_max_overlap_not_hit_count(self) -> None:
         """同一格内先后完成的两条：命中数 2，但同时只有 1 条 → 必须报 1。"""
-        start = stats._series()['start']
+        start = self.series()['start']
         _log(start + 3, 2_000)          # [start+1, start+3)
         _log(start + 6, 2_000)          # [start+4, start+6)
-        out = stats._series()
+        out = self.series()
         self.assertEqual(out['rpm'][0], 2)
         self.assertEqual(out['concurrency'][0], 1)
 
     def test_empty_window_is_all_zero(self) -> None:
-        out = stats._series()
+        out = self.series()
         self.assertEqual(set(out['rpm']), {0})
         self.assertEqual(set(out['concurrency']), {0})
 
@@ -193,10 +219,16 @@ class RealtimeEndpointTest(_DbCase):
         self.assertFalse(out['available'])
         self.assertIn('client_inflight', out, '上游挂了也要有客户端在途，界面小字不能空')
 
-    def test_limits_fall_back_to_2(self) -> None:
+    def test_limits_fall_back_to_upstream_defaults(self) -> None:
+        """配置缺失时按**上游默认值**回落：cn=3、global=2。
+
+        （上游 `cmd/server/config.go:214` 的默认 `MaxInFlight = 3`；global 的
+        默认/归一化值是 2。之前这里写 2/2 是错的 —— 会让界面报一个比真实
+        上限更小的容量。）
+        """
         with mock.patch.object(config, 'UPSTREAM_CONFIG',
                                Path(self._tmp.name) / 'missing.json'):
-            self.assertEqual(stats._per_account_limit(), {'cn': 2, 'global': 2})
+            self.assertEqual(stats._per_account_limit(), {'cn': 3, 'global': 2})
 
     def test_capacity_uses_global_limit_for_global_realm(self) -> None:
         """国际版账号走 `max_in_flight_global`：不是国内版那个键，也不是全池上限。"""
@@ -215,13 +247,31 @@ class RealtimeEndpointTest(_DbCase):
         self.assertEqual(out['per_account_limit_global'], 1)
         self.assertEqual(out['capacity'], 7, '2 个 cn×3 + 1 个 global×1')
 
-    def test_zero_limit_is_normalised_to_2(self) -> None:
-        """上游把 0（含负数）归一化成 2：不同口径的话界面会显示「上限 0」。"""
+    def test_zero_limit_semantics_differ_by_realm(self) -> None:
+        """两个键的 0 **语义不同**（上游 `config.go:437` / `pool.go:241`）：
+
+        · `max_in_flight: 0` = **不限**（池子层 `if limit <= 0` 直接不限制）；
+        · `max_in_flight_global: 0` 或负数 = 归一化成 **2**。
+
+        之前这里把两者都归一化成 2，是错的口径 —— 会让「不限」显示成「上限 2」。
+        """
         cfg = Path(self._tmp.name) / 'config.json'
         cfg.write_text(json.dumps({'pool': {'max_in_flight': 0,
                                             'max_in_flight_global': -5}}), encoding='utf-8')
         with mock.patch.object(config, 'UPSTREAM_CONFIG', cfg):
-            self.assertEqual(stats._per_account_limit(), {'cn': 2, 'global': 2})
+            self.assertEqual(stats._per_account_limit(), {'cn': 0, 'global': 2})
+
+    def test_unlimited_cn_reports_capacity_null(self) -> None:
+        """`max_in_flight: 0` 时 capacity 必须是 null（不限），不能是「账号数×0=0」。"""
+        cfg = Path(self._tmp.name) / 'config.json'
+        cfg.write_text(json.dumps({'pool': {'max_in_flight': 0}}), encoding='utf-8')
+        payload = self._upstream(accounts=[
+            {'realm': 'cn', 'in_flight': 1},
+            {'realm': 'cn', 'in_flight': 0},
+        ])
+        with mock.patch.object(config, 'UPSTREAM_CONFIG', cfg):
+            out = self._call(payload)
+        self.assertIsNone(out['capacity'], '不限时应报 null，前端显示「不限」')
 
     def test_rpm_windows(self) -> None:
         now = int(time.time())
@@ -378,3 +428,97 @@ class PeakSqlPitfallsTest(unittest.TestCase):
 
     def test_no_overlap(self) -> None:
         self.assertEqual(self._peak([(1794970000, 100), (1794970100, 100)]), 1)
+
+class UpstreamStatusCacheTest(unittest.TestCase):
+    """实时指标的 `/status` 短缓存（1 秒轮询下的必要保护）。
+
+    发现过程：前端改成 1 秒轮询后用 30 个并发请求压了一遍，耗时 3.7 秒 ——
+    因为 `wb2api.get_status()` 每次都新建 HTTP 往返（连接超时 3 秒 / 读超时
+    10 秒），上游不可达时**每个轮询都要等满超时**，worker 全被占住，面板其他
+    操作也跟着卡。
+
+    修法：成功缓存 2 秒（`in_flight` 是「此刻」的量，不能缓存太久）、失败缓存
+    15 秒（挡住轮询风暴，又能在上游恢复后及时反映）。
+    """
+
+    def setUp(self) -> None:
+        stats._status_cache = None
+
+    def tearDown(self) -> None:
+        stats._status_cache = None
+
+    def test_failure_is_cached(self) -> None:
+        calls = []
+
+        async def fake():
+            calls.append(1)
+            return {'connected': False, 'error': 'boom'}
+
+        orig = wb2api.get_status
+        wb2api.get_status = fake
+        try:
+            for _ in range(5):
+                got = asyncio.run(stats._upstream_status_cached())
+            self.assertEqual(len(calls), 1, '失败应被缓存，5 次调用只应打一次上游')
+            self.assertFalse(got['connected'])
+        finally:
+            wb2api.get_status = orig
+
+    def test_success_ttl_is_short(self) -> None:
+        """成功缓存 2 秒：`in_flight` 是瞬时值，缓存太久数字会明显滞后。"""
+        self.assertLessEqual(stats._STATUS_OK_TTL, 2.0)
+        self.assertGreater(stats._STATUS_FAIL_TTL, stats._STATUS_OK_TTL,
+                           '失败缓存必须比成功缓存久，否则挡不住轮询风暴')
+
+    def test_cache_expires(self) -> None:
+        calls = []
+
+        async def fake():
+            calls.append(1)
+            return {'connected': True, 'accounts': []}
+
+        orig = wb2api.get_status
+        wb2api.get_status = fake
+        try:
+            asyncio.run(stats._upstream_status_cached())
+            # 手工把时间戳推老，模拟过期
+            at, payload = stats._status_cache
+            stats._status_cache = (at - 100, payload)
+            asyncio.run(stats._upstream_status_cached())
+            self.assertEqual(len(calls), 2, '过期后应重新取一次')
+        finally:
+            wb2api.get_status = orig
+            stats._status_cache = None
+
+    def test_realtime_uses_the_cache(self) -> None:
+        """端点必须走缓存版，否则 1 秒轮询仍会把上游打满。"""
+        src = (_ROOT / 'server' / 'routers' / 'stats.py').read_text(encoding='utf-8')
+        body = src[src.find('async def realtime'):]
+        self.assertIn('_upstream_status_cached()', body,
+                      'realtime() 应当用缓存版 /status —— 直接调 wb2api.get_status() '
+                      '会让上游不可达时每个轮询都等满超时')
+
+class GatewayPathCoverageTest(unittest.TestCase):
+    """「客户端在途」必须覆盖**所有**模型调用入口（审计发现漏了两条）。
+
+    原来只认 `/v1/`，于是：
+      · `POST /responses`（OpenAI SDK 的 `responses.create`，baseURL 不含 /v1 时走它）；
+      · `POST /v2/chat/completions`；
+    这两条真实调用的在途数**完全不计入**，而「客户端在途」正是用来和上游槽位
+    占用比对「是否在排队」的 —— 漏计会让这个数字结构性偏小，恰好在多协议混跑
+    时失真。
+    """
+
+    def test_covers_all_gateway_entries(self) -> None:
+        from server.main import _is_gateway_path
+        for path in ('/v1/chat/completions', '/v1/messages', '/v1/models',
+                     '/v2/chat/completions', '/responses'):
+            self.assertTrue(_is_gateway_path(path), path)
+
+    def test_does_not_catch_admin_or_lookalikes(self) -> None:
+        from server.main import _is_gateway_path
+        # `/responses/x` 也不算：网关只有精确的 `/responses` 一条路由，
+        # 按前缀匹配会误吃将来可能出现的 `/responses-admin` 之类
+        for path in ('/api/status', '/api/accounts', '/v1foo', '/v10/x',
+                     '/responses-admin', '/responses/x', '/v1', '/'):
+            self.assertFalse(_is_gateway_path(path), path)

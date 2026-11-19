@@ -927,7 +927,8 @@ export interface StatsRealtime {
   /** 国际版账号的单账号在途上限（`pool.max_in_flight_global`，不是全池上限） */
   per_account_limit_global?: number;
   /** 全池同时在途上限 = 各账号按 realm 取上限后求和 */
-  capacity?: number;
+  /** 总在途上限；`null` = 不限（上游 `pool.max_in_flight` 为 0）。缺失 = 上游不可达。 */
+  capacity?: number | null;
   full_accounts?: number;
   healthy?: number;
   sticky?: number;

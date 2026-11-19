@@ -354,7 +354,8 @@
     "costUnpriced": "另有 {n} 次未計價",
     "costNote": "按每次呼叫時刻的官方價目估算（分高峰/空閒、快取命中/未命中），僅供參考。上游真實扣的積分見上面的「今日積分」。",
     "colCost": "費用",
-    "costUnavailableHint": "該模型未收錄價目，顯示「—」而不是 0"
+    "costUnavailableHint": "該模型未收錄價目，顯示「—」而不是 0",
+    "realtimeUnlimited": "不限"
   },
   "accounts": {
     "badgeBanned": "● 帳號被封禁",

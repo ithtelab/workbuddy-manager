@@ -6,7 +6,7 @@
  * 单独成组件而不是塞进页面里的原因：
  *
  *  - 刷新节奏与页面其余部分不同。汇总 / 趋势 / 分解表跟「时段选择器」走，60 秒
- *    心跳一次就够了；这两个数字是**此刻**的状态，5 秒才跟得上（上游在途数变化
+ *    心跳一次就够了；这两个数字是**此刻**的状态，1 秒才跟得上（上游在途数变化
  *    远快于分钟级聚合）。
  *  - 口径也与下面那排累计卡不同，见 `StatsRealtime` 的注释。
  *
@@ -21,7 +21,7 @@ import {Area, ComposedChart, Line, ResponsiveContainer, Tooltip, YAxis} from 're
 import {StatCard} from './StatCard';
 import {statsApi} from '@/lib/api';
 import type {StatsRealtime} from '@/lib/types';
-import {fmtNumber} from '@/lib/format';
+import {fmtAgo, fmtNumber} from '@/lib/format';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useT} from '@/lib/i18n/provider';
 
@@ -70,13 +70,23 @@ export function RealtimeStatsStrip({days}: {days: number}) {
    * 心跳每 1 秒触发一次；如果某次 `/api/stats/realtime` 因为长时段扫描或网络
    * 抖动花了 3 秒，不加这道门就会叠出 3 个在途请求，越拖越糟。丢弃的这一次
    * 不影响正确性 —— 下一次心跳会再问。
+   *
+   * ⚠️ **换时段必须绕过这道门**（`force`）：`days` 变化时如果因为「上一次还在
+   * 途」就 return，新时段的请求根本没发出、`seq` 也没前进，于是旧时段的响应
+   * 回来时仍然通过 `ticket === seq.current` 检查、把旧数据写进界面 —— 选择器
+   * 写着「近 7 天」、数字却是近 1 天的，而且旧请求慢的话会一直冻在那里。
+   *
+   * 因此 `busy` 用 **owner ticket** 释放：只有「当前这个 ticket」完成时才解锁，
+   * 被强制取代的旧请求回来时不会误清掉新请求的忙标志。
    */
   const busy = useRef(false);
+  const busyOwner = useRef(0);
 
-  const load = useCallback(() => {
-    if (busy.current) return;
-    busy.current = true;
+  const load = useCallback((force = false) => {
+    if (busy.current && !force) return;
     const ticket = ++seq.current;
+    busy.current = true;
+    busyOwner.current = ticket;
     statsApi
       .realtime(days)
       .then((next) => {
@@ -89,15 +99,16 @@ export function RealtimeStatsStrip({days}: {days: number}) {
         setFailed(true);
       })
       .finally(() => {
-        busy.current = false;
+        // 只由「当前 owner」解锁：被强制取代的旧请求不能清掉新请求的忙标志
+        if (busyOwner.current === ticket) busy.current = false;
       });
   }, [days]);
 
-  // 换时段要立刻重取：留着上一个时段的峰值会和下面的表对不上
+  // 换时段要立刻重取（强制，不受在途守卫阻挡）：留着上一个时段的峰值会和下面的表对不上
   useEffect(() => {
-    load();
+    load(true);
   }, [load]);
-  useHeartbeat(load, POLL_MS);
+  useHeartbeat(() => load(), POLL_MS);
 
   const series = data?.series;
   const points = useMemo<ChartPoint[]>(() => {
@@ -128,12 +139,25 @@ export function RealtimeStatsStrip({days}: {days: number}) {
   // 就说明池子在排队或回传积压——那正是需要看见的时刻。
   const parts: string[] = [];
   if (data) {
-    parts.push(t('stats.realtimeClientInflight', {n: fmtNumber(data.client_inflight)}));
+    parts.push(t('stats.realtimeClientInflight', {
+      // 缺失时显示「—」而不是「0」：把「未知」写成「零」是假事实（同主数字口径）
+      n: data.client_inflight == null ? '—' : fmtNumber(data.client_inflight),
+    }));
     if (available) {
       parts.push(t('stats.realtimePeak', {n: fmtNumber(peaks?.concurrency)}));
-      parts.push(t('stats.realtimeCapacity', {c: fmtNumber(data.capacity)}));
-    } else if (data.error) {
-      parts.push(data.error);
+      parts.push(t('stats.realtimeCapacity', {
+        // capacity 为 null = 上游「不限」；缺失（旧后端）时退回数字口径
+        c: data.capacity === null ? t('stats.realtimeUnlimited') : fmtNumber(data.capacity),
+      }));
+    } else {
+      // 没有 error 文本时也要说明「上游不可达」，否则只剩一行「客户端在途 N」，
+      // 读者不知道主数字为什么是「—」。
+      parts.push(data.error || t('stats.realtimeUnavailable'));
+    }
+    // 请求失败时数字是**上一次成功**的，明确标出「多久以前」，否则读者会把它
+    // 当作此刻的值。
+    if (failed && data.updated_at) {
+      parts.push(fmtAgo(data.updated_at));
     }
   }
   const concHint = parts.join(' · ');
@@ -150,7 +174,9 @@ export function RealtimeStatsStrip({days}: {days: number}) {
         label={t('stats.realtimeConcurrency')}
         value={available ? fmtNumber(data?.inflight) : '—'}
         hint={concHint}
-        hintTone={data && !available ? 'danger' : undefined}
+        // 请求失败时也标红：界面会继续显示上一次成功的数字，没有任何提示的话
+        // 读者会把它当成「此刻的值」
+        hintTone={(data && !available) || failed ? 'danger' : undefined}
         icon={Zap}
         tone="warning"
         delay={0}

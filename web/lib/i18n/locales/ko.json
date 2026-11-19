@@ -354,7 +354,8 @@
     "costUnpriced": "추가로 {n}건 미계산",
     "costNote": "각 호출 시점의 공식 가격(피크/비피크, 캐시 적중/미적중)으로 추정한 참고값입니다. 실제 차감된 크레딧은 위의 표시를 보세요.",
     "colCost": "비용",
-    "costUnavailableHint": "이 모델은 가격이 없어 0 대신 — 로 표시합니다"
+    "costUnavailableHint": "이 모델은 가격이 없어 0 대신 — 로 표시합니다",
+    "realtimeUnlimited": "무제한"
   },
   "accounts": {
     "badgeBanned": "● 계정 이용 정지",

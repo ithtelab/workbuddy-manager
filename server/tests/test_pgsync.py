@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import sqlite3
 import sys
 import tempfile
@@ -710,19 +711,105 @@ class AutoExportBackoffTest(unittest.TestCase):
         self.assertEqual(db.get_setting(pgsync.FAIL_COUNT_KEY), 0)
         self.assertEqual(pgsync._backoff_factor(), 1)
 
-    def test_failure_increments_and_stamps_attempt(self) -> None:
-        before = int(time.time())
+    def test_failure_increments_counter(self) -> None:
         pgsync._note_attempt('export', ok=False)
         self.assertEqual(db.get_setting(pgsync.FAIL_COUNT_KEY), 1)
-        self.assertGreaterEqual(db.get_setting(pgsync.LAST_ATTEMPT_KEY), before)
 
-    def test_attempt_stamp_written_even_when_failed(self) -> None:
-        """核心保证：失败也要推进「尝试时间」，否则会被立刻重试。"""
-        pgsync._note_attempt('export', ok=False)
-        attempt = pgsync._as_int(db.get_setting(pgsync.LAST_ATTEMPT_KEY, 0), 0)
-        self.assertGreater(attempt, 0, '失败后必须记下尝试时刻，否则 60 秒后立刻重试')
+    def test_attempt_stamp_written_at_start_not_at_finish(self) -> None:
+        """核心保证：尝试时刻必须在**启动任务时**写，不能等收尾。
+
+        只写在 `_run_job` 的 `finally` 里是不够的 —— 被内核 OOM kill / SIGKILL
+        时进程直接消失，`except` 与 `finally` 都不会跑，于是失败永远记不下，
+        重启后立刻重试、再被 kill。这是 issue #457 自持循环的真正修法。
+        """
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / 'services' / 'pgsync.py').read_text(encoding='utf-8')
+        start_job_body = src[src.index('def start_job'): src.index('def _run_job')]
+        self.assertIn('LAST_ATTEMPT_KEY', start_job_body,
+                      'start_job 必须在启动线程之前写尝试时刻（硬杀也不丢）')
+        self.assertLess(start_job_body.index('LAST_ATTEMPT_KEY'),
+                        start_job_body.index('thread.start()'),
+                        '写尝试时刻必须在线程启动之前')
+
+    def test_hard_kill_still_stamps_attempt(self) -> None:
+        """端到端：子进程调 start_job 后被 SIGKILL，尝试时刻仍在库里。"""
+        import subprocess
+        import sys as _sys
+        import tempfile as _tmp
+        workdir = _tmp.mkdtemp()
+        env = dict(os.environ)
+        env['WB_DATA_DIR'] = workdir
+        env['PYTHONPATH'] = os.environ.get('PYTHONPATH', '')
+        code = '\n'.join([
+            'from server import db',
+            'db.connect()',
+            'from server.services import pgsync',
+            "db.set_setting('pg_sync_config', {'host':'127.0.0.1','port':1,"
+            "'dbname':'x','user':'u','password':'p','enabled':False,"
+            "'interval_minutes':0})",
+            "print(pgsync.start_job('export'), flush=True)",
+            'import time; time.sleep(30)',
+        ])
+        proc = subprocess.Popen([_sys.executable, '-S', '-c', code], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True)
+        try:
+            first = proc.stdout.readline()
+            self.assertIn('True', first, f'子进程没能启动任务：{first!r}')
+        finally:
+            proc.kill()          # 等价 SIGKILL：finally 不执行
+            proc.wait()
+        conn = sqlite3.connect(str(pathlib.Path(workdir) / 'manager.db'))
+        try:
+            row = conn.execute('SELECT value FROM settings WHERE key = ?',
+                               (pgsync.LAST_ATTEMPT_KEY,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, '硬杀后尝试时刻必须已落库')
+        self.assertGreater(int(json.loads(row[0])), 0)
 
     def test_import_does_not_touch_export_state(self) -> None:
         """恢复任务不该影响导出的退避状态。"""
         pgsync._note_attempt('import', ok=False)
         self.assertEqual(db.get_setting(pgsync.FAIL_COUNT_KEY), 0)
+
+class PgConnectParamsTest(unittest.TestCase):
+    """PG 连接的参数必须是 libpq 认识的键（发版前审计发现的阻断级 bug）。
+
+    事故：为了给「对端永不应答」加读超时，写成了 `socket_timeout=300` —— 那是
+    **psycopg2** 的参数。psycopg3 会把未知 kwargs 展成 conninfo 交给
+    `PQconninfoParse` 校验，非法键抛 `ProgrammingError: invalid connection
+    option`，而这发生在**建连之前**，于是每一次导出/恢复都必然失败。
+
+    更隐蔽的是：`test_connection()`（界面上的「测试连接」）只传
+    `connect_timeout`，所以测试显示成功、备份却全失败。
+
+    这个守卫不联网，只静态检查：
+      1. 源码里不出现 `socket_timeout`（它是 psycopg2 的）；
+      2. 两处 `psycopg.connect` 用的是通过实测确认的 libpq 参数。
+    """
+
+    SRC = pathlib.Path(__file__).resolve().parents[1] / 'services' / 'pgsync.py'
+
+    def test_no_psycopg2_only_option(self) -> None:
+        src = self.SRC.read_text(encoding='utf-8')
+        # 注释里会提到它（解释为什么不能用），所以只看**调用参数**那一行
+        call_lines = [ln for ln in src.splitlines()
+                      if 'psycopg.connect(' in ln or 'socket_timeout=' in ln]
+        offenders = [ln.strip() for ln in call_lines
+                     if 'socket_timeout=' in ln and not ln.strip().startswith('#')]
+        self.assertEqual(offenders, [],
+                         'socket_timeout 是 psycopg2 的参数；psycopg3 会抛 '
+                         'ProgrammingError，导致每次备份都失败')
+
+    def test_uses_libpq_keepalive_params(self) -> None:
+        src = self.SRC.read_text(encoding='utf-8')
+        for name in ('tcp_user_timeout', 'keepalives_idle',
+                     'keepalives_interval', 'keepalives_count'):
+            self.assertIn(name, src, f'缺少 {name}：死连接不会被及时回收')
+
+    def test_both_connect_sites_use_same_params(self) -> None:
+        """导出与恢复必须用同一套参数 —— 否则会出现「一边能连一边不能」。"""
+        src = self.SRC.read_text(encoding='utf-8')
+        self.assertEqual(src.count('tcp_user_timeout=TCP_USER_TIMEOUT_MS'), 2,
+                         '导出与恢复两处 psycopg.connect 都应带上同样的超时参数')
