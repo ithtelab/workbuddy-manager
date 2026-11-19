@@ -275,6 +275,15 @@ class NonChatFilterTest(unittest.TestCase):
                     'some-video-gen-1', 'foo-tts-bar'):
             self.assertTrue(non_chat_model(mid, 8192, []), mid)
 
+    def test_bare_type_suffix_is_filtered(self) -> None:
+        """以 `-video` / `-tts` / `-audio` **结尾**的也要剔。
+
+        `hunyuan-video` 这种没有后缀版本号，`-video-`（带尾连字符）匹配不到 ——
+        自测时发现的遗漏。
+        """
+        for mid in ('hunyuan-video', 'some-tts', 'x-audio'):
+            self.assertTrue(non_chat_model(mid, 8192, []), mid)
+
     def test_video_tags_are_filtered(self) -> None:
         for tag in ('text-to-video', 'image-to-video', 'text-to-speech', 'video-generation'):
             self.assertTrue(non_chat_model('whatever', 8192, [tag]), tag)

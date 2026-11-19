@@ -1226,6 +1226,10 @@ _NON_CHAT_ID_MARKERS = (
     'text-to-image', 'image-to-video', 'image-to-image',
     '-audio-gen', 'audio-gen-',
 )
+# 以这些**结尾**的也剔：`hunyuan-video` 这种没有后缀版本号，上面那组片段匹配不到。
+# 单独一组而不是塞进上面，是因为「结尾」比「片段」更强——`xxx-video` 一定是视频
+# 模型，而 `video-xxx` 可能是视频理解。
+_NON_CHAT_ID_SUFFIXES = ('-video', '-tts', '-audio')
 
 
 # 明确是**多模态对话**的 id 片段：能读图/视频/音频，但产出仍是文本，是可用的。
@@ -1261,6 +1265,8 @@ def _non_chat_model(mid: str, max_output_tokens: int, tags: list) -> bool:
     # 多模态**对话**优先放行：它们读视频/图片但产出文本，剔掉就是误伤
     if any(marker in low for marker in _CHAT_MULTIMODAL_MARKERS):
         return False
+    if any(low.endswith(suffix) for suffix in _NON_CHAT_ID_SUFFIXES):
+        return True
     return any(marker in low for marker in _NON_CHAT_ID_MARKERS)
 
 
