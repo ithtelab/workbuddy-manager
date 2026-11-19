@@ -1,5 +1,5 @@
 import type {Metadata} from 'next';
-import {Inter, Noto_Sans_SC} from 'next/font/google';
+import localFont from 'next/font/local';
 import {Toaster} from '@/components/ui/sonner';
 import {ThemeProvider} from '@/components/common/layout/ThemeProvider';
 import {AuthProvider} from '@/lib/auth-context';
@@ -7,17 +7,23 @@ import {I18nProvider} from '@/lib/i18n/provider';
 import {withBasePath} from '@/lib/base-path';
 import './globals.css';
 
-const inter = Inter({
+// 字体改为随仓库分发的本地文件：原来用 next/font/google 时，构建期必须联网访问
+// fonts.googleapis.com 拉 CSS 与 woff2。GitHub Actions、国内 Docker 构建经常连不上
+// （next/font 只会报一句含糊的 `TypeError: Cannot read properties of null`），整个
+// next build 直接失败，镜像也就建不出来。字体文件与原先 google 版本同源、同子集
+// （latin），appearance 不变，但构建不再依赖外网。
+const inter = localFont({
+  src: './fonts/Inter-variable.woff2',
   variable: '--font-inter',
-  subsets: ['latin'],
   display: 'swap',
+  weight: '100 900',
 });
 
-const notoSansSC = Noto_Sans_SC({
+const notoSansSC = localFont({
+  src: './fonts/NotoSansSC-variable.woff2',
   variable: '--font-noto-sans-sc',
-  subsets: ['latin'],
   display: 'swap',
-  weight: ['300', '400', '500', '600', '700'],
+  weight: '300 700',
 });
 
 export const metadata: Metadata = {
