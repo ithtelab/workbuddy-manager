@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WorkBuddy Manager · 计费功能预览（静态示意稿）</title>
+<style>
+  :root { --bg:#0a0a0b; --card:#17171a; --line:#26262b; --fg:#ededf0; --dim:#8b8b95;
+           --ok:#34d399; --warn:#fbbf24; --accent:#a78bfa; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:18px 16px 40px; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif; }
+  h1 { font-size:16px; margin:0 0 4px; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:18px; }
+  .sec { margin:26px 0 10px; font-size:13px; color:var(--dim); letter-spacing:.04em; }
+  .card { background:var(--card); border-radius:18px; padding:14px; margin-bottom:12px; }
+  .grid4 { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+  .stat { background:var(--card); border-radius:16px; padding:12px 14px; }
+  .stat .k { color:var(--dim); font-size:11px; }
+  .stat .v { font-size:22px; font-weight:600; margin-top:2px; font-variant-numeric:tabular-nums; }
+  .stat .h { color:var(--dim); font-size:11px; margin-top:2px; }
+  .row { display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }
+  .title { display:flex; align-items:center; gap:8px; font-weight:600; font-size:14px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--accent); }
+  .pill { font-size:11px; padding:3px 9px; border-radius:999px; background:#1e1e24; color:var(--dim); }
+  .pill.peak { color:var(--warn); background:rgba(251,191,36,.12); }
+  .cost3 { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .cost3 .k { color:var(--dim); font-size:11px; }
+  .cost3 .v { font-size:19px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .warn { color:var(--warn); font-size:10px; }
+  .note { color:var(--dim); font-size:11px; margin-top:10px; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; color:var(--dim); font-weight:400; font-size:11px; padding:6px 8px 6px 0; white-space:nowrap; }
+  td { padding:7px 8px 7px 0; border-top:1px solid var(--line); font-size:12px; vertical-align:middle; }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  .name { max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .cost { color:var(--ok); font-weight:500; }
+  .dim { color:var(--dim); }
+  .badge { font-size:11px; padding:2px 8px; border-radius:999px; }
+  .badge.ok { color:var(--ok); background:rgba(52,211,153,.12); }
+  .badge.bad { color:#f87171; background:rgba(248,113,113,.12); }
+  .chip { font-size:10px; color:var(--ok); background:rgba(52,211,153,.10); padding:2px 6px; border-radius:6px; }
+  .link { color:var(--dim); font-size:11px; text-decoration:underline; }
+  .warnbox { margin-top:10px; padding:8px 10px; border-radius:12px; background:rgba(251,191,36,.10);
+              color:var(--warn); font-size:11px; }
+  .scroll { overflow-x:auto; }
+  .tag { display:inline-block; font-size:10px; padding:1px 7px; border-radius:6px; background:#1e1e24; color:var(--dim); }
+</style></head><body>
+
+<h1>WorkBuddy Manager · 计费功能预览</h1>
+<div class="sub">静态示意稿 · 数据来自 114 条演示调用（非真实账号）· 深色主题与真实界面一致，交互需看运行中的面板</div>
+
+<div class="sec">一、用量统计页</div>
+<div class="grid4" style="margin-bottom:12px">
+  <div class="stat"><div class="k">今日请求</div><div class="v">8</div><div class="h">1277.5K tokens</div></div>
+  <div class="stat"><div class="k">近 7 天请求</div><div class="v">98</div><div class="h">10431.3K tokens</div></div>
+  <div class="stat"><div class="k">今日积分（上游实扣）</div><div class="v">6.76</div><div class="h">上游 usage.credit</div></div>
+  <div class="stat"><div class="k">活跃密钥</div><div class="v">2</div><div class="h">deepseek-v4.1-flash</div></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <div class="title"><span class="dot"></span>按 DeepSeek 官方价估算</div>
+    <span class="link">价目与说明 →</span>
+  </div>
+  <div class="cost3">
+    <div><div class="k">今日</div><div class="v">¥3.23</div>
+      <div class="warn">另有 1 次未计价</div></div>
+    <div><div class="k">近 7 天</div><div class="v">¥13.42</div>
+      <div class="warn">另有 18 次未计价</div></div>
+    <div><div class="k">累计</div><div class="v">¥16.36</div>
+      <div class="warn">另有 19 次未计价</div></div>
+  </div>
+  <div class="note">按每次调用时刻的官方价目估算（分高峰/空闲、缓存命中/未命中），仅供参考。上游真实扣的积分见上面的「今日积分」。</div>
+</div>
+
+<div class="card">
+  <div class="row"><div class="title"><span class="dot"></span>按模型</div></div>
+  <div class="scroll"><table>
+    <tr><th>模型</th><th class="n">请求</th><th class="n">Token</th><th class="n">费用</th><th></th></tr>
+    <tr><td class="name">deepseek-v4.1-flash</td><td class="n">66</td>
+      <td class="n">6928.9K</td><td class="n cost">¥4.93</td><td></td></tr><tr><td class="name">deepseek-v4-pro</td><td class="n">29</td>
+      <td class="n">2855.5K</td><td class="n cost">¥11.43</td><td></td></tr><tr><td class="name">glm-5.3</td><td class="n">11</td>
+      <td class="n">1414.1K</td><td class="n cost"><span class="dim">—</span></td><td><span class="warn">未计价 11 次</span></td></tr><tr><td class="name">kimi-k2.7</td><td class="n">8</td>
+      <td class="n">1007.2K</td><td class="n cost"><span class="dim">—</span></td><td><span class="warn">未计价 8 次</span></td></tr>
+  </table></div>
+</div>
+
+<div class="card">
+  <div class="row"><div class="title"><span class="dot"></span>按密钥</div></div>
+  <div class="scroll"><table>
+    <tr><th>密钥</th><th class="n">请求</th><th class="n">Token</th><th class="n">费用</th></tr>
+    <tr><td class="name">我的密钥</td><td class="n">87</td>
+      <td class="n">8948.8K</td><td class="n cost">¥11.64</td></tr><tr><td class="name">同事的密钥</td><td class="n">27</td>
+      <td class="n">3256.8K</td><td class="n cost">¥4.72</td></tr>
+  </table></div>
+</div>
+
+<div class="sec">二、请求日志页（新增「费用」列，最右仍是上游实扣积分）</div>
+<div class="card"><div class="scroll"><table>
+  <tr><th>时间</th><th>密钥</th><th>模型</th><th>状态</th><th class="n">输入</th><th class="n">输出</th><th>缓存</th><th class="n">费用</th><th class="n">积分</th></tr>
+  <tr><td class="dim">11-02 09:23:00</td><td>我的密钥</td>
+      <td>deepseek-v4.1-flash</td><td><span class="badge ok">200</span></td>
+      <td class="n">61,753</td><td class="n">8,611</td>
+      <td><span class="chip">缓存 91%</span></td><td class="n cost">¥0.0818</td><td class="n dim">0.721</td></tr><tr><td class="dim">11-02 10:31:00</td><td>我的密钥</td>
+      <td>deepseek-v4-pro</td><td><span class="badge ok">200</span></td>
+      <td class="n">303,223</td><td class="n">2,113</td>
+      <td><span class="chip">缓存 68%</span></td><td class="n cost">¥0.9880</td><td class="n dim">1.068</td></tr><tr><td class="dim">11-02 11:31:00</td><td>我的密钥</td>
+      <td>deepseek-v4-pro</td><td><span class="badge ok">200</span></td>
+      <td class="n">301,067</td><td class="n">3,003</td>
+      <td><span class="chip">缓存 63%</span></td><td class="n cost">¥1.14</td><td class="n dim">1.128</td></tr><tr><td class="dim">11-02 14:10:00</td><td>我的密钥</td>
+      <td>deepseek-v4.1-flash</td><td><span class="badge ok">200</span></td>
+      <td class="n">300,827</td><td class="n">5,124</td>
+      <td><span class="chip">缓存 91%</span></td><td class="n cost">¥0.1050</td><td class="n dim">0.84</td></tr><tr><td class="dim">11-02 14:39:00</td><td>我的密钥</td>
+      <td>deepseek-v4-pro</td><td><span class="badge ok">200</span></td>
+      <td class="n">120,127</td><td class="n">7,550</td>
+      <td><span class="chip">缓存 59%</span></td><td class="n cost">¥0.6722</td><td class="n dim">0.698</td></tr><tr><td class="dim">11-02 10:50:00</td><td>我的密钥</td>
+      <td>deepseek-v4-pro</td><td><span class="badge ok">200</span></td>
+      <td class="n">21,206</td><td class="n">5,628</td>
+      <td><span class="chip">缓存 65%</span></td><td class="n cost">¥0.2235</td><td class="n dim">1.094</td></tr><tr><td class="dim">11-02 10:56:00</td><td>我的密钥</td>
+      <td>glm-5.3</td><td><span class="badge ok">200</span></td>
+      <td class="n">120,438</td><td class="n">4,439</td>
+      <td><span class="chip">缓存 59%</span></td><td class="n cost"><span class="dim">—</span></td><td class="n dim">0.138</td></tr><tr><td class="dim">11-02 09:01:00</td><td>我的密钥</td>
+      <td>deepseek-v4.1-flash</td><td><span class="badge ok">200</span></td>
+      <td class="n">10,854</td><td class="n">1,511</td>
+      <td><span class="chip">缓存 57%</span></td><td class="n cost">¥0.0216</td><td class="n dim">1.072</td></tr>
+</table></div>
+<div class="note">没有价目的模型（GLM / Kimi / MiniMax…）这一列显示「—」，不显示 ¥0。</div>
+</div>
+
+<div class="sec">三、设置 → 模型管理 → 计费价格</div>
+<div class="card">
+  <div class="row">
+    <div class="title"><span class="dot"></span>计费价格（DeepSeek 官方价）</div>
+    <span class="pill ">当前空闲时段</span>
+  </div>
+  <div class="note" style="margin-top:0">费用按每次调用的时刻取当时生效的价目与时段，改价不会重算历史账。</div>
+  <div style="margin-top:10px;font-size:12px;line-height:1.9">
+    生效版本：<span class="tag">2026-09-01</span><br>
+    上次核对官方价：2026-11-02（0 天前）<br>
+    <span class="link">查看官方价目 ↗</span>
+  </div>
+  <div class="warnbox">缺少 2027 年的节假日安排：这些日期的高峰判定只看周几，节假日会被按高峰价计（偏高）。</div>
+</div>
+
+<div class="card">
+  <div class="row"><div class="title"><span class="dot"></span>当前单价（元 / 百万 tokens，高峰 / 空闲）</div></div>
+  <div class="scroll"><table>
+    <tr><th>模型</th><th class="n">输入·缓存命中</th><th class="n">输入·未命中</th><th class="n">输出</th></tr>
+    <tr><td class="name">deepseek-flash <span class="dim">DeepSeek-V4.1-Flash</span></td>
+          <td class="n">¥0.0400 / ¥0.0200</td><td class="n">¥2.00 / ¥1.00</td><td class="n">¥8.00 / ¥4.00</td></tr><tr><td class="name">deepseek-v4-pro <span class="dim">DeepSeek-V4-Pro</span></td>
+          <td class="n">¥0.3000 / ¥0.1500</td><td class="n">¥9.00 / ¥4.50</td><td class="n">¥27.00 / ¥13.50</td></tr>
+  </table></div>
+  <div class="note">高峰：北京时间周一至周五 9:00-12:00、14:00-18:00（不含法定节假日）；其余时段为空闲，单价是高峰的一半。</div>
+</div>
+
+<div class="card">
+  <div class="row"><div class="title"><span class="dot"></span>自定义价目（覆盖）</div></div>
+  <div class="note" style="margin-top:0">官方调价后不必等新版本：把新版本贴进来，effective_from 写生效日期即可（可以只写 models，峰谷时段与节假日会自动继承）。只影响该日期之后的调用，历史账不重算。</div>
+  <div style="margin-top:10px;background:#101013;border:1px solid var(--line);border-radius:12px;padding:10px;
+              font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#b9b9c4;white-space:pre">{
+  "versions": [
+    {"effective_from": "2026-12-01",
+      "models": {"deepseek-flash": {"cache_miss": {"peak": 2.4, "off_peak": 1.2}}}}
+  ]
+}</div>
+  <div style="margin-top:10px"><span class="pill">保存</span> &nbsp; <span class="pill">恢复默认价目</span></div>
+</div>
+
+<div class="sub" style="margin-top:24px">示意稿由本地演示实例的真实接口数据渲染；运行中的面板另见本地部署；本文件是静态示意稿，不含真实账号数据</div>
+</body></html>

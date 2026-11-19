@@ -1,0 +1,62 @@
+diff --git a/internal/pool/state.go b/internal/pool/state.go
+index 166e3b6..1637de1 100644
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -484,26 +484,26 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
+ 		// 成本台账（P1-anti-monopoly）：每模型一行（modelCost 内 TTL 未过期的
+ 		// 条目），运维据此自查「为什么总选它」；只读遍历零风险，过期即消失。
+ 		ModelCosts: p.modelCostsStatusLocked(e, now),
+-		Realm:             e.a.Realm(),
+-		Nickname:          e.a.Nickname,
+-		Credits:           e.credits,
++		Realm:      e.a.Realm(),
++		Nickname:   e.a.Nickname,
++		Credits:    e.credits,
+ 		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
+ 		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
+-		Cooling: now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
+-		Reason:            reason,
+-		Disabled:          e.disabled,
+-		ManualDisabled:    e.manualDisabled,
+-		SuccessCount:      e.successCount,
+-		ErrTotal:          e.errTotal,
+-		LastSuccessTime:   e.lastSuccess,
+-		LastErrTime:       e.lastErr,
+-		ConsecutiveFails:  e.consecutiveFails,
+-		DegradeUntil:      e.degradeUntil,
+-		Until:             e.until,
+-		SoftStreak:        e.softStreak,
+-		InFlight:          int(e.inFlight.Load()),
+-		BreakerFails:      e.fails,
+-		BreakerUntil:      e.breakerUntil,
++		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
++		Reason:           reason,
++		Disabled:         e.disabled,
++		ManualDisabled:   e.manualDisabled,
++		SuccessCount:     e.successCount,
++		ErrTotal:         e.errTotal,
++		LastSuccessTime:  e.lastSuccess,
++		LastErrTime:      e.lastErr,
++		ConsecutiveFails: e.consecutiveFails,
++		DegradeUntil:     e.degradeUntil,
++		Until:            e.until,
++		SoftStreak:       e.softStreak,
++		InFlight:         int(e.inFlight.Load()),
++		BreakerFails:     e.fails,
++		BreakerUntil:     e.breakerUntil,
+ 	}
+ 	if st.Disabled {
+ 		// 禁用账号透出禁用原因（运维看不到为什么死）。
+diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
+index 93aa042..ceb1dca 100644
+--- a/internal/upstream/client_test.go
++++ b/internal/upstream/client_test.go
+@@ -154,7 +154,7 @@ func TestIsWafBlocked(t *testing.T) {
+ 	}{
+ 		{403, "", true},
+ 		{403, "<html>blocked</html>", true},
+-		{403, `{"code":1}`, false},               // 有 "code": 字段
++		{403, `{"code":1}`, false},                // 有 "code": 字段
+ 		{403, `{"msg":"request illegal"}`, false}, // 有 "msg": 字段（且该文案本就该走 accountFault）
+ 		{402, "", false},                          // 非 403
+ 		{429, "", false},

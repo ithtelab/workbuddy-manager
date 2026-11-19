@@ -184,5 +184,45 @@ class ModelListScopingTest(KeyRealmTestBase):
         self.assertIsNotNone(keysvc.validate(row, '1.2.3.4', None, is_model_list=False))
 
 
+class CreateKeyUnlimitedRealmUiTest(unittest.TestCase):
+    """新建密钥时要能**显式**选「不限制」（issue #191）。
+
+    后端一直支持 `realm=''`（= 两版都能调，存量密钥的形态），缺的是入口：新建弹窗
+    里那个选择器被刻意藏了起来（跟随当前页面版本），于是想建一把两版都能调的密钥
+    只能「先建出来再编辑」。修法是在新建态补一个显式开关，**默认关** —— 既满足
+    #191，也保留「不给国内版/国际版二选一」这条（选错是静默的，只有调用时才暴露）。
+    """
+
+    def _src(self) -> str:
+        return (Path(__file__).resolve().parents[2]
+                / 'web' / 'app' / '(main)' / 'keys' / 'page.tsx').read_text(encoding='utf-8')
+
+    def test_create_dialog_offers_explicit_unlimited(self) -> None:
+        src = self._src()
+        self.assertIn('key-realm-unlimited', src, '新建弹窗里没有「不限制」开关')
+
+    def test_payload_keeps_explicit_unlimited(self) -> None:
+        """用户在新建议窗里勾了「不限制」就必须照传 ''。
+
+        原来写的是 `editing ? form.realm : realm`（新建一律用页面版本）—— 那样
+        勾了开关也会被覆盖回当前版本，用户看到的是「我明明选了不限制，建出来还是有
+        版本的密钥」，而错误是静默的（直到调用才报「仅限某版本」）。
+
+        断言写成整条表达式而非整行：格式化（prettier 折行）不该让这条守卫失效。
+        """
+        src = self._src()
+        self.assertIn("editing || form.realm === ''", src,
+                      '新建时用户显式选择的「不限制」被页面版本覆盖了')
+
+    def test_default_still_follows_page_realm(self) -> None:
+        """默认（没开开关）仍跟随当前页面版本 —— 这条不能被 #191 顺手改掉。"""
+        src = self._src()
+        start = src.index('key-realm-unlimited')
+        seg = src[start:start + 900]
+        self.assertIn('onCheckedChange', seg, '「不限制」开关没有回写 form.realm')
+        self.assertIn("on ? '' : realm", seg, '关掉开关时没有回到当前页面版本')
+        self.assertIn("t('keys.realmFollowsPage')", src)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -67,12 +67,26 @@ class SpoofedForwardHeaderTest(unittest.TestCase):
         req = _FakeRequest('127.0.0.1', {'x-forwarded-for': '1.2.3.4, 9.9.9.9'})
         self.assertEqual(iputil.client_ip(req), '9.9.9.9')
 
-    def test_private_network_proxy_trusted(self) -> None:
-        """反代在另一台内网机器时同样可信（默认网段含私网）。"""
-        req = _FakeRequest('192.168.1.10', {'x-real-ip': '9.9.9.9'})
-        self.assertEqual(iputil.client_ip(req), '9.9.9.9')
-        req2 = _FakeRequest('10.1.2.3', {'x-real-ip': '8.8.8.8'})
-        self.assertEqual(iputil.client_ip(req2), '8.8.8.8')
+    def test_private_peer_is_not_trusted_by_default(self) -> None:
+        """默认只信回环（审计 2026-10-18）。
+
+        以前默认还包含全部 RFC1918：同一局域网/同一 Docker 网络里的任意主机都能
+        伪造 `X-Real-IP`，绕过登录锁定、密钥 IP 白名单与红包限领。
+        """
+        for peer in ('192.168.1.10', '10.1.2.3', '172.16.5.5'):
+            req = _FakeRequest(peer, {'x-real-ip': '9.9.9.9'})
+            self.assertEqual(iputil.client_ip(req), peer,
+                             f'{peer} 默认不该被当成可信反代')
+
+    def test_private_proxy_works_when_explicitly_configured(self) -> None:
+        """反代在另一台内网机器时，把它加进 WB_TRUSTED_PROXY_CIDRS 即可。"""
+        with mock.patch.object(config, 'TRUSTED_PROXY_CIDRS',
+                               ['127.0.0.0/8', '192.168.0.0/16']):
+            req = _FakeRequest('192.168.1.10', {'x-real-ip': '9.9.9.9'})
+            self.assertEqual(iputil.client_ip(req), '9.9.9.9')
+            # 未列入的网段仍不可信
+            req2 = _FakeRequest('10.1.2.3', {'x-real-ip': '8.8.8.8'})
+            self.assertEqual(iputil.client_ip(req2), '10.1.2.3')
 
     def test_no_headers_falls_back_to_peer(self) -> None:
         self.assertEqual(iputil.client_ip(_FakeRequest('127.0.0.1')), '127.0.0.1')

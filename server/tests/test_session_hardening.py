@@ -229,6 +229,10 @@ class SecureWarningTest(unittest.TestCase):
             def __init__(self) -> None:
                 self.headers = headers
                 self.url = type('U', (), {'scheme': scheme})()
+                # cookie_secure 会读 scope.scheme 与 client.host（对端按可信
+                # 反代 127.0.0.1 构造，与「反代在本机」的部署形态一致）
+                self.scope = {'scheme': scheme}
+                self.client = type('C', (), {'host': '127.0.0.1'})()
         return R()
 
     def test_warns_behind_proxy_without_proto(self) -> None:

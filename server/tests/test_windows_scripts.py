@@ -127,6 +127,28 @@ class GitAttributesTest(unittest.TestCase):
             '在 Linux 上检出/打包时 .cmd 会变成 LF，用户下到的发布包里脚本是坏的',
         )
 
+    def test_ps1_files_have_utf8_bom(self) -> None:
+        """`.ps1` 必须带 UTF-8 BOM。
+
+        为什么（dev/test-delete-rules.ps1 实测踩到）：没有 BOM 时 Windows PowerShell 5.1
+        按**系统 ANSI 代码页**读脚本，中文变成乱码 —— 而且某个汉字的第二字节可能正好是
+        `'` 或 `*`，于是引号被吃掉、代码直接解析失败（报「必须在 * 运算符后面提供一个
+        值表达式」这种与真实原因毫不相干的错）。`.cmd` 不能带 BOM（cmd.exe 会把 BOM 当
+        命令），`.ps1` 相反：PowerShell 认 BOM，本仓的 .ps1 一律带。
+        """
+        offenders = []
+        for path in _ROOT.rglob('*.ps1'):
+            parts = set(path.parts)
+            if parts & {'.git', 'node_modules', '.next', '.tools', '.runtime', 'dist'}:
+                continue
+            if not path.read_bytes().startswith(bytes([0xEF, 0xBB, 0xBF])):
+                offenders.append(str(path.relative_to(_ROOT)))
+        self.assertEqual(
+            offenders, [],
+            '这些 .ps1 缺 UTF-8 BOM —— PowerShell 5.1 会按 ANSI 读，中文会乱码甚至解析失败：'
+            + '、'.join(offenders),
+        )
+
     def test_rule_is_not_vacuous(self) -> None:
         """反证：确认这条规则真的会作用于我们的脚本路径（而不是没匹配上）。"""
         import subprocess
@@ -138,6 +160,296 @@ class GitAttributesTest(unittest.TestCase):
         if r.returncode != 0:
             self.skipTest('本环境没有 git，跳过（CI 上会跑）')
         self.assertIn('eol: crlf', r.stdout, f'git 没把该文件判成 crlf：{r.stdout!r}')
+
+
+
+class WindowsUpdaterIntegrityTest(unittest.TestCase):
+    """Windows 一键更新脚本（`update.ps1`）的完整性守卫。
+
+    2026-10-13 起这里不再有「离线私钥验签」（原因见 docs/release-signing.md），
+    改为核对发布包 sha256。这条门禁的特点是**失效时不报错**：一句 `-not` 写反、
+    或校验结果没被用来中止流程，就变成「装什么都放行」，而界面看起来一切正常。
+    所以按文本机械地钉住四件事。
+    """
+
+    UPDATER = _ROOT / 'windows' / 'update.ps1'
+
+    def _src(self) -> str:
+        return self.UPDATER.read_text(encoding='utf-8-sig')
+
+    def test_script_exists(self) -> None:
+        self.assertTrue(self.UPDATER.is_file(), f'找不到 {self.UPDATER}')
+
+    def test_hashes_with_sha256(self) -> None:
+        src = self._src()
+        self.assertIn('Test-PackageDigest', src, '没有摘要校验函数')
+        self.assertIn('Get-FileHash', src, '没有真的算哈希')
+        self.assertIn('-Algorithm SHA256', src, '算的不是 sha256 —— 发布页给的是 sha256')
+
+    def test_digest_mismatch_is_fatal(self) -> None:
+        """摘要不符必须中止：函数返回 $false，且调用点据此 exit。"""
+        src = self._src()
+        body = src.split('function Test-PackageDigest', 1)[1].split('\n# ──', 1)[0]
+        self.assertIn('return $false', body, '摘要不符的分支没有报失败')
+        self.assertIn('已拒绝安装', body, '摘要不符时没有给出明确拒绝语')
+        call = [l.strip() for l in src.splitlines() if 'Test-PackageDigest -archivePath' in l]
+        self.assertTrue(call, '没有任何地方调用摘要校验')
+        self.assertTrue(any(l.startswith('if (-not (Test-PackageDigest') for l in call),
+                            f'调用点没有按「失败即中止」写：{call}')
+        after = src.split('Test-PackageDigest -archivePath', 1)[1]
+        self.assertIn('exit 1', after.split('# ──', 1)[0],
+                      '校验失败后没有中止更新流程')
+
+    def test_signature_machinery_is_gone(self) -> None:
+        """旧的公钥验签要不留残渣：留着会让人以为还有这道门禁。"""
+        src = self._src()
+        for token in ('Test-PackageSignature', 'ssh-ed25519', 'allowed_signers',
+                      'tar.gz.sig'):
+            self.assertNotIn(token, src, f'{token} 仍在脚本里 —— 旧的签名门禁没清干净')
+
+    def test_no_unverified_source_update(self) -> None:
+        """不许在更新流程里 `git reset/fetch`：那是**第二条代码来源**。
+
+        会把 origin 指向的任意代码（fork、镜像）铺进用户目录，并丢弃本地改动。
+        """
+        src = self._src()
+        offending = [l.strip() for l in src.splitlines()
+                     if re.search(r'\bgit\s+(reset|fetch|pull|checkout)\b', l)
+                     and not l.strip().startswith('#')]
+        self.assertEqual(offending, [], f'更新流程里出现了 git 代码来源：{offending}')
+
+    def test_confirm_before_destructive_phase(self) -> None:
+        """停服务 / 清 web/out / 覆盖文件之前必须有一次确认。"""
+        src = self._src()
+        self.assertRegex(src, r'Read-Host\s+"[^"]*确认', '更新前没有确认提示')
+        # 且确认必须在「停服务」之前
+        self.assertLess(src.index('Read-Host'), src.index('stop.ps1'),
+                        '确认排在了停服务之后 —— 用户点「不要」时服务已经被停了')
+
+
+
+class WindowsScriptLayoutTest(unittest.TestCase):
+    """脚本住在 `windows/`：项目根 = 脚本目录的**上一级**。
+
+    这条布局不是审美问题，而是脚本能跑的前提：
+
+      · `start.ps1` / `service-tools.ps1` / `update.ps1` 按「项目根」找 `server/`、
+        `web/out`、`.env`、`upstream/`、`.venv/`；
+      · `stop.ps1` 调同目录的 `service-tools.ps1`，`start.ps1` 调同目录的 `update.ps1`；
+      · `update.ps1` 更新前把这一套脚本备份到 `.tools/scripts_backup`，更新后按名字
+        **还原回脚本目录** —— 基准用错的话，更新完脚本会散落到仓库根，下次就找不到了。
+
+    写错的形态都是「脚本语法没错、也能跑，只是在错的地方找文件」：启动时报
+    「未找到 .venv」、更新后根目录多出一套脚本。所以这里按文本机械地钉住三条。
+    """
+
+    PS1 = ('start.ps1', 'stop.ps1', 'service-tools.ps1', 'update.ps1')
+    ENTRY_CMD = (('start.cmd', 'start.ps1'), ('stop.cmd', 'stop.ps1'), ('update.cmd', 'update.ps1'))
+
+    def _scripts(self) -> dict:
+        out = {}
+        names = list(self.PS1) + [c for c, _ in self.ENTRY_CMD]
+        for name in names:
+            p = _ROOT / 'windows' / name
+            self.assertTrue(p.is_file(), f'windows/{name} 不见了（被挪回根目录了？）')
+            out[name] = p.read_text(encoding='utf-8-sig')
+        return out
+
+    def test_root_is_the_parent_directory(self) -> None:
+        """项目根必须由**脚本目录的上一级**算出，而不是脚本自己所在目录。"""
+        for name, src in self._scripts().items():
+            if not name.endswith('.ps1'):
+                continue
+            with self.subTest(script=name):
+                self.assertIn('$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path', src)
+                self.assertIn('$root = Split-Path -Parent $scriptDir', src,
+                              f'{name} 没把项目根当成上一级 —— 它会在脚本目录里找 server/')
+
+    def test_sibling_scripts_use_script_dir(self) -> None:
+        """找兄弟脚本（同一目录里的那几个）必须走 `$scriptDir`，不许走 `$root`。"""
+        siblings = list(self.PS1) + [c for c, _ in self.ENTRY_CMD]
+        for name, src in self._scripts().items():
+            if not name.endswith('.ps1'):
+                continue
+            for line in src.splitlines():
+                if line.strip().startswith('#'):
+                    continue
+                with self.subTest(script=name, line=line.strip()[:60]):
+                    self.assertNotIn('Join-Path $root $s', line,
+                                     f'{name} 的批量备份/还原又用回 $root 了：{line.strip()[:80]}')
+                    for sib in siblings:
+                        for quoted in (f"Join-Path $root '{sib}'", f'Join-Path $root "{sib}"'):
+                            self.assertNotIn(quoted, line,
+                                             f'{name} 用 $root 找兄弟脚本了：{line.strip()[:80]}')
+
+    def test_entry_cmd_stays_sibling(self) -> None:
+        """三个双击入口要按 `%~dp0`（自己所在目录）调同目录的 .ps1 —— 它们总是一起挪动。"""
+        scripts = self._scripts()
+        for cmd, ps1 in self.ENTRY_CMD:
+            with self.subTest(script=cmd):
+                self.assertIn(f'%~dp0{ps1}', scripts[cmd],
+                              f'{cmd} 没有按 %~dp0 调同目录的 {ps1}')
+
+
+class WindowsPythonIsolationTest(unittest.TestCase):
+    """issue #268：预置运行时不能被用户级 site-packages 覆盖。"""
+
+    def test_python_env_disables_user_site(self) -> None:
+        src = (_ROOT / 'windows' / 'python-env.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn("$env:PYTHONNOUSERSITE = '1'", src,
+                      'python-env.ps1 没有禁用用户级 site-packages；'
+                      '用户目录里的旧 typing_extensions 会盖住内置运行时')
+
+    def test_runtime_scripts_source_the_common_env(self) -> None:
+        """启动/准备/更新/服务脚本都必须 dot-source 这个公共设置。"""
+        for name in ('prepare.ps1', 'start.ps1', 'update.ps1', 'service-tools.ps1'):
+            with self.subTest(script=name):
+                src = (_ROOT / 'windows' / name).read_text(encoding='utf-8-sig')
+                self.assertIn('python-env.ps1', src,
+                              f'{name} 没加载 python-env.ps1，无法继承 PYTHONNOUSERSITE')
+
+
+class WindowsHostSettingsTest(unittest.TestCase):
+    """issue #368：启动器里保存的监听地址不能被 prepare 每次启动重置。
+
+    现场：Windows 安装版把 IP 改成 0.0.0.0 保存，重启/开机自启后又变回 127.0.0.1，
+    局域网访问时好时坏。根因是 prepare.ps1 无条件把 0.0.0.0 改写成回环地址。
+    模板默认已经是 127.0.0.1，不需要这条「迁移」；它只会覆盖用户设置。
+    """
+
+    def test_prepare_does_not_reset_user_host(self) -> None:
+        src = (_ROOT / 'windows' / 'prepare.ps1').read_text(encoding='utf-8-sig')
+        self.assertNotIn("WB_MANAGER_HOST=127.0.0.1", src,
+                         'prepare.ps1 仍在改写 WB_MANAGER_HOST，用户保存的 0.0.0.0 会被重置')
+
+    def test_service_tools_uses_env_host(self) -> None:
+        """监听地址必须来自 .env，才能在保存后真正生效。"""
+        src = (_ROOT / 'windows' / 'service-tools.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn("WB_MANAGER_HOST", src)
+        self.assertIn("'--host', $bindHost", src)
+
+
+class WindowsAutostartProjectTest(unittest.TestCase):
+    """issue #388：开机自启不能只驻留托盘，还要能按偏好自动启动项目。"""
+
+    def _src(self, name: str) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / name
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_preference_is_persisted_and_gated(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('autostart_project', src)
+        self.assertIn('_chkAutostartProject.Enabled = _chkAutostart.Checked', src,
+                      '「同时启动项目」必须在未勾开机自启时禁用')
+
+    def test_boot_starts_project_quietly(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('StartProject(true)', src,
+                      '开机自启没有调用静默启动')
+        self.assertIn('_openBrowserOnHealthy = !quiet', src,
+                      '静默启动不该自动打开浏览器')
+        self.assertIn('if (quiet) { AppendLog', src,
+                      '静默启动出错时不该弹模态框')
+
+class WindowsAutostartTest(unittest.TestCase):
+    """issue #269：Windows 启动器开机自启（HKCU Run + 静默到托盘 + 卸载清理）。"""
+
+    def _src(self, name: str) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / name
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_uses_current_user_run_key(self) -> None:
+        """当前用户 Run 键即可，不需要管理员权限；不能写 HKLM。"""
+        src = self._src('Autostart.cs')
+        self.assertIn(r'Software\Microsoft\Windows\CurrentVersion\Run', src)
+        self.assertIn('Registry.CurrentUser', src)
+        self.assertNotIn('Registry.LocalMachine', src)
+
+    def test_silent_argument_is_tray(self) -> None:
+        self.assertIn('--tray', self._src('Autostart.cs'))
+        self.assertIn('Autostart.SilentArgument', self._src('Program.cs'))
+
+    def test_hidden_start_does_not_show_then_hide(self) -> None:
+        """静默启动必须拦住 SetVisibleCore，不能先 Show 再 Hide（会闪窗口）。"""
+        src = self._src('MainForm.cs')
+        self.assertIn('protected override void SetVisibleCore(bool value)', src)
+        self.assertIn('base.SetVisibleCore(false)', src)
+        self.assertIn('CreateHandle()', src)
+
+    def test_tray_failure_falls_back_to_window(self) -> None:
+        src = self._src('MainForm.cs')
+        self.assertIn('_startHidden = false;', src,
+                      '托盘初始化失败时必须回退为显示窗口（否则既无窗口也无托盘）')
+
+    def test_uninstall_removes_autostart(self) -> None:
+        src = self._src('UninstallForm.cs')
+        self.assertIn('Autostart.DisableIfOwned(_installDir)', src,
+                      '卸载要清理开机自启，否则卸载后仍会自启')
+
+
+class WindowsLauncherUpdateTest(unittest.TestCase):
+    """issue #288：启动器检查最新 Release、下载并校验安装包。
+
+    不做端到端下载（需要网络与 42MB 安装包），但把安全不变量钉在源码里：
+      · 只查本仓库的 `releases/latest`；
+      · 只接受 HTTPS 资产；
+      · 必须先校验 `.sha256` 再启动安装程序；
+      · 启动前必须让用户确认，且不能静默覆盖。
+    """
+
+    def _src(self) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / 'MainForm.cs'
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_checks_this_repo_latest_release(self) -> None:
+        src = self._src()
+        self.assertIn('api.github.com/repos/ithtelab/workbuddy-manager/releases/latest', src)
+        self.assertIn('WorkBuddyManagerSetup.exe', src)
+
+    def test_requires_https_and_sha256_before_running(self) -> None:
+        src = self._src()
+        self.assertIn('Uri.UriSchemeHttps', src)
+        self.assertIn('VerifySha256', src)
+        self.assertIn('.sha256', src)
+        # 校验失败必须中止，且提示里要说明「未运行安装程序」
+        self.assertIn('未运行安装程序', src)
+
+    def test_user_confirms_before_download(self) -> None:
+        src = self._src()
+        self.assertIn('MessageBoxButtons.YesNo', src)
+        self.assertIn('是否下载并安装', src)
+
+    def test_honors_update_proxy(self) -> None:
+        """国内网络访问 GitHub 时复用服务器的 WB_UPDATE_PROXY 约定。"""
+        self.assertIn('WB_UPDATE_PROXY', self._src())
+
+    def test_update_entry_points_exist(self) -> None:
+        src = self._src()
+        self.assertIn('OnCheckUpdate', src)
+        self.assertIn('检查更新', src)
+
+
+class WindowsConsoleEncodingTest(unittest.TestCase):
+    """issue #306：UTF-8 控制台（Beta「Unicode UTF-8 全球语言支持」）下不能按 GBK 解码。"""
+
+    def _src(self) -> str:
+        path = _ROOT / 'windows' / 'launcher' / 'src' / 'ServiceGate.cs'
+        self.assertTrue(path.is_file(), f'缺少 {path}')
+        return path.read_text(encoding='utf-8-sig')
+
+    def test_uses_console_output_encoding(self) -> None:
+        src = self._src()
+        self.assertIn('ConsoleOutputEncoding()', src,
+                      '脚本输出必须按当前控制台编码解码，不能写死 OEM 代码页')
+        self.assertIn('Console.OutputEncoding', src)
+
+    def test_falls_back_to_oem_when_console_missing(self) -> None:
+        src = self._src()
+        self.assertIn('OEMCodePage', src,
+                      '取不到控制台编码时应退回 OEM 代码页（无控制台启动的旧行为）')
 
 
 if __name__ == '__main__':

@@ -1,0 +1,280 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index f16d643..7759c79 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -800,6 +800,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				st.status = http.StatusBadRequest
+ 				return
+ 			}
++			// 11148 is deterministic for this request body. Return immediately without
++			// rotating accounts or incrementing account failure counters.
++			if kind == upstream.ErrToolCallMismatch {
++				fail(acct.UID)
++				writeOpenAIErrorHint(w, http.StatusBadRequest, "tool_call_mismatch",
++					string(respBody), h.hintOf(kind, string(respBody), bareModel, reqHasImage, uerr))
++				st.status = http.StatusBadRequest
++				return
++			}
+ 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
+ 			// 5755fe3 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
+ 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+diff --git a/internal/server/handler_test.go b/internal/server/handler_test.go
+index 94d62bc..a103203 100644
+--- a/internal/server/handler_test.go
++++ b/internal/server/handler_test.go
+@@ -2700,3 +2700,35 @@ func TestHandlerAppendTurnKeyStable(t *testing.T) {
+ 		t.Errorf("X-Conversation-Request-ID=%v want %q (derived from pre-rewrite body)", reqIDs, want)
+ 	}
+ }
++
++func TestChatToolCallMismatchDoesNotRotateOrPenalize(t *testing.T) {
++	calls := 0
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		calls++
++		return 400, "{\"code\":11148,\"msg\":\"tool calls and tool results do not match, please start a new conversation and retry\"}", false
++	})
++	p := testPoolWith(
++		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
++	)
++	h := NewHandler(Config{Pool: p, Upstream: up})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader("{\"model\":\"glm-5.2\",\"messages\":[]}")))
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("status=%d body=%s want 400", rec.Code, rec.Body)
++	}
++	if calls != 1 {
++		t.Fatalf("request mismatch must not rotate, upstream calls=%d", calls)
++	}
++	if !strings.Contains(rec.Body.String(), "11148") ||
++		!strings.Contains(rec.Body.String(), "tool calls and tool results do not match") {
++		t.Fatalf("upstream error body should be preserved: %s", rec.Body)
++	}
++	for _, uid := range []string{"u1", "u2"} {
++		st, _ := p.Status(uid)
++		if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.ConsecutiveFails != 0 || !st.DegradeUntil.IsZero() || st.BreakerFails != 0 || st.InFlight != 0 {
++			t.Errorf("request-level mismatch penalized or leaked lease for %s: %+v", uid, st)
++		}
++	}
++}
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index c65902c..4df7b20 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -24,20 +24,21 @@ import (
+ type ErrKind int
+ 
+ const (
+-	ErrNone           ErrKind = iota // 成功
+-	ErrHardCredit                    // 余额不足（402 或 body 关键词）→ 长冷却
+-	ErrSoftRate                      // 429 软限流 → 短冷却
+-	ErrSessionDead                   // 401 + 12153 offline session 失效 → 禁用
+-	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
+-	ErrServer                        // 5xx 上游故障
+-	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
+-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
+-	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
+-	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+-	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
+-	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+-	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+-	ErrClient                        // 其他 4xx / 业务错误
++	ErrNone             ErrKind = iota // 成功
++	ErrHardCredit                      // 余额不足（402 或 body 关键词）→ 长冷却
++	ErrSoftRate                        // 429 软限流 → 短冷却
++	ErrSessionDead                     // 401 + 12153 offline session 失效 → 禁用
++	ErrNotFound                        // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
++	ErrServer                          // 5xx 上游故障
++	ErrContentBlocked                  // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
++	ErrBadParams                       // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 不罚账号，仍轮转
++	ErrAccountFault                    // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
++	ErrModelBlocked                    // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
++	ErrWafBlock                        // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避（WAF 403 修复 P0-1）
++	ErrPromptTooLong                   // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
++	ErrImageInvalid                    // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
++	ErrClient                          // 其他 4xx / 业务错误
++	ErrToolCallMismatch                // 11148 工具调用/结果历史错配 → 请求级错误：不罚号、不轮转
+ )
+ 
+ func (k ErrKind) String() string {
+@@ -66,6 +67,8 @@ func (k ErrKind) String() string {
+ 		return "prompt_too_long"
+ 	case ErrImageInvalid:
+ 		return "image_invalid"
++	case ErrToolCallMismatch:
++		return "tool_call_mismatch"
+ 	case ErrClient:
+ 		return "client"
+ 	default:
+@@ -534,6 +537,12 @@ func ParseRateReset(body string) (time.Time, bool) {
+ //     带业务信封的 403 已被上方各层捕获（11140 request illegal →
+ //     ErrAccountFault 禁用语义不变），走不到本层。
+ //  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
++func isToolCallMismatch(lower string) bool {
++	return strings.Contains(lower, "tool calls and tool results do not match") ||
++		strings.Contains(lower, "tool_call_sequence_broken") ||
++		codeMarker(lower, "11148")
++}
++
+ func Classify(status int, body string) ErrKind {
+ 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
+ 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
+@@ -605,6 +614,10 @@ func Classify(status int, body string) ErrKind {
+ 	if status == http.StatusBadRequest && (invalidImageRule.hit(body, lower) || codeMarker(lower, "11135")) {
+ 		return ErrImageInvalid
+ 	}
++	// 11148 is deterministic for this request body, so switching accounts cannot fix it.
++	if status == http.StatusBadRequest && isToolCallMismatch(lower) {
++		return ErrToolCallMismatch
++	}
+ 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
+ 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
+ 	// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
+diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
+index 202c709..63df8f6 100644
+--- a/internal/upstream/client_test.go
++++ b/internal/upstream/client_test.go
+@@ -44,6 +44,12 @@ func TestClassify(t *testing.T) {
+ 		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
+ 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
+ 		{400, `unapproved channel`, ErrContentBlocked},
++		// 11148 tool-call sequence mismatch is request-scoped, including nested/quoted code fields.
++		{400, "{\"code\":11148,\"msg\":\"tool calls and tool results do not match\"}", ErrToolCallMismatch},
++		{400, "{\"error\":{\"data\":{\"code\":\"11148\",\"message\":\"invalid tool history\"}}}", ErrToolCallMismatch},
++		{400, "tool_call_sequence_broken", ErrToolCallMismatch},
++		{400, "{\"requestId\":\"11148\",\"msg\":\"bad request\"}", ErrClient},
++		{500, "{\"code\":11148,\"msg\":\"tool calls and tool results do not match\"}", ErrServer},
+ 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
+ 		{400, `bad request`, ErrClient},
+ 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。
+diff --git a/internal/upstream/tool_pairing.go b/internal/upstream/tool_pairing.go
+index eab1cfc..5b03cc2 100644
+--- a/internal/upstream/tool_pairing.go
++++ b/internal/upstream/tool_pairing.go
+@@ -58,12 +58,11 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
+ 				}
+ 			}
+ 		}
+-		// 收集紧随其后（允许被其他消息打断）的同批 tool 结果，按原相对顺序。
+ 		out = append(out, messages[i])
+ 		i++
+ 		var results []any
+-		var between []any
+-		sawNonTool := false
++		var notices []any
++		noticeBeforeLaterResult := false
+ 		for i < len(messages) {
+ 			mm, ok := messages[i].(map[string]any)
+ 			if !ok {
+@@ -75,31 +74,31 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
+ 				if !want[id] {
+ 					break
+ 				}
+-				results = append(results, messages[i])
+-				if sawNonTool {
+-					changed = true
++				if len(notices) > 0 {
++					noticeBeforeLaterResult = true
+ 				}
++				results = append(results, messages[i])
+ 				i++
+ 				continue
+ 			}
+-			if len(results) == 0 {
+-				break // assistant 后没有结果：交由 cleanupOrphanToolCalls 处理
+-			}
+-			// 下一组 assistant.tool_calls 是新的组头，绝不能当插入物吞掉：一旦被收进
+-			// between，它永远不再被外层循环当作组头处理，它自己那批结果也就永远得不
+-			// 到重排（真实会话 msg[181] 正是这样漏掉的）。必须 break 交还外层循环。
+-			if role == "assistant" {
+-				if next, _ := mm["tool_calls"].([]any); len(next) > 0 {
+-					break
+-				}
++			// System/developer notices may precede the first result or split parallel results.
++			// Keep them in this block and never cross a user or assistant turn.
++			if role == "system" || role == "developer" {
++				notices = append(notices, messages[i])
++				i++
++				continue
+ 			}
+-			// 同批结果尚未收齐时，中间消息视为插入物，暂存待后移。
+-			between = append(between, messages[i])
+-			sawNonTool = true
+-			i++
++			break
++		}
++		if len(results) == 0 {
++			out = append(out, notices...)
++			continue
++		}
++		if noticeBeforeLaterResult {
++			changed = true
+ 		}
+ 		out = append(out, results...)
+-		out = append(out, between...)
++		out = append(out, notices...)
+ 	}
+ 	if !changed {
+ 		return messages, false
+diff --git a/internal/upstream/tool_pairing_test.go b/internal/upstream/tool_pairing_test.go
+index d3b198b..8927c39 100644
+--- a/internal/upstream/tool_pairing_test.go
++++ b/internal/upstream/tool_pairing_test.go
+@@ -451,3 +451,56 @@ func TestRepackThenCleanupRealShape(t *testing.T) {
+ 	assertRepackPairsContiguous(t, msgs)
+ 	assertPairingSymmetric(t, msgs)
+ }
++
++func TestRepackToolResultBlocksNoticeBeforeFirstResult(t *testing.T) {
++	call := map[string]any{"role": "assistant", "tool_calls": []any{
++		map[string]any{"id": "c1", "type": "function", "function": map[string]any{"name": "f", "arguments": "{}"}},
++	}}
++	notice := map[string]any{"role": "developer", "content": "URI guard"}
++	result := map[string]any{"role": "tool", "tool_call_id": "c1", "content": "ok"}
++	next := map[string]any{"role": "user", "content": "next"}
++	out, changed := repackToolResultBlocks([]any{call, notice, result, next})
++	if !changed {
++		t.Fatal("notice before first result should trigger repacking")
++	}
++	if len(out) != 4 ||
++		reflect.ValueOf(out[0]).Pointer() != reflect.ValueOf(call).Pointer() ||
++		reflect.ValueOf(out[1]).Pointer() != reflect.ValueOf(result).Pointer() ||
++		reflect.ValueOf(out[2]).Pointer() != reflect.ValueOf(notice).Pointer() ||
++		reflect.ValueOf(out[3]).Pointer() != reflect.ValueOf(next).Pointer() {
++		t.Fatalf("unexpected order/content: %#v", out)
++	}
++}
++
++func TestRepackToolResultBlocksNoticeAndTurnBoundaries(t *testing.T) {
++	call := map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "c1"}, map[string]any{"id": "c2"}}}
++	dev := map[string]any{"role": "developer", "content": "dev"}
++	sys := map[string]any{"role": "system", "content": "system"}
++	r1 := map[string]any{"role": "tool", "tool_call_id": "c1", "content": "one"}
++	r2 := map[string]any{"role": "tool", "tool_call_id": "c2", "content": "two"}
++	user := map[string]any{"role": "user", "content": "boundary"}
++	out, changed := repackToolResultBlocks([]any{call, dev, r1, sys, r2, user})
++	want := []any{call, r1, r2, dev, sys, user}
++	if !changed || !reflect.DeepEqual(out, want) {
++		t.Fatalf("changed=%v out=%#v want=%#v", changed, out, want)
++	}
++
++	nextCall := map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "later"}}}
++	laterResult := map[string]any{"role": "tool", "tool_call_id": "later", "content": "later"}
++	input := []any{call, dev, user, r1, nextCall, laterResult}
++	out, changed = repackToolResultBlocks(input)
++	if changed || !reflect.DeepEqual(out, input) {
++		t.Fatalf("must preserve turn boundary: changed=%v", changed)
++	}
++}
++
++func TestRepackToolResultBlocksTrailingNoticeIsNoop(t *testing.T) {
++	call := map[string]any{"role": "assistant", "tool_calls": []any{map[string]any{"id": "c1"}}}
++	result := map[string]any{"role": "tool", "tool_call_id": "c1", "content": "ok"}
++	notice := map[string]any{"role": "developer", "content": "notice"}
++	input := []any{call, result, notice}
++	out, changed := repackToolResultBlocks(input)
++	if changed || !reflect.DeepEqual(out, input) {
++		t.Fatalf("trailing notice should be a no-op: changed=%v out=%#v", changed, out)
++	}
++}

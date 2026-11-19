@@ -15,11 +15,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
 from .. import config
-from . import tencent, wb2api
+from .errtext import err_text
+from . import tencent, wb2api, native_modality
 
 # 成功缓存 5 分钟：模型清单变化很慢，没必要每次进页面都打腾讯
 _TTL_OK = 300
@@ -89,8 +91,12 @@ def _load_token(filename: str) -> str:
 # 模型中心显示「不支持推理」，与真实能力不符（用户报的 issue #8）。
 #
 # **两个版本的表绝不混用**：同一模型在两个版本下的档位可能不同
-# （deepseek-v4.1-flash：国内版 low/high/max，国际版仅 high）。
+# （deepseek-v4.1-flash：国内版 low/high/max，国际版 high/max）。
 # 这张表是「远端没给时的兜底」，远端给了就以远端为准（见 _decorate）。
+#
+# _EFFORT_EXTEND 是**产品能力已更新、模型接口元数据还没跟上**时的补档：
+# 2026-10 issue #238，国际版官方客户端已能选 Max，但模型接口仍只回 high。
+# 只在远端/兜底已有档位时追加，不会给未知模型凭空造档位。
 _EFFORT_FALLBACK: dict[str, dict[str, dict]] = {
     'cn': {
         'deepseek-v4-flash': {'efforts': ['low', 'high', 'max']},
@@ -116,7 +122,7 @@ _EFFORT_FALLBACK: dict[str, dict[str, dict]] = {
         'primary-model': {'efforts': ['high']},
         'hy4-preview-f': {'efforts': ['high'], 'default': 'high'},
         'hy3': {'efforts': ['low', 'high'], 'default': 'high'},
-        'deepseek-v4.1-flash': {'efforts': ['high']},
+        'deepseek-v4.1-flash': {'efforts': ['high', 'max'], 'default': 'high'},
         'gpt-6-astra': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
         'gpt-5.6-sol': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
         'gpt-5.6-terra': {'efforts': ['low', 'medium', 'high', 'xhigh', 'max'], 'default': 'high'},
@@ -130,6 +136,11 @@ _EFFORT_FALLBACK: dict[str, dict[str, dict]] = {
         'kimi-k3': {'efforts': ['medium']},
         'kimi-k2.6': {'efforts': ['medium']},
     },
+}
+
+_EFFORT_EXTEND: dict[str, dict[str, list[str]]] = {
+    # issue #238：官方客户端已可选 Max，接口 supportedEfforts 仍为 ['high']。
+    'global': {'deepseek-v4.1-flash': ['max']},
 }
 
 
@@ -146,8 +157,11 @@ def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
     显示「不支持推理」，与真实能力不符（用户报的 issue #8 即此）。
 
     兜底表**按版本分表且不混用**：同一模型在两个版本下的档位可能不同
-    （deepseek-v4.1-flash：国内版三档、国际版仅 high），混用会把国际版
+    （deepseek-v4.1-flash：国内版三档、国际版 high/max），混用会把国际版
     显示成支持国内版的档位。
+
+    远端元数据滞后于产品客户端时，`_EFFORT_EXTEND` 在已有档位上补差
+    （issue #238）；只在 efforts 非空时追加，避免给未知模型造档位。
     """
     out = []
     for m in items:
@@ -162,11 +176,16 @@ def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
             cap = _EFFORT_FALLBACK.get(realm, {}).get(mid)
             efforts = list(cap['efforts']) if cap else []
             eff_default = str(cap.get('default') or '') if cap else ''
+        if efforts:
+            for extra in _EFFORT_EXTEND.get(realm, {}).get(mid, ()):
+                if extra not in efforts:
+                    efforts.append(extra)
         # 默认档必须在支持列表内才有效（镜像上游的 containsEffort 校验）
         if eff_default and eff_default not in efforts:
             eff_default = ''
         out.append({
             'id': mid,
+            **native_modality.describe(mid),
             'name': m.get('name') or '',
             'context_length': int(m.get('context_length') or 0),
             'max_output_tokens': int(m.get('max_output_tokens') or 0),
@@ -174,8 +193,10 @@ def _decorate(items: list[dict], realm: str = 'cn') -> list[dict]:
             'series': series_of(mid),
             # 默认推理档位；空 = 未声明（由上游自行回退到硬编码默认）
             'default_effort': eff_default,
-            # 多模态能力（官方 /v1/models 也透出 supports_images）
-            'supports_images': bool(m.get('supports_images')),
+            # 平台图片输入声明保留 true/false/unknown 与官方来源冲突。
+            'supports_images': m.get('supports_images') if type(m.get('supports_images')) is bool else None,
+            'image_input_conflict': m.get('image_input_conflict') is True,
+            'image_input_sources': dict(m.get('image_input_sources') or {}),
             # ── 上游 2026-09-15 补齐的目录字段 ──
             # 模型描述（腾讯的 descriptionZh，中文）
             'description': str(m.get('description') or ''),
@@ -233,7 +254,7 @@ async def _build(realm: str, force: bool = False) -> dict:
         candidates.sort(key=lambda a: a.get('remain_seconds', 0), reverse=True)
     except Exception as exc:  # noqa: BLE001
         candidates = []
-        errors.append(f'读取本地账号失败: {exc}')
+        errors.append(f'读取本地账号失败: {err_text(exc)}')
     if not candidates:
         errors.append(f'没有可用的{"国际版" if realm == "global" else "国内版"}账号')
 
@@ -242,7 +263,8 @@ async def _build(realm: str, force: bool = False) -> dict:
         if not token:
             continue
         ok, data = await tencent.fetch_models({'access_token': token, 'realm': realm,
-                                               'domain': acct.get('domain', '')})
+                                               'domain': acct.get('domain', ''),
+                                               'proxy': acct.get('proxy', '')})
         if ok and isinstance(data, list) and data:
             return {
                 'models': _decorate(data, realm),
@@ -314,7 +336,8 @@ def _map_upstream_model_fields(m: dict) -> dict:
             else:
                 out[dst] = str(m.get(src) or '')
     if 'supports_images' in m:
-        out['supports_images'] = bool(m.get('supports_images'))
+        out['supports_images'] = m.get('supports_images') if type(m.get('supports_images')) is bool else None
+        out['image_input_sources'] = {'upstream_models': out['supports_images']}
     return out
 
 
@@ -371,6 +394,35 @@ def cached_ids(realm: str) -> set[str] | None:
     if not models:
         return None
     return {str(m.get('id') or '') for m in models if isinstance(m, dict) and m.get('id')}
+
+
+def fetch_ids_blocking(realm: str) -> dict:
+    """**同步**拉一次该版本的模型目录，返回 `catalog()` 的结果（给同步路由用）。
+
+    为什么要这个同步桥：本应用的路由多数写成 `def`，跑在线程池里——这是刻意的，
+    为的是让 sqlite、子进程、写盘这些阻塞动作不去占用事件循环。而 `catalog()`
+    是 async，所以这里在线程内自建一个临时事件循环跑一次。
+
+    为什么自建循环是安全的（不是碰运气）：
+      * 上游的 HTTP 客户端全部是「每次调用新建 + `async with` 用完即弃」
+        （见 `config.http_client`），**不绑定任何事件循环**，所以临时循环既不会
+        与主循环抢资源，也不会复用跨循环的连接池；
+      * 线程池里的工作线程本身没有运行中的循环，`asyncio.run` 不会撞上
+        「已有事件循环」的限制；
+      * `asyncio.run` 的信号处理只在主线程生效，工作线程里是空操作。
+
+    若当前线程**已经**在跑事件循环（正常不会发生：同步路由在线程池线程里），
+    就不敢自建第二个循环，直接返回一个"没拉到"的结果，让调用方按"取不到"处理
+    ——宁可少一个模型名，也不要在这里把请求卡死。
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        return {'models': [], 'source': 'none', 'source_label': '', 'via': '',
+                'errors': ['当前上下文已有事件循环，未实时拉取模型清单']}
+    return asyncio.run(catalog(realm))
 
 
 def summarize(models: list[dict]) -> dict:

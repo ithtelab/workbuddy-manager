@@ -52,8 +52,11 @@ class NamespaceCompatTests(unittest.TestCase):
         self.assertIn('apply_patch', bridge.custom_names)
         self.assertEqual(bridge.outbound_name('apply_patch'), 'apply_patch')
         self.assertEqual(bridge.outbound_name('read_file'), 'read_file')
-        self.assertEqual(bridge.restore('read_file_2'), ('read_file', 'function'))
-        self.assertEqual(bridge.restore('stat'), ('stat', 'function'))
+        self.assertEqual(bridge.restore('read_file_2'), ('read_file', 'function', None))
+        self.assertEqual(bridge.restore('read_file'), ('read_file', 'function', 'shell'))
+        self.assertEqual(bridge.restore('stat'), ('stat', 'function', 'nested.inner'))
+        self.assertEqual(bridge.restore('unknown'), ('unknown', 'function', None))
+        self.assertEqual(bridge.outbound_name('stat', 'nested.inner'), 'stat')
 
     def test_history_and_choice_use_outbound_names(self):
         body = {
@@ -121,8 +124,10 @@ class BothPathsRestoreNamesTest(unittest.TestCase):
         """调用点必须把 bridge 传给 to_responses_object。"""
         src = (Path(__file__).resolve().parents[1]
                / 'routers' / 'responses.py').read_text(encoding='utf-8')
+        # 参数表在 issue #450 之后多了 parallel_tool_calls（PR #451），这里只锚
+        # **前五个位置参数**仍然按序传对，避免每加一个可选参数就要改一次断言。
         self.assertIn(
-            'to_responses_object(data, model, resp_id, custom_tool_names, bridge)',
+            'to_responses_object(data, model, resp_id, custom_tool_names, bridge,',
             src,
             '非流式出口漏传 bridge —— 改名后的工具名会原样发给客户端，'
             '而流式路径会还原，两条路径不一致',
@@ -181,6 +186,7 @@ class NamespacedCustomStreamTest(unittest.TestCase):
         self.assertEqual(payload['item']['type'], 'custom_tool_call')
         self.assertEqual(payload['item']['name'], 'apply_patch')
         self.assertEqual(payload['item']['input'], 'PATCH')
+        self.assertNotIn('namespace', payload['item'])
 
     def test_custom_decision_uses_one_criterion(self) -> None:
         """「是不是 custom」与「取哪份入参」必须是**同一个判据**。

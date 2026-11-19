@@ -8,16 +8,31 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as _StarletteHTTPException
+from starlette.middleware.gzip import GZipMiddleware
 
+import json
 import logging
 
-from . import config, db, security
+from . import config, db, inflight, redpacket, security
 from .iputil import client_ip
+from .stdio_utf8 import force_utf8_stdio
 from .routers import (
-    accounts, anthropic, auth, gateway, keys, logs, models, playground,
-    responses, security as security_router, settings, stats, system,
+    accounts, accountrisk as accountrisk_router, anthropic, auth, balance, gateway, keys, logs, models,
+    playground,
+    pgsync as pgsync_router, redpackets, responses, security as security_router,
+    proxies, settings, stats, system, tap as tap_router, tokens, upstreams,
+    watchdog as watchdog_router,
 )
-from .services import renew, tasklog, taskrun
+from .services import (
+    accountlog, accountrisk, autoupdate, cooling, dailyplan, gatewaycors, modelrecovery, pgsync,
+    renew, tasklog, taskrun, watchdog,
+)
+
+# 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
+# 一旦出现 emoji（账号昵称就可能带）就会抛 UnicodeEncodeError —— 与「成长任务」
+# 那次崩溃同源（issue #147），只是触发条件更少。
+force_utf8_stdio()
 
 logger = logging.getLogger(__name__)
 
@@ -27,22 +42,93 @@ async def lifespan(app: FastAPI):
     config.ensure_dirs()
     db.connect()
     security.load_users()  # 首次启动会自动生成管理员并打印一次密码
+    weak_admins = security.weak_admin_passwords()
+    if weak_admins:
+        # 不拒绝启动：用户需要先进面板改密码。日志必须足够醒目。
+        logger.error('管理员仍在使用常见弱口令：%s。请立即在「设置 → 管理用户」'
+                     '中修改；本次生产事故的入口就是 admin123。',
+                     '、'.join(weak_admins))
     _warn_if_exposed()
+    _warn_weak_upstream_key()
+    # 给「抽奖码」这一列上线之前建的红包补码（幂等）：没有码就拼不出抽奖链接，
+    # 等于那些红包只能自己发 key、没法让大家抽。
+    filled = redpacket.backfill_codes()
+    if filled:
+        logger.info('为 %d 个旧红包补上了抽奖码', filled)
     # 后台采集上游自动任务日志（旅行/活跃/签到/保活），容器日志会被重建清掉，
     # 这里解析后落库长期保留，界面才能看到「这趟旅行领了多少积分」
     tasklog.start_collector()
+    accountrisk.initialize()
+    accountrisk.start()
     # 定时领奖（成长任务里幂等的那一半）：只把已完成任务的奖励领回来，不伪造
     # 任何活跃上报，因此可以安全地到点自动跑。点亮那半只允许手动（见 taskrun）
     taskrun.start_scheduler()
     # token 自动续期（issue #40）：上游只在「保活时刻」与「有流量时」刷新，
     # 长期闲置的账号会一路走到过期。这里按剩余寿命巡检补齐那个空档。
     renew.start_scheduler()
+    # 强制冷却到期清理：manual_disabled 不会随 until 自动消失，不清理会让
+    # 定时冷却变成永久停用（见 services/cooling.py）。
+    cooling.start_scheduler()
+    modelrecovery.start_scheduler()
+    # 每日任务计划（签到 / 领奖 / 做任务）：管理端自己的调度器，把「一键」动作
+    # 做成每天到点自动跑。默认全部关闭，由用户在账号页显式开启（full 有风控风险）。
+    dailyplan.start_scheduler()
+    # 请求日志的「账号」回填（issue #69）：账号是上游选的、不在响应里回传，
+    # 只能从它的容器日志里读出来再按时间对回去（见 accountlog 的说明）。
+    accountlog.start_collector()
+    # PostgreSQL 定时备份（用户反馈：怕服务器暴雷丢数据）。默认关闭 ——
+    # 只有配好连接、打开开关并设了间隔才会真的推数据出去。
+    pgsync.start_scheduler()
+    # 上游网页改版监控：抓结构指纹 → 变化时 LLM 判读 / 查活动补偿 → 邮件上报。
+    # 默认关闭；邮件启用前会先探 SMTP 出口（出口不通就不给开）。
+    watchdog.start_scheduler()
+    # 自动更新：按「设置 → 更新」里的开关与时间窗定时检测并执行一键更新。
+    # 默认关闭；真正的更新仍走 updater.start_update（与按钮同一条路）。
+    autoupdate.start_scheduler()
     try:
         yield
     finally:
         tasklog.stop_collector()
+        accountrisk.stop()
         taskrun.stop_scheduler()
         renew.stop_scheduler()
+        cooling.stop_scheduler()
+        modelrecovery.stop_scheduler()
+        dailyplan.stop_scheduler()
+        accountlog.stop_collector()
+        pgsync.stop_scheduler()
+        watchdog.stop_scheduler()
+        autoupdate.stop_scheduler()
+        # 出站客户端是共享的（issue #144：Windows 上每次新建要 ~1 秒），
+        # 退出时统一关掉，别把连接池与 SSL 上下文丢在原地。
+        await config.close_clients()
+
+
+def _warn_weak_upstream_key() -> None:
+    """上游 api_key 为空或仍是样例值时点名警告（2026-10-21 安全检查 H3）。
+
+    随包上游 workbuddy2api 的鉴权是「api_key 非空才启用」：为空时 /v1 对话、
+    /status、统计、管理端点全部无需凭据即可访问，且它的启动日志只打一个布尔
+    值，用户很难察觉。本面板是它的前置入口，部署形态下端口已收敛回环，但
+    只要 7863 被改绑到对外地址（或同机其他进程可达），弱 key 就等于公开。
+    读不到配置（本地开发没有上游）时静默跳过。
+    """
+    try:
+        cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
+    except Exception:  # noqa: BLE001
+        return
+    key = str(cfg.get('api_key') or '').strip()
+    if not key:
+        logger.error(
+            '上游 config.json 的 api_key 为空：%s 的全部端点（对话、状态、统计、'
+            '管理）此刻不需要任何凭据。请在「设置 → 上游」立即配置强 api_key。',
+            config.UPSTREAM_CONFIG,
+        )
+    elif key.lower() in ('test_key', 'changeme', 'your_api_key'):
+        logger.error(
+            '上游 api_key 仍是样例值 %r：等同于公开，任何知道默认值的人都能'
+            '消耗账号池积分。请立即改为强随机值。', key,
+        )
 
 
 def _warn_if_exposed() -> None:
@@ -64,7 +150,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='1.0.63',
+    version='2.11.18',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -74,17 +160,26 @@ app = FastAPI(
     openapi_url='/openapi.json' if config.ENABLE_DOCS else None,
 )
 
+def _validate_cors_origins(origins: list[str]) -> None:
+    """`*` 与凭据模式互斥：命中直接抛错，让服务起不来（配置错误要在启动时暴露）。"""
+    if any(o.strip() == '*' for o in origins):
+        raise RuntimeError(
+            'WB_CORS_ORIGINS 含 `*` 且管理端启用 Cookie 凭据：任意网站都能冒用'
+            '管理员身份读写 /api/*。请改为列出具体来源（逗号分隔），或留空'
+            '（同源部署，默认）。'
+        )
+
+
 if config.CORS_ORIGINS:
     # 只允许**明确列出的**来源。绝不要把 WB_CORS_ORIGINS 设成 `*`：
     # 本应用用 Cookie 认证管理端，而 Starlette 在 allow_credentials=True 时
     # 会把 `*` 回显成请求方 Origin（不是字面 `*`），于是**任意网站**都能带着
     # 管理员的 Cookie 调 /api/* 并读到响应 —— 等于把控制台交给任何网页。
     # 留空（默认）即同源部署，安全。
-    if any(o.strip() == '*' for o in config.CORS_ORIGINS):
-        logging.getLogger('workbuddy').error(
-            'WB_CORS_ORIGINS 含 `*` 且已启用凭据：任意网站都能冒用管理员身份读取 '
-            '/api/*。请改为列出具体来源，或留空（同源部署）。'
-        )
+    #
+    # 这是"误配即全面接管"的开关，因此检测到 `*` 直接拒绝启动，而不是只记
+    # 一条日志继续跑：日志拦不住照抄配置的人，历史上确有人这么配过。
+    _validate_cors_origins(config.CORS_ORIGINS)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=config.CORS_ORIGINS,
@@ -93,46 +188,367 @@ if config.CORS_ORIGINS:
         allow_headers=['*'],
     )
 
+# ── 数据面 CORS（`/v1`、`/v2`）────────────────────────────────────
+#
+# 与上面 `WB_CORS_ORIGINS` 是**两套**东西，别合并：
+#   · 上面那套管 `/api/*`（Cookie 会话），`allow_credentials=True`，禁止 `*`；
+#   · 这一套管 `/v1`、`/v2`（`Authorization: Bearer`），不涉及 Cookie，因此
+#     可以允许 `*` —— 任何网页都能跨域发请求，但拿不到密钥还是调不动。
+#
+# 为什么不用 `CORSMiddleware`：它的 allow_origins 是启动时固定的，改配置要重启。
+# 而这是面板上的配置项 —— 改完不生效会被当成「没保存成功」，所以这里每请求现读
+# 设置（读 SQLite 一行），即时生效。
+#
+# 预检由这里直接应答：`/v1/*` 只有 POST 路由，OPTIONS 落到路由表会被 405，
+# 浏览器那边就报跨域失败 —— 这是 issue #445 现象的直接来源。
+_CORS_ALLOW_HEADERS = 'authorization,content-type,x-api-key,anthropic-version,x-trace-id'
+
+# 预检里回显 `Access-Control-Request-Headers` 的白名单前缀/全名。
+#
+# 为什么不能直接把请求方要的头原样回显：那等于对任意头放行。但只回一份固定
+# 列表又会挡住真实客户端 —— OpenAI SDK 会带 `openai-organization`、
+# `openai-beta`，Anthropic SDK 会带 `anthropic-beta`，这些请求会因为预检失败
+# 而根本发不出去。折中：命名空间前缀 + 明确列出的头名，其余一律不放。
+_CORS_ALLOWED_HEADER_EXACT = frozenset(_CORS_ALLOW_HEADERS.split(','))
+_CORS_ALLOWED_HEADER_PREFIXES = ('x-stainless-', 'anthropic-', 'openai-')
+
+
+def _echo_request_headers(requested: str) -> str:
+    """把预检请求要的头裁到白名单内，返回可直接写进响应头的值。
+
+    返回空串表示「一个都不允许」——调用方据此把整个预检拒掉，而不是给一个
+    缺头的允许响应（那样浏览器照样拦，但报错方向会误导人）。
+    """
+    wanted: list[str] = []
+    for raw in (requested or '').split(','):
+        name = raw.strip().lower()
+        if not name or not name.isascii():
+            continue
+        # 头名只允许 token 字符（RFC 7230）——防止有人拿逗号/换行拼出额外的头
+        if any(ch not in 'abcdefghijklmnopqrstuvwxyz0123456789-_' for ch in name):
+            continue
+        if name in _CORS_ALLOWED_HEADER_EXACT or name.startswith(_CORS_ALLOWED_HEADER_PREFIXES):
+            # 只有前缀、没有后半截（如 `openai-`）不是有效头名
+            if name.endswith('-'):
+                continue
+            if name not in wanted:
+                wanted.append(name)
+    return ','.join(wanted)
+_CORS_ALLOW_METHODS = 'GET,POST,OPTIONS'
+
+
+def _merge_vary_origin(headers: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    """把 `Origin` 并进 `Vary`（已有值保留）。
+
+    CORS 响应的缓存正确性依赖 `Vary: Origin`：同一个 URL 对不同来源回不同的
+    `Access-Control-Allow-Origin`，不声明就会让共享缓存把一份响应发给另一个来源。
+    下游可能已经写了 `Vary: Accept-Encoding`（压缩），所以这里**合并**而不是追加
+    一条独立的 `Vary`（多条 Vary 的语义是「所有值的并集」，但不少代理只看第一条）。
+    """
+    out: list[tuple[bytes, bytes]] = []
+    merged: list[str] = []
+    for key, value in headers:
+        if key.lower() != b'vary':
+            out.append((key, value))
+            continue
+        for item in value.decode('latin-1').split(','):
+            name = item.strip()
+            if name and not any(n.lower() == name.lower() for n in merged):
+                merged.append(name)
+    if not any(n.lower() == 'origin' for n in merged):
+        merged.append('Origin')
+    # 只写一条 Vary：多条虽然语义上是并集，但不少代理/缓存实现只看第一条
+    out.append((b'vary', ', '.join(merged).encode('latin-1')))
+    return out
+
+
+class GatewayCorsMiddleware:
+    """纯 ASGI：只处理数据面路径，来源白名单每次现读面板设置。"""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http':
+            await self.app(scope, receive, send)
+            return
+        path = scope.get('path') or ''
+        if not gatewaycors.is_data_api_path(path):
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.decode('latin-1').lower(): v.decode('latin-1')
+                   for k, v in scope.get('headers') or []}
+        origin = headers.get('origin') or ''
+        cfg = gatewaycors.settings()
+        allow = gatewaycors.allow_origin_value(origin, cfg)
+
+        # 预检：直接应答，不进路由（进了也是 405）。
+        if scope.get('method') == 'OPTIONS' and headers.get('access-control-request-method'):
+            if not allow:
+                # 来源未放行：回 403 而不是静默 200 —— 静默放行会让浏览器在
+                # 真实请求上才失败，用户看不到「预检被拒」这个明确信号。
+                # 403 也带 `Vary: Origin`：否则中间缓存可能把一个来源的拒绝
+                # 结果复用给另一个来源。
+                response = JSONResponse(
+                    {'error': {'message': '来源不在网关 CORS 白名单内',
+                               'type': 'cors_error', 'code': 'origin_not_allowed'}},
+                    status_code=403,
+                    headers={'Vary': 'Origin'})
+                await response(scope, receive, send)
+                return
+            # 没有 `Access-Control-Request-Headers` 是**合法**的（简单请求的
+            # 预检只问方法）；只有「要了头但一个都不在白名单里」才拒。
+            raw_requested = headers.get('access-control-request-headers') or ''
+            requested = _echo_request_headers(raw_requested)
+            if raw_requested.strip() and not requested:
+                response = JSONResponse(
+                    {'error': {'message': '预检请求了不被允许的自定义请求头',
+                               'type': 'cors_error', 'code': 'header_not_allowed'}},
+                    status_code=403,
+                    headers={'Vary': 'Origin'})
+                await response(scope, receive, send)
+                return
+            extra = [
+                (b'access-control-allow-origin', allow.encode('latin-1')),
+                (b'access-control-allow-methods', _CORS_ALLOW_METHODS.encode()),
+                (b'access-control-allow-headers', requested.encode('latin-1')),
+                (b'access-control-max-age', str(cfg['max_age']).encode()),
+                (b'vary', b'Origin'),
+            ]
+            await send({'type': 'http.response.start', 'status': 204, 'headers': extra})
+            await send({'type': 'http.response.body', 'body': b''})
+            return
+
+        if not allow:
+            await self.app(scope, receive, send)
+            return
+
+        # 普通请求：补上 CORS 头。注意**不加** allow-credentials —— 数据面用
+        # Bearer，不需要 Cookie；带上一旦将来来源放宽成 `*` 就会与规范冲突。
+        #
+        # **必须先删掉下游已有的同名头再加自己的**：`WB_CORS_ORIGINS` 装上全局
+        # `CORSMiddleware` 时它也会处理 `/v1`，两层各加一次的结果是
+        # `Access-Control-Allow-Origin: https://a, https://a` —— 浏览器按单个值
+        # 解析，重复值直接判定为非法来源，表现为「明明加了白名单还是跨域」。
+        # 实测确认过（见 test_gateway_cors.GlobalCorsCoexistenceTest）。
+        # 同理丢掉对方的 allow-credentials：数据面不该声明它。
+        async def send_with_cors(message):
+            if message.get('type') == 'http.response.start':
+                message = dict(message)
+                drop = {b'access-control-allow-origin', b'access-control-allow-credentials'}
+                headers = [(k, v) for k, v in message.get('headers') or []
+                           if k.lower() not in drop]
+                headers.append((b'access-control-allow-origin', allow.encode('latin-1')))
+                if b'access-control-expose-headers' not in {k.lower() for k, _ in headers}:
+                    headers.append((b'access-control-expose-headers',
+                                    b'x-trace-id,x-request-id'))
+                # Vary 必须**并进已有值**，不能「有就跳过」：下游可能已经带了
+                # `Vary: Accept-Encoding`（压缩中间件），跳过就等于没声明按 Origin
+                # 区分，共享缓存会把 A 来源的响应复用给 B 来源。
+                headers = _merge_vary_origin(headers)
+                message['headers'] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors)
+
+
+app.add_middleware(GatewayCorsMiddleware)
+
 # 管理端请求体上限。网关那条路有自己的逐块校验（gateway._read_json_body），
 # 但 `/api/*` 此前**没有任何上限** —— 未鉴权的 `/api/login` 就能用大 body
 # 把内存占住（实测：12MB 请求体被完整缓冲并解析，没有 413）。这里统一兜住。
 # 取得比网关默认（8MB）宽松些：管理端有「保存上游配置」这类正常的大请求。
 MAX_API_BODY_BYTES = 16 * 1024 * 1024
 
+# 唯一需要更大请求体的管理端路径：上传离线升级包（issue #153）。发布包现在约
+# 11 MB，将来会变大，所以这里给到 64 MB —— 仍然是个**硬上限**，不是没有上限：
+# 上传本身还要过会话管理员鉴权，且落盘后立刻做 tar.gz 结构与 .version 校验。
+# 与 `updater.PACKAGE_MAX_BYTES` 必须一致（有测试盯着，别只改一边）。
+MAX_PACKAGE_BODY_BYTES = 64 * 1024 * 1024
+PACKAGE_UPLOAD_PATHS = ('/api/system/update-package',)
+
 
 @app.middleware('http')
 async def limit_api_body(request: Request, call_next):
-    """给 `/api/*` 的请求体加上限。
+    """给 `/api/*` 的请求体加上限（上传升级包那条路放宽，见上面的常量）。
 
     只看 `Content-Length`：本中间件拦的是「声明了超大长度」这条最容易发起、
-    也最容易自动化的路径（无鉴权即可打 /api/login）。ASGI 在中间件之前不会把
-    body 读进内存，所以先声明后读没有意义；不带该头的分块请求由 uvicorn 自身的
-    缓冲与并发限制兜底。
+    也最容易自动化的路径（无鉴权即可打 /api/login），不用读流就能立即拒绝。
+    不带该头的分块请求在这里声明为 0、拦不住，由下面的
+    `ApiBodyLimitMiddleware` 在**实际读取层**强制。
     """
     if request.url.path.startswith('/api/'):
         try:
             declared = int(request.headers.get('content-length') or 0)
         except ValueError:
             declared = 0
-        if declared > MAX_API_BODY_BYTES:
+        limit = (MAX_PACKAGE_BODY_BYTES
+                 if request.url.path in PACKAGE_UPLOAD_PATHS else MAX_API_BODY_BYTES)
+        if declared > limit:
             return JSONResponse(
-                {'detail': f'请求体过大（上限 {MAX_API_BODY_BYTES // 1024 // 1024} MB）'},
+                {'detail': f'请求体过大（上限 {limit // 1024 // 1024} MB）'},
                 status_code=413,
             )
     return await call_next(request)
 
+
+class _ApiBodyTooLarge(Exception):
+    """内部信号：/api/* 请求体在读取层超过上限。
+
+    注意：路由里 `except Exception` 很常见（`/api/login` 解析失败就转 400），
+    所以它不一定能到达中间件变成 413 —— 被就地转成 400 也是**安全**的：
+    超限时读取已经中止，内存不再增长。声明 413 只在这条异常成功穿透路由时生效。
+    """
+
+
+class ApiBodyLimitMiddleware:
+    """在 ASGI receive 层强制 `/api/*` 的请求体上限。
+
+    为什么上面的 Content-Length 预检不够：分块传输（chunked）没有该头，
+    `declared` 为 0 直接放行；而 handler 里的 `await request.json()` 会把整个
+    body 无上限地聚合进内存（Starlette 的 `Request.body()` 逐块追加，uvicorn
+    自身也不设请求体上限）。`/api/login` 是未鉴权可达的，少量并发分块大请求
+    就能把这个进程（管理面、/v1 网关、静态托管同体）的内存吃光。
+    网关那条路早有同款读取层限额（`gateway._read_json_body`），这里补管理面。
+
+    实现：包住 receive 通道逐块计数，超限即抛内部异常中止 handler，由本层
+    （异常向外传播的必经之路）直接发 413。此时 handler 还在读 body、尚未
+    开始写响应，所以 413 是该连接上唯一的响应，不会出现"半个响应 + 413"。
+    """
+
+    def __init__(self, app, *, limit: int = MAX_API_BODY_BYTES,
+                 package_limit: int = MAX_PACKAGE_BODY_BYTES,
+                 package_paths: tuple = PACKAGE_UPLOAD_PATHS) -> None:
+        self.app = app
+        self.limit = limit
+        self.package_limit = package_limit
+        self.package_paths = package_paths
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http' or not scope.get('path', '').startswith('/api/'):
+            await self.app(scope, receive, send)
+            return
+        limit = (self.package_limit
+                 if scope['path'] in self.package_paths else self.limit)
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message.get('type') == 'http.request':
+                received += len(message.get('body') or b'')
+                if received > limit:
+                    raise _ApiBodyTooLarge()
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _ApiBodyTooLarge:
+            response = JSONResponse(
+                {'detail': f'请求体过大（上限 {limit // 1024 // 1024} MB）'},
+                status_code=413,
+            )
+            await response(scope, receive, send)
+
+
+# 计入「客户端在途」的路径前缀：只有网关调用算，面板自身的 /api/* 不算。
+GATEWAY_PATH_PREFIX = '/v1/'
+
+
+class GatewayInFlightMiddleware:
+    """统计「客户端在途」：`/v1/*` 从请求进来到**响应写完**（含整个流式传输）。
+
+    为什么按 `/v1/` 划：这些才是 agent 客户端的模型调用（chat / responses /
+    messages / models）。面板自己的 `/api/*` 是浏览器在翻页，算进来会把数字搅乱。
+
+    为什么要在中间件里数而不是从日志推：日志只有请求**结束**时才写，正在跑的那条
+    根本不在库里。要「此刻几条」，只能在进程内数。
+
+    注意 `await self.app(...)` 对 `StreamingResponse` 而言是等整个 body 发完才返回，
+    所以一条边吐 chunk 边跑的请求在这段时间里始终算 1。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        path = str(scope.get('path') or '')
+        if scope.get('type') != 'http' or not path.startswith(GATEWAY_PATH_PREFIX):
+            await self.app(scope, receive, send)
+            return
+        inflight.enter()
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            inflight.leave()
+
+
+app.add_middleware(GatewayInFlightMiddleware)
+app.add_middleware(ApiBodyLimitMiddleware)
+
+# 压缩静态资源（web/out 下的 JS/CSS，首屏 2 MB 的大头）。
+#
+# 为什么**只压静态资源**而不是全局：
+#   · 本应用外层还有 `@app.middleware('http')`（cache_headers / 限流），那层会把
+#     下游响应包成**流式**转发，Starlette 的 GZipMiddleware 遇到流式响应会无条件
+#     压缩，`minimum_size` 直接失效 —— 实测 140 字节的 /api/status 也被压了，
+#     白白付 CPU 与几字节头开销。
+#   · 全局压缩还会碰到 `/v1` 的流式对话；虽然 Starlette 会跳过 text/event-stream，
+#     但静态路径白名单更明确，不依赖它对 content-type 的判定。
+_STATIC_COMPRESS_SUFFIXES = ('.js', '.css', '.svg', '.json', '.map', '.txt', '.woff2')
+
+
+class StaticGzipMiddleware:
+    """只对静态产物做 gzip；其余请求原样穿过（含 /v1 流式与管理面 JSON）。"""
+
+    def __init__(self, app, *, minimum_size: int = 1024) -> None:
+        self.app = app
+        self.gz = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') == 'http' and scope.get('method') in ('GET', 'HEAD'):
+            path = scope.get('path') or ''
+            if path.startswith('/_next/') or path.endswith(_STATIC_COMPRESS_SUFFIXES):
+                await self.gz(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+if config.GZIP_ENABLED:
+    app.add_middleware(StaticGzipMiddleware, minimum_size=config.GZIP_MIN_SIZE)
+
 # ── 路由注册顺序很重要：先 API / 网关，最后挂静态文件 ──
 app.include_router(auth.router)
 app.include_router(accounts.router)
+app.include_router(accountrisk_router.router)
 app.include_router(keys.router)
+# 红包：批量发放带额度的密钥（与密钥同属「分发」这件事，所以挨着放）
+app.include_router(redpackets.router)
+# 抽奖：**公开端点**（收到链接的人不需要账号），单独挂便于区分边界
+app.include_router(redpackets.claim_router)
 app.include_router(logs.router)
+# 调用抓包（Trace Tap）：把每次调用的完整上下文留在面板里回放与对比，
+# 与请求日志是两套数据（见 services/tap.py 的模块注释）
+app.include_router(tap_router.router)
 app.include_router(stats.router)
 app.include_router(security_router.router)
+# 管理面作用域化 API Token（见 docs/api-tokens.md）；接口本身只接受会话鉴权
+app.include_router(tokens.router)
 app.include_router(settings.router)
+# 代理线路与全局出口代理（设置 → 代理）
+app.include_router(proxies.router)
+# PostgreSQL 异地备份：把本地数据镜像出去、需要时拉回来（见 services/pgsync）
+app.include_router(pgsync_router.router)
+app.include_router(watchdog_router.router)
+# 多上游（账号池分组）：密钥绑定上游 = 请求走那个池，见 upstreamsvc
+app.include_router(upstreams.router)
 app.include_router(system.router)
 app.include_router(models.router)
 app.include_router(playground.router)
 app.include_router(gateway.router)
+# 余额协议（/api/usage/token/ 与 /api/status）：客户端面板据此显示剩余额度
+app.include_router(balance.router)
 # Anthropic Messages API 兼容层（/v1/messages）——给只认该协议的客户端用
 app.include_router(anthropic.router)
 # OpenAI Responses API 兼容层（/v1/responses、/responses）——给 Codex /
@@ -305,6 +721,23 @@ def _rsc_page_for(full_path: str) -> str | None:
     return f'/{stem}' if stem else '/'
 
 
+@app.exception_handler(_StarletteHTTPException)
+async def _json_http_error(request: Request, exc: _StarletteHTTPException) -> JSONResponse:
+    """`/v1`、`/v2` 下的 404/405 一律回 JSON。
+
+    以前 `GET /v1/chat/completions` 会落到 SPA 兜底、返回整页 HTML（还带 404 的
+    Next 外壳），客户端解析 HTML 只能得到更难排查的错误。其余路径保持原样。
+    """
+    headers = getattr(exc, 'headers', None)
+    if request.url.path.startswith(('/v1/', '/v2/')):
+        code = 'method_not_allowed' if exc.status_code == 405 else 'not_found'
+        return JSONResponse({'error': {'message': str(exc.detail),
+                                       'type': 'invalid_request_error',
+                                       'code': code}},
+                            status_code=exc.status_code, headers=headers)
+    return JSONResponse({'detail': exc.detail}, status_code=exc.status_code, headers=headers)
+
+
 if config.STATIC_DIR.is_dir():
     app.mount('/_next', StaticFiles(directory=str(config.STATIC_DIR / '_next')), name='next-assets')
     if (config.STATIC_DIR / 'favicon.ico').exists():
@@ -318,6 +751,12 @@ if config.STATIC_DIR.is_dir():
 
     @app.get('/{full_path:path}', include_in_schema=False)
     def spa(full_path: str, request: Request):
+        # 网关路径绝不该落到 SPA 外壳：宁可回一条 JSON 404，也不要把首页 HTML
+        # 当成接口响应发给客户端。
+        if full_path.startswith(('v1/', 'v2/')):
+            return JSONResponse({'error': {'message': f'未知的接口路径 /{full_path}',
+                                           'type': 'invalid_request_error',
+                                           'code': 'not_found'}}, status_code=404)
         # 优先命中导出的静态页面 / 资源，否则回退到 404 页面。
         # 所有路径都必须先通过 _safe_static_path（越界即 None → 404）。
         #
@@ -332,7 +771,9 @@ if config.STATIC_DIR.is_dir():
         if _is_document_request(request):
             page = _rsc_page_for(full_path)
             if page is not None:
-                return RedirectResponse(page, status_code=302)
+                # 补上子路径前缀：反代剥掉前缀后才到这里，但 Location 是发回浏览器
+                # 的绝对地址，不带前缀就会跳到域名根（另一个站点）上。
+                return RedirectResponse(f'{config.BASE_PATH}{page}', status_code=302)
         target = _safe_static_path(full_path)
         if target is not None:
             return FileResponse(target)
@@ -343,3 +784,70 @@ if config.STATIC_DIR.is_dir():
         if not_found.is_file():
             return FileResponse(not_found, status_code=404)
         return JSONResponse({'error': 'not found'}, status_code=404)
+
+
+# ── 子路径部署（反向代理前缀）────────────────────────────────────────
+#
+# 反向代理把本站挂在 /workbuddy-manager 这类前缀下、且**不剥离**前缀时，后端
+# 收到的路径仍带着前缀 —— 路由、静态挂载与 SPA 兜底全都匹配不上，页面会 404。
+# 这里在最外层统一剥掉，让内部逻辑只看到「前缀之后的路径」。
+#
+# 反向代理若已经剥离了前缀（proxy_pass 带 URI 的常见写法），本中间件找不到
+# 前缀、原样放行 —— 两种反代配置都能工作，nginx 侧不必改。
+#
+# 响应侧同步处理：SPA 的 RSC 兜底等场景会 302 到站内绝对路径（`/xxx`），
+# 不补回前缀就会把用户带出子路径、落到站点根目录。
+#
+# 与 `config.BASE_PATH` 的分工：那个值被用来**主动构造**带前缀的绝对地址
+# （见上面 SPA 兜底的 RedirectResponse）；本中间件负责「进来的路径带前缀」与
+# 「出去的 Location 漏前缀」这两件事。两者都指同一个 WB_BASE_PATH。
+class StripBasePathMiddleware:
+    """纯 ASGI 中间件：剥离请求前缀，并把响应里的站内绝对位置补回前缀。"""
+
+    def __init__(self, app, prefix: str) -> None:
+        self.app = app
+        self.prefix = prefix
+        self._prefix_slash = prefix + '/'
+
+    async def __call__(self, scope, receive, send):
+        if scope.get('type') != 'http':
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get('path') or '/'
+        if path == self.prefix or path.startswith(self._prefix_slash):
+            stripped = path[len(self.prefix):] or '/'
+            scope = dict(scope)
+            scope['path'] = stripped
+            scope['raw_path'] = stripped.encode('utf-8')
+
+        async def send_with_prefix(message):
+            if message.get('type') == 'http.response.start' and message.get('headers'):
+                message = dict(message)
+                message['headers'] = [
+                    (k, self._rewrite_location(v) if k.lower() == b'location' else v)
+                    for k, v in message['headers']
+                ]
+            await send(message)
+
+        await self.app(scope, receive, send_with_prefix)
+
+    def _rewrite_location(self, value: bytes) -> bytes:
+        try:
+            text = value.decode('latin-1')
+        except Exception:  # noqa: BLE001
+            return value
+        # 只处理站内绝对路径（/ 开头，且不是 //host 这种协议相对写法）
+        if not text.startswith('/') or text.startswith('//'):
+            return value
+        # 已经带前缀的不重复叠加（SPA 兜底那处已自己补过）
+        if text == self.prefix or text.startswith(self._prefix_slash):
+            return value
+        return (self.prefix + text).encode('latin-1')
+
+
+if config.BASE_PATH:
+    # add_middleware 后注册的在外层，所以这行放在文件末尾：请求进来先过它，
+    # 后面的限流 / 缓存头 / 路由看到的都是剥离后的路径。
+    app.add_middleware(StripBasePathMiddleware, prefix=config.BASE_PATH)
+    logger.info('子路径部署：已启用前缀 %s（反代可保留或自行剥离，两者都可用）', config.BASE_PATH)

@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
+import sqlite3
 import time
 
 from . import db
 from .iputil import ip_matches
 
 TOKEN_PREFIX = 'wbk_'
+# `api_keys.prefix` 列存的长度（= token 前 N 个字符）。创建与解析必须同口径。
+TOKEN_PREFIX_LEN = 12
 
 
 class Rejection(str):
@@ -44,14 +48,119 @@ class Rejection(str):
         return self
 
 
+class TokenConflict(ValueError):
+    """自定义 token 与已有密钥冲突（唯一索引兜底命中）。
+
+    单独一个类型是为了让路由层能**区分对待**：冲突是 409（换一个就好），
+    而 `_norm_custom_token` 抛的 ValueError 是格式/弱口令问题，应为 400。
+    两者混用会让「密码太短」也回 409，用户会以为是撞车而不是格式错。
+    """
+
+
 def _hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+# ── 自定义密钥形态（issue #447）─────────────────────────────
+#
+# 为什么允许自定义：从 one-api / new-api 迁过来的部署里，客户端配置、脚本、
+# `.env` 遍地是 `sk-xxx` 形态；强制改成 `wbk_` 等于让用户改一大片。而鉴权本来就
+# 是「按 prefix 定位 + 哈希比对」，前缀只是**快速筛**，不是安全边界。
+#
+# 代价是弱口令：随机 43 字符猜不到，`sk-test` 一猜就中。所以这里不是「原样收下」，
+# 而是三条硬约束 + 一次弱密钥拦截：
+#   · 长度 16–96（太短易猜，太长会撑爆 header 且不像任何真实网关的形态）
+#   · 字符集 `[A-Za-z0-9_.\-]`（冒号/空格/换行会破坏 `Authorization: Bearer` 解析，
+#     也可能被当成额外的头注入）
+#   · 全局唯一（撞了已有密钥直接拒绝，而不是让两把密钥指向同一行）
+CUSTOM_TOKEN_MIN = 16
+CUSTOM_TOKEN_MAX = 96
+_CUSTOM_TOKEN_RE = re.compile(r'^[A-Za-z0-9_.\-]+$')
+
+# 明显是弱口令/占位符的**整段**（按分隔符切开后逐段比对，小写）。
+#
+# 为什么按段而不是子串：子串会把 `sk-valid-token-2026-prod-x` 这类正常密钥
+# 判成弱口令（它含 `token` 这个词），而用户恰恰是想要 `sk-xxx` 这种形态。
+# 按段比对只拦「整段就叫 test / admin」的那种。
+# 注意**不**包含 `token` / `key` / `api`：它们是密钥里极常见的命名片段
+# （`sk-token-2026-...`、`team-key-prod-...`），当成弱词会把正常形态误杀。
+# 真正的弱口令是「整段就叫 password / test / admin」那种。
+_WEAK_TOKEN_SEGMENTS = frozenset({
+    'password', 'passwd', 'secret', 'apikey', 'test', 'example', 'sample',
+    'demo', 'changeme', 'default', 'admin', 'qwerty', 'letmein',
+    'null', 'none', 'undefined',
+})
+_SEGMENT_SPLIT = re.compile(r'[^A-Za-z0-9]+')
+
+
+def _looks_weak(text: str) -> bool:
+    """是否像「一眼能猜到」的密钥。
+
+    三条判据：
+      · 有整段命中常见弱词（`sk-test-xyz...` 里的 `test`）；
+      · 字符种类太少（`aaaa...`、`0000...`）；
+      · 纯十进制数字（`1234567890123456` 这类的变体太多，整段比对拦不全）。
+    """
+    lowered = text.lower()
+    # 去掉 `sk-` / `wbk_` 这类形态前缀后再切段：前缀是约定，不是弱词
+    bare = lowered
+    for prefix in ('sk-', 'wbk_', 'sk_', 'key-', 'key_'):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+    segments = [s for s in _SEGMENT_SPLIT.split(bare) if s]
+    if any(s in _WEAK_TOKEN_SEGMENTS for s in segments):
+        return True
+    if text.isdigit():
+        return True
+    return len(set(text)) <= 3
+
+
+def _norm_custom_token(value: object) -> str:
+    """校验并归一化自定义 token。不合法直接抛 `ValueError`（路由层转 400）。
+
+    不做大小写转换、不裁剪中间字符 —— 密钥是**逐字节**比对的凭证，替用户
+    「顺手规整」会让他在别处粘贴的原值失效。
+    """
+    # 只 strip 首尾空白：从聊天工具/终端复制时常带进去，那不是密钥的一部分
+    text = str(value or '').strip()
+    if not text:
+        raise ValueError('密钥不能为空')
+    if len(text) < CUSTOM_TOKEN_MIN:
+        raise ValueError(f'密钥至少 {CUSTOM_TOKEN_MIN} 个字符（太短容易被猜到）')
+    if len(text) > CUSTOM_TOKEN_MAX:
+        raise ValueError(f'密钥最多 {CUSTOM_TOKEN_MAX} 个字符')
+    if not _CUSTOM_TOKEN_RE.match(text):
+        raise ValueError(
+            '密钥只能包含字母、数字、下划线、点与连字符'
+            '（空格、冒号、换行会破坏 Authorization 头解析）')
+    if _looks_weak(text):
+        raise ValueError('这个密钥太容易被猜到（含常见弱词、纯数字或字符种类太少），请换一个')
+    return text
 
 
 def _norm_realm(value: object) -> str:
     """归一化密钥的版本归属；'' = 不限制（存量密钥的形态，见 db._MIGRATIONS）。"""
     v = str(value or '').strip().lower()
     return v if v in ('cn', 'global') else ''
+
+
+def _norm_upstream_id(value: object) -> int | None:
+    """归一化密钥绑定的上游 id：空 / 非法一律当「未绑定」（= 默认上游）。
+
+    与 realm 的归一化同口径：**不报错**。原因是这个值来自管理端表单，
+    而「未绑定」本身是合法且有意义的取值（存量密钥全是这个形态），
+    把脏值吃掉成「未绑定」既安全又不会让保存整个失败。
+    真正「绑了一个不存在的上游」由路由层拦（见 routers/keys.py），
+    那里能拿到准确的 400 文案。
+    """
+    if value in (None, '', 0, '0'):
+        return None
+    try:
+        uid = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return uid if uid > 0 else None
 
 
 def _norm_credit_quota(value: object) -> float:
@@ -144,6 +253,28 @@ def _json_list(raw: object) -> list[str]:
     return [str(x) for x in parsed if x]
 
 
+def _row_get(row, name: str):
+    try:
+        return row[name]
+    except (IndexError, KeyError):
+        return None
+
+
+def _daily_used(row) -> int:
+    """今天（本地日期，与 usage_daily 同口径）已用的 token；记账日不是今天即为 0。"""
+    if (_row_get(row, 'daily_used_day') or '') != db.day_of():
+        return 0
+    return int(_row_get(row, 'daily_used_tokens') or 0)
+
+
+def _norm_daily_quota(value: object) -> int:
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, n)
+
+
 def _parse(row) -> dict:
     return {
         'id': row['id'],
@@ -155,18 +286,40 @@ def _parse(row) -> dict:
         'ip_allowlist': _json_list(row['ip_allowlist']),
         'models': _json_list(row['models']),
         'realm': _norm_realm(row['realm']),
+        # 绑定的上游接入点（多上游 / 分组隔离）。None = 默认上游 —— 见 upstreamsvc
+        # 的模块注释：默认上游不是数据库里的某一行，所以这里保持 None 而不是补 0。
+        'upstream_id': _norm_upstream_id(row['upstream_id']),
         'quota': row['quota'],
         'used_tokens': row['used_tokens'],
         'quota_credit': row['quota_credit'],
         'used_credit': row['used_credit'],
+        # 每日 token 限额：0 = 不限。已用量只算今天（本地日期），记账日不是今天即为 0。
+        'daily_quota': int(_row_get(row, 'daily_quota') or 0),
+        'daily_used_tokens': _daily_used(row),
         'created_at': row['created_at'],
         'last_used_at': row['last_used_at'],
     }
 
 
 def list_keys() -> list[dict]:
-    rows = db.query('SELECT * FROM api_keys ORDER BY id DESC')
-    return [_parse(r) for r in rows]
+    """全部密钥，附带 `packet_id`（来源红包）。
+
+    为什么要在列表里带这个：红包一次生成一批、额度零碎，混在手工建的密钥里
+    很难看，界面上要能单独分组。用**标量子查询**而不是 JOIN —— JOIN 在
+    「一个 key 意外对应多条 share」时会把同一把密钥返回两遍（接口返回重复行
+    是最难查的一类问题），子查询天然只取一条。
+    """
+    rows = db.query(
+        'SELECT k.*, (SELECT s.packet_id FROM red_packet_shares s '
+        '             WHERE s.key_id = k.id LIMIT 1) AS packet_id '
+        'FROM api_keys k ORDER BY k.id DESC'
+    )
+    out = []
+    for r in rows:
+        item = _parse(r)
+        item['packet_id'] = r['packet_id']      # None = 手工建的
+        out.append(item)
+    return out
 
 
 def create_key(
@@ -178,29 +331,95 @@ def create_key(
     quota: int = 0,
     realm: str = '',
     quota_credit: float = 0,
+    upstream_id: int | None = None,
+    daily_quota: int = 0,
+    custom_token: str | None = None,
+    *,
+    _conn: sqlite3.Connection | None = None,
 ) -> dict:
-    token = TOKEN_PREFIX + secrets.token_urlsafe(32)
-    key_id = db.execute(
-        'INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, ip_allowlist, models, realm, quota, used_tokens, quota_credit, used_credit, created_at) '
-        'VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?)',
-        (
-            name,
-            _hash(token),
-            token[:12],
-            expires_at,
-            max_ips,
-            json.dumps(_norm_cidrs(ip_allowlist)),
-            json.dumps(models or []),
-            _norm_realm(realm),
-            quota,
-            _norm_credit_quota(quota_credit),
-            int(time.time()),
-        ),
+    """创建一个密钥。返回含**明文 token** 的字典。
+
+    明文**存两份**：`key_hash`（网关校验用，明文永不参与比对）与 `key_plain`
+    （管理端「再次查看 / 复制」用，见 `reveal_key`）。为什么后者也存、代价是什么，
+    写在 db.py 那张表的列注释里。
+
+    `_conn`：传入一个**已开启事务**的连接时，本函数在它上面执行且**不自行提交**，
+    由调用方负责 commit/rollback。红包（`redpacket.create_packet`）用它来保证
+    「N 个密钥 + 红包记录」整批原子——中途失败必须整体回滚，否则会留下几个
+    没人知道出处的密钥。默认 None 时行为与从前完全一致（自己提交）。
+
+    之所以做成参数而不是让红包自己写一份 INSERT：SQL 抄第二遍就是第二份事实，
+    改一处漏一处——本项目在 count_tokens 的鉴权上正是这么漂移出真漏洞的。
+
+    `custom_token`（issue #447）：自定义完整 token。默认 None = 走 `wbk_` + 随机。
+    传了就**原样**使用，但仍要过与默认路径同样的归一化与弱密钥拦截
+    （见 `_norm_custom_token`）——那条路径的成本是把「生成随机串」换成「接受输入」，
+    安全性不能跟着降级。
+    """
+    token = _norm_custom_token(custom_token) if custom_token is not None \
+        else TOKEN_PREFIX + secrets.token_urlsafe(32)
+    sql = ('INSERT INTO api_keys(name, key_hash, key_plain, prefix, enabled, expires_at, '
+           'max_ips, ip_allowlist, models, realm, quota, used_tokens, quota_credit, '
+           'used_credit, created_at, upstream_id, daily_quota) '
+           'VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?, ?)')
+    args = (
+        name,
+        _hash(token),
+        token,
+        token[:TOKEN_PREFIX_LEN],
+        expires_at,
+        max_ips,
+        json.dumps(_norm_cidrs(ip_allowlist)),
+        json.dumps(models or []),
+        _norm_realm(realm),
+        quota,
+        _norm_credit_quota(quota_credit),
+        int(time.time()),
+        _norm_upstream_id(upstream_id),
+        _norm_daily_quota(daily_quota),
     )
-    row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
+    if _conn is not None:
+        try:
+            key_id = int(_conn.execute(sql, args).lastrowid or 0)
+        except sqlite3.IntegrityError as exc:
+            raise TokenConflict('这个密钥已被占用，请换一个') from exc
+        row = _conn.execute('SELECT * FROM api_keys WHERE id = ?', (key_id,)).fetchone()
+    else:
+        # 唯一索引（idx_keys_hash）兜住并发创建同一 token：路由层的「先查再插」
+        # 之间存在竞态窗口，实测 8 个线程能落下 8 行同 hash。转成 ValueError，
+        # 由路由层统一成 409 —— 与「检查时就已经存在」给用户同一个提示。
+        try:
+            key_id = db.execute(sql, args)
+        except sqlite3.IntegrityError as exc:
+            raise TokenConflict('这个密钥已被占用，请换一个') from exc
+        row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
     out = _parse(row)
-    out['key'] = token  # 仅此一次返回明文
+    out['key'] = token  # 创建响应里直接给出，界面不必再调一次 reveal
     return out
+
+
+def reveal_key(key_id: int) -> dict | None:
+    """取回一把密钥的明文（供「再复制一次」）。密钥不存在返回 None。
+
+    `key` 为空串 = 取不回来（存量密钥，那时只存哈希）；判断归调用方，因为
+    「取不回来」与「没有这把密钥」要给两种不同的提示（409 / 404）。
+
+    **这是唯一输出明文的地方**（除创建响应之外）——列表、日志、审计都不能带它。
+    红包密钥有兜底：它们创建时就把明文写进了 `red_packet_shares.token`
+    （见 db.py 那张表），所以即便 `key_plain` 是空的也能从那里取回 —— 否则
+    「红包发的密钥取不回、手工建的能取回」会让人以为功能坏了。
+    """
+    row = db.query_one('SELECT id, name, prefix, key_plain FROM api_keys WHERE id = ?',
+                       (key_id,))
+    if not row:
+        return None
+    plain = str(row['key_plain'] or '')
+    if not plain:
+        share = db.query_one("SELECT token FROM red_packet_shares WHERE key_id = ? "
+                             "AND token <> '' LIMIT 1", (key_id,))
+        plain = str(share['token']) if share else ''
+    return {'id': row['id'], 'name': row['name'] or '', 'prefix': row['prefix'] or '',
+            'key': plain}
 
 
 def update_key(key_id: int, patch: dict) -> dict | None:
@@ -229,6 +448,12 @@ def update_key(key_id: int, patch: dict) -> dict | None:
         fields['quota'] = int(patch['quota'] or 0)
     if 'quota_credit' in patch:
         fields['quota_credit'] = _norm_credit_quota(patch['quota_credit'])
+    if 'daily_quota' in patch:
+        fields['daily_quota'] = _norm_daily_quota(patch['daily_quota'])
+    if 'upstream_id' in patch:
+        # 显式传 null / 0 是**允许**的：管理员可以把密钥改回「默认上游」。
+        # 与 realm 同口径，不能用真值判断（否则改不回默认上游）。
+        fields['upstream_id'] = _norm_upstream_id(patch['upstream_id'])
     if fields:
         assignments = ', '.join(f'{k} = ?' for k in fields)
         db.execute(f'UPDATE api_keys SET {assignments} WHERE id = ?', (*fields.values(), key_id))
@@ -256,20 +481,53 @@ def reset_usage(key_id: int) -> bool:
     """
     if not db.query_one('SELECT id FROM api_keys WHERE id = ?', (key_id,)):
         return False
-    db.execute('UPDATE api_keys SET used_tokens = 0, used_credit = 0 WHERE id = ?', (key_id,))
+    db.execute('UPDATE api_keys SET used_tokens = 0, used_credit = 0, '
+               'daily_used_tokens = 0 WHERE id = ?', (key_id,))
     return True
 
 
 def resolve(token: str) -> dict | None:
-    """按前缀定位后比对哈希，避免全表扫描。"""
-    if not token or not token.startswith(TOKEN_PREFIX):
+    """按前缀定位后比对哈希，避免全表扫描。
+
+    **不再要求 `wbk_` 开头**（issue #447）：前缀只是定位用的索引键，不是安全
+    边界。放开它是为了让自定义形态（`sk-xxx` 这类从别的网关迁过来的存量密钥）
+    能直接用 —— 真正的校验一直是 `secrets.compare_digest(哈希)`，与形态无关。
+
+    代价：任何字符串都会触发一次带索引的查询。这里是热路径（每个请求一次），
+    所以先做**廉价预筛**（长度/字符集）把明显无效的输入挡在查库之前 —— 与
+    `_norm_custom_token` 同一套字符集，但**不**做弱口令判断（那会让「方案正确、
+    只是恰好含弱词」的存量密钥突然失效）。
+    """
+    if not token:
         return None
-    rows = db.query('SELECT * FROM api_keys WHERE prefix = ?', (token[:12],))
+    # 廉价预筛：长度与字符集。长度用与创建时同一对边界 —— 默认生成的
+    # `wbk_`+43 字符（共 47）与自定义的都在区间内，区间外的不可能是本系统签出的。
+    if not (CUSTOM_TOKEN_MIN <= len(token) <= CUSTOM_TOKEN_MAX):
+        return None
+    if not _CUSTOM_TOKEN_RE.match(token):
+        return None
+    # `prefix` 列存 `token[:12]`（创建时写入），这里必须用同一个口径查，否则
+    # 存量密钥一把都匹配不上。
+    rows = db.query('SELECT * FROM api_keys WHERE prefix = ?', (token[:TOKEN_PREFIX_LEN],))
     digest = _hash(token)
     for row in rows:
         if secrets.compare_digest(row['key_hash'], digest):
             return _parse(row)
     return None
+
+
+def token_exists(token: str) -> bool:
+    """该明文 token 是否已经存在（按哈希判，不比对明文）。
+
+    只用于创建时的唯一性检查：两把密钥若能指向同一个 token，鉴权会命中
+    先查到的任意一行，额度与日志归属都会变得不可预测。
+    """
+    try:
+        row = db.query_one('SELECT 1 FROM api_keys WHERE key_hash = ? LIMIT 1',
+                           (_hash(token),))
+    except Exception:  # noqa: BLE001
+        return False
+    return row is not None
 
 
 def model_allowed(key: dict, model: object) -> bool:
@@ -293,7 +551,49 @@ def model_allowed(key: dict, model: object) -> bool:
     # 白名单里可能写着带前缀的 `cn:glm-5.2`。若按字面比对，改版后前者会
     # 被后者拒掉（用户看到「模型不在白名单内」却查不出哪里不对）。
     # `global:` 不归一化——它决定路由，两个版本的同名模型是**不同的东西**。
-    return _bare_model(model) in {_bare_model(x) for x in allow}
+    #
+    # 例外：密钥**已锁定版本**（realm=cn/global）时，前缀不再承担路由信息
+    # （另一版本根本进不来），两边都按裸名比。否则会出现一种死锁（issue #255）：
+    # 国际版密钥的白名单写裸名 `deepseek-v4.1-flash`，客户端按界面提示加
+    # `global:` 前缀调用，反而被白名单拒掉；不加前缀又被版本校验拒掉。
+    want = _norm_realm(key.get('realm'))
+    if want:
+        # 版本已被密钥锁死：前缀不再承担路由信息（另一版本根本进不来），
+        # 两边都按裸名比（issue #255 的死锁）。
+        return (_strip_realm_prefix(str(model))
+                in {_strip_realm_prefix(str(x)) for x in allow})
+
+    # 未锁定版本：**显式前缀只匹配同版本，裸名视为「不限版本」**。
+    #
+    # 裸名当通配符是 issue #357 的修法：密钥编辑器按版本分组展示模型，国际版
+    # 那一组给的是**裸名**（目录本身就是按版本取的），勾选后存进白名单的也是
+    # 裸名；而客户端调用时要带 `global:` 前缀才能路由到国际版账号池。严格的
+    # 字面比对让这两条路互相堵死——列表里能选、一调用就 400「不在白名单内」。
+    # 裸名没有携带版本信息，把它解释成「这个模型的任意版本」才是用户的意图；
+    # 想只放行某一版，写 `cn:` / `global:` 前缀即可（编辑器现在也会带前缀）。
+    req_realm, req_bare = _split_realm(model)
+    req_realm = req_realm or 'cn'  # 裸名默认国内版，与上游路由口径一致
+    for entry in allow:
+        entry_realm, entry_bare = _split_realm(entry)
+        if entry_bare != req_bare:
+            continue
+        if not entry_realm or entry_realm == req_realm:
+            return True
+    return False
+
+
+def _split_realm(model: object) -> tuple[str, str]:
+    """把模型名拆成（版本, 裸名）；不带前缀返回 `('', 原名)`。
+
+    与 `_bare_model` 的区别：这里把两种前缀都拆出来，供白名单**按版本比对**；
+    `_bare_model` 只去 `cn:`，保留 `global:` 参与字面比对。
+    """
+    m = str(model or '').strip()
+    low = m.lower()
+    for pref in ('cn:', 'global:'):
+        if low.startswith(pref):
+            return pref[:-1], m[len(pref):]
+    return '', m
 
 
 def _strip_realm_prefix(name: str) -> str:
@@ -397,6 +697,13 @@ def validate(key: dict, ip: str, model: str | None,
         # 配额用尽与认证无关，用 429 才对（403 会被客户端读成「密钥无效」：
         # 用户于是去查密钥、而不是去调额度，方向就被带偏了）。
         return Rejection('密钥配额已用尽', 429, 'insufficient_quota', 'quota_exhausted')
+    # 每日 token 限额：与总额度各自独立；按本地日期计，次日 0 点自动恢复。
+    daily_quota = int(key.get('daily_quota') or 0)
+    daily_used = int(key.get('daily_used_tokens') or 0)
+    if daily_quota and daily_used >= daily_quota:
+        return Rejection(
+            f'密钥今日 token 额度已用尽（已用 {daily_used} / 上限 {daily_quota}），次日 0 点恢复',
+            429, 'insufficient_quota', 'daily_quota_exhausted')
     # 积分额度（issue #27）：与 token 额度**各自独立**，任一超限即拦。
     # 文案里带上具体数字：这个额度是按真实扣费算的，用户需要知道「超了多少、
     # 该充多少」，只说「已用尽」会让他去翻日志。
@@ -481,6 +788,16 @@ def touch(key: dict, ip: str, tokens: int = 0, credit: float | None = None) -> N
     db.execute('UPDATE api_keys SET last_used_at = ? WHERE id = ?', (int(time.time()), key['id']))
     if tokens:
         db.execute('UPDATE api_keys SET used_tokens = used_tokens + ? WHERE id = ?', (tokens, key['id']))
+        # 每日已用：记账日是今天就累加，否则从本次开始重新计（跨天自动归零）。
+        # 单条 UPDATE 完成判断与累加，并发请求不会互相覆盖。
+        today = db.day_of()
+        db.execute(
+            'UPDATE api_keys SET '
+            '  daily_used_tokens = CASE WHEN daily_used_day = ? '
+            '    THEN daily_used_tokens + ? ELSE ? END, '
+            '  daily_used_day = ? '
+            'WHERE id = ?',
+            (today, tokens, tokens, today, key['id']))
     if credit:
         db.execute('UPDATE api_keys SET used_credit = used_credit + ? WHERE id = ?',
                    (float(credit), key['id']))

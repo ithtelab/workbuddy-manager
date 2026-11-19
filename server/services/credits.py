@@ -15,8 +15,10 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
 import time
+import uuid
 
 from .. import db
 from . import tencent
@@ -72,8 +74,49 @@ def _save_snapshot(snap: dict) -> None:
         pass
 
 
-def record_balance(uid: str, nickname: str, credits: int | float | None) -> int | None:
-    """记录一次余额；较上次增加时写一条积分流水并返回增加量。
+def _package_keys(expiries: list[dict] | None) -> list[list[int]] | None:
+    """把到期积分包列表转成可持久化的 `[到期时刻, 额度, 到账时刻]` 键。
+
+    第三个字段是上游 CreateTime（epoch 秒）；缺失/旧补丁给 0，记账时回退采集
+    时刻。拿不到到期列表返回 None（与「空列表」区分）。
+    """
+    if not isinstance(expiries, list):
+        return None
+    out: list[list[int]] = []
+    for e in expiries:
+        if not isinstance(e, dict):
+            continue
+        try:
+            at = int(e.get('at'))
+            amount = int(e.get('amount'))
+        except (TypeError, ValueError):
+            continue
+        try:
+            created = int(e.get('created') or 0)
+        except (TypeError, ValueError):
+            created = 0
+        out.append([at, amount, created])
+    return sorted(out, key=lambda item: (item[0], item[2]))
+
+
+def _package_balances(packages: list[list[int]]) -> dict[int, int]:
+    """按到期时刻汇总剩余额度；兼容旧快照的两元组。"""
+    balances: dict[int, int] = {}
+    for item in packages:
+        at, amount = int(item[0]), int(item[1])
+        balances[at] = balances.get(at, 0) + amount
+    return balances
+
+
+def record_balance(uid: str, nickname: str, credits: int | float | None,
+                   expiries: list[dict] | None = None) -> int | None:
+    """记录一次余额；写一条积分获取流水并返回本次入账额度。
+
+    收入判据（issue #393）优先用**积分包出现**而不是余额净增：签到发 100、同一天
+    有 100 的旧包到期时，余额净增为 0，只按净增记账会把这次签到收入完全吞掉。
+    `expiries.amount` 是套餐剩余额度，会随消费减少。按到期时间汇总后，只记
+    剩余额度的正向差额。新增到期桶仍能识别同日旧包到期抵消的签到收入。
+    到期列表不可用时回退余额净增。
 
     首次见到的账号只建立基线、不记流水，否则会把历史余额误报成「刚获得」。
     """
@@ -84,34 +127,85 @@ def record_balance(uid: str, nickname: str, credits: int | float | None) -> int 
     except (TypeError, ValueError):
         return None
 
+    now = int(time.time())
     snap = _load_snapshot()
     prev_raw = snap.get(uid)
-    snap[uid] = value
+    prev = _snapshot_value(prev_raw)
+    prev_packages = None
+    if isinstance(prev_raw, dict):
+        raw_packages = prev_raw.get('packages')
+        if isinstance(raw_packages, list):
+            prev_packages = []
+            for item in raw_packages:
+                if isinstance(item, list) and len(item) >= 2:
+                    try:
+                        prev_packages.append([int(item[0]), int(item[1]),
+                                              int(item[2]) if len(item) >= 3 else 0])
+                    except (TypeError, ValueError):
+                        continue
+    packages = _package_keys(expiries)
+    # 正余额却没有到期数据，不代表已知的空包基线。
+    if packages == [] and value > 0:
+        packages = None
+    if prev_packages == [] and prev is not None and prev > 0:
+        prev_packages = None
+    previous_observation = prev_raw.get('observation_id', prev_raw.get('at', 0)) if isinstance(prev_raw, dict) else 0
+    entry = {'credits': value, 'at': now, 'observation_id': uuid.uuid4().hex}
+    if packages is not None:
+        entry['packages'] = packages
+    snap[uid] = entry
     _save_snapshot(snap)
 
-    if prev_raw is None:
-        return None
-    try:
-        prev = int(prev_raw)
-    except (TypeError, ValueError):
+    if prev is None:
         return None
 
-    delta = value - prev
-    if delta <= 0 or delta > _MAX_DELTA:
-        return None
-
-    db.add_task_logs([{
-        'ts': int(time.time()),
-        'uid': uid,
-        'kind': 'credit',
-        'level': 'credit',
-        'credits': delta,
-        'message': f'余额 +{delta}（{prev} → {value}）'
-                   + (f' · {nickname}' if nickname else ''),
-        # 用余额值做去重键：同一余额只会留下一条流水
-        'dedup_key': f'credit|{uid}|{value}',
-    }])
-    return delta
+    # 1) 同一到期桶的余额下降是消费。补充额度只计增加的部分。
+    income = 0
+    logs: list[dict] = []
+    if packages is not None and prev_packages is not None:
+        before = _package_balances(prev_packages)
+        # 同一到期桶可能有多条包，额度先汇总；到账时刻取该桶里最晚的 CreateTime。
+        created_by_at: dict[int, int] = {}
+        for at, _amount, created in packages:
+            created_by_at[at] = max(created_by_at.get(at, 0), created)
+        for at, amount in _package_balances(packages).items():
+            increase = amount - before.get(at, 0)
+            if increase <= 0 or increase > _MAX_DELTA:
+                continue
+            income += increase
+            created = created_by_at.get(at, 0)
+            # 用上游到账时刻，而不是采集时刻（issue #414）；异常/未来值回退 now。
+            deliver_at = created if 0 < created <= now else now
+            logs.append({
+                'ts': deliver_at,
+                'uid': uid,
+                'kind': 'credit',
+                'level': 'credit',
+                'credits': increase,
+                'message': f'积分包 +{increase}（{datetime.datetime.fromtimestamp(at).strftime("%m-%d %H:%M")} 到期）'
+                           + (f' · {nickname}' if nickname else ''),
+                # 同一快照的并发观察去重，消费后再次补充相同额度可再次入账。
+                'dedup_key': f'credit|{uid}|pkg-delta|{previous_observation}|{at}|{amount}',
+            })
+    # 2) 到期列表拿不到/没有新包时，退回余额净增（存量行为）。
+    if not logs:
+        delta = value - prev
+        if delta <= 0 or delta > _MAX_DELTA:
+            return None
+        income = delta
+        logs.append({
+            'ts': now,
+            'uid': uid,
+            'kind': 'credit',
+            'level': 'credit',
+            'credits': delta,
+            'message': f'余额 +{delta}（{prev} → {value}）'
+                       + (f' · {nickname}' if nickname else ''),
+            # 用余额值做去重键：同一余额只会留下一条流水
+            'dedup_key': f'credit|{uid}|{value}',
+        })
+    db.add_task_logs(logs)
+    return income or None
 
 
 async def get_credits(
@@ -144,11 +238,28 @@ async def get_credits(
 
     if ok and record:
         try:
-            record_balance(uid, nickname, credits)
+            record_balance(uid, nickname, credits, expiries)
         except Exception:  # noqa: BLE001
             pass
 
     return ok, credits, message, False, None, expiries
+
+
+def forget(uid: str) -> None:
+    """账号删除后把它的余额登记一并清掉（issue #404）。
+
+    快照不是审计日志：它回答的是「这些账号现在还有多少积分」。账号都删了，
+    留着这条登记只会让按 uid/按域汇总的外部调用方算出虚高的余额。历史留痕
+    由 task_logs 负责，不靠这张设置表。
+    """
+    if not uid:
+        return
+    uid = str(uid)
+    snap = _load_snapshot()
+    if uid in snap:
+        snap.pop(uid, None)
+        _save_snapshot(snap)
+    _cache.pop(uid, None)
 
 
 def invalidate(uid: str | None = None) -> None:
@@ -157,3 +268,42 @@ def invalidate(uid: str | None = None) -> None:
         _cache.pop(uid, None)
     else:
         _cache.clear()
+
+def _snapshot_value(raw: object) -> int | None:
+    """快照条目的数值。新形态是 {'credits': n, 'at': ts}；升级前存的是纯数字。"""
+    if isinstance(raw, dict):
+        raw = raw.get('credits')
+    try:
+        return int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_time(raw: object) -> int | None:
+    """快照条目的登记时刻（旧形态没有，返回 None）。"""
+    if isinstance(raw, dict):
+        try:
+            return int(raw.get('at'))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def snapshot_entries() -> dict:
+    """已登记的积分快照（**只读本地记录，不触发任何上游查询**）。
+
+    给管理端的只读查询用：面板平时已经在记录余额（`record_balance`），这里只是把
+    那份记录连同**登记时刻**一起交出来。数字可能是几分钟/几小时前的，调用方要如实
+    标注为「已登记」而不是实时余额 —— 这也是它不查上游的原因：既省一次账单请求，
+    也不会因为别人刷新页面就给上游加压。
+    """
+    snap = _load_snapshot()
+    rows: list[dict] = []
+    for uid, raw in snap.items():
+        value = _snapshot_value(raw)
+        if value is None:
+            continue
+        rows.append({'uid': str(uid), 'credits': value, 'registered_at': _snapshot_time(raw)})
+    rows.sort(key=lambda r: r['uid'])
+    newest = max((r['registered_at'] or 0 for r in rows), default=0)
+    return {'snapshot_at': newest, 'count': len(rows), 'accounts': rows}

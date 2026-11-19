@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .. import config, security
+from .. import config, security, upstreamsvc
 from ..iputil import client_ip
 from . import gateway
 
@@ -59,7 +59,9 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
     管理员限定：测试台会**真实消耗积分**，而默认部署里存在一个弱口令的 guest
     账号，放开给所有登录用户等于把额度暴露出去。
     """
-    upstream_key = config.upstream_api_key()
+    # 测试台没有下游密钥（管理员会话直连），固定走默认上游 —— 与从前一致。
+    # 走 upstreamsvc 而不是直接读 config：默认上游的取值只有一处事实来源。
+    upstream = upstreamsvc.default_upstream()
     ip = client_ip(request)
     started = time.time()
     realm = 'global' if str(body.realm).strip().lower() == 'global' else 'cn'
@@ -79,10 +81,8 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
         # 让上游在末帧返回 usage（含 credit），界面据此显示本次消耗
         payload['stream_options'] = {'include_usage': True}
 
-    headers = {'Content-Type': 'application/json'}
-    if upstream_key:
-        headers['Authorization'] = f'Bearer {upstream_key}'
-    url = f'{config.WB2API_BASE}/v1/chat/completions'
+    headers = gateway._upstream_headers(upstream)
+    url = f'{upstream["base_url"]}/v1/chat/completions'
 
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
@@ -111,13 +111,14 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
                 usage = parsed['usage']
         except Exception:  # noqa: BLE001
             pass
+        # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段都在这一份里
         gateway._record(
             None, ip, model_sent, '', resp.status_code,
             int(usage.get('prompt_tokens') or 0),
             int(usage.get('completion_tokens') or 0),
             int((time.time() - started) * 1000),
             request.headers.get('user-agent'), None, False,
-            credit=gateway._usage_credit(usage),
+            usage=usage,
         )
         return StreamingResponse(iter([raw]), media_type='application/json',
                                  status_code=resp.status_code)
@@ -156,7 +157,7 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
                 int(usage.get('completion_tokens') or 0),
                 int((time.time() - started) * 1000),
                 request.headers.get('user-agent'), error_text, True,
-                credit=gateway._usage_credit(usage),
+                usage=usage,
                 first_token=first_token_ms,
             )
 

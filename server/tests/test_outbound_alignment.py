@@ -158,11 +158,13 @@ class BillingHeaderTest(_Base):
         self.assertNotIn('User-Agent', h, 'SaaS 模式下 billing 域不设 UA（对齐上游）')
 
     def test_fetch_credits_carries_identity_headers(self) -> None:
+        # AUTH 带 enterprise_id：企业额度走专用端点（PR #227），个人路径零改动。
         _run(tencent.fetch_credits(self.AUTH))
         _, url, kw = self._last()
         h = kw['headers']
-        self.assertIn('get-user-resource', url)
+        self.assertIn('get-enterprise-user-usage', url)
         self.assertEqual(h.get('X-User-Id'), 'u123')
+        self.assertEqual(h.get('X-Enterprise-Id'), 'ent-9')
         self.assertEqual(h.get('X-Domain'), 'copilot.tencent.com')
 
     def test_trial_carries_user_id(self) -> None:
@@ -378,9 +380,16 @@ class ExpiringSoonFieldTest(unittest.TestCase):
 
     def test_duration_accepted(self) -> None:
         from server.services import wb2api
-        for val in ('168h', '7d', '30m'):
+        for val in ('168h', '30m'):
             out = wb2api._sanitize_section('pool', {'expiring_soon': val})
             self.assertEqual(out['expiring_soon'], val)
+
+    def test_day_suffix_rejected(self) -> None:
+        """上游是 Go time.ParseDuration，不认 `d`；面板保存前必须拦下。"""
+        from server.services import wb2api
+        for val in ('7d', '1d'):
+            with self.assertRaises(ValueError):
+                wb2api._sanitize_section('pool', {'expiring_soon': val})
 
     def test_empty_and_zero_mean_disabled(self) -> None:
         from server.services import wb2api

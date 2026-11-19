@@ -72,6 +72,11 @@ dev/.shots-admin
 dev/.admin-flow
 # 白名单校验验收（verify_whitelist_hint.py）的临时数据与截图
 dev/.wl-hint
+# 「设置 → 代理」页面的浏览器验收（verify_proxy_page_ui.py）
+dev/.proxy-ui
+dev/.shots-proxy
+dev/.enhance-ui
+dev/.shots-enhance
 dev/.shots-wl
 # 用量页「默认今日」验收（verify_stats_today_ui.py）的临时数据与截图
 dev/.stats-today
@@ -88,3 +93,53 @@ dev/.shots-copy-link
 # 模型受限徽章验收（verify_model_limit_ui.py）的临时数据与截图
 dev/.model-limit
 dev/.shots-model-limit
+# 上游官方统计验收（verify_upstream_stats_ui.py）的临时数据与截图
+dev/.upstream-stats
+dev/.shots-upstream-stats
+# 密钥列表列对齐验收（verify_keys_layout_ui.py）的临时数据与截图
+dev/.keys-layout
+dev/.shots-keys-layout
+# 账号备注验收（verify_account_note_ui.py）的临时数据与截图
+dev/.account-note
+dev/.shots-account-note
+# 账号分组验收（verify_account_groups_ui.py）的临时数据（截图随 PR 提交，不忽略）
+dev/.account-groups
+# 出口线路验收（verify_account_proxy_ui.py）的临时数据（截图随 PR 提交，不忽略）
+dev/.account-proxy
+# 备份页表单轮询验收（verify_pgsync_form_ui.py）的临时数据（截图随 PR 提交，不忽略）
+dev/.pg-form
+# 自建 Redis 探测验收（verify_redis_probe_e2e.py）的临时数据
+dev/.redis-probe
+# 给贡献者/用户的回复草稿（发出去就不必留在仓库里）
+dev/.replies
+# 提示词缓存标记验收（verify_cache_log_ui.py）的临时数据与截图
+dev/.cache-log
+dev/.shots-cache-log
+# 子路径部署验收（verify_subpath.py）的临时数据
+dev/.subpath
+# 发布包组装自检（check_release_pack.py）的临时现场
+dev/.pack-test
+# 红包抽奖页验收（verify_claim_ui.py）的临时数据与截图
+dev/.claim-ui
+dev/.shots-claim-ui
+# 新增控件验收（verify_new_controls_ui.py）的临时数据与截图
+dev/.new-controls
+dev/.shots-new-controls
+# DeviceTokenTest 的临时文件现场（test_outbound_alignment.py，只清文件、目录保留）
+server/tests/_dt_tmp/
+
+# ── 本机部署产物（严禁提交：含账号授权凭据与体积庞大的工具链）─────
+# upstream/ 内有 auths/（真实 CodeBuddy 账号授权）与 config.json（含 api_key）；
+# .tools/ 是本地 Go 工具链（数百 MB）；local-ops/ 是单机启停脚本。
+# 只锚定**仓库根目录**那份上游源码；不锚定的话这条会连带吞掉任何同名子目录
+# （web/app/(main)/settings/upstream/ 就这么丢过 —— 文件提交不进去，本地测试照样绿）。
+/upstream/
+.tools/
+local-ops/
+LOCAL_DEPLOY_NOTES.md
+# 安装器构建产物（windows\launcher\build.ps1 输出）
+/windows/launcher/dist/
+start-all.cmd
+stop-all.cmd
+dev/.weight-task
+dev/.shots-weight-task

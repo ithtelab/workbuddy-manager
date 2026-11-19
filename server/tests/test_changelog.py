@@ -165,6 +165,48 @@ class LoadChangelogTest(unittest.TestCase):
             self.assertFalse(data['path'].endswith(str(Path('server') / 'CHANGELOG.md')))
 
 
+class ChangelogOrderTest(unittest.TestCase):
+    """段落顺序：版本必须**从新到旧**，且 [未发布] 只能有一个、排在最前。
+
+    这是 v1.0.72 发版后发现的问题：文件里当时存在**两个** `## [未发布]` 段落，
+    发版时把下面那个改成了 `## [1.0.72]`，于是 1.0.72 落在了 1.0.71 后面 ——
+    界面「更新日志」页按文件顺序渲染，用户看到的最新版本排在旧版本下面。
+    顺序错了不会有任何报错，只会让每一个人看到的列表都是乱的，所以钉一条。
+    """
+
+    ROOT_CHANGELOG = Path(__file__).resolve().parents[2] / 'CHANGELOG.md'
+
+    @staticmethod
+    def _key(version: str) -> tuple[int, ...]:
+        return tuple(int(x) for x in re.findall(r'\d+', version))
+
+    def _headings(self) -> list[str]:
+        text = self.ROOT_CHANGELOG.read_text(encoding='utf-8')
+        return re.findall(r'^## \[([^\]]+)\]', text, re.M)
+
+    def test_versions_are_newest_first(self) -> None:
+        heads = self._headings()
+        self.assertGreater(len(heads), 50, f'只解析到 {len(heads)} 个版本段落，解析可能失效')
+        released = [h for h in heads if h not in ('未发布', 'Unreleased')]
+        keys = [self._key(v) for v in released]
+        self.assertEqual(
+            keys, sorted(keys, reverse=True),
+            '版本段落没有按从新到旧排列，界面上的更新日志会顺序错乱：'
+            + ', '.join(released[:6]),
+        )
+
+    def test_only_one_unreleased_section_and_it_is_first(self) -> None:
+        heads = self._headings()
+        unreleased = [i for i, h in enumerate(heads) if h in ('未发布', 'Unreleased')]
+        self.assertLessEqual(
+            len(unreleased), 1,
+            f'有 {len(unreleased)} 个「未发布」段落 —— 发版时很容易改错那一个'
+            f'（v1.0.72 就是这么排到 1.0.71 后面的）',
+        )
+        if unreleased:
+            self.assertEqual(unreleased[0], 0, '「未发布」段落必须排在最前面')
+
+
 class ChangelogIsUserFacingTest(unittest.TestCase):
     """更新日志必须**面向用户**，不能写内部实现细节。
 
@@ -222,6 +264,25 @@ class ChangelogIsUserFacingTest(unittest.TestCase):
         secs = self._sections()
         self.assertGreater(len(secs), 10, '没切出版本段落，守卫会空转')
         self.assertIn('1.0.49', [v for v, _ in secs])
+
+    def test_no_content_before_the_first_version_heading(self) -> None:
+        """第一个 `## [版本]` 之前不能有**条目**（审查发现的空档）。
+
+        为什么需要：切段是按 `## [x.y.z]` 分的，于是**标题之前**的内容不属于任何
+        段落 —— 上面几条检查全都看不到它，写了等于没写。实测就这么漏过一次：
+        加条目时替换字符串把 `## [未发布]` 那行一起吞了，两段条目挂在文件顶部没有
+        任何版本归属，而守卫全绿。
+
+        （文件头部的说明文字允许存在：它在第一个 `---` 之前，这里只看分隔线之后。）
+        """
+        head = self.text.split('\n---\n', 1)[0]
+        body = self.text[len(head):]
+        before = body.split('\n## [', 1)[0]
+        loose = [ln for ln in before.splitlines()
+                 if ln.startswith(('- ', '### ')) or re.match(r'^\d+\.\s', ln)]
+        self.assertEqual(loose, [],
+                         '第一个版本标题之前出现了条目/小节 —— 它们不属于任何版本段落：'
+                         + '; '.join(loose[:3]))
 
     def test_no_internal_identifiers(self) -> None:
         """不得出现函数名、模块路径、下划线开头的内部名。"""
@@ -284,3 +345,59 @@ class ChangelogIsUserFacingTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NoConflictMarkersTest(unittest.TestCase):
+    """任何文件里都不许留下合并冲突标记。
+
+    为什么值得一条守卫：CHANGELOG.md 的冲突标记**不报错、也不影响解析**——
+    它只是被解析器当成普通文本忽略掉，于是带着 `<<<<<<< HEAD` 的更新日志会被
+    CI 抽成 Release 正文、也会出现在应用内的「更新日志」页（真发生过：
+    2026-09-27 为 v1.0.73 发版前才发现，标记和**重复的一整段条目**都已经提交）。
+    这类问题只有人眼看才会发现，所以钉成机械检查。
+    """
+
+    ROOT = Path(__file__).resolve().parents[2]
+    # 扫描范围：会被用户看到的文本（文档、代码、脚本、i18n），跳过依赖与产物
+    SKIP_DIRS = {'node_modules', '.git', 'out', '.next', '__pycache__',
+                 '.shots-account-groups', '.shots-dash-states', '.shots-dash-groups',
+                 '.shots-state-honesty', '.login-shots', '.shots-upstreams-ui',
+                 '.dash-states', '.dash-groups', '.state-honesty', '.login-poll',
+                 '.account-groups', '.pack-test'}
+    SUFFIXES = {'.md', '.py', '.ts', '.tsx', '.mjs', '.js', '.json', '.yml', '.yaml',
+                '.sh', '.cmd', '.ps1', '.txt', '.example', '.toml', '.cfg', '.ini'}
+
+    def _files(self) -> list[Path]:
+        out: list[Path] = []
+        for p in self.ROOT.rglob('*'):
+            if not p.is_file() or p.suffix not in self.SUFFIXES:
+                continue
+            parts = set(p.parts)
+            if parts & self.SKIP_DIRS or any(part.startswith('.') and part != '.github'
+                                             for part in p.relative_to(self.ROOT).parts[:-1]):
+                continue
+            out.append(p)
+        return out
+
+    def test_scan_found_files(self) -> None:
+        files = self._files()
+        self.assertGreater(len(files), 100, f'只扫到 {len(files)} 个文本文件，扫描逻辑可能失效')
+
+    def test_no_merge_conflict_markers(self) -> None:
+        # 用拼接构造，免得这条守卫自己的源码里出现「行首七个尖括号」被自己抓到
+        marks = ('<' * 7 + ' ', '>' * 7 + ' ', '=' * 7)
+        offenders: list[str] = []
+        for p in self._files():
+            try:
+                text = p.read_text(encoding='utf-8')
+            except (UnicodeDecodeError, OSError):
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                s = line.rstrip()
+                if s.startswith(marks[0]) or s.startswith(marks[1]) or s == marks[2]:
+                    offenders.append(f'{p.relative_to(self.ROOT)}:{i}: {s[:40]}')
+        self.assertEqual(
+            offenders, [],
+            '这些文件里残留了合并冲突标记（用户会看到，且解析器不会报错）：\n  '
+            + '\n  '.join(offenders),
+        )

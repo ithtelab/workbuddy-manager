@@ -251,6 +251,66 @@ class AtomicAuthWriteTest(unittest.TestCase):
         self.assertTrue(mode & 0o044,
                         f'chmod 到 {oct(mode)}：其他 uid 仍读不到（宿主部署会失败）')
 
+    def test_group_chown_denied_does_not_block_write(self) -> None:
+        """属组改不动不该阻断写入 —— 属主对齐就够了。
+
+        实测现场（2026-10-26）：面板以 uid 10001 / gid 987 在宿主机运行，上游容器
+        写回的账号文件属组是容器内的 10001。重登时把原文件的属主属组照抄到临时
+        文件，`chown` 到 10001 这个组必然 EPERM（非 root 只能改到自己所属的组），
+        用户看到「账号已授权成功，但写入账号文件失败：Operation not permitted」，
+        并被引去检查一个权限完全正常的目录。
+
+        属主相同就够上游读取（0600 同 uid 可读），属组只影响附加的组可读性，
+        所以这类失败要忽略；**属主**改不动才是真故障（见下一条）。
+        """
+        real_chown = getattr(os, 'chown', None)
+        if real_chown is None:
+            self.skipTest('该平台没有 os.chown')
+
+        tencent.write_auth_file(self._acct(token='OLD'))
+        target = config.AUTH_DIR / 'workbuddy-u1.json'
+        mode_before = target.stat().st_mode & 0o777
+
+        def _deny_group(path, uid, gid):
+            if gid != -1:
+                raise PermissionError(1, 'Operation not permitted', str(path))
+            return real_chown(path, uid, gid)
+
+        with mock.patch.object(tencent.os, 'chown', _deny_group, create=True):
+            tencent.write_auth_file(self._acct(token='NEW'))
+
+        data = json.loads(target.read_text(encoding='utf-8'))
+        self.assertEqual(data['auth']['accessToken'], 'NEW', '新 token 没写进去')
+        self.assertEqual(target.stat().st_mode & 0o777, mode_before, '权限模式没保住')
+        leftovers = [p.name for p in config.AUTH_DIR.iterdir()
+                     if p.name != 'workbuddy-u1.json']
+        self.assertEqual(leftovers, [], f'留下了临时文件：{leftovers}')
+
+    def test_owner_chown_denied_fails_write(self) -> None:
+        """属主改不动必须报错：跨 uid 部署时上游正是靠属主读文件的。
+
+        静默忽略属主失败会写出一个上游读不到的账号文件——表现为「账号加进去了
+        但池里没有」，比一条明确的报错难查得多。
+        """
+        if getattr(os, 'chown', None) is None:
+            self.skipTest('该平台没有 os.chown')
+
+        tencent.write_auth_file(self._acct(token='OLD'))
+        target = config.AUTH_DIR / 'workbuddy-u1.json'
+        before = target.read_bytes()
+
+        def _deny(*_a, **_k):
+            raise PermissionError(1, 'Operation not permitted')
+
+        with mock.patch.object(tencent.os, 'chown', _deny, create=True):
+            with self.assertRaises(PermissionError):
+                tencent.write_auth_file(self._acct(token='NEW'))
+
+        self.assertEqual(target.read_bytes(), before, '写失败却动了原账号文件')
+        leftovers = [p.name for p in config.AUTH_DIR.iterdir()
+                     if p.name != 'workbuddy-u1.json']
+        self.assertEqual(leftovers, [], f'留下了临时文件：{leftovers}')
+
     def test_rejects_uid_that_would_escape_auth_dir(self) -> None:
         """uid 来自腾讯响应，是外部输入；异常形态必须拒绝，不能拼进文件名。
 

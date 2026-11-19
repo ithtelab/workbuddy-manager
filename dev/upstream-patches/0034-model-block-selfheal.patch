@@ -1,0 +1,127 @@
+--- a/internal/pool/cooldown.go
++++ b/internal/pool/cooldown.go
+@@ -181,6 +181,41 @@ func (p *Pool) BlockModelClear(uid, model string) {
+ 	p.dirty.Store(true)
+ }
+ 
++// ClearModelBlocks 清掉**所有账号**上该模型的 11102 负缓存，返回清理条数。
++//
++// 背景：上游 11102 有时是瞬时故障（模型注册表抖动 / 灰度切换）。一次抖动会让每个
++// 被选中的账号各写一条 6h 起的指数退避负缓存，全池写满后对外就是「一整天 503
++// no_healthy_account」，而模型其实早已恢复（实测 20/20 账号直连均 200）。
++//
++// 选号侧发现「该模型 0 个可用账号」时调用本方法自愈：清一次、重试一次。
++// 只清 reason 以 "11102" 开头的条目，不碰 6004 的独立冷却表。
++func (p *Pool) ClearModelBlocks(model string) int {
++	if model == "" {
++		return 0
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	n := 0
++	for _, e := range p.byUID {
++		if len(e.modelCooldowns) == 0 {
++			continue
++		}
++		mc, ok := e.modelCooldowns[model]
++		if !ok || !strings.HasPrefix(mc.Reason, "11102") {
++			continue
++		}
++		delete(e.modelCooldowns, model)
++		if len(e.modelCooldowns) == 0 {
++			e.modelCooldowns = nil
++		}
++		n++
++	}
++	if n > 0 {
++		p.dirty.Store(true)
++	}
++	return n
++}
++
+ // CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。
+ //
+ // 语义：
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -677,6 +677,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+ 
++	modelBlocksCleared := false
+ 	for i := 0; i < h.cfg.MaxRotate; i++ {
+ 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
+ 		var acct *auth.Auth
+@@ -693,6 +694,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+ 		}
+ 		if acct == nil {
++			// 自愈：全池被同一个模型挡死时，几乎都是上游**瞬时** 11102（模型注册表
++			// 抖动 / 灰度切换），而不是所有账号真的缺这个模型。6h 起的指数退避会把
++			// 一次抖动放大成半天 503（实测：deepseek-v4.1-flash 20/20 账号被写负缓存，
++			// 直连全部 200）。这里对「该模型 0 个可用账号」清一次负缓存并重试；
++			// 只清一次，避免模型真下线时死循环（届时仍返回 503，并透传上游 11102 原文）。
++			if !modelBlocksCleared && bareModel != "" && len(h.cfg.Pool.AvailableUIDsForModel(bareModel)) == 0 {
++				if n := h.cfg.Pool.ClearModelBlocks(bareModel); n > 0 {
++					modelBlocksCleared = true
++					tried = map[string]bool{}
++					log.Printf("WARN: [server] model=%s: all accounts blocked by 11102 negative cache, cleared %d and retrying (suspect transient upstream)", bareModel, n)
++					continue
++				}
++			}
+ 			st.status = http.StatusServiceUnavailable
+ 			break
+ 		}
+--- /dev/null
++++ b/internal/pool/modelblocks_clear_test.go
+@@ -0,0 +1,50 @@
++package pool
++
++import (
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++// ClearModelBlocks 只清 11102 负缓存，不碰 6004 的独立冷却表。
++func TestClearModelBlocks(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.Add(&auth.Auth{UID: "u2"})
++
++	now := time.Now()
++	block := func() modelCooldown {
++		return modelCooldown{Until: now.Add(6 * time.Hour), Reason: "11102 model not available"}
++	}
++	p.mu.Lock()
++	p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
++		"glm-5.3":             block(),
++		"deepseek-v4.1-flash": block(),
++	}
++	p.byUID["u2"].modelCooldowns = map[string]modelCooldown{
++		"deepseek-v4.1-flash": block(),
++		// 6004 是配额重置语义，不能被本方法顺带清掉
++		"glm-5.3": {Until: now.Add(time.Hour), ResetAt: now.Add(time.Hour), Reason: "6004"},
++	}
++	p.mu.Unlock()
++
++	if n := p.ClearModelBlocks("deepseek-v4.1-flash"); n != 2 {
++		t.Fatalf("ClearModelBlocks = %d, want 2", n)
++	}
++	if n := p.ClearModelBlocks("deepseek-v4.1-flash"); n != 0 {
++		t.Fatalf("重复清理 = %d, want 0", n)
++	}
++	if n := p.ClearModelBlocks("glm-5.3"); n != 1 {
++		t.Fatalf("glm-5.3 清理 = %d, want 1（只清 u1 的 11102）", n)
++	}
++	p.mu.RLock()
++	_, kept := p.byUID["u2"].modelCooldowns["glm-5.3"]
++	p.mu.RUnlock()
++	if !kept {
++		t.Fatal("u2 的 6004 冷却不应被清掉")
++	}
++	if n := p.ClearModelBlocks(""); n != 0 {
++		t.Fatalf("空模型名 = %d, want 0", n)
++	}
++}

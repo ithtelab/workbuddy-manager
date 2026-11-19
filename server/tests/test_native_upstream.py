@@ -137,12 +137,18 @@ class NativeUpstreamRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue((tpl / name).is_file(),
                                 f'缺少 {name} —— 文档让用户指向它，却没有模板可用')
 
-        # 文档仍要指向那个目录，否则模板等于没提供
+        # 文档仍要能走到那个目录，否则模板等于没提供。
+        # 链路随文档重构调整过一次：Windows 原生那一节从 README 搬进了部署指南
+        # （README 精简成落地页，只留入口），所以现在检查的是整条链路：
+        #   README → deploy/README.md → deploy/windows-native/
         for doc in ('README.md', 'README.en.md'):
             with self.subTest(doc=doc):
                 text = (root / doc).read_text(encoding='utf-8')
-                self.assertIn('deploy/windows-native', text,
-                              f'{doc} 没有指向模板目录')
+                self.assertIn('deploy/README.md', text,
+                              f'{doc} 没有指向部署指南（Windows 原生那节在里面）')
+        deploy_doc = (root / 'deploy' / 'README.md').read_text(encoding='utf-8')
+        self.assertIn('windows-native', deploy_doc,
+                      '部署指南没有指向启停脚本模板目录（模板等于没提供）')
 
     def test_start_template_returns_immediately(self) -> None:
         """启动脚本模板必须用 `start /b` 那种后台方式 —— 前台运行会让重启超时。

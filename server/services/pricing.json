@@ -1,0 +1,50 @@
+{
+  "_note": "DeepSeek 官方价目表（issue #380）。改价时**追加一条 version**，不要改旧的：历史调用按它自己的时间戳去找当时生效的那一版，改旧版会让已发生的账跟着变。单价单位：元 / 百万 tokens。",
+  "currency": "CNY",
+  "versions": [
+    {
+      "effective_from": "2026-09-01",
+      "verified_at": "2026-11-02",
+      "source": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing",
+      "source_note": "「模型 & 价格」页：空闲时段价格为高峰时段的一半；北京时间周一至周五（不含中国法定节假日）9:00-12:00、14:00-18:00 为高峰时段。",
+      "peak_days": [1, 2, 3, 4, 5],
+      "peak_windows": [[9, 12], [14, 18]],
+      "holidays": {
+        "2026": [
+          "2026-01-01", "2026-01-02", "2026-01-03",
+          "2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19",
+          "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",
+          "2026-04-04", "2026-04-05", "2026-04-06",
+          "2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
+          "2026-06-19", "2026-06-20", "2026-06-21",
+          "2026-09-25", "2026-09-26", "2026-09-27",
+          "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05",
+          "2026-10-06", "2026-10-07"
+        ]
+      },
+      "holiday_source": "国务院办公厅关于2026年部分节假日安排的通知（国办发明电〔2025〕7号）https://www.gov.cn/zhengce/content/202511/content_7047090.htm",
+      "models": {
+        "deepseek-flash": {
+          "label": "DeepSeek-V4.1-Flash",
+          "cache_hit": {"peak": 0.04, "off_peak": 0.02},
+          "cache_miss": {"peak": 2.0, "off_peak": 1.0},
+          "output": {"peak": 8.0, "off_peak": 4.0}
+        },
+        "deepseek-v4-pro": {
+          "label": "DeepSeek-V4-Pro",
+          "cache_hit": {"peak": 0.3, "off_peak": 0.15},
+          "cache_miss": {"peak": 9.0, "off_peak": 4.5},
+          "output": {"peak": 27.0, "off_peak": 13.5}
+        }
+      }
+    }
+  ],
+  "_aliases_note": "CodeBuddy / 腾讯侧用的模型名 → 官方价目表里的模型名。官方说明：deepseek-v4-flash 等旧名已下线，请求由 V4.1-Flash 提供服务并按 Flash 价格计费。",
+  "model_aliases": {
+    "deepseek-flash": "deepseek-flash",
+    "deepseek-v4.1-flash": "deepseek-flash",
+    "deepseek-v4-flash": "deepseek-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash",
+    "deepseek-v4-pro": "deepseek-v4-pro"
+  }
+}

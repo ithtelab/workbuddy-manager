@@ -35,8 +35,9 @@ import uuid
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import config, db, iputil, keysvc
+from .. import config, db, iputil, keysvc, upstreamsvc
 from ..routers.security import get_config as get_security_config
+from ..services import tap as tap_svc
 # responses 只为复用推理凭据的编解码（`_encode_credential` / `_decode_credential`）：
 # Anthropic 的 `signature` 与 Responses 的 `encrypted_content` 语义完全相同——
 # 都是「客户端原样搬来搬去的不透明串」，两边编解码必须一致，否则同一轮对话在
@@ -225,7 +226,8 @@ def _authorize(request: Request, model: str | None, *,
         ]
         if not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist')):
             gateway._log_ip(ip, path, True, ua, 'ip_blocked')
-            gateway._record(key, ip, model or '', _mapped_for_log or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+            gateway._record(key, ip, model or '', _mapped_for_log or '', 403, 0, 0, 0, ua, 'IP 被拦截', False,
+                            account_expected=False)
             return None, ip, _err(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error')
 
     # 注意：`blocked=False` 的这一行现在默认**不写库**（审计日志只留拦截，
@@ -245,7 +247,8 @@ def _authorize(request: Request, model: str | None, *,
         # 与 gateway._authorize 同口径：状态码来自 keysvc，不再一律 403
         # （403 会被客户端显示成「API 密钥无效」，掩盖真实原因）。
         status = getattr(reason, 'status', 403)
-        gateway._record(key, ip, model or '', mapped or '', status, 0, 0, 0, ua, reason, False)
+        gateway._record(key, ip, model or '', mapped or '', status, 0, 0, 0, ua, reason, False,
+                        account_expected=False)
         # 也记进安全页的入站日志：走 /v1/messages 的客户端被拒时，此前在
         # 「IP 访问日志」里**完全看不到**（只有 gateway 那条路记），两套协议
         # 的审计口径不一致。原因码复用 gateway 的归类，避免两处写法漂移。
@@ -255,7 +258,8 @@ def _authorize(request: Request, model: str | None, *,
     limited, _count = gateway._rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{gateway.RATE_WINDOW}s 内超过 {gateway.RATE_MAX_PER_MIN} 次）'
-        gateway._record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
+        gateway._record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False,
+                        account_expected=False)
         gateway._log_ip(ip, path, True, ua, 'rate_limited')
         return None, ip, _err(msg, 429, 'rate_limit_error')
 
@@ -554,6 +558,15 @@ def _thinking_enabled(body: dict) -> bool:
     Anthropic 的形状是 `thinking: {'type': 'enabled', 'budget_tokens': N}`；
     关闭时客户端会写 `{'type': 'disabled'}` 或干脆不带这个字段。两种都算没启用。
 
+    **`adaptive` 同样算启用**：新版 Claude Code 对「模型自适应决定思考量」的模型
+    发 `{'type': 'adaptive', 'display': ...}`（无 `budget_tokens`）。而它判断一个
+    模型是否支持 adaptive 的依据是**模型名是否在它的官方能力表里**——本地网关
+    后面挂的 `cn:deepseek-v4-flash` 这类第三方模型名一律查不到，于是**全部**回落
+    到 `adaptive`。只认 `enabled` 会让这些请求的推理在网关这一跳被整段丢弃：
+    上游照常思考（`output_config.effort` 也照常传），但客户端一个 `thinking_delta`
+    都收不到，表现为「思考过程不可见、`thinking_tokens` 恒为 0」。
+    两种 type 对网关的语义相同——客户端能接受 thinking 块——因此都回。
+
     宽容处理**畸形值**：不是 dict、或缺 type，都按「没启用」—— 宁可少回一个
     thinking 块（客户端拿不到凭据时只是多花点 token 重新思考），也不要对着
     一个不认这种块的客户端硬塞。
@@ -561,7 +574,7 @@ def _thinking_enabled(body: dict) -> bool:
     think = body.get('thinking')
     if not isinstance(think, dict):
         return False
-    return str(think.get('type') or '').lower() == 'enabled'
+    return str(think.get('type') or '').lower() in ('enabled', 'adaptive')
 
 
 # Anthropic 的 `output_config.effort` → 上游 `reasoning_effort` 的档位映射。
@@ -965,9 +978,15 @@ async def messages(request: Request):
     model = body.get('model')
     if not isinstance(model, str) or not model.strip():
         return _err('model 必须是字符串')
+    # 客户端原样的 Anthropic 请求体（快照要在 clamp_max_tokens 之前：那一步会
+    # 就地改 `max_tokens`，之后就看不出客户端原本要了多少）。
+    client_body = tap_svc.snapshot(body)
     # max_tokens 在 Anthropic 协议里是**必填项**，缺失即 400（与 OpenAI 不同）
     if body.get('max_tokens') is None:
         return _err('缺少必填字段 max_tokens')
+    # 越界的 max_tokens 会被上游包装成 503（见 gateway.clamp_max_tokens 的说明）。
+    # 在必填性校验之后压回上限，转换层就能拿到已收敛的值。
+    gateway.clamp_max_tokens(body)
 
     # 鉴权：与 gateway._authorize 同一套检查、同一顺序（见该函数说明）
     # 映射先算：版本归属判的是**映射后**的实际模型名（issue #47）
@@ -986,8 +1005,16 @@ async def messages(request: Request):
     try:
         payload = to_openai_request(body)
     except Exception as exc:  # noqa: BLE001
-        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
         return _err(f'请求转换失败：{exc}')
+
+    # 思考档位（issue #319）：客户端选了档位，日志里却一直是「—」，因为只有
+    # chat 路径把 reasoning_effort 传给了 _record。这里从**已转换的 payload**
+    # 取——to_openai_request 已经把 Anthropic 的 output_config / thinking
+    # 映射成上游的 reasoning_effort，取它才是「这次真正发出去的值」。
+    effort = payload.get('reasoning_effort')
+    effort = effort.strip()[:16] if isinstance(effort, str) and effort.strip() else None
 
     if mapped:
         payload['model'] = mapped
@@ -996,13 +1023,30 @@ async def messages(request: Request):
         if isinstance(payload['stream_options'], dict):
             payload['stream_options'].setdefault('include_usage', True)
 
-    url = f'{config.WB2API_BASE}/v1/chat/completions'
+    # 上游按密钥解析（多上游 / 分组隔离）；绑定缺失或停用时明确报错，不回落。
+    try:
+        upstream = upstreamsvc.resolve_for_key(key)
+    except upstreamsvc.UpstreamUnavailable as exc:
+        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
+        # anthropic 的错误体没有 code 字段（只有 type），故第三参给 type
+        return _err(str(exc), 503, 'api_error')
+    url = f'{upstream["base_url"]}/v1/chat/completions'
+    # 转发头只构造一次：既给 httpx，也给抓包（双视角的一半）
+    up_headers = gateway._upstream_headers(upstream)
+    # 关联键：让上游的出站转储能精确对回这一轮（见 gateway 同名注释）
+    # 关联键只服务抓包：关闭时不发这个头，交给上游自己按会话生成 32 位 ID。
+    # 开着时也用 32 位 hex（与上游/官方客户端同形），16 位会改变出站头的形状。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=payload, headers=gateway._upstream_headers())
+                resp = await client.post(url, json=payload,
+                                         headers=up_headers)
             latency = int((time.time() - started) * 1000)
             usage: dict = {}
             try:
@@ -1010,11 +1054,34 @@ async def messages(request: Request):
                 usage = data.get('usage') or {}
             except Exception:  # noqa: BLE001
                 data = None
+            # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段
+            # 都在这一份里，分开取就会出现「某条协议缓存永远是空的」（issue #69）。
             gateway._record(
                 key, ip, model, mapped or '', resp.status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                credit=gateway._usage_credit(usage),
+                usage=usage, effort=effort,
+            )
+            # 抓包：body 是 Anthropic 原形（客户端意图），payload 是转换后真正
+            # 发往上游的 OpenAI 体 —— 排查「转换层吃了什么字段」要靠后者。
+            # 客户端视角：Anthropic 客户端实际收到的报文（翻译后的形态）。
+            # 与 `payload`（上游原文）是两份东西，抓包页要能对着看。
+            client_doc = None
+            if resp.status_code < 400:
+                try:
+                    client_doc = to_anthropic_response(
+                        data if isinstance(data, dict) else {}, model,
+                        thinking=want_thinking)
+                except Exception:  # noqa: BLE001 - 翻译失败不该影响抓包
+                    client_doc = None
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/messages', protocol='anthropic',
+                status=resp.status_code, latency_ms=latency, stream=False,
+                payload=data, usage=usage,
+                error=None if resp.status_code < 400 else str(data)[:500],
+                upstream_body=payload, upstream_headers=up_headers,
+                trace_id=trace_id, client_response=client_doc,
             )
             if resp.status_code >= 400:
                 msg = ''
@@ -1025,25 +1092,44 @@ async def messages(request: Request):
                     msg = resp.text[:300]
                 return _err(msg, resp.status_code, 'api_error',
                             hint=gateway._error_hint(data))
-            return JSONResponse(to_anthropic_response(
-                data if isinstance(data, dict) else {}, model, thinking=want_thinking))
+            # 复用上面为抓包算好的那份：翻译一次就够，重复翻译既慢又可能
+            # 因为两次取值不同（例如时间戳字段）而在界面上与实际的响应对不上。
+            return JSONResponse(client_doc if client_doc is not None else
+                                to_anthropic_response(
+                                    data if isinstance(data, dict) else {},
+                                    model, thinking=want_thinking))
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                            account_expected=gateway._account_expected_after_error(exc))
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/messages', protocol='anthropic', status=502,
+                latency_ms=latency, stream=False, error=str(exc),
+                upstream_body=payload, upstream_headers=up_headers, trace_id=trace_id,
+            )
             return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     # ── 流式 ────────────────────────────────────────────────
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
-        req = client.build_request('POST', url, json=payload, headers=gateway._upstream_headers())
+        req = client.build_request('POST', url, json=payload,
+                                   headers=up_headers)
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True,
+                        account_expected=gateway._account_expected_after_error(exc))
         return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     status_code = resp.status_code
+
+    # 抓包用的原始流缓冲（`pending` 会被逐行消费，存不出完整响应，同 gateway）
+    raw_stream = tap_svc.RawStream()
+    # 回给客户端的那条流（Anthropic 事件）。与 `raw_stream` 分开：那份是上游的
+    # OpenAI 形态，这份才是客户端手里拿到的报文 —— 抓包页的「客户端视角」用它。
+    client_stream = tap_svc.RawStream()
 
     async def gen():
         usage: dict = {}
@@ -1055,7 +1141,9 @@ async def messages(request: Request):
 
         try:
             async for chunk in resp.aiter_bytes():
-                pending += chunk.decode('utf-8', errors='ignore')
+                piece = chunk.decode('utf-8', errors='ignore')
+                raw_stream.feed(piece)
+                pending += piece
 
                 if status_code >= 400:
                     # 有数据就留一份：早先要等到 4000 字节才取，而常见的上游错误体
@@ -1115,6 +1203,7 @@ async def messages(request: Request):
                         usage.update(frame_usage)
 
                     for event in translator.feed(obj):
+                        client_stream.feed(event.decode('utf-8', 'ignore'))
                         yield event
 
                     if translator.saw_content and first_token_ms is None:
@@ -1136,14 +1225,17 @@ async def messages(request: Request):
             #     残缺」的回答：不重试、不报错，排障时毫无线索；截断点若落在
             #     input_json_delta 中间，还会拿半截 JSON 去执行工具调用。
             if error_text:
-                yield _event('error', {
+                err_event = _event('error', {
                     'type': 'error',
                     'error': {'type': 'api_error', 'message': error_text},
                 })
+                client_stream.feed(err_event.decode('utf-8', 'ignore'))
+                yield err_event
             # 仍补一套收尾事件（含 message_start，若流尚未开始）：部分客户端期
             # 待流以 message_stop 结束，缺了会一直等（挂住）。error 已先发出，
             # 不会再被吞掉。
             for event in translator.finish(None, force=True):
+                client_stream.feed(event.decode('utf-8', 'ignore'))
                 yield event
         finally:
             await resp.aclose()
@@ -1153,7 +1245,15 @@ async def messages(request: Request):
                 key, ip, model, mapped or '', status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
-                credit=gateway._usage_credit(usage), first_token=first_token_ms,
+                usage=usage, first_token=first_token_ms, effort=effort,
+            )
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/messages', protocol='anthropic', status=status_code,
+                latency_ms=latency, first_token_ms=first_token_ms, stream=True,
+                text=raw_stream.text(), usage=usage, error=error_text,
+                upstream_body=payload, upstream_headers=up_headers,
+                trace_id=trace_id, client_response=client_stream.text() or None,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

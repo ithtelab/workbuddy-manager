@@ -11,6 +11,15 @@
 
 另外确认「暂时查不了」不会被显示成「全部正确」——那会让用户以为没问题。
 
+2026-10 复审又补了三步（都是**先发现真 bug 再补的钉子**）：
+  4. 粘贴「正确, 拼错」两个名字 → **两个都要留下**（此前的实现逐个 add()、各自
+     基于同一份旧值计算，粘贴一串只剩最后一个）；
+  5. 只**手输**一个拼错的名字然后失焦 → 当场就要报（父组件此前读的是自己还没
+     更新的旧值，刚输入的那个逃过了校验，要再点一次别处才现身）；
+  6. 手输正确的名字 → 不报（别为了修 5 而误报）。
+  7. 「从清单选择」弹层：候选齐全、与密钥版本一致的那一组排前面、可搜索、
+     勾选即加入白名单（这几条都是渲染出来的行为，静态断言看不出来）。
+
     python dev/verify_whitelist_hint_ui.py
 
 数据落在 dev/.wl-hint/（已 gitignore），截图输出到 dev/.shots-wl/。
@@ -343,6 +352,81 @@ const BASE = process.env.BASE, OUT = process.env.OUT;
   await input.fill('glm-5.2');
   await p.waitForTimeout(700);
   step(!(await hintFullyVisible()), '改回正确名字后提示立即消失（旧结论已作废）');
+
+  // 芯片列表（只认带 × 按钮的那种 span，避免把清单里的模型名也算进来）
+  const chipNames = async () => p.evaluate(() => {
+    const dlg = document.querySelector('[role=dialog]');
+    if (!dlg) return [];
+    return [...dlg.querySelectorAll('span.font-mono')]
+      .filter((e) => e.querySelector('button'))
+      .map((e) => e.textContent.trim());
+  });
+  const clearChips = async () => {
+    for (let i = 0; i < 12; i++) {
+      const btns = p.locator('[role=dialog] span.font-mono > button');
+      if (!(await btns.count())) break;
+      await btns.first().click();
+      await p.waitForTimeout(120);
+    }
+  };
+
+  // ④ 粘贴一串（含逗号）→ 每个名字都要留下（复审时这里丢过名字）
+  await clearChips();
+  await input.click();
+  await input.fill('glm-5.2, deepseek-v4.1-flash, glm-5.9');
+  await p.waitForTimeout(900);
+  const pasted = await chipNames();
+  step(pasted.includes('glm-5.2') && pasted.includes('deepseek-v4.1-flash')
+       && pasted.includes('glm-5.9'),
+       '粘贴多个名字后每个都在（含逗号分隔）', JSON.stringify(pasted));
+
+  // ⑤ 手输一个拼错的名字 + 失焦 → 当场报（此前要再点一次别处才现身）
+  await clearChips();
+  await input.click();
+  await input.fill('glm-5.9');
+  await input.blur();
+  await p.waitForTimeout(1800);
+  step(await hintFullyVisible(), '刚手输的拼错名字在失焦时就报出来');
+
+  // ⑥ 手输正确的名字 + 失焦 → 不报（不能为了 ⑤ 而误报）
+  //    先清干净：⑤ 留下的那个拼错的名字还在列表里，不清就会连它一起报（第一次
+  //    写这一步时忘了清，结果把「正确的行为」判成了失败——harness 自己的 bug）。
+  await clearChips();
+  await input.click();
+  await input.fill('glm-5.2');
+  await input.blur();
+  await p.waitForTimeout(1800);
+  step(!(await hintFullyVisible()), '手输的正确名字不报问题');
+
+  // ⑦ 「从清单选择」弹层：候选齐全、与密钥版本一致的那一组排前面、可搜索、勾选即加入
+  await clearChips();
+  await p.locator('button', {hasText: '从清单选择'}).first().click();
+  await p.waitForTimeout(1000);
+  const popoverIds = async () => p.evaluate(() => {
+    const root = document.querySelector('[data-radix-popper-content-wrapper]');
+    if (!root) return [];
+    return [...root.querySelectorAll('button[role=checkbox]')]
+      .map((e) => e.textContent.trim());
+  });
+  const ids = await popoverIds();
+  step(ids.length === 3, '清单列出了全部候选模型', JSON.stringify(ids));
+  step(ids.length > 0 && !ids[0].startsWith('global:'),
+       '与密钥版本一致的那组排前面（国内版密钥 → 国内版清单在前）', JSON.stringify(ids));
+  step(ids.length > 0 && ids[ids.length - 1].startsWith('global:'),
+       '另一版本的清单排在后面', JSON.stringify(ids));
+  const searchBox = p.locator('[data-radix-popper-content-wrapper] input').first();
+  await searchBox.fill('gpt');
+  await p.waitForTimeout(400);
+  const filtered = await popoverIds();
+  step(filtered.length === 1 && filtered[0].startsWith('global:gpt'),
+       '清单可按关键字搜索', JSON.stringify(filtered));
+  await p.locator('[data-radix-popper-content-wrapper] button[role=checkbox]').first().click();
+  await p.waitForTimeout(500);
+  const afterPick = await chipNames();
+  step(afterPick.includes('global:gpt-5.6-sol'), '勾选即加入白名单', JSON.stringify(afterPick));
+  await p.screenshot({path: `${OUT}/wl-picker.png`});
+  await p.keyboard.press('Escape');
+  await p.waitForTimeout(300);
 
   await b.close();
   if (findings.length) { console.log('\nFAILURES:\n'+findings.join('\n')); process.exit(1); }

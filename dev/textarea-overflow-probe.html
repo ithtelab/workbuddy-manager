@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>导出片段文本框：为什么会把弹窗内容撑出屏幕</title>
+<!--
+  复现「导出为客户端配置」那一块把整个弹窗内容撑宽的机制。
+
+  三个因素缺一不可，所以这个探针必须**三者都还原**，否则量不出问题：
+
+  1. Textarea 基类带 `field-sizing-content` + 实例 `wrap="off"`
+     → 文本框的 min-content 宽度 = 最长那一行（Codex 的 TOML 被塞进 JSON 的
+       `config` 字段，是一整行很长的、带 \n 转义的字符串）。
+  2. 它是 `flex-1` 但没写 `min-w-0`
+     → flex 项的 `min-width: auto` 把这个 min-content 当成不可压缩的下限，
+       于是这一行拒绝变窄。
+  3. 外面套着 Radix ScrollArea 的 Viewport；它内层是
+     `display: table; min-width: 100%`（见下 .tablewrap）
+     → 表格会**跟着内容的 min-content 一起变宽**，所以撑宽会往上传染到整块内容，
+       而 Viewport 的 overflow-x 是 hidden → 右侧被裁掉。
+       表现就是：卡片右边贴边被切、`justify-between` 右端的 select/按钮消失。
+
+  对照实验：同一套结构 + 同一段内容，只差 `min-w-0` 这一个类。
+  用**真实编译产物**的 CSS（页面末尾按 ?css= 挂载）。
+-->
+<style>
+  /* 这三条不是 Tailwind 工具类，所以内联；其余全部用真实构建产物。 */
+  body { margin: 0; padding: 24px; background: #f7f8fa; font: 13px/1.5 system-ui, sans-serif; color: #111; }
+  /* Radix ScrollArea Viewport 的内层：`display: table` 是撑宽传染的关键 */
+  .tablewrap { display: table; min-width: 100%; }
+  /* 模拟 DialogBody：overflow-x 是 hidden，所以溢出=被裁掉（而不是出现滚动条） */
+  .frame { width: 920px; max-width: 100%; overflow: hidden; background: #fff;
+           border: 1px solid #e5e7eb; border-radius: 8px; }
+  .rack { display: grid; gap: 28px; }
+  .case h3 { margin: 0 0 8px; font-size: 13px; }
+  .out { margin-top: 6px; font: 12px/1.7 ui-monospace, monospace; white-space: pre-wrap; }
+  .out.ok  { color: #067647; }
+  .out.bad { color: #b42318; font-weight: 600; }
+  .mark { background: #eef2ff; border: 1px dashed #6366f1; border-radius: 4px; padding: 2px 6px; font-size: 11px; }
+</style>
+<script>
+  // 解析期就换好样式表：动态 append 的 <link> 赶不上 load 事件（见 dialog-width-probe 的坑）
+  (function () {
+    var q = new URLSearchParams(location.search);
+    var href = q.get('css') || '../web/out/_next/static/css/29d3a62818b8d970.css';
+    document.write('<link rel="stylesheet" href="' + href + '">');
+  })();
+</script>
+</head>
+<body>
+<div class="rack" id="rack"></div>
+
+<script>
+// 与 keys/page.tsx 里那段导出片段完全一致的类名（除 min-w-0 这一个变量）
+const TA_BASE = 'placeholder:text-muted-foreground flex field-sizing-content min-h-16 w-full rounded-xl border border-transparent bg-muted/55 px-3 py-2 text-base shadow-none outline-none read-only:bg-muted/40 md:text-sm';
+const TA_INST = 'max-h-[min(240px,28dvh)] min-h-[120px] flex-1 overflow-auto font-mono text-[11px] leading-relaxed';
+
+// 与真实导出内容同量级：Codex 的 TOML 被塞进 JSON 的 config 字段，是一整行
+const LONG = '{"auth":{"OPENAI_API_KEY":"wbk_04h39uC7LxvT-AnZ60C_YXljRDYJbuNMhoHTQFO3as"},'
+  + '"config":"model_provider = \\"workbuddy\\"\\nmodel = \\"cn:auto\\"\\n\\n[model_providers]\\n'
+  + '[model_providers.workbuddy]\\nname = \\"WorkBuddy 22\\"\\nwire_api = \\"responses\\"\\n'
+  + 'requires_openai_auth = true\\nbase_url = \\"http://127.0.0.1:7864/v1\\"\\n"}';
+
+// 关键：`display: table` 的自动布局按**列的 max-content** 定宽。
+// field-sizing-content 让文本框固有宽度=最长一行（Codex 导出的 TOML 塞进 JSON
+// config 字段就是一整行几百字符），table 把它原样吃进列宽 → 整块内容被撑出弹窗。
+// 实测：min-w-0 单独**压不住**（只改 min-content 下限，table 取的是 max-content），
+// 必须用 field-sizing-fixed 让文本框回到按 CSS 宽度排布。
+const CASES = [
+  {tag: 'A. 修复前：flex-1',                          cls: 'flex-1',                          wantOverflow: true },
+  {tag: 'B. 只有 min-w-0（不够，留作反例）',           cls: 'flex-1 min-w-0',                  wantOverflow: true },
+  {tag: 'C. 修复后：flex-1 + min-w-0 + field-sizing-fixed', cls: 'flex-1 min-w-0 field-sizing-fixed', wantOverflow: false },
+];
+
+function build(i, c) {
+  const cell = document.createElement('div');
+  cell.className = 'case';
+  cell.innerHTML = `<h3>${i + 1}. ${c.tag}</h3>`;
+  const box = document.createElement('div');
+  box.className = 'frame';
+  box.innerHTML = `
+    <div class="tablewrap">
+      <div class="px-6 py-4 space-y-3">
+        <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-1.5">
+          <span class="text-xs font-medium">导出为客户端配置</span>
+          <div class="flex items-center gap-2" data-right>
+            <span class="text-xs rounded-full border px-2 py-1">cc-switch（Codex）</span>
+            <span class="text-xs rounded-full border px-2 py-1 mark">导出按钮</span>
+          </div>
+        </div>
+        <div class="flex items-start gap-2 rounded-xl bg-muted p-2">
+          <textarea readOnly wrap="off" class="${TA_BASE} ${c.cls} ${TA_INST}"></textarea>
+          <span class="text-xs mark">复制</span>
+        </div>
+      </div>
+    </div>`;
+  box.querySelector('textarea').value = LONG;
+  cell.append(box);
+  document.getElementById('rack').append(cell);
+  return cell;
+}
+
+function report() {
+  const vw = document.documentElement.clientWidth;
+  document.querySelectorAll('.case').forEach((cell, i) => {
+    const c = CASES[i];
+    const frame = cell.querySelector('.frame');
+    const table = cell.querySelector('.tablewrap');
+    const right = cell.querySelector('[data-right]');
+    const ta = cell.querySelector('textarea');
+    const offscreen = Math.round(right.getBoundingClientRect().right - frame.getBoundingClientRect().right);
+    // 溢出判据取的是**几何事实**：右端控件有没有被推到框外
+    const overflow = offscreen > 1;
+    const ok = overflow === c.wantOverflow;
+    const cs = getComputedStyle(ta);
+    const out = document.createElement('div');
+    out.className = 'out ' + (ok ? 'ok' : 'bad');   // ok = 符合预期（A/B 该溢出、C 不该）
+    out.textContent =
+        `框宽=${Math.round(frame.clientWidth)}  内容表宽=${Math.round(table.getBoundingClientRect().width)}`
+      + `  文本框宽=${Math.round(ta.getBoundingClientRect().width)}`
+      + `  右端控件超出框=${offscreen}px`
+      + `  → ${overflow ? '内容被撑出框（右侧被裁）' : '内容收在框内'}`
+      + `\n              computed: field-sizing=${cs.getPropertyValue('field-sizing') || '(无)'}`
+      + `  min-width=${cs.minWidth}  max-width=${cs.maxWidth}  flex=${cs.flex}`
+      + (ok ? '   ✔ 符合预期' : '   ✘ 不符合预期');
+    cell.append(out);
+  });
+}
+
+// ⚠️ 必须写成箭头函数：`CASES.forEach(build)` 会把 (元素, 下标) 传进去，
+// 而 build 期望的是 (下标, 元素) —— 结果是**每个用例的差异都没注入**，
+// 五组量出完全一样的数字，看上去像"所有修法都无效"。踩过一次。
+CASES.forEach((c, i) => build(i, c));
+window.addEventListener('load', () => requestAnimationFrame(report));
+</script>
+</body>
+</html>

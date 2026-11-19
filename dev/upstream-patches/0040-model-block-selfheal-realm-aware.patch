@@ -1,0 +1,104 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 182da85..59faa63 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -703,7 +703,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			// 一次抖动放大成半天 503（实测：deepseek-v4.1-flash 20/20 账号被写负缓存，
+ 			// 直连全部 200）。这里对「该模型 0 个可用账号」清一次负缓存并重试；
+ 			// 只清一次，避免模型真下线时死循环（届时仍返回 503，并透传上游 11102 原文）。
+-			if !modelBlocksCleared && bareModel != "" && len(h.cfg.Pool.AvailableUIDsForModel(bareModel)) == 0 {
++			//
++			// 判据必须与**选号同一个 realm 维度**（issue #332）：上面选号走
++			// PickExcludingForRealm(realm)，这里却按全池看可用性 —— 双 realm 部署下
++			// 只要另一个 realm 还有账号，全池判据就永远非空，自愈永不触发；而本次请求
++			// 的 realm 池已被负缓存全挡，于是固定 503（换任何模型都一样，逐个被打成
++			// 负缓存）。realm 为空时该变体退化为全池语义，单 realm 部署行为不变。
++			if !modelBlocksCleared && bareModel != "" && len(h.cfg.Pool.AvailableUIDsForModelRealm(bareModel, realm)) == 0 {
+ 				if n := h.cfg.Pool.ClearModelBlocks(bareModel); n > 0 {
+ 					modelBlocksCleared = true
+ 					tried = map[string]bool{}
+diff --git a/internal/server/model_block_realm_selfheal_test.go b/internal/server/model_block_realm_selfheal_test.go
+new file mode 100644
+index 0000000..5cc796b
+--- /dev/null
++++ b/internal/server/model_block_realm_selfheal_test.go
+@@ -0,0 +1,79 @@
++package server
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/upstream"
++)
++
++// issue #332：自愈的判据必须与选号**同一个 realm 维度**。
++//
++// 现场：11 个国内版账号，deepseek-v4.1-flash 在全部账号上被 11102 负缓存，
++// 而池里还有其它 realm 的账号（它们不被该模型的负缓存挡）。旧判据
++// AvailableUIDsForModel(裸名) 看的是**全池**，于是返回非空 → 自愈不触发 →
++// PickExcludingForRealm(realm=cn) 选不出号 → 503；换别的模型一样，因为每个
++// cn 模型都会被轮流打成负缓存。
++func TestModelBlockSelfHealIsRealmAware(t *testing.T) {
++	cn1 := &auth.Auth{UID: "cn1", AccessToken: "a", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"}
++	cn2 := &auth.Auth{UID: "cn2", AccessToken: "b", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"}
++	gl := &auth.Auth{UID: "gl1", AccessToken: "c", ExpiresAt: 9999999999, Domain: "www.workbuddy.ai"}
++	p := testPoolWith(cn1, cn2, gl)
++	for _, uid := range []string{"cn1", "cn2"} {
++		p.BlockModelBackoff(uid, "deepseek-v4.1-flash", "11102 model not available")
++	}
++
++	var calls int32
++	up := &upstream.Client{HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++		atomic.AddInt32(&calls, 1)
++		return sseResponse(200, sseOK), nil
++	})}, ChatBaseCN: "https://test.invalid"}
++	h := NewHandler(Config{Pool: p, Upstream: up})
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
++		`{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
++	if rec.Code == http.StatusServiceUnavailable {
++		t.Fatalf("cn 池被负缓存挡住时必须自愈重试，实际 503：%s", rec.Body.String())
++	}
++	if atomic.LoadInt32(&calls) == 0 {
++		t.Fatal("自愈后应当真的把请求发出去")
++	}
++	for _, uid := range []string{"cn1", "cn2"} {
++		st, ok := p.Status(uid)
++		if !ok {
++			continue
++		}
++		if len(st.RateLimitedModels) != 0 {
++			t.Fatalf("%s 的 11102 负缓存应已被清掉：%+v", uid, st.RateLimitedModels)
++		}
++	}
++}
++
++// 反向约束：模型**真的**在池里不可用时不能变成重试风暴。
++// 自愈只清一次；上游始终 11102 时按错误返回，调用次数有上界。
++func TestModelBlockSelfHealIsBounded(t *testing.T) {
++	cn1 := &auth.Auth{UID: "cn1", AccessToken: "a", ExpiresAt: 9999999999, Domain: "www.codebuddy.cn"}
++	p := testPoolWith(cn1)
++	p.BlockModelBackoff("cn1", "deepseek-v4.1-flash", "11102 model not available")
++
++	var calls int32
++	up := &upstream.Client{HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++		atomic.AddInt32(&calls, 1)
++		return sseResponse(400, `{"code":11102,"msg":"model [deepseek-v4.1-flash] service info not found"}`), nil
++	})}, ChatBaseCN: "https://test.invalid"}
++	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 4})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
++		`{"model":"deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
++	if rec.Code == http.StatusOK {
++		t.Fatalf("模型确实不存在时不该报成功：%s", rec.Body.String())
++	}
++	if n := atomic.LoadInt32(&calls); n > 8 {
++		t.Fatalf("自愈不得变成重试风暴，实际上游调用 %d 次", n)
++	}
++}

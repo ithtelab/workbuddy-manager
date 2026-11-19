@@ -1,0 +1,232 @@
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -153,6 +153,12 @@ func main() {
+ 	// 上游逐词扩充黑名单时改 config.json 重启即可，不必重编译镜像。
+ 	// 空表 = 只用内置静态表（行为与旧版一致）。
+ 	upstream.ConfigureSanitize(cfg.Features.SanitizeExtraFeatures, cfg.Features.SanitizeExtraRewrites)
++	// 配置变更时热重载词表（issue #396）：重启会断在途请求，而词表是整体替换语义。
++	if *cfgPath != "" {
++		stopSanitizeWatch := make(chan struct{})
++		defer close(stopSanitizeWatch)
++		go watchSanitizeConfig(*cfgPath, stopSanitizeWatch)
++	}
+ 	if n := len(cfg.Features.SanitizeExtraFeatures); n > 0 {
+ 		log.Printf("净化额外特征词表已加载：%d 条（config.json features.sanitize_extra_features）", n)
+ 	}
+new file mode 100644
+index 0000000..1708fdc
+--- /dev/null
++++ b/cmd/server/sanitize_reload.go
+@@ -0,0 +1,67 @@
++package main
++
++// 配置热重载：features.sanitize_extra_features / _rewrites（issue #396）。
++//
++// 上游黑名单是逐词扩充的，词表做成配置项后运维仍要重启容器才能生效。重启会
++// 断开在途请求（挂了池的下游每次都要吃一次抖动），而词表本身是**整体替换**
++// 语义（ConfigureSanitize 幂等），可以安全地重入。
++//
++// 这里只监听 config.json 的 mtime+size，变了就重新 Load 并把两张词表注入；
++// 解析失败只记日志、保留旧词表，不能让一次手误把正在跑的净化关掉。
++
++import (
++	"log"
++	"os"
++	"time"
++
++	"workbuddy2api/internal/upstream"
++)
++
++const sanitizeWatchInterval = 10 * time.Second
++
++// reloadSanitizeConfig 读一次配置并注入词表；返回是否成功。
++func reloadSanitizeConfig(path string) bool {
++	cfg, err := Load(path)
++	if err != nil {
++		log.Printf("WARN: 净化词表热重载跳过（配置读取失败）：%v", err)
++		return false
++	}
++	upstream.ConfigureSanitize(cfg.Features.SanitizeExtraFeatures,
++		cfg.Features.SanitizeExtraRewrites)
++	f, r := upstream.SanitizeExtraCounts()
++	log.Printf("净化词表已热重载：features=%d rewrites=%d（config.json 变更）", f, r)
++	return true
++}
++
++// watchSanitizeConfig 后台轮询配置文件；stop 关闭时退出。
++func watchSanitizeConfig(path string, stop <-chan struct{}) {
++	if path == "" {
++		return
++	}
++	stamp := func() (int64, int64) {
++		st, err := os.Stat(path)
++		if err != nil {
++			return 0, 0
++		}
++		return st.ModTime().UnixNano(), st.Size()
++	}
++	lastMod, lastSize := stamp()
++	ticker := time.NewTicker(sanitizeWatchInterval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-stop:
++			return
++		case <-ticker.C:
++			mod, size := stamp()
++			if mod == 0 {
++				continue // 文件暂时不可读（编辑器原子替换的间隙）：下轮再看
++			}
++			if mod == lastMod && size == lastSize {
++				continue
++			}
++			lastMod, lastSize = mod, size
++			reloadSanitizeConfig(path)
++		}
++	}
++}
+new file mode 100644
+index 0000000..0e8fad6
+--- /dev/null
++++ b/cmd/server/sanitize_reload_test.go
+@@ -0,0 +1,45 @@
++package main
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"workbuddy2api/internal/upstream"
++)
++
++// issue #396：改 config.json 后词表可热重载；解析失败保留旧词表。
++func TestReloadSanitizeConfig(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "config.json")
++	write := func(s string) {
++		if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	write(`{"features":{"sanitize_extra_features":["foo-phrase"],"sanitize_extra_rewrites":[["a","b"]]}}`)
++	if !reloadSanitizeConfig(path) {
++		t.Fatal("首次热重载失败")
++	}
++	f, r := upstream.SanitizeExtraCounts()
++	if f != 1 || r != 1 {
++		t.Fatalf("词表数量不对：features=%d rewrites=%d", f, r)
++	}
++
++	write(`{"features":{"sanitize_extra_features":["x","y"]}}`)
++	if !reloadSanitizeConfig(path) {
++		t.Fatal("第二次热重载失败")
++	}
++	f, r = upstream.SanitizeExtraCounts()
++	if f != 2 || r != 0 {
++		t.Fatalf("整体替换语义不对：features=%d rewrites=%d", f, r)
++	}
++
++	write(`{not-json`)
++	if reloadSanitizeConfig(path) {
++		t.Fatal("坏配置不该报告成功")
++	}
++	if f, _ := upstream.SanitizeExtraCounts(); f != 2 {
++		t.Fatalf("坏配置把旧词表冲掉了：%d", f)
++	}
++}
+--- a/internal/upstream/sanitize.go
++++ b/internal/upstream/sanitize.go
+@@ -8,6 +8,7 @@ package upstream
+ import (
+ 	"regexp"
+ 	"strings"
++	"sync"
+ )
+ 
+ // sanitizeFeatures 特征预检：任一命中才进入净化（strings.Contains 快速路径，
+@@ -27,6 +28,10 @@ var sanitizeFeatures = []string{
+ // sanitizeExtraFeatures 运行期从 config 追加的特征（features.sanitize_extra_features）。
+ // 启动时一次性注入、之后只读，因此无需加锁；与 sanitizeFeatures 分开存放是为了可幂等
+ // 重新配置（ConfigureSanitize 先清空再加，避免重复 append）。
++// sanitizeMu 保护下面两张运行期词表（issue #396：配置热重载）。
++// 读侧在函数开头取一次快照后释放锁，避免每段文本都阻塞在锁上。
++var sanitizeMu sync.RWMutex
++
+ var sanitizeExtraFeatures []string
+ 
+ // sanitizeExtraRewrites 运行期从 config 追加的逐字替换（features.sanitize_extra_rewrites）。
+@@ -168,7 +173,10 @@ func sanitizeText(text string) string {
+ 	}
+ 	// 运行期注入的额外逐字替换（features.sanitize_extra_rewrites）：让上游新增
+ 	// 黑名单词不必重编译镜像，改 config.json 重启即可。
+-	for _, rw := range sanitizeExtraRewrites {
++	sanitizeMu.RLock()
++	extraRewrites := sanitizeExtraRewrites
++	sanitizeMu.RUnlock()
++	for _, rw := range extraRewrites {
+ 		if rw[0] == "" || rw[0] == rw[1] {
+ 			continue
+ 		}
+@@ -210,7 +218,10 @@ func hasFingerprint(text string) bool {
+ 		}
+ 	}
+ 	// 运行期注入的额外特征（features.sanitize_extra_features）：同样走小写兜底。
+-	for _, f := range sanitizeExtraFeatures {
++	sanitizeMu.RLock()
++	extraFeatures := sanitizeExtraFeatures
++	sanitizeMu.RUnlock()
++	for _, f := range extraFeatures {
+ 		if f == "" {
+ 			continue
+ 		}
+@@ -386,6 +397,15 @@ func ConfigureSanitize(extraFeatures []string, extraRewrites [][2]string) {
+ 		}
+ 		cleanRewrites = append(cleanRewrites, rw)
+ 	}
++	sanitizeMu.Lock()
+ 	sanitizeExtraFeatures = cleanFeatures
+ 	sanitizeExtraRewrites = cleanRewrites
++	sanitizeMu.Unlock()
++}
++
++// SanitizeExtraCounts 当前运行期词表的条数（供热重载日志与测试）。
++func SanitizeExtraCounts() (features, rewrites int) {
++	sanitizeMu.RLock()
++	defer sanitizeMu.RUnlock()
++	return len(sanitizeExtraFeatures), len(sanitizeExtraRewrites)
+ }
+new file mode 100644
+index 0000000..a0b44fd
+--- /dev/null
++++ b/internal/upstream/sanitize_runtime_test.go
+@@ -0,0 +1,29 @@
++package upstream
++
++import (
++	"strings"
++	"testing"
++)
++
++// issue #396：运行期词表可整体替换；热重载后新词立即生效、旧词消失。
++func TestConfigureSanitizeReplacesAndApplies(t *testing.T) {
++	// 改写词同时要进 features，否则预检不命中、改写层不会执行。
++	ConfigureSanitize([]string{"hot-word-aaa", "bad-token"}, [][2]string{{"bad-token", "replaced-token"}})
++	t.Cleanup(func() { ConfigureSanitize(nil, nil) })
++
++	// features 是「检测触发词」：命中才会进入改写管线；rewrites 才是替换表。
++	if !hasFingerprint("prefix hot-word-aaa suffix") {
++		t.Fatal("额外特征未参与预检")
++	}
++	if out := sanitizeText("use bad-token here"); strings.Contains(out, "bad-token") {
++		t.Fatalf("额外改写未生效：%q", out)
++	}
++
++	ConfigureSanitize([]string{"hot-word-bbb"}, nil)
++	if hasFingerprint("prefix hot-word-aaa suffix") {
++		t.Fatal("整体替换后旧特征仍在预检表里")
++	}
++	if !hasFingerprint("prefix hot-word-bbb suffix") {
++		t.Fatal("新特征未进入预检表")
++	}
++}

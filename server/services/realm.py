@@ -262,18 +262,20 @@ def billing_base(realm: Realm) -> str:
 
 
 def chat_paths(realm: Realm) -> list[str]:
-    """聊天补全的候选路径，按尝试顺序。两个版本都只有 `/v2`。
+    """聊天补全的候选路径，按尝试顺序：**/v2 优先，/console 兜底**。
 
     国际版原先是 `/console` 优先、404/405 回落 `/v2`；上游 2026-09-18（#119）改为
     **固定 `/v2`**：`/console` 挂腾讯云 WAF 的请求体内容规则——正文里出现反引号
     `printf` / `whoami` 这类命令执行特征会被确定性拦成 403（用户问一句 shell 命令
     就中招）。`/v2` 是同一 base 下不挂该规则的等价端点。
 
-    本函数返回列表是为了保留「多条候选」的形态，但**当前两边都只有一个元素**——
-    调用方的 404/405 回落分支因此实际不会触发，保留它只为将来要加回候选路径时
-    不必再改调用方。
+    2026-10-17 又把 `/console` 加回来做**兜底**：上游给 /v2 加了渠道强校验，被校验
+    到的请求回「没通过渠道校验」；而官方客户端走的 /console 正常放行（用户实测：
+    换过去连通性测试与对话都恢复）。**只在 /v2 被判渠道校验时才换 /console**
+    （见 `probe_account` 与上游 `IsChannelCheck`），所以上面那条 WAF 规则只在兜底
+    路径上才可能碰到，主路径行为零改动。
     """
-    return ['/v2/chat/completions']
+    return ['/v2/chat/completions', '/console/chat/completions']
 
 
 def billing_paths(realm: Realm, kind: str) -> list[str]:
@@ -447,8 +449,12 @@ def billing_headers(realm: Realm, auth: dict | None = None) -> dict:
 def supports_checkin(realm: Realm) -> bool:
     """该 realm 是否有签到体系。
 
-    国际版**没有**签到 / 旅行 / 活跃上报（上游调度器对 global 账号直接过滤、
-    不发起任何请求，理由是避免风控）。调用方据此跳过，而不是打过去吃 4xx。
-    令牌保活两边都支持，不在此列。
+    国际版**没有**签到 / 旅行（上游调度器对 global 账号直接过滤、不发起任何请求，
+    理由是避免风控）。调用方据此跳过，而不是打过去吃 4xx。
+
+    **活跃上报不在此列**（此前这句多写了它，让用户以为国际版刷不了活跃 —— 见
+    issue #134）：上游 `RunActivityNow` 对 CN 与 global 都上报（其 `gating_test.go`
+    的 `TestRunActivityNowReportsGlobalAccounts` 锁定了这条），面板文案也已同步。
+    令牌保活同样两边都支持。
     """
     return realm != GLOBAL

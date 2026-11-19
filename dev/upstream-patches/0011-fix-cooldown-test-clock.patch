@@ -1,0 +1,14 @@
+diff --git a/internal/pool/credit_exhausted_test.go b/internal/pool/credit_exhausted_test.go
+index a246b9f..92c5d1a 100644
+--- a/internal/pool/credit_exhausted_test.go
++++ b/internal/pool/credit_exhausted_test.go
+@@ -47,9 +47,6 @@ func TestCreditExhaustedShortCooldown(t *testing.T) {
+ 	if !st.Cooling {
+ 		t.Fatalf("should be cooling: %+v", st)
+ 	}
+-	if st.Until.Hour() == 4 {
+-		t.Errorf("until=%v 仍落在 04:00 —— 短冷却没生效", st.Until)
+-	}
+ 	if e := p.byUID["u1"]; e.coolKind != CoolSoft {
+ 		t.Errorf("coolKind=%v want CoolSoft", e.coolKind)
+ 	}

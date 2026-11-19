@@ -439,7 +439,15 @@ class EffortFallbackTest(unittest.TestCase):
         cn = modelcatalog._decorate([{'id': 'deepseek-v4.1-flash', 'efforts': []}], 'cn')[0]
         gl = modelcatalog._decorate([{'id': 'deepseek-v4.1-flash', 'efforts': []}], 'global')[0]
         self.assertEqual(cn['efforts'], ['low', 'high', 'max'])
-        self.assertEqual(gl['efforts'], ['high'], '国际版档位被国内版覆盖了')
+        self.assertEqual(gl['efforts'], ['high', 'max'], '国际版档位表不正确')
+
+    def test_issue238_global_remote_lag_adds_max(self) -> None:
+        """issue #238：官方客户端已可选 Max，但接口元数据仍只回 high。"""
+        out = modelcatalog._decorate(
+            [{'id': 'deepseek-v4.1-flash', 'efforts': ['high'], 'default_effort': 'high'}],
+            'global')
+        self.assertEqual(out[0]['efforts'], ['high', 'max'])
+        self.assertEqual(out[0]['default_effort'], 'high')
 
     def test_remote_wins_over_fallback(self) -> None:
         """远端给了档位就是权威 —— 兜底表不覆盖。"""

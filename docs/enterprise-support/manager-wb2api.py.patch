@@ -1,0 +1,14 @@
+--- wb2api.py	2026-10-18 15:50:38.335405874 +0000
++++ /opt/workbuddy-manager/patches/wb2api.py	2026-10-18 15:34:22.097189195 +0000
+@@ -269,7 +269,10 @@
+                 # 钳制与默认值只在选号时生效（上游 auth.PickWeight）。
+                 'weight': _weight_of(raw),
+                 # 该版本是否支持签到体系（国际版没有，调用方据此跳过而不是打 4xx）
+-                'checkin_supported': supports_checkin(
++                # 企业账号（enterpriseId 非空）没有个人成长体系：签到端点恒返回
++                # 400 code=10001「企业账号不支持该操作」（实测 2026-10-18）。
++                # 这里直接置 False，面板不渲染签到按钮、定时任务也不发起请求。
++                'checkin_supported': not str(acct.get('enterpriseId') or '').strip() and supports_checkin(
+                     realm_of({'realm': raw.get('realm') or auth.get('realm'),
+                               'domain': auth.get('domain')})),
+                 'source': 'file',

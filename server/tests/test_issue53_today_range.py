@@ -57,29 +57,41 @@ class TodayOptionTest(unittest.TestCase):
         opts = re.findall(r'<SelectItem value="(\d+)">', self.src)
         self.assertEqual(opts, ['1', '7', '30', '90'])
         # 一个 d 同时喂给 daily / byModel / byKey（三处跟随）
-        for call in ('statsApi.daily(d, realm)', 'statsApi.byModel(d, realm)',
-                     'statsApi.byKey(d, realm)'):
+        # 自定义日期（issue #257）通过第三个参数传范围；三处仍共用同一个 d。
+        for call in ('statsApi.daily(d, realm, range)', 'statsApi.byModel(d, realm, range)',
+                     'statsApi.byKey(d, realm, range)'):
             self.assertIn(call, self.src, f'{call} 没有跟随时段')
 
     def test_fallback_matches_default(self) -> None:
         """`Number(days) || X` 的兜底值要与默认值一致，否则非法值时口径会跳变。"""
-        m = re.search(r'const d = Number\(days\) \|\| (\d+);', self.src)
+        m = re.search(r'return Number\(days\) \|\| (\d+);', self.src)
         self.assertIsNotNone(m)
         self.assertEqual(m.group(1), '1')
 
     def test_subtitle_follows_the_window(self) -> None:
-        """窗口只有一天时不能还写「按天聚合」（就一根柱子）。"""
-        self.assertIn("days === '1' ? t('stats.dailyAggToday')", self.src)
+        """副标题必须跟着**实际粒度**走，不能写死。
+
+        最早的实现里它写死「按天聚合」，于是「今日」那一屏（只有一个数据点）
+        还写着「按天聚合」——正是用户反馈的「今日还是柱状图，不太对劲」的一半。
+        现在图的粒度与副标题都从 `chartSpecFor()` 来，两者不可能再脱钩。
+        """
+        import re
+        self.assertRegex(
+            self.src,
+            r"spec\.granularity === 'hour'[\s\S]{0,80}stats\.hourlyAgg",
+            '副标题没有跟随粒度 —— 今日会写着「按天聚合」',
+        )
+        self.assertIn("stats.dailyAgg'", self.src, '多日仍然要说「按天聚合」')
 
 
 class TodayPhrasesTest(unittest.TestCase):
-    """五语言都要有「今日」与「当日汇总」，不允许漏翻。"""
+    """五语言都要有「今日」与「按小时（当日汇总）」，不允许漏翻。"""
 
     def test_phrases_in_all_locales(self) -> None:
         import json
         for loc in ('zh-CN', 'zh-TW', 'en', 'ja', 'ko'):
             d = json.loads((_LOCALES / f'{loc}.json').read_text(encoding='utf-8'))
-            for key in ('today', 'dailyAggToday'):
+            for key in ('today', 'hourlyAgg'):
                 self.assertIn(key, d.get('stats', {}), f'{loc} 缺 stats.{key}')
                 self.assertTrue(str(d['stats'][key]).strip(), f'{loc} 的 stats.{key} 是空的')
 

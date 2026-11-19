@@ -179,7 +179,7 @@ WebUI 的后端需要向 `workbuddy2api`（`127.0.0.1:7863`）拉取运行时状
 | GET | `/api/auth/poll?state=` | 轮询扫码结果，成功即自动签到+落盘 |
 | DELETE | `/api/accounts/{filename}` | 删除指定账号 |
 | POST | `/api/accounts/{filename}/checkin` | 单账号手动签到 |
-| GET | `/api/status` | 代理透传 workbuddy2api 的 `/status`（可选） |
+| GET | `/api/upstream/status` | 代理透传 workbuddy2api 的 `/status`（可选） |
 
 ---
 
@@ -851,13 +851,13 @@ onMounted(() => {
 
 1. 启动服务（监听 `0.0.0.0:7864`）。
 2. **1Panel → 网站 → 创建反向代理**：
-   - 域名：`wb.sbai.shop`
+   - 域名：`wb.example.com`（换成你自己的域名）
    - 目标：`http://127.0.0.1:7864`
    - **务必加** `client_max_body_size 2m;`（虽然本面板无大请求体，但统一习惯）
 3. **申请 Let's Encrypt 证书**并开启强制 HTTPS → Cookie 自动受 TLS 保护。
 4. 登录后按需在 `users.json` 里增删用户（改完重启服务生效）。
 5. **可选加固**：
-   - 在 1Panel 里对 `wb.sbai.shop` 配 **IP 白名单**（只允许公司/家庭 IP 访问）。
+   - 在 1Panel 里对 `wb.example.com` 配 **IP 白名单**（只允许公司/家庭 IP 访问）。
    - 或叠加 Cloudflare 的 Access / WAF。
 
 ### 6. 安全红线（务必遵守）
@@ -873,7 +873,7 @@ onMounted(() => {
 
 1. **新建项目文件**：在本地完成开发调试，或在服务器 `/opt/workbuddy-manager` 放置代码。
 2. **开放反代或端口**：
-   - 可以在 1Panel 创建反代站点 `wb.sbai.shop` 指向 `127.0.0.1:7864`。
+   - 可以在 1Panel 创建反代站点 `wb.example.com` 指向 `127.0.0.1:7864`。
    - 开启 HTTPS，直接通过浏览器进行手机扫码与号池管理。
 3. **接入分销 (sub2api)**：
    - 后台通过 WebUI 纳管所有腾讯账号后，底层由 `workbuddy2api` 负责轮询并发，上层由 sub2api 负责给下游发放 Key 和计算 Token 计费。
@@ -1340,9 +1340,9 @@ docker restart workbuddy2api
 
 ### 第三阶段：上线与加固
 - [ ] 11. 注册 systemd 服务常驻（第八节）
-- [ ] 12. 1Panel 建反代 `wb.sbai.shop` → `127.0.0.1:7864`，申请 SSL + 强制 HTTPS
+- [ ] 12. 1Panel 建反代 `wb.example.com` → `127.0.0.1:7864`，申请 SSL + 强制 HTTPS
 - [ ] 13. （可选）1Panel 配 IP 白名单 / Cloudflare Access 加固
-- [ ] 14. （可选）接入 sub2api：Base URL `http://172.17.0.1:7863`，Key 用 `2987c600...`
+- [ ] 14. （可选）接入 sub2api：Base URL `http://172.17.0.1:7863`，Key 用上游 api_key（见上游 config.json）
 - [ ] 15. （可选·进阶）升级为 **Next.js 15 + shadcn/ui (new-york) + Sonner + motion** 以 1:1 复刻 LDC 组件
 
 > **开发提示 1**：`server.py` 里需给 FastAPI 挂载静态文件，把 `index.html` 作为根路径返回：

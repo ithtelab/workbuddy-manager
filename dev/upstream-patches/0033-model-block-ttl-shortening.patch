@@ -1,0 +1,73 @@
+diff --git a/internal/pool/entry.go b/internal/pool/entry.go
+index 6c5edf9..ab1b473 100644
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -475,12 +475,17 @@ const (
+ const defaultSoftRateMax = 2 * time.Hour
+ 
+ // 11102「该后端无此模型」负缓存的退避参数（吸收 model_blocks.py 语义，复用 modelCooldowns
+-// 机制承载）。首次命中冷却 6h，半开到期放行重试；再命中按 Hits 指数退避（×2^min(hits-1,6)），
+-// 封顶 24h（最多一天再试一次）；该模型请求成功即清。6004 限流不参与本退避（各自独立语义）。
++// 机制承载）。首次命中冷却 2m，半开到期放行重试；再命中按 Hits 指数退避（×2^min(hits-1,6)），
++// 封顶 10m；该模型请求成功即清。6004 限流不参与本退避（各自独立语义）。
++//
++// 2026-10-28 从 6h/24h 缩短到 2m/10m：原参数把「一次偶发 11102」放大成整池锁死——
++// 见 ithtelab/workbuddy-manager#308 作者的复现（同样波次只让单账号停 2 分钟即自愈，
++// 而 6h 基数会把 14 个账号逐个锁死一整天）。缩短的代价只是「真无此模型」时多试几次，
++// 收益是全池自愈速度从小时级回到分钟级。
+ const (
+-	modelBlockBaseTTL = 6 * time.Hour
+-	modelBlockMaxTTL  = 24 * time.Hour
+-	modelBlockShift   = 6 // 2^6=64 倍后封顶：6h×64>24h，实际封顶锚定 24h
++	modelBlockBaseTTL = 2 * time.Minute
++	modelBlockMaxTTL  = 10 * time.Minute
++	modelBlockShift   = 6 // 2^6=64 倍后封顶：2m×64>10m，实际封顶锚定 10m
+ )
+ 
+ // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
+diff --git a/internal/pool/modelcooldown_test.go b/internal/pool/modelcooldown_test.go
+index 5fb8dbd..83f499a 100644
+--- a/internal/pool/modelcooldown_test.go
++++ b/internal/pool/modelcooldown_test.go
+@@ -681,7 +681,7 @@ func TestBlockModelBackoffCooledAndExempt(t *testing.T) {
+ 	}
+ }
+ 
+-// TestBlockModelBackoffExponentialTtl 11102 退避：首次 6h、二次 12h、封顶 24h。
++// TestBlockModelBackoffExponentialTtl 11102 退避：首次 2m、二次 4m、封顶 10m（2026-10-28 缩短）。
+ func TestBlockModelBackoffExponentialTtl(t *testing.T) {
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+@@ -691,7 +691,7 @@ func TestBlockModelBackoffExponentialTtl(t *testing.T) {
+ 	first := time.Until(p.byUID["u1"].modelCooldowns["m"].Until)
+ 	p.mu.RUnlock()
+ 	if d := first - modelBlockBaseTTL; d > time.Second || d < -time.Second {
+-		t.Errorf("首次 TTL=%v want ~6h", first)
++		t.Errorf("首次 TTL=%v want ~%v", first, modelBlockBaseTTL)
+ 	}
+ 
+ 	p.BlockModelBackoff("u1", "m", "11102 model not available")
+@@ -703,11 +703,11 @@ func TestBlockModelBackoffExponentialTtl(t *testing.T) {
+ 	if hits != 2 {
+ 		t.Errorf("hits=%d want 2", hits)
+ 	}
+-	if d := second - 12*time.Hour; d > time.Second || d < -time.Second {
+-		t.Errorf("二次 TTL=%v want ~12h", second)
++	if want := 2 * modelBlockBaseTTL; second-want > time.Second || second-want < -time.Second {
++		t.Errorf("二次 TTL=%v want ~%v", second, want)
+ 	}
+ 
+-	// 连打到远超封顶：TTL 封顶 24h。
++	// 连打到远超封顶：TTL 封顶 modelBlockMaxTTL。
+ 	for i := 0; i < 10; i++ {
+ 		p.BlockModelBackoff("u1", "m", "11102 model not available")
+ 	}
+@@ -715,7 +715,7 @@ func TestBlockModelBackoffExponentialTtl(t *testing.T) {
+ 	capped := time.Until(p.byUID["u1"].modelCooldowns["m"].Until)
+ 	p.mu.RUnlock()
+ 	if d := capped - modelBlockMaxTTL; d > time.Second || d < -time.Second {
+-		t.Errorf("封顶 TTL=%v want ~24h", capped)
++		t.Errorf("封顶 TTL=%v want ~%v", capped, modelBlockMaxTTL)
+ 	}
+ }
+ 

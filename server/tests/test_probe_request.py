@@ -105,6 +105,24 @@ class ProbeRequestShapeTest(unittest.TestCase):
         self.assertIn('user', roles, '仍需一条 user 消息作为实际输入')
         self.assertEqual(len(body['messages']), 2, '不必多发消息，保持最小探测')
 
+    def test_probe_sends_conversation_header_family(self) -> None:
+        """探测请求必须带**会话头族**（issue #193）。
+
+        上游 2026-10-16 起对**部分账号**灰度启用渠道校验：出站缺 X-Conversation-ID
+        即判 `11-128 conversation id missing` —— 被灰度到的账号在探测里必红。那是
+        **探测请求形态**的问题，不是账号坏了（真实对话走网关，同一族头由上游补）。
+        报告方的剥离实测：校验对象是头，body 里的 conversationId 不是必填项。
+        """
+        self._probe()
+        h = _Client.sent['headers'] or {}
+        self.assertIn('X-Conversation-ID', h, '缺这个头会被判 11-128（渠道校验）')
+        for name in ('X-Conversation-Request-ID', 'X-Conversation-Message-ID',
+                     'X-Root-Request-ID', 'X-Trace-ID'):
+            self.assertIn(name, h, f'会话头族缺 {name}')
+        ids = {h['X-Conversation-ID'], h['X-Conversation-Request-ID'],
+               h['X-Conversation-Message-ID']}
+        self.assertEqual(len(ids), 3, '会话 / 轮 / 消息三个 ID 语义不同，不该复用同一个值')
+
     def test_probe_succeeds(self) -> None:
         ok, msg = self._probe()
         self.assertTrue(ok, msg)

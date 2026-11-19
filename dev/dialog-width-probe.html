@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>弹窗宽度探针（DialogContent 类名组合）</title>
+<!-- 真实编译产物。用 ?css=… 覆盖，好在"修复前/修复后"两份 CSS 上跑同一套断言。
+     必须在**解析期**就改好 href：动态 append 的 link 赶不上 load 事件，
+     `--dump-dom` 会在样式表应用之前就把 DOM 抓走（会量到 0）。 -->
+<link id="probe-css" rel="stylesheet" href="../web/out/_next/static/css/8c6c4f85ca9e12fc.css">
+<script>
+  (() => {
+    const css = new URLSearchParams(location.search).get('css');
+    if (css) document.getElementById('probe-css').setAttribute('href', css);
+  })();
+</script>
+<style>
+  body { margin: 0; font: 12px/1.5 system-ui, sans-serif; background: #111; color: #eee; }
+  .rack { padding: 4px; }
+  .cell { margin: 2px 0; padding: 4px 6px; }
+  .tag { font: 11px ui-monospace, monospace; color: #ffd479; }
+  .out { font: 11px ui-monospace, monospace; color: #7dd3fc; }
+  .ok  { color: #4ade80; }
+  .bad { color: #f87171; }
+  /* 探针自己的背景，用来量"弹窗在视口里占多宽"。 */
+  .probe-bg { background: rgba(255,255,255,.06); }
+</style>
+</head>
+<body>
+<div class="rack" id="rack"></div>
+
+<script>
+// 探针：把 DialogContent 的**真实类名字符串**（含 cn() 的合并语义）直接贴到元素上，
+// 用**真实编译产物**的 CSS 量出实际占宽。
+// 为什么要这么做：`sm:max-w-lg` 这种响应式变体在样式表里排在基础工具类**之后**，
+// 所以只要组件基类里还留着它，页面传进来的 `max-w-[600px]` 就在 ≥640px 时被它压掉——
+// 而且 tailwind-merge 不认为这两个类冲突（变体不同），不会帮你剔掉任何一个。
+// 也就是说：**看类名看不出来，只有量出来才知道**。
+
+// ── 组件基类（修复前 / 修复后只差一个 sm:max-w-lg）──────────────
+const BASE = 'fixed left-[50%] top-[50%] z-50 grid w-[calc(100%-2rem)] max-w-lg '
+  + 'translate-x-[-50%] translate-y-[-50%] gap-0 overflow-hidden rounded-[24px] '
+  + 'border border-border/60 bg-background duration-200 ';
+const BASE_OLD = BASE + 'sm:max-w-lg ';   // 修复前
+
+// ── 各调用方传进来的 className ────────────────────────────────
+const CASES = [
+  {tag: '修复前 keys 弹窗（基类带 sm:max-w-lg + max-w-[600px]）', cls: BASE_OLD + 'max-h-[calc(100dvh-2rem)] max-w-[600px]', want: 512},
+  {tag: '修复后 keys 弹窗（本次新值 920）',        cls: BASE + 'max-h-[calc(100dvh-2rem)] w-[min(920px,calc(100vw-2rem))] max-w-[min(920px,calc(100vw-2rem))] sm:max-w-[min(920px,calc(100vw-2rem))]', want: 920},
+  {tag: '修复后 keys 弹窗（等价裸写法 max-w-[460px]）', cls: BASE + 'max-w-[460px]', want: 460},
+  {tag: '修复后 小弹窗 max-w-[380px]',             cls: BASE + 'max-w-[380px]', want: 380},
+  {tag: '修复后 新建密钥 max-w-[520px]',            cls: BASE + 'max-w-[520px]', want: 520},
+];
+
+// ── 组件的 cn() = twMerge(clsx(...))：同组同类只留最后一个 ──────────
+// 探针必须把这一步也做出来，否则测的不是真实行为：基础类里的 `max-w-lg`
+// 如果不被 twMerge 剔掉，它会在样式表里和调用方的 `max-w-[380px]` 抢，
+// 而谁赢取决于两者的先后顺序 —— 那就量出了一个应用里不存在的组合。
+// 变体前缀（sm: 等）不同则视为**不同组**（tailwind-merge 就是这么判的），
+// 所以 `max-w-[920px]` 和基类的 `sm:max-w-lg` 可以同时留着。
+const GROUPS = ['max-w', 'min-w', 'max-h', 'min-h', 'w', 'h'];
+function twMergeLite(...lists) {
+  const seen = new Map();
+  const out = [];
+  for (const tok of lists.join(' ').split(/\s+/).filter(Boolean)) {
+    const m = tok.match(/^((?:[a-z0-9-]+:)*)(.*)$/);
+    const variant = m[1] || '';
+    const body = m[2];
+    const g = GROUPS.find((c) => body.startsWith(c + '-') || body === c);
+    if (!g) { out.push(tok); continue; }
+    const key = variant + '|' + g;
+    if (seen.has(key)) out[seen.get(key)] = tok;   // 后者胜，占原位置
+    else { seen.set(key, out.length); out.push(tok); }
+  }
+  return out.join(' ');
+}
+
+function build(i, c) {
+  const cell = document.createElement('div');
+  cell.className = 'cell';
+  cell.innerHTML = `<div class="tag">${i + 1}. ${c.tag}</div>`;
+  const dlg = document.createElement('div');
+  dlg.className = twMergeLite(c.cls);
+  // 真实内容：一段**不换行**的 JSON（和弹窗里的导出块一样），
+  // 保证 max-content 足够宽，能真正试出 max-width 的上限。
+  dlg.innerHTML = `<div style="padding:12px 24px"><b>密钥创建成功</b></div>`
+    + `<div style="padding:0 24px 12px"><pre style="margin:0;white-space:pre;`
+    + `overflow:auto;font:11px ui-monospace,monospace">{"env": {"ANTHROPIC_AUTH_TOKEN":`
+    + ` "wbk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "ANTHROPIC_BASE_URL": "http://127.0.0.1:7864"}}`
+    + `</pre></div>`
+    + `<div style="padding:12px 24px"><button>我已保存</button></div>`;
+  const out = document.createElement('div');
+  out.className = 'out';
+  cell.append(dlg, out);
+  document.getElementById('rack').append(cell);
+  return [dlg, out, c];
+}
+
+function measure() {
+  const vw = window.innerWidth;
+  document.getElementById('rack').insertAdjacentHTML('afterbegin',
+    `<div class="cell tag">视口宽 = ${vw}px（${vw >= 640 ? '≥640px：sm: 变体生效的区间' : '<640px：sm: 不生效'}）</div>`);
+  const all = [];
+  document.querySelectorAll('.cell').forEach((cell) => {
+    const dlg = cell.querySelector('div:not(.tag):not(.out)');
+    if (!dlg) return;
+    const cs = getComputedStyle(dlg);
+    const w = Math.round(dlg.getBoundingClientRect().width);
+    all.push({dlg, cs, w});
+  });
+  return {all, vw};
+}
+
+function report() {
+  const {all, vw} = measure();
+  const cells = [...document.querySelectorAll('.cell')].filter((c) => c.querySelector('.out'));
+  all.forEach(({dlg, cs, w}, i) => {
+    const c = CASES[i];
+    const out = cells[i].querySelector('.out');
+    // 关键判据三条：
+    //  1) 量到的宽度等于调用方想要的值；
+    //  2) max-width 这条声明**真的存在于计算样式里**（不是被浏览器当成非法 CSS 丢弃）；
+    //  3) width 那条也得有效（w-[calc(100%-2rem)] 这种写法在少了空格时是非法 CSS）。
+    const want = Math.min(c.want, vw - 32);
+    const widthOk = Math.abs(w - want) <= 1;
+    const declOk = cs.maxWidth !== 'none';
+    // 把"参与宽度竞争"的几个类打出来：合并后还剩哪条，是判断谁赢的直接依据。
+    const wClasses = [...dlg.classList]
+      .filter((t) => /(^|:)(max-w|min-w|w)-/.test(t)).join(' ');
+    out.className = 'out ' + (widthOk && declOk ? 'ok' : 'bad');
+    out.textContent =
+        `实宽=${w}px 期望=${want}px ${widthOk ? '✔' : '✘'}`
+      + ` | computed: width=${cs.width} max-width=${cs.maxWidth}`
+      + ` | 宽度类: ${wClasses}`;
+  });
+  document.title = JSON.stringify(all.map((a) => a.w));
+}
+
+// CSS 由 ?css= 指定（默认按 ../web/out 里的构建产物找），注入后再量，
+// 确保量的是**真实编译出来的规则**（含 media query 的真实先后顺序）。
+// 报错也要落在页面上：`--dump-dom` 只看得到 DOM，控制台看不见。
+function fail(msg) {
+  document.getElementById('rack').insertAdjacentHTML('afterbegin',
+    `<div class="cell bad">探针失败：${msg}</div>`);
+}
+window.addEventListener('error', (e) => fail(e.message));
+CASES.forEach((c, i) => build(i, c));
+// load 之后再量：window.load 会等样式表加载完（这就是必须静态写 link 的原因）。
+window.addEventListener('load', () => requestAnimationFrame(() => {
+  try { report(); } catch (e) { fail(e && e.stack ? e.stack : e); }
+  // ?flow=1 截图模式：弹窗是 position:fixed 的，直接截图会全部叠在一起。
+  // **测量早已完成**，这里改的只是排版，所以不影响上面那些数字（也正因此必须放在
+  // report() 之后）。
+  if (new URLSearchParams(location.search).get('flow')) {
+    document.title = 'flow';
+    document.querySelectorAll('.cell > div.fixed').forEach((d) => {
+      d.style.position = 'static';
+      d.style.transform = 'none';
+      d.style.margin = '6px 0';
+      d.style.maxHeight = 'none';
+    });
+  }
+}));
+</script>
+</body>
+</html>

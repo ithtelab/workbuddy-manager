@@ -25,7 +25,8 @@ from server.routers import gateway  # noqa: E402
 
 
 def _reset_cache() -> None:
-    gateway._body_limit_cache.update({'at': 0.0, 'bytes': 0})
+    gateway._body_limit_cache.update({'at': 0.0, 'bytes': 0, 'source': ''})
+    gateway._BODY_LIMIT_SOURCE['value'] = ''
 
 
 def _request(body: bytes, headers: dict | None = None) -> Request:
@@ -173,6 +174,52 @@ class BodyLimitEnforcement(unittest.TestCase):
         _, err = self._read(raw, {'content-length': str(len(raw))})
         self.assertIsNotNone(err)
         self.assertEqual(err.status_code, 400)
+
+    def test_message_points_at_the_upstream_key_when_it_wins(self) -> None:
+        """上限来自**旧版上游**的 config.json 时，报错必须指上游那个键。
+
+        issue #180 的实际形状：用户的上游是旧版、`server.max_body_mb` 还在，
+        面板优先听它；旧文案却一律写「由环境变量 WB_GATEWAY_MAX_BODY_MB 决定」，
+        用户把环境变量改大了毫无效果，还以为面板不认这个配置。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = pathlib.Path(tmp) / 'config.json'
+            cfg.write_text(json.dumps({'server': {'max_body_mb': 1}}), encoding='utf-8')
+            orig = config.UPSTREAM_CONFIG
+            config.UPSTREAM_CONFIG = cfg
+            _reset_cache()
+            try:
+                _, err = self._read(self.big, {})
+                msg = json.loads(err.body)['error']['message']
+                self.assertIn('上游', msg)
+                self.assertIn('server.max_body_mb', msg,
+                              '要指出上游那个键 —— 那才是用户该改的地方')
+                self.assertIn('WB_GATEWAY_MAX_BODY_MB', msg, '也要给出删键后的替代做法')
+            finally:
+                config.UPSTREAM_CONFIG = orig
+                _reset_cache()
+
+    def test_message_says_default_when_nothing_is_configured(self) -> None:
+        """既没有上游那个键、也没设环境变量时，说清「这是默认上限、可以调大」。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = pathlib.Path(tmp) / 'config.json'
+            cfg.write_text(json.dumps({}), encoding='utf-8')
+            orig = config.UPSTREAM_CONFIG
+            orig_default = gateway.DEFAULT_MAX_BODY_MB
+            config.UPSTREAM_CONFIG = cfg
+            gateway.DEFAULT_MAX_BODY_MB = 1          # 与 self.big（2 MB）配对，便于构造超限
+            _reset_cache()
+            try:
+                gateway.max_body_bytes()
+                self.assertEqual(gateway._BODY_LIMIT_SOURCE['value'], '', '没设过就应是默认值')
+                _, err = self._read(self.big, {})
+                msg = json.loads(err.body)['error']['message']
+                self.assertIn('默认上限', msg)
+                self.assertIn('WB_GATEWAY_MAX_BODY_MB', msg)
+            finally:
+                config.UPSTREAM_CONFIG = orig
+                gateway.DEFAULT_MAX_BODY_MB = orig_default
+                _reset_cache()
 
     def test_error_message_has_guidance(self) -> None:
         """报错要说清怎么改，而不是只丢一个 413。

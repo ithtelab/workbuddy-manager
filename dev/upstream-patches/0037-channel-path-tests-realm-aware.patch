@@ -1,0 +1,55 @@
+diff --git a/internal/upstream/gzip_body_test.go b/internal/upstream/gzip_body_test.go
+--- a/internal/upstream/gzip_body_test.go
++++ b/internal/upstream/gzip_body_test.go
+@@ -70,17 +70,26 @@
+ 	}
+ }
+ 
+-// TestChannelBlockedReordersPaths 被渠道校验拦过的账号优先走 /console（issue #296）。
++// TestChannelBlockedReordersPaths 渠道校验记忆只对 global 提前 /console（#296 / #308）。
++//
++// CN 的 /console 不提供 deepseek-v4.1-flash 等模型：一旦把 /console 排到首位，
++// 该账号之后 10 分钟的**每个**请求都会先吃一次必然失败的 11102，进而把整池写成
++// 模型冷却。所以 CN 保持 /v2 优先，11128 由调用方按请求级处理。
+ func TestChannelBlockedReordersPaths(t *testing.T) {
+ 	c := &Client{}
+-	a := &auth.Auth{UID: "u1"}
+-	if got := c.chatPaths(a); got[0] != chatCompletionsPath {
++	cn := &auth.Auth{UID: "u1"}
++	if got := c.chatPaths(cn); got[0] != chatCompletionsPath {
+ 		t.Fatalf("默认应 /v2 优先，got %v", got)
+ 	}
+ 	c.markChannelBlocked("u1")
+-	got := c.chatPaths(a)
+-	if got[0] != chatConsolePath || got[1] != chatCompletionsPath {
+-		t.Fatalf("命中渠道校验后应 /console 优先，got %v", got)
++	if got := c.chatPaths(cn); got[0] != chatCompletionsPath {
++		t.Fatalf("CN 账号即使命中渠道校验也应保持 /v2 优先，got %v", got)
++	}
++	// global 命中后提前 /console（#296 的行为保留）
++	gl := &auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"}
++	c.markChannelBlocked("g1")
++	if got := c.chatPaths(gl); got[0] != chatConsolePath || got[1] != chatCompletionsPath {
++		t.Fatalf("global 命中渠道校验后应 /console 优先，got %v", got)
+ 	}
+ 	// 未命中的其他账号不受影响
+ 	if other := c.chatPaths(&auth.Auth{UID: "u2"}); other[0] != chatCompletionsPath {
+diff --git a/internal/upstream/console_first_model_missing_test.go b/internal/upstream/console_first_model_missing_test.go
+--- a/internal/upstream/console_first_model_missing_test.go
++++ b/internal/upstream/console_first_model_missing_test.go
+@@ -38,9 +38,13 @@
+ 
+ 	c := New()
+ 	c.ChatBaseCN = srv.URL
+-	acct := &auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}
++	// 用 global 账号：只有 global 会因渠道校验把 /console 提前（CN 保持 /v2 优先，
++	// 见 0032-console-first-global-only）。分类判定本身与 realm 无关，这里覆盖的是
++	// 「/console 排首位时 11102 不能被升级成 model_blocked」，所以仍要能构造出该顺序。
++	acct := &auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999,
++		Domain: "www.workbuddy.ai"}
+ 	// 关键前置：模拟「撞过 11128」，chatPaths 因此返回 [/console, /v2]。
+-	c.markChannelBlocked("u1")
++	c.markChannelBlocked("g1")
+ 
+ 	body, status, raw, err := c.ChatStream(acct,
+ 		[]byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})

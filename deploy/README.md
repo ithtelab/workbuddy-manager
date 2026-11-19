@@ -1,11 +1,109 @@
 # 部署指南
 
-本项目管理端**依赖上游 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)**
-（提供账号池调度与 OpenAI 兼容接口）。单独 clone 本仓库是跑不起来的 ——
-为此我们提供了一键脚本，会在干净机器上自动安装好两者。
+本项目管理端**依赖上游 workbuddy2api**（提供账号池调度与 OpenAI 兼容接口）。
+单独 clone 本仓库是跑不起来的 —— 为此我们提供了一键脚本，会在干净机器上安装好两者。
 
 > **重要**：请勿把本项目管理端的数据目录与上游账号目录提交或公开分享，
 > 其中含账号授权凭据。
+
+---
+
+## 〇、上游源码从哪来（随发布包分发）
+
+上游 workbuddy2api 的源码**随本项目的发布包一起分发**（包内 `upstream/`），
+装的时候不用去任何外部地址取。影响如下：
+
+| 场景 | 现在的状态 |
+|---|---|
+| **已经在跑**的部署 | **不受影响**。上游源码在你机器上、镜像也是本地构建的；面板的一键更新会沿用现有源码重建上游，面板自己照常更新 |
+| **新装** | 直接用包内那份（下面的脚本会自动识别） |
+| **更新上游代码** | 跟着管理端一起更新（一键更新会把包内那份同步进来）；要改代码就改本地那份，或用 `UPSTREAM_SRC` 换一份 |
+
+### 包内自带，开箱即用
+
+最新版本的 Release 包内含 `upstream/`（上游源码），装的时候直接用，
+**不需要联网取任何外部源码**：
+
+```bash
+wget https://github.com/ithtelab/workbuddy-manager/releases/latest/download/workbuddy-manager-<版本>.tar.gz
+tar xzf workbuddy-manager-*.tar.gz && cd workbuddy-manager-*
+sudo bash deploy/install.sh          # 自动使用包内的 upstream/
+```
+
+要改用你自己那份源码（或机器上已有的 `/opt/workbuddy2api`），按下面的优先级覆盖：
+
+```bash
+# 1) 显式指定本地源码（目录 / .tar.gz / .zip 都行）
+sudo UPSTREAM_SRC=/opt/workbuddy2api bash deploy/install.sh
+sudo UPSTREAM_SRC=/path/to/workbuddy2api-<版本>.tar.gz bash deploy/install.sh
+
+# 2) 上游已手工装好，只想装面板
+sudo bash deploy/install.sh --skip-upstream
+```
+
+优先级：`UPSTREAM_SRC` → 发布包自带的 `upstream/` → 目标目录里已有的完整源码。
+上游已由本项目维护，不再从外部 git 仓库克隆。`UPSTREAM_DIR` 默认 `/opt/workbuddy2api`。
+
+### 以后怎么更新上游代码
+
+用面板里的**一键更新**即可 —— 它会把包内那份上游源码同步进 `/opt/workbuddy2api`
+（只增改，不动 `config.json` / `auths/` / `data/`），**有变化才重建容器**。
+随包分发的上游没有 `git pull` 可拉；要改代码请改本地那份（或用 `UPSTREAM_SRC`
+覆盖一份新的），再：
+
+```bash
+cd /opt/workbuddy2api && docker compose up -d --build
+```
+
+这三样务必保留：`config.json`（含 `api_key`）、`auths/`（账号授权）、`data/`。
+
+### 直接用预构建的上游镜像（不想本地构建时）
+
+每次发版也会把**上游**构建成镜像推到 GHCR。它和管理端镜像**同源**：都用发布包里
+那份源码（= `upstream-src` 资产 + 我们的全部补丁），所以不会出现「第三方上游镜像
+与项目上游源码不一致」的版本漂移。
+
+```bash
+docker pull ghcr.io/ithtelab/workbuddy2api:<版本>
+# latest 指向最近一次发布；长期跑建议钉版本号（理由同管理端镜像）
+```
+
+要跑多个上游（分组 / 多号池）时，把各自目录里 compose 的 `build: .` 换成 `image:`
+即可，端口与卷不变：
+
+```yaml
+services:
+  wb2api:
+    image: ghcr.io/ithtelab/workbuddy2api:2.8.0
+    container_name: workbuddy2api
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "127.0.0.1:7863:7863"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro
+```
+
+三点要知道：
+
+- 镜像里**不带**真实配置（只有 `config.example.json`），`config.json` 必须自己挂；
+  首次使用可从发布包的 `upstream/config.example.json` 复制一份再改。
+- 镜像是**多架构**（amd64 / arm64），与管理端镜像一致。
+- 用镜像之后，上游就**不再由面板的一键更新维护**（那条路同步源码并
+  `docker compose up -d --build`）：升级上游 = 改 `image:` 的版本号 +
+  `docker compose up -d`。面板「全部更新」里针对上游源码的那一步对镜像部署无效，
+  这是预期行为。
+- 镜像自带 `dev.workbuddy.upstream-id` label，面板读运行中容器的这个 label 判断
+  「镜像部署且与本次发布同源」，同源时不会提示「随包上游与本机不一致」。读不到
+  label 的旧镜像（≤ 2.8.2）仍按部署目录的 `.upstream-id` 判定，行为不变。
+
+### 许可
+
+上游为 MIT 许可（版权归原作者）。继续使用、修改、再分发都需保留它的 `LICENSE`
+与版权声明 —— 源码目录里那份 `LICENSE` 不要删。
 
 ---
 
@@ -17,15 +115,15 @@ wget https://github.com/ithtelab/workbuddy-manager/releases/latest/download/work
 tar xzf workbuddy-manager-*.tar.gz
 cd workbuddy-manager-*
 
-# 2) 一键部署（会自动检测并安装上游 workbuddy2api）
+# 2) 一键部署（自动检测上游；上游源码用 UPSTREAM_SRC 指定，见上一节）
 sudo bash deploy/install.sh
 ```
 
 脚本会自动完成：
 
 1. 环境预检（Python ≥3.9、Docker、端口占用检查）
-2. **安装上游 workbuddy2api** —— 克隆、生成随机 `api_key`、设置目录属主、
-   构建并启动容器、等待就绪
+2. **安装上游 workbuddy2api** —— 取源码（本地目录或 git 地址）、生成随机 `api_key`、
+   设置目录属主、构建并启动容器、等待就绪
 3. 安装管理端 —— 部署代码、装依赖、注册 systemd 服务
 4. 验证两条链路并打印访问地址与初始密码
 
@@ -70,10 +168,39 @@ sudo APP_DIR=/opt/wbm \
 |---|---|---|
 | `APP_DIR` | `/opt/workbuddy-manager` | 管理端目录 |
 | `UPSTREAM_DIR` | `/opt/workbuddy2api` | 上游目录 |
-| `UPSTREAM_REPO` | 上游 GitHub 地址 | 上游仓库地址 |
 | `MANAGER_PORT` | `7864` | 管理端端口 |
 | `UPSTREAM_PORT` | `7863` | 上游端口 |
 | `PY` | `/usr/bin/python3` | Python 解释器路径 |
+
+### 上游由 systemd 托管（非 docker）
+
+上游直接以二进制运行、由 systemd 管理时，在管理端 `.env` 里写明，否则「清除冷却 /
+设定冷却 / 重启上游」会因为找不到 docker 而失败：
+
+```dotenv
+WB2API_MODE=systemd
+WB2API_SERVICE=workbuddy2api   # 上游的 unit 名，按实际填写
+```
+
+管理端服务账号（install.sh 默认 `workbuddy`）不是 root 时，需要允许它启停这一个
+unit、并读取它的日志：
+
+```bash
+sudo tee /etc/polkit-1/rules.d/49-workbuddy2api.rules >/dev/null <<'POLKIT'
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.user == "workbuddy" &&
+        action.lookup("unit") == "workbuddy2api.service") {
+        return polkit.Result.YES;
+    }
+});
+POLKIT
+sudo usermod -aG systemd-journal workbuddy
+sudo systemctl restart workbuddy-web
+```
+
+只是 `11102` 误判造成的模型限流，或面板设的强制冷却，开启上游 `admin.enabled`
+（「设置 → 上游」）后会在线清除，不需要上面的授权，也不会重启上游。
 
 ---
 
@@ -133,7 +260,129 @@ server {
 > 首段可被客户端伪造）。若前面还叠了 CDN，请把服务端
 > `WB_TRUSTED_PROXY_HOPS` 设为 CDN + 反代的层数。
 
-### 4. 加固建议
+#### 前面是 Cloudflare（或任何 CDN）时**必须**再配一步
+
+只把 `X-Real-IP` 设成 `$remote_addr` 在 CF 后面是不够的：请求经过 CDN 时
+`$remote_addr` 是**边缘节点**的地址（`162.159.x` / `172.68.x` …），于是应用侧的
+全局 IP 白/黑名单、登录失败锁定、密钥 IP 白名单、审计日志全部按「CDN 的 IP」
+记账 —— 所有用户看起来都是同一个来源，IP 类管控既拦不准也锁不准（实测线上：
+`request_logs` 访问量前几名全是 CF 网段，单条 1.8 万次）。要用 nginx 自带的
+`realip` 模块从 `CF-Connecting-IP` 还原真实来源：
+
+```bash
+{
+  curl -fsS https://www.cloudflare.com/ips-v4
+  curl -fsS https://www.cloudflare.com/ips-v6
+  echo
+  echo 'real_ip_header CF-Connecting-IP;'
+  echo 'real_ip_recursive on;'
+} | sed -E '/^[0-9a-fA-F:.]+\/[0-9]+$/ { s/^/set_real_ip_from /; s/$/;/ }' \
+  | sudo tee /etc/nginx/conf.d/cloudflare-realip.conf
+
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+这个文件由 `nginx.conf` 里 `http {}` 中的 `include conf.d/*.conf` 加载，对所有
+站点生效。要点：
+
+- **`set_real_ip_from` 必须限定为 CDN 网段**。绕过 CDN 直连源站的请求，TCP
+  对端不匹配这些网段，伪造的 `CF-Connecting-IP` 就不会被采信。
+- CF 网段会变（官方列表会增减），建议把上面那段放进 cron（例如每月一次）后
+  跟 `nginx -t && systemctl reload nginx`，别只跑一次就忘了。
+- 应用侧**不用改**：`X-Real-IP` 仍由 nginx 覆盖成 `$remote_addr`，此时它已是
+  真实客户端 IP；`WB_TRUSTED_PROXY_HOPS` 也不必上调 —— 那是给「直接采信
+  `X-Forwarded-For`」的场景算层数用的。
+
+验证：`sudo tail -1 /var/log/nginx/access.log` 的第一列应是真实客户端 IP；
+或者不带密钥请求一次 `/v1/usage`（会返回 401），管理端「安全 → IP 访问日志」
+里新增那条的来源 IP 应是你的公网 IP，而不是 CF 网段。
+
+### 4. 子路径部署（可选）
+
+如果域名根路径已被别的站点占用（例如 `https://example.com/` 是另一个系统），
+管理端可以挂在子路径下，例如 `https://example.com/workbuddy-manager/`。
+
+需要**两处**同时配置，缺一不可。
+
+**① 把前缀交给前端构建**
+
+宿主机 / 源码部署：
+
+```bash
+cd /opt/workbuddy-manager/web
+NEXT_PUBLIC_BASE_PATH=/workbuddy-manager npm run build:export
+```
+
+容器部署时前端是**在镜像构建阶段**编译的（宿主机上没有 `web/out`），所以前缀要传给
+构建而不是运行时：
+
+```bash
+docker compose build --build-arg BASE_PATH=/workbuddy-manager
+docker compose up -d
+```
+
+也可以直接写进 `docker-compose.yml` 的 `build.args.BASE_PATH`（留空 = 根路径部署，与
+改动前一致）。
+
+**② 后端与反代对齐前缀**
+
+加到 **systemd unit 的 `Environment=`** 里（容器部署则把 compose 的 `environment:` 里
+那行 `WB_BASE_PATH` 取消注释），取值与上面完全一致：
+
+```
+WB_BASE_PATH=/workbuddy-manager
+```
+
+> **这一项（`WB_BASE_PATH`）别写在 `.env` 里**：它在构建期与前缀绑定，必须落在
+> systemd 的 `Environment=` / compose 的 `environment:` 这类**显式变量**里，
+> 症状很隐蔽 —— 配置看起来加了，但前缀没被剥掉，表现为「页面能打开、接口全 404」，
+> 容易误判成反代写错了。
+>
+> 其余可选项（出口代理 `WB_HTTP_PROXY`、更新代理 `WB_UPDATE_PROXY`、GitHub 镜像
+> `WB_GITHUB_MIRROR`、新账号默认线路
+> `WB_DEFAULT_ACCOUNT_PROXY` 等）**写进安装目录的 `.env` 即可**：容器部署由 compose 的
+> `${}` 取过去，systemd 部署由单元里的 `EnvironmentFile=` 读进来，Windows 原生由
+> 启动脚本交给面板（`uvicorn --env-file .env`）。
+
+**③ 反向代理：两种 `proxy_pass` 写法都可以**
+
+带尾斜杠（反代自己把前缀剥掉）：
+
+```nginx
+location /workbuddy-manager/ {
+    proxy_pass http://127.0.0.1:7864/;   # 末尾这个 / 就是「剥掉前缀」
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade    $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 300s;
+}
+```
+
+不带尾斜杠（反代原样转发，前缀由服务端自己剥掉）：
+
+```nginx
+location /workbuddy-manager/ {
+    proxy_pass http://127.0.0.1:7864;    # 没有尾斜杠：请求带着前缀进来
+    ...同样那几个 header 与超时...
+}
+```
+
+> 第二种写法值得单独说明：**面板类工具（如 1Panel）新建反向代理时，界面拼出来的
+> `proxy_pass` 常常是不带尾斜杠的那种**，而手写配置的人也很容易漏掉那个 `/`。
+> 两种都能用的意义是——不必先搞清楚「该不该带尾斜杠」才能配通。
+
+> 网关（`/v1`）会一起挂到前缀下：接入地址是
+> `https://example.com/workbuddy-manager/v1`。密钥页展示的地址会自动带上前缀。
+
+> 症状好认：页面能打开，但随即跳到域名根的 `/login` 并 404 —— 根路径属于另一个
+> 站点，自然没有这个路由。这说明 ① 或 ② 漏了一个：前缀只在前端和后端**都**知道
+> 的情况下才成立。
+
+### 5. 加固建议
 
 - 用防火墙或安全组只放行 `22 / 80 / 443`；`7863`、`7864` 保持仅本机
 - 可在 1Panel 为站点配置 IP 白名单，或叠加 Cloudflare Access
@@ -143,7 +392,8 @@ server {
 
 ## 四·五、后续更新
 
-部署后有两种更新方式，**都不需要重新执行安装脚本**。
+部署后有两种更新方式，**都不需要重新执行安装脚本**。（下面两条都是按**宿主安装**
+写的；容器部署请看本节末尾的「容器（Docker Compose）部署的更新」。）
 
 ### 方式一：网页一键更新（推荐）
 
@@ -170,18 +420,101 @@ sudo /opt/workbuddy-manager/venv/bin/python deploy/update.py --target both
 
 `--target` 取值为 `manager` / `upstream` / `both`。
 
+### 国内网络：用镜像加速更新
+
+直连 GitHub 超时、发布包下载卡在 0% 时，可以填一个 GitHub 加速服务的基址
+（issue #216）。两种填法，任选其一：
+
+```bash
+# ① 面板：设置 → 系统更新 → GitHub 镜像加速，填 https://gh-proxy.com/
+# ② 命令行 / .env（面板里没填时生效）
+WB_GITHUB_MIRROR=https://gh-proxy.com/
+```
+
+版本检测与发布包下载都会**先走镜像、失败自动回退直连**，所以镜像临时不可用也
+不会把更新卡死。程序会自动拼成 `https://gh-proxy.com/https://github.com/...`
+这种「基址 + 完整原始地址」的形式，不用自己拼。
+
+> **镜像会把请求转给第三方**，因此走镜像时**不会发送 GitHub Token**。下载公开
+> 仓库的 Release 本身不需要认证；如果你配镜像的目的是绕开 API 限流，请注意这条
+> 路径用的是镜像自己的配额。不放心的话，用 `WB_UPDATE_PROXY` 配一个自己能控制的
+> 代理，效果类似且流量不经过第三方。
+>
+> 加速服务的可用性由服务方决定。换了服务只要改基址即可（`gh-proxy.org` 是同一家
+> 的另一个域名）；留空 = 全部直连。
+
+### 容器（Docker Compose）部署的更新
+
+上面两种方式都是按宿主安装写的（方式二用的是宿主上的 venv）。容器部署用面板里的
+「一键更新」即可；想在容器里跑命令行也行：
+
+```bash
+docker compose exec workbuddy-manager python /app/deploy/update.py --target both
+```
+
+> 这条命令结束时**会按设计终止容器**（更新进程发信号给 PID 1，再由 compose 的
+> `restart: unless-stopped` 用新代码拉起），所以 `exec` 会跟着断开 —— 这是正常的。
+
+**更新的代码落在哪**（决定了什么操作会让它「退回旧版」）：
+
+| 内容 | 位置 | `docker restart` | 重建容器（`up -d --build`） |
+|---|---|---|---|
+| 管理端代码 | 容器可写层 `/app/server`、`/app/web/out` | 保留 | **退回镜像里的版本** |
+| 更新时新装的依赖 | `/app/.local`（`PYTHONUSERBASE`） | 保留 | **丢失** |
+| 数据库 / 日志 / 配置 | 宿主 `./data`（bind mount） | 保留 | 保留 |
+
+所以**更新之后不要对管理端执行 `docker compose up -d`** —— 那会用镜像里的旧代码
+重建容器。要重启用 `docker restart workbuddy-manager`；要升级镜像本身，走下面这步。
+
+#### 一次性：离线更新（也是「更新后打不开面板」的救法）
+
+**更新器本身也在被更新的代码里** —— 这一版跑的仍是上一版的更新逻辑。所以这两种
+情况必须用发布包重建镜像，面板里的按钮帮不上忙：
+
+- 更新后管理端起不来（例如新版本引入了新依赖，而容器里装不上）；
+- 你要升级的是**镜像本身**（Dockerfile / compose / 基础依赖有变化）。
+
+```bash
+# 在部署目录（有 docker-compose.yml 的地方）
+tar xzf workbuddy-manager-vX.Y.Z.tar.gz
+cd workbuddy-manager-vX.Y.Z
+docker compose up -d --build workbuddy-manager
+```
+
+发布包里带 `Dockerfile`、`docker-compose.yml`、`server/`、`web/out/` 与 `upstream/`，
+所以这一步既能救砖、也能把镜像升到最新。`./data` 与 `../workbuddy2api` 都是挂载卷，
+不会被覆盖。
+
+#### 容器内操作 docker（更新上游 / 重载配置）
+
+**默认不挂 docker.sock**：挂上它等于把宿主 root 权限交给管理端容器（`docker run -v /:/host`
+即可拿到宿主文件系统），这不该是默认状态。需要「保存设置后自动重载上游容器 / 一键更新上游」
+这些界面功能时，再按下面两步显式开启：
+
+1. 把 `docker-compose.yml` 里 `docker.sock` 挂载与 `group_add` 两段的注释解开；
+2. 把宿主 socket 的真实 GID 填进 `.env`（容器以 uid 10001 运行，宿主的
+   `/var/run/docker.sock` 通常归 `root:docker`，不在那个组里就是 `permission denied`）：
+
+```bash
+echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
+docker compose up -d workbuddy-manager
+```
+
+不配也不会静默失败：更新上游时会提示你去取真实 GID。不挂 socket 时，相关功能
+会如实降级为「请到宿主机执行 docker compose ...」。
+
 ---
 
 ## 五、目录与端口
 
 ```
-管理端   /opt/workbuddy-manager         :7864   仅本机（经反代对外）
+管理端   /opt/workbuddy-manager         :7864   仅监听 127.0.0.1（公网访问走反向代理）
   ├─ server/        后端代码
   ├─ web/out/       前端静态产物
   ├─ data/          SQLite、users.json（含会话密钥）
   └─ venv/          Python 虚拟环境
 
-上游     /opt/workbuddy2api             :7863   仅本机
+上游     /opt/workbuddy2api             :7863   仅本机（安装脚本把端口映射绑到 127.0.0.1）
   ├─ auths/         账号授权文件（每个账号一个 JSON）
   ├─ data/state.json 账号池状态
   └─ config.json    上游配置（含 api_key）
@@ -245,9 +578,64 @@ curl -s http://127.0.0.1:7863/healthz
 chown -R 10001:10001 /opt/workbuddy2api/auths /opt/workbuddy2api/data
 ```
 
+若管理端跑在宿主机（systemd）而**不是**容器里，建议再给 `auths` 打开 setgid
+并把属组对齐服务账号。这样容器里新建的账号文件继承同一个属组，管理端重登时
+写回也不会因为「改不到别的组」被拒：
+
+```bash
+chgrp -R workbuddy /opt/workbuddy2api/auths
+chmod g+s /opt/workbuddy2api/auths
+```
+
+**Q：容器反复重启，日志报 `unable to open database file` / 「目录不可写：/app/data」**
+
+这是**权限**问题，不是数据库坏了，也不是路径配错。管理端容器以 uid 10001 运行
+（Dockerfile 里的 `USER app`），而 compose 默认把宿主 `./data` bind mount 到
+`/app/data` —— 这个目录的属主由宿主机决定，Docker 首次自动创建时归 `root`，
+容器内的 10001 写不进去，SQLite 连库文件都建不了，启动即失败；配合
+`restart: unless-stopped` 就表现为一直重启、页面打不开。
+
+在 docker-compose.yml 所在目录确认一下：
+
+```bash
+ls -ld ./data     # drwxr-xr-x root root → 中招
+```
+
+**修法一（能 SSH、能改属主，推荐）**：只改权限，不动配置，也不用重建容器：
+
+```bash
+sudo chown -R 10001:10001 ./data
+docker restart workbuddy-manager
+```
+
+> 只 `restart`，不要 `docker compose up -d`：后者会用镜像里的代码重建容器，
+> 之前通过面板「一键更新」装进容器的新代码会退回旧版（见上表）。
+
+**修法二（NAS / 群晖 / SMB / 没开 SSH，改不了属主）**：换成命名卷。命名卷首次
+创建时会继承镜像内 `/app/data` 的属主（10001），不需要 chown。
+
+- 新版 compose（挂载行是 `${WB_DATA_VOLUME:-./data}:/app/data`）：在 compose
+  同目录的 `.env` 里加一行 `WB_DATA_VOLUME=wb-manager-data`，再
+  `docker compose up -d`。
+- 旧版 compose（挂载行是 `- ./data:/app/data`）：把整行改成
+  `- wb-manager-data:/app/data`，并在文件末尾加：
+
+  ```yaml
+  volumes:
+    wb-manager-data:
+  ```
+
+  然后 `docker compose up -d --force-recreate workbuddy-manager`。
+
+切过去之后数据库不再落在宿主 `./data`，取备份用
+`docker compose cp workbuddy-manager:/app/data/manager.db ./manager.db`。
+首次启动就失败时 `./data` 是空的，直接切即可；若里面已有数据，先用
+`cp -a ./data/ ./data.bak/` 留一份再操作。
+
 **Q：首次构建上游很慢**
 上游是 Go 项目，首次 `docker compose up --build` 需拉取基础镜像并编译，
-视网络情况可能需要几分钟，属正常现象。
+视网络情况可能需要几分钟，属正常现象。不想本地编译就把 compose 的 `build: .`
+换成预构建镜像（见「〇、上游源码从哪来 → 直接用预构建的上游镜像」）。
 
 **Q：构建管理端镜像失败 / 启动后打开页面显示 ERR_CONNECTION_REFUSED**
 
@@ -262,24 +650,25 @@ docker compose build     # 重新构建，看真正的报错
 构建在国内网络下最常见的失败点是**软件源/依赖源不可达**，典型报错：
 
 ```
-E: Failed to fetch http://deb.debian.org/... 502  Bad Gateway
-E: The repository '...' is no longer signed.
+fetch https://dl-cdn.alpinelinux.org/... 502 Bad Gateway
 SSL: UNEXPECTED_EOF_WHILE_READING        # pip 拉 PyPI 时
 ```
 
-官方源（`deb.debian.org` / `pypi.org`）走国际 CDN，国内实测约 367 kB/s 且频繁
-502。Dockerfile 内置了一次**自动降级**（失败后改用阿里云 / 清华镜像重试），
-所以通常能自己建成功，只是会先白等几分钟。想直接跳过这段等待，显式指定镜像源：
+镜像基于 `python:3.12-alpine`。官方源（`dl-cdn.alpinelinux.org` / `pypi.org`）
+走国际 CDN，国内偶有卡顿或 502。Dockerfile 内置了一次**自动降级**（pip 官方源
+失败后改用清华镜像重试），所以通常能自己建成功；想直接跳过等待，显式指定镜像源：
 
 ```bash
 docker compose build \
-  --build-arg DEBIAN_MIRROR=mirrors.aliyun.com \
+  --build-arg ALPINE_MIRROR=mirrors.aliyun.com \
   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 docker compose up -d
 ```
 
-也可以把这两个值写进 `docker-compose.yml` 的 `build.args`，之后 `up --build` 就不必再带参数。
+`ALPINE_MIRROR` 是现在的参数名；老版本用的 `DEBIAN_MIRROR` 仍保留兼容（同样填
+`mirrors.aliyun.com` 即可）。也可以把值写进 `docker-compose.yml` 的 `build.args`，
+之后 `up --build` 就不必再带参数。
 可选镜像：`mirrors.aliyun.com` / `mirrors.tuna.tsinghua.edu.cn` / `mirrors.ustc.edu.cn`。
 
 **Q：扫码后账号没出现**
@@ -343,6 +732,12 @@ grep api_key /opt/workbuddy2api/config.json
 >   （Windows / macOS）会把 `host.docker.internal` 转发到宿主回环、连得上；
 >   而 Linux 上容器访问宿主回环通常**不通**。
 >
+> 一键更新会自动处理这个差异：检测到 `WB2API_BASE` 用的是
+> `host.docker.internal` 时，把上游端口绑到宿主网桥地址（如 `172.17.0.1`），
+> 容器可达且不对公网开放；Docker Desktop 仍用 `127.0.0.1`。要指定别的地址
+> （例如只绑内网网卡），在管理端环境变量里设 `WB_UPSTREAM_BIND=192.168.1.10`
+> 后重新执行一次更新。
+>
 > 更可靠的做法有两条，按你的部署形态选：
 >
 > **① 让两个容器进同一个 Docker 网络（推荐，最干净）**
@@ -369,3 +764,59 @@ grep api_key /opt/workbuddy2api/config.json
 
 **Q：公网访问点「添加账号」二维码加载不出来**
 管理端需要访问腾讯接口生成授权链接，请确认服务器可访问外网。
+
+---
+
+## 附：Windows 原生部署（无需 Docker）
+
+前提：`workbuddy2api` 已在本机运行，并有可用的启停脚本与文件日志。
+
+```powershell
+git clone https://github.com/ithtelab/workbuddy-manager.git
+cd workbuddy-manager
+Copy-Item .env.example .env
+```
+
+在 `.env` 中至少设置以下项目（Windows 路径建议使用 `/`）：
+
+```dotenv
+WB_MANAGER_HOST=127.0.0.1
+WB_SECURE_COOKIE=false
+WB2API_MODE=native
+WB_UPSTREAM_DIR=C:/path/to/workbuddy2api
+WB_AUTH_DIR=C:/path/to/workbuddy2api/auths
+WB_UPSTREAM_CONFIG=C:/path/to/workbuddy2api/config.json
+WB2API_START_SCRIPT=C:/path/to/workbuddy2api/start-workbuddy2api.cmd
+WB2API_STOP_SCRIPT=C:/path/to/workbuddy2api/stop-workbuddy2api.cmd
+WB2API_LOG_FILE=C:/path/to/workbuddy2api/data/server.err.log
+```
+
+安装依赖、构建前端并后台启动：
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r server\requirements.txt
+Set-Location web
+npm ci
+npm run build:export
+Set-Location ..
+powershell -ExecutionPolicy Bypass -File .\windows\service-tools.ps1 start
+```
+
+用 `windows\service-tools.ps1 status|restart|stop` 管理后台进程。
+
+> Windows 的启动脚本都在 `windows\` 目录里，**不要把它们挪出去**：脚本按自己所在
+> 目录的上一级当项目根（找 `server/`、`web/out`、`.env`、`upstream/`）。双击
+> `windows\start.cmd` 前台启动（关窗口即停）、`stop.cmd` 停止、`update.cmd` 一键更新；
+> 后台常驻用 `windows\service-tools.ps1 start`。Windows 原生模式支持
+保存配置后重启上游及读取上游日志；网页一键更新依赖 Linux/Docker，当前会明确拒绝，
+请手动更新代码后重启服务。
+
+> **启停脚本优先用上游自带的**：上游 `workbuddy2api` 2026-09-18 起自带
+> `start/stop/status-workbuddy2api.cmd`（PID 文件 + 进程路径校验，不会误杀同名进程），
+> 直接把 `WB2API_START_SCRIPT` / `WB2API_STOP_SCRIPT` 指过去即可。若你的上游目录里
+> 没有这三个文件（旧版上游），`windows-native/` 下有一对可直接改用的模板。
+
+> **两个约定必须满足**（上游脚本已满足）：启动脚本要**立即返回**（前台运行会让
+> 「重启」等到超时才报失败），日志要写到 `WB2API_LOG_FILE`（否则「任务记录」读不到
+> 自动任务日志）。细节见 `windows-native/README.md`。

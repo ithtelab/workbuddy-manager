@@ -1,0 +1,80 @@
+{
+  "glm-5.3": {
+    "kind": "text",
+    "source": "https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3.md",
+    "evidence": "官方声明输入模态为文本；GLM-5.3 明确写明仅支持文本。",
+    "verified_at": "2026-09-25"
+  },
+  "glm-5.2": {
+    "kind": "text",
+    "source": "https://docs.bigmodel.cn/cn/guide/models/text/glm-5.2.md",
+    "evidence": "官方声明输入模态为文本；GLM-5.3 明确写明仅支持文本。",
+    "verified_at": "2026-09-25"
+  },
+  "glm-5.1": {
+    "kind": "text",
+    "source": "https://docs.bigmodel.cn/cn/guide/models/text/glm-5.1.md",
+    "evidence": "官方声明输入模态为文本；GLM-5.3 明确写明仅支持文本。",
+    "verified_at": "2026-09-25"
+  },
+  "glm-5.3-flash": {
+    "kind": "multimodal",
+    "source": "https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash.md",
+    "evidence": "官方声明原生多模态，支持图片、视频和文本。",
+    "verified_at": "2026-09-25"
+  },
+  "glm-5v-turbo": {
+    "kind": "multimodal",
+    "source": "https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5v-turbo.md",
+    "evidence": "官方声明原生多模态输入。",
+    "verified_at": "2026-09-25"
+  },
+  "deepseek-v4-pro": {
+    "kind": "text",
+    "source": "https://api-docs.deepseek.com/quick_start/pricing",
+    "evidence": "官方型号对照表 V4-Pro 的 Vision 为 Not supported。",
+    "verified_at": "2026-09-25"
+  },
+  "deepseek-v4.1-flash": {
+    "kind": "multimodal",
+    "source": "https://api-docs.deepseek.com/quick_start/pricing",
+    "evidence": "官方型号对照表 V4.1-Flash 支持 Vision。",
+    "verified_at": "2026-09-25"
+  },
+  "minimax-m3": {
+    "kind": "multimodal",
+    "source": "https://platform.minimax.io/docs/guides/text-generation.md",
+    "evidence": "MiniMax-M3 官方声明输入包括文本、图片和视频。",
+    "verified_at": "2026-09-25"
+  },
+  "kimi-k2.6": {
+    "kind": "multimodal",
+    "source": "https://platform.moonshot.cn/docs/overview",
+    "evidence": "官方快速开始明确 K2.6 和 K2.7 Code 支持文本、图片和视频；CodeBuddy 的 kimi-k2.7 显示名为 Kimi-K2.7-Code。",
+    "verified_at": "2026-09-25"
+  },
+  "kimi-k2.7": {
+    "kind": "multimodal",
+    "source": "https://platform.moonshot.cn/docs/overview",
+    "evidence": "官方快速开始明确 K2.6 和 K2.7 Code 支持文本、图片和视频；CodeBuddy 的 kimi-k2.7 显示名为 Kimi-K2.7-Code。",
+    "verified_at": "2026-09-25"
+  },
+  "kimi-k3-1": {
+    "kind": "multimodal",
+    "source": "https://github.com/MoonshotAI/Kimi-K3",
+    "evidence": "官方 Kimi K3 模型卡声明 native multimodal；CodeBuddy 的 kimi-k3-1 显示名为 Kimi-K3。",
+    "verified_at": "2026-09-25"
+  },
+  "hy3": {
+    "kind": "text",
+    "source": "https://huggingface.co/tencent/Hy3/blob/main/README.md",
+    "evidence": "腾讯官方模型卡声明 pipeline_tag: text-generation。",
+    "verified_at": "2026-09-25"
+  },
+  "hy4-preview": {
+    "kind": "text",
+    "source": "https://huggingface.co/tencent/Hy4-preview/blob/main/README.md",
+    "evidence": "腾讯官方模型卡声明 pipeline_tag: text-generation。",
+    "verified_at": "2026-09-25"
+  }
+}

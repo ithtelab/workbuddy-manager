@@ -184,7 +184,6 @@ function AnimateIcon({
   );
 }
 
-// eslint-disable-next-line quotes
 const pathClassName = "[&_[stroke-dasharray='1px_1px']]:![stroke-dasharray:1px_0px]";
 
 function IconWrapper<T extends string>({

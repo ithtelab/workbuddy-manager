@@ -8,10 +8,13 @@ import json
 import os
 import secrets
 import time
+from pathlib import Path
 
 from fastapi import Depends, HTTPException, Request
 
-from . import config
+from . import config, tokensvc
+from .iputil import client_ip
+from .iputil import _is_trusted_proxy  # noqa: SLF001 —— 与 client_ip 同一份可信代理判据
 
 _fail: dict[str, list] = {}
 MAX_FAILS = 5
@@ -34,6 +37,91 @@ def verify_pwd(pwd: str, stored: str) -> bool:
         return hmac.compare_digest(digest.hex(), expect)
     except Exception:
         return False
+
+
+# ── 管理端密码策略 ─────────────────────────────────────
+#
+# 生产事故复盘：公网面板的 admin 密码被设成了 `admin123`，攻击者直接登录，
+# 导出了全部账号凭据。登录失败锁定拦不住「已知弱口令」——必须在设置密码时
+# 就拒绝，而不是等到被撞开以后。这里只做最小、确定的规则：
+#   · 至少 12 位；
+#   · 常见弱口令（含 admin/password/123456 等变体）直接拒绝；
+#   · 不允许「用户名 + 纯数字」；
+#   · 不允许纯数字或单一重复字符。
+# 不做复杂度打分/字典工程：规则越复杂越容易误伤，真正兜底的是长度与黑名单。
+MIN_PASSWORD_LENGTH = 12
+
+_WEAK_PASSWORDS = frozenset({
+    'admin', 'admin123', 'admin1234', 'admin12345', 'admin123456',
+    'admin1234567', 'admin12345678', 'admin123456789',
+    'password', 'password123', 'password1234', 'password12345',
+    '123456789012', '1234567890123', '12345678901234',
+    'qwertyuiop', 'qwerty123456', 'qwertyuiop123',
+    'workbuddy', 'workbuddy123', 'workbuddy1234', 'workbuddy2024',
+    'letmein12345', 'iloveyou1234', '111111111111', '000000000000',
+})
+
+
+def password_problem(pwd: str, username: str = '') -> str | None:
+    """返回密码不合规的原因；合规返回 None。
+
+    给 bootstrap（WB_ADMIN_PASSWORD）、新建用户、重置密码共用同一套判据，
+    避免「启动时能设弱口令、界面改密码时却被拦」这种不一致。
+    """
+    value = str(pwd or '')
+    if len(value) < MIN_PASSWORD_LENGTH:
+        return f'密码至少 {MIN_PASSWORD_LENGTH} 位'
+    low = value.lower()
+    if low in _WEAK_PASSWORDS:
+        return '密码过于常见，请换一个'
+    if username:
+        user = str(username).strip().lower()
+        if user and low.startswith(user) and low[len(user):].isdigit():
+            return '密码不能是用户名加数字'
+    if value.isdigit():
+        return '密码不能全是数字'
+    if len(set(value)) == 1:
+        return '密码不能是重复字符'
+    return None
+
+
+def weak_admin_passwords() -> list[str]:
+    """启动时检测**存量**管理员是否仍在用已知弱口令。
+
+    新密码在设置入口就被拦了，但升级上来的 users.json 里可能已经有
+    `admin123` 这类值（本次生产事故就是如此）。这里只拿小的静态黑名单去比对
+    哈希，命中就返回用户名，让启动日志能明确点出来；不直接拒绝启动——
+    否则用户会被锁在面板外，连改密码的入口都没有。
+    """
+    try:
+        cfg = load_users()
+    except Exception:  # noqa: BLE001
+        return []
+    found: list[str] = []
+    for item in cfg.get('users', []):
+        if item.get('role') != 'admin':
+            continue
+        stored = str(item.get('pwd_hash') or '')
+        for candidate in _WEAK_PASSWORDS:
+            if verify_pwd(candidate, stored):
+                found.append(str(item.get('username') or ''))
+                break
+    return found
+
+_DUMMY_HASH: str | None = None
+
+
+def dummy_verify(pwd: str) -> None:
+    """对一份固定的哑哈希完整跑一遍 PBKDF2，丢弃结果。
+
+    登录时用户不存在会短路跳过 PBKDF2（260000 轮，毫秒级时间差），响应快慢
+    因此暴露"用户名是否存在"——管理端默认必有 admin，价值有限，但公网服务
+    不该留这个侧信道。用户不存在的分支先跑一次本函数，把耗时对齐。
+    """
+    global _DUMMY_HASH
+    if _DUMMY_HASH is None:
+        _DUMMY_HASH = make_hash(secrets.token_urlsafe(24))
+    verify_pwd(pwd, _DUMMY_HASH)
 
 
 # ── 用户存储 ─────────────────────────────────────────────
@@ -127,18 +215,28 @@ def save_users(data: dict) -> None:
 
 
 def bootstrap_users() -> dict:
-    """首次启动：创建 admin 用户，密码取 WB_ADMIN_PASSWORD 或随机生成并打印一次。"""
+    """首次启动：创建 admin 用户，密码取 WB_ADMIN_PASSWORD 或随机生成。"""
     import os
     import sys
 
-    pwd = os.environ.get('WB_ADMIN_PASSWORD', '').strip() or secrets.token_urlsafe(9)
+    env_pwd = os.environ.get('WB_ADMIN_PASSWORD', '').strip()
+    if env_pwd:
+        problem = password_problem(env_pwd, 'admin')
+        if problem:
+            raise RuntimeError(
+                f'WB_ADMIN_PASSWORD 不符合管理端密码策略：{problem}。'
+                f'请使用至少 {MIN_PASSWORD_LENGTH} 位、非常见弱口令的密码。'
+            )
+    # 随机密码也留足长度；token_urlsafe(12) 约 16 字符。
+    pwd = env_pwd or secrets.token_urlsafe(12)
     data = {
         'secret': config.new_secret(),
         'users': [{'username': 'admin', 'role': 'admin', 'pwd_hash': make_hash(pwd)}],
         'api_keys': [],
     }
     save_users(data)
-    if not os.environ.get('WB_ADMIN_PASSWORD', '').strip():
+    if not env_pwd:
+        _write_initial_password_file(pwd)
         print('=' * 60, file=sys.stderr)
         print('[WorkBuddy Manager] 已生成初始管理员账号', file=sys.stderr)
         print(f'  用户名: admin', file=sys.stderr)
@@ -146,6 +244,55 @@ def bootstrap_users() -> dict:
         print('  请登录后立即在「设置 → 管理用户」中修改密码。', file=sys.stderr)
         print('=' * 60, file=sys.stderr)
     return data
+
+
+def initial_password_path() -> Path:
+    """初始密码落盘文件的位置（与 users.json 同级）。"""
+    return config.USERS_FILE.with_name('initial-admin-password.txt')
+
+
+def _write_initial_password_file(pwd: str) -> None:
+    """把随机生成的初始密码落盘，0600。
+
+    为什么必须留一份：随机密码**只在 stderr 打一次**（issue #179）。journal 会被
+    轮转、安装脚本可能因为竞态没抓到、用户在几屏日志里也可能翻过去 —— 一旦错过，
+    库里只有 pbkdf2 哈希，`users.json` 里也读不出明文，于是**没有任何办法登录**。
+    落一份明文 + 登录页指路，是唯一能把这个死结解开的办法。
+
+    权限与 users.json 同级（仅属主可读写）：那已经是能伪造任意管理员会话的
+    secret 所在，再多一个同样只属主可读的明文密码不改变暴露面。
+
+    改过密码后由 clear_initial_password_file() 抹掉。
+    """
+    target = initial_password_path()
+    try:
+        # 与 save_users 同样的降级写法：不支持 O_CREAT mode 的平台上退化为
+        # 写完再 chmod，并继续收紧权限。
+        try:
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        except OSError:
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(f'{pwd}\n')
+        else:
+            target.write_text(f'{pwd}\n', encoding='utf-8')
+        _restrict_permissions(target)
+    except OSError:
+        # 写不进去也不能影响启动：日志里那条记录仍然是唯一副本。
+        pass
+
+
+def clear_initial_password_file() -> None:
+    """密码被改掉（或显式重置）后，抹掉明文副本。
+
+    留着旧密码文件等于给了一份永远有效的凭据 —— 那正是 issue #179 想要的
+    「找回来」能力用过期的方式继续生效，安全上不能接受。
+    """
+    try:
+        initial_password_path().unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ── 会话签名 ─────────────────────────────────────────────
@@ -235,6 +382,10 @@ def cookie_secure(request: Request) -> bool:
     """会话 cookie 是否带 `Secure` 标志。`WB_SECURE_COOKIE` = auto | true | false。
 
     `auto` 的判据是 `X-Forwarded-Proto`（反代终止 TLS 时由它告知原始协议）。
+    该头与 X-Real-IP 一样是普通请求头，只在 **TCP 对端是可信代理**时才采信
+    （与 `iputil.client_ip` 同一份判据）：直连的攻击者发
+    `X-Forwarded-Proto: http` 不能让 HTTPS 部署漏发 `Secure`。
+
     **这里有个隐蔽的失效形态**：反代没传该头时（1Panel / nginx 默认配置就未必传），
     后端只看到明文 HTTP，于是 `auto` 静默地不加 `Secure` —— 而用户访问的确实是
     HTTPS，他以为自己受保护。这类「以为安全其实没有」比明确的报错更危险，
@@ -245,7 +396,10 @@ def cookie_secure(request: Request) -> bool:
         return True
     if setting in ('false', '0'):
         return False
-    proto = request.headers.get('x-forwarded-proto', request.url.scheme)
+    proto = request.scope.get('scheme') or request.url.scheme
+    peer = request.client.host if request.client else ''
+    if config.TRUST_PROXY and _is_trusted_proxy(peer):
+        proto = request.headers.get('x-forwarded-proto', proto)
     return proto == 'https'
 
 
@@ -324,7 +478,14 @@ def login_blocked(ip: str, username: str | None = None) -> bool:
         key = username.lower()
         ucnt, ufirst = _user_fail.get(key, [0, 0.0])
         if ucnt >= MAX_FAILS and (now - ufirst) < LOCK_SECONDS:
-            return True
+            # 按用户名的锁定是为了防「换 IP 爆破同一账号」，但它同时给了匿名者
+            # 一件武器：对 admin 提交 5 次错误密码就能把**从未输错**的管理员
+            # 也锁在门外（远程锁定 DoS）。所以这里只拦**自己也失败过**的来源
+            # IP：爆破者每个 IP 都有失败记录，照样被拦；干净的管理员 IP 不受
+            # 牵连（它自己的输错次数仍由上面的按 IP 计数管着）。
+            icnt, ifirst = _fail.get(ip, [0, 0.0])
+            if icnt > 0 and (now - ifirst) < LOCK_SECONDS:
+                return True
     return False
 
 
@@ -385,13 +546,16 @@ def revoke_sessions(username: str) -> int:
     return new_sv
 
 
-def audit(actor: dict | None, action: str, target: str = '', detail: str = '') -> None:
+def audit(actor: dict | None, action: str, target: str = '', detail: str = '',
+          ip: str = '') -> None:
     """记录一条管理端审计日志。
 
     为什么必须做：本次事故中，攻击者改掉管理员密码、建了自己的账号，而**服务端
     没有留下任何痕迹**——只能靠反代 access log 去猜。管理端是公网入口，
     敏感操作（登录、改密码、增删用户、改安全配置）必须可追溯。
 
+    `ip` 是可选的结构化来源地址。历史调用把来源写进 detail（`来源 x.x.x.x`），
+    这里保留兼容；新调用应同时传 `ip`，方便按列筛选/告警，不必再解析文本。
     审计属于旁路，任何异常都不能影响请求本身（与请求日志同样的处理原则）。
     """
     try:
@@ -401,29 +565,20 @@ def audit(actor: dict | None, action: str, target: str = '', detail: str = '') -
             str(action),
             str(target or ''),
             str(detail or '')[:500],
+            str(ip or '')[:64],
         )
     except Exception:  # noqa: BLE001
         pass
 
 
 # ── FastAPI 依赖 ─────────────────────────────────────────
-def current_user(request: Request) -> dict:
-    """解析请求身份。**这是管理端唯一的身份入口**。
-
-    仅接受签名 cookie，并且必须**回查用户表**：
+def _cookie_identity(request: Request, cfg: dict) -> dict:
+    """会话 Cookie 的身份解析（**既有逻辑，逐字保留**）。
 
       - role 以表里的为准，不用 cookie 里的快照（否则降权后旧 cookie 仍是管理员）
       - 用户已被删除 → 拒绝（否则删号后其 cookie 在有效期内仍然通行）
       - 会话版本不匹配 → 拒绝（改密码 / 吊销后旧 cookie 立即失效）
-
-    安全事件记录（2026-09-14）：这里**曾经**接受 `X-API-Key` 头，只要它出现在
-    `users.json` 的 `api_keys` 数组里就直接授予 admin。那个数组没有任何代码
-    去写、没有管理界面，唯一作用就是这条提权后门；而它在早前的路径穿越里
-    与 secret 一起泄露，直接导致生产站管理员被改密码。**已彻底移除**：
-    管理端身份只认签名 cookie。下游调用请用网关的 `/v1/*`（那套密钥走
-    SQLite api_keys 表、只授权模型调用，与后台权限无关）。
     """
-    cfg = load_users()
     token = request.cookies.get(config.COOKIE_NAME)
     if not token:
         raise HTTPException(status_code=401, detail='未登录')
@@ -454,7 +609,88 @@ def current_user(request: Request) -> dict:
     return user
 
 
+def _bearer_token(request: Request) -> str:
+    """取管理面 API Token（`Authorization: Bearer wbt_...`，也接受 `X-API-Key`）。
+
+    只认 `wbt_` 前缀的形态，其余一律当「没有」——避免把网关密钥（`wbk_`）或
+    别的东西误当管理凭据。
+    """
+    auth = request.headers.get('authorization', '') or ''
+    tok = auth[7:].strip() if auth.lower().startswith('bearer ') else ''
+    if not tok:
+        tok = (request.headers.get('x-api-key') or '').strip()
+    return tok if tok.startswith(tokensvc.TOKEN_PREFIX) else ''
+
+
+def _token_identity(request: Request, token: str) -> dict:
+    """作用域化 API Token 的身份解析（见 docs/api-tokens.md）。
+
+    角色由 token 的 **scope** 决定（不查用户表，避免与用户表产生暧昧耦合）；
+    失败时**不区分**「不存在 / 已停用 / 已过期」，只回一个笼统的 401，不给探测者
+    信号。失败同样计入既有的按 IP 失败计数（与登录共用），成功则清除。
+    """
+    ip = client_ip(request)
+    row = tokensvc.resolve(token)
+    if not row or not tokensvc.usable(row):
+        record_fail(ip)
+        audit(None, 'token_rejected', '', f'来源 {ip}')
+        raise HTTPException(status_code=401, detail='未登录')
+    clear_fail(ip)
+    tokensvc.touch(int(row['id']), ip)
+    # 标记来源，供 require_session_admin 识别并拒绝高危接口。
+    request.state.token_id = int(row['id'])
+    return {
+        'username': f"token:{row['name']}",
+        'role': tokensvc.scope_to_role(row['scope']),
+    }
+
+
+def current_user(request: Request) -> dict:
+    """解析请求身份。**这是管理端唯一的身份入口**。
+
+    两条凭据路径，**会话优先**：
+
+      1. **签名 Cookie**（浏览器）——既有行为逐字保留，含改密码 / 吊销 / 闲置
+         超时的专门提示；role 以用户表为准，用户被删或会话版本不匹配即拒绝。
+      2. **`Authorization: Bearer wbt_...`**（作用域化 API Token，见
+         docs/api-tokens.md）——角色由 token 的 scope 决定，并在 `request.state`
+         上标记来源，供 `require_session_admin` 拒绝高危接口。
+
+    安全事件记录（2026-09-14）：这里**曾经**接受 `users.json` 里 `api_keys`
+    数组中的 `X-API-Key`，只要命中就直接授予 admin。那是一条提权后门，已彻底
+    移除。现在的 token 走 SQLite `api_tokens` 表：**只存哈希**、有 scope、
+    可吊销、有审计——与那次事故的形态刻意不同（见设计文档的「必须避免重蹈的
+    覆辙」一节）。下游调用请用网关的 `/v1/*`（那套密钥走 `api_keys` 表、
+    只授权模型调用，与后台权限无关）。
+    """
+    cfg = load_users()
+    session_err: HTTPException | None = None
+    if request.cookies.get(config.COOKIE_NAME):
+        try:
+            return _cookie_identity(request, cfg)
+        except HTTPException as exc:
+            session_err = exc
+    token = _bearer_token(request)
+    if token:
+        return _token_identity(request, token)
+    raise session_err or HTTPException(status_code=401, detail='未登录')
+
+
 def require_admin(user: dict = Depends(current_user)) -> dict:
     if user.get('role') != 'admin':
         raise HTTPException(status_code=403, detail='需要管理员权限')
+    return user
+
+
+def require_session_admin(request: Request,
+                          user: dict = Depends(require_admin)) -> dict:
+    """要求**会话**管理员：拒绝用 API Token 调用。
+
+    用于高危 / 不可逆接口（一键更新、删账号、清日志、改安全策略，以及管理
+    token 自身的接口）。原则是「能改代码、能扩大权限、或能抹掉痕迹的入口只对
+    真人开放」——这样即便 token 泄露，攻击面也不包含这些。（见 docs/api-tokens.md）
+    """
+    if getattr(request.state, 'token_id', None) is not None:
+        raise HTTPException(status_code=403,
+                            detail='该接口不接受 API Token，请用会话登录后操作')
     return user

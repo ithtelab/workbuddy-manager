@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import unittest
 from pathlib import Path
@@ -89,6 +90,16 @@ class ListMatchesCallAdmissionTest(unittest.TestCase):
             _key(realm='global', models=['global:deepseek-v4.1-flash']))
         self.assertEqual(listed, ['global:deepseek-v4.1-flash'],
                          '白名单外的模型仍被列出（用户选中就 400）')
+
+    def test_global_key_with_bare_whitelist(self) -> None:
+        """issue #255：国际版密钥的白名单写裸名时，列表要给出 `global:` 条目。
+
+        否则客户端按提示加 `global:` 前缀调用会被白名单拒掉，不加又被版本
+        校验拒掉——两条路都走不通。
+        """
+        listed = self._assert_invariant(
+            _key(realm='global', models=['deepseek-v4.1-flash']))
+        self.assertEqual(listed, ['global:deepseek-v4.1-flash'])
 
     def test_cross_realm_whitelist(self) -> None:
         listed = self._assert_invariant(
@@ -211,16 +222,143 @@ class SharedCriterionTest(unittest.TestCase):
         self.assertIn('不在密钥白名单内', str(not_allowed))
 
     def test_predicate_semantics(self) -> None:
-        """判据本身：空白名单放行一切；`cn:` 归一化；`global:` 不归一化。"""
+        """判据本身：空白名单放行一切；裸名通配两版；显式前缀只放行本版。"""
         self.assertTrue(keysvc.model_allowed(_key(), 'anything'))
         self.assertTrue(keysvc.model_allowed(_key(models=['cn:glm-5.2']), 'glm-5.2'))
         self.assertTrue(keysvc.model_allowed(_key(models=['glm-5.2']), 'cn:glm-5.2'))
-        # global: 决定路由，两个版本的同名模型不是一回事
+        # 显式 global: 只放行国际版，不放行国内版裸名
         self.assertFalse(keysvc.model_allowed(_key(models=['global:glm-5.2']), 'glm-5.2'))
-        self.assertFalse(keysvc.model_allowed(_key(models=['glm-5.2']), 'global:glm-5.2'))
+        # 裸名不带版本信息 → 视为「这个模型的任意版本」（issue #357：密钥编辑器
+        # 国际版组存的是裸名，客户端调用带 global: 前缀，严格比对会互相堵死）
+        self.assertTrue(keysvc.model_allowed(_key(models=['glm-5.2']), 'global:glm-5.2'))
         # 畸形输入不放行
         self.assertFalse(keysvc.model_allowed(_key(models=['glm-5.2']), None))
         self.assertFalse(keysvc.model_allowed(_key(models=['glm-5.2']), '   '))
+
+    def test_locked_realm_ignores_prefix_in_whitelist(self) -> None:
+        """issue #255：锁定版本的密钥，白名单裸名与带本版本前缀都放行。
+
+        版本已经由密钥锁死，前缀不再提供额外信息（另一版本根本进不来）；
+        列表给出的是 `global:` 条目，白名单写裸名的用户必须也能调用它。
+        """
+        self.assertTrue(keysvc.model_allowed(
+            _key(realm='global', models=['deepseek-v4.1-flash']),
+            'global:deepseek-v4.1-flash'))
+        self.assertTrue(keysvc.model_allowed(
+            _key(realm='global', models=['global:deepseek-v4.1-flash']),
+            'deepseek-v4.1-flash'))
+        # 未锁定版本时，显式 global: 条目仍只放行国际版
+        self.assertFalse(keysvc.model_allowed(
+            _key(models=['global:glm-5.2']), 'glm-5.2'))
+        # 而裸名条目放行两个版本（issue #357）
+        self.assertTrue(keysvc.model_allowed(
+            _key(models=['glm-5.2']), 'global:glm-5.2'))
+
+
+class PrefixedRequestAgainstBareWhitelistTest(unittest.TestCase):
+    """issue #357：白名单存裸名（编辑器国际版组的形态）时必须能调用 global: 请求。
+
+    现场：在密钥编辑器里勾选「国际版 deepseek-v4.1-flash」，保存后白名单是
+    `deepseek-v4.1-flash`；Codex 按模型列表加前缀调用 `global:deepseek-v4.1-flash`，
+    被 400 拒掉。裸名没有携带版本信息，解释成「任意版本」才是用户意图。
+    """
+
+    def test_bare_entry_allows_global_request(self) -> None:
+        key = _key(models=['deepseek-v4.1-flash'])
+        self.assertIsNone(keysvc.validate(key, '1.2.3.4', 'global:deepseek-v4.1-flash'))
+
+    def test_bare_entry_allows_global_listing(self) -> None:
+        """列表与调用同一口径：白名单写裸名时，global: 条目仍出现在 /v1/models。"""
+        listed = _listed(_key(models=['deepseek-v4.1-flash']))
+        self.assertIn('global:deepseek-v4.1-flash', listed)
+        self.assertIn('deepseek-v4.1-flash', listed)
+
+    def test_explicit_global_entry_stays_scoped(self) -> None:
+        """显式写了 global: 就是「只要国际版」，不要把裸名请求也放进来。"""
+        key = _key(models=['global:deepseek-v4.1-flash'])
+        self.assertIsNotNone(keysvc.validate(key, '1.2.3.4', 'deepseek-v4.1-flash'))
+
+    def test_locked_realm_unchanged(self) -> None:
+        self.assertIsNone(keysvc.validate(
+            _key(realm='global', models=['deepseek-v4.1-flash']), '1.2.3.4',
+            'global:deepseek-v4.1-flash'))
+
+
+class CatalogShrinkTest(unittest.TestCase):
+    """issue #239：上游清单里的已下架模型要按模型中心的实时目录裁掉。
+
+    上游 `/v1/models` 会列出一批腾讯早已收缩掉的旧模型（cn 域 52 个，
+    模型中心只有 20 个），下游拿它当选择器，选中后才 503。模型中心直连
+    腾讯的目录是当前可用的权威清单；取不到时原样透传，绝不能把列表清空。
+    """
+
+    def _scope(self, payload, key, mapping=None):
+        with mock.patch.object(db, 'get_setting',
+                               lambda k, d=None: (mapping or {}) if k == 'model_map' else d):
+            return G._scope_models(payload, key)
+
+    def test_drops_ids_missing_from_tencent_catalog(self) -> None:
+        payload = {'object': 'list', 'data': [
+            {'id': 'glm-5.2'}, {'id': 'deepseek-v4.1-flash'},
+            {'id': 'global:gpt-5.6-sol'},
+        ]}
+        key = _key(realm='cn')
+        scoped = self._scope(payload, key)
+        out = G._filter_catalog_models(scoped, key, 'cn', {'glm-5.2'})
+        self.assertEqual([m['id'] for m in out['data']], ['glm-5.2'],
+                         'cn 清单里仍留着模型中心没有的旧模型')
+
+    def test_global_prefix_is_compared_bare(self) -> None:
+        """模型中心给裸名，上游国际版给 `global:` 前缀，前缀不能导致误删。"""
+        payload = {'data': [{'id': 'global:gpt-5.6-sol'}]}
+        key = _key(realm='global')
+        out = G._filter_catalog_models(payload, key, 'global', {'gpt-5.6-sol'})
+        self.assertEqual([m['id'] for m in out['data']], ['global:gpt-5.6-sol'])
+
+    def test_alias_entry_survives(self) -> None:
+        """白名单里的别名指向仍在目录里的模型时，别名条目不能被裁掉。"""
+        mapping = {'gpt-4o-mini': 'glm-5.2'}
+        key = _key(models=['gpt-4o-mini'])
+        scoped = self._scope({'data': [{'id': 'glm-5.2'}]}, key, mapping)
+        self.assertEqual([m['id'] for m in scoped['data']], ['gpt-4o-mini'])
+        with mock.patch.object(db, 'get_setting',
+                               lambda k, d=None: mapping if k == 'model_map' else d):
+            out = G._filter_catalog_models(scoped, key, 'cn', {'glm-5.2'})
+        self.assertEqual([m['id'] for m in out['data']], ['gpt-4o-mini'],
+                         '别名指向的模型仍可用，别名不该被删')
+
+    def test_alias_to_dead_model_is_dropped(self) -> None:
+        """别名指向的模型已下架 → 别名同样不可用，应删。"""
+        mapping = {'dead-alias': 'old-model'}
+        key = _key(models=['dead-alias'])
+        scoped = self._scope({'data': [{'id': 'old-model'}, {'id': 'glm-5.2'}]},
+                             key, mapping)
+        with mock.patch.object(db, 'get_setting',
+                               lambda k, d=None: mapping if k == 'model_map' else d):
+            out = G._filter_catalog_models(scoped, key, 'cn', {'glm-5.2'})
+        self.assertEqual([m['id'] for m in out['data']], [])
+
+    def test_upstream_fallback_source_skips_filter(self) -> None:
+        """目录来源是上游回退（同一份旧表）时不做裁剪。"""
+        payload = {'data': [{'id': 'old-model'}]}
+        key = _key(realm='cn')
+        cat = {'source': 'upstream', 'models': [{'id': 'glm-5.2'}]}
+        with mock.patch.object(G.modelcatalog, 'catalog',
+                               mock.AsyncMock(return_value=cat)):
+            out = asyncio.run(G._drop_models_outside_catalog(payload, key))
+        self.assertEqual([m['id'] for m in out['data']], ['old-model'])
+
+    def test_catalog_failure_keeps_list(self) -> None:
+        """目录取不到/超时 → 原样返回，不能把列表清空。"""
+        payload = {'data': [{'id': 'old-model'}]}
+        key = _key(realm='cn')
+
+        async def _boom(realm):
+            raise TimeoutError('catalog timeout')
+
+        with mock.patch.object(G.modelcatalog, 'catalog', _boom):
+            out = asyncio.run(G._drop_models_outside_catalog(payload, key))
+        self.assertEqual([m['id'] for m in out['data']], ['old-model'])
 
 
 if __name__ == '__main__':
@@ -384,6 +522,11 @@ class CachedIdsTest(unittest.TestCase):
 class HintFrontendWiringTest(unittest.TestCase):
     """前端要真的显示这个提示，且「查不了」不能显示成「全部正确」。"""
 
+    def _component(self) -> str:
+        return (Path(__file__).resolve().parents[2]
+                / 'web/components/common/keys/ModelWhitelistInput.tsx'
+                ).read_text(encoding='utf-8')
+
     def _page(self) -> str:
         return (Path(__file__).resolve().parents[2]
                 / 'web/app/(main)/keys/page.tsx').read_text(encoding='utf-8')
@@ -405,11 +548,23 @@ class HintFrontendWiringTest(unittest.TestCase):
                       'checked=false 时没退回 null')
 
     def test_editing_invalidates_previous_result(self) -> None:
-        """改了内容要作废上次结论，否则显示的是**过期**的「都对」。"""
+        """改了内容要作废上次结论，否则显示的是**过期**的「都对」。
+
+        #141 之后白名单换成组件（`ModelWhitelistInput`：可勾选的清单 + 手输），
+        但这条不变量没变：凡是把用户改动写回 `form.models` 的地方，都要顺手把上次
+        校验结果清掉。
+        """
         src = self._page()
-        seg = src[src.index('onChange={(e) => {'):]
-        seg = seg[:seg.index('onBlur')]
+        start = src.index('<ModelWhitelistInput')
+        seg = src[start:src.index('onBlur', start)]
         self.assertIn('setUnknownModels(null)', seg, '改了白名单却留着上次的校验结果')
+        self.assertIn('models: next', seg, '组件回传的值没写回 form.models')
+        # 打字过程中也要作废：输入框里的草稿要失焦才提交，只清 onChange 的话
+        # 「改到一半」这一段里提示还是上一版的值（浏览器验收实测踩到，见
+        # dev/verify_whitelist_hint.py 的第 3 步）。
+        self.assertIn('onEdit=', seg, '打字时不作废旧结论')
+        comp = self._component()
+        self.assertIn('onEdit?.()', comp, '组件没有把「正在编辑」告诉父组件')
 
     def test_all_locales_define_the_key(self) -> None:
         import json

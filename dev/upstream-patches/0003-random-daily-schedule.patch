@@ -1,0 +1,917 @@
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index 321decf..9dacc29 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -144,23 +144,33 @@ func main() {
+ 	up.BillingBaseGlobal = cfg.Global.BillingBase
+ 	up.GlobalEnabled = cfg.Global.Enabled
+ 
++	// The private deployment identity makes the daily random offsets stable
++	// across restarts, and independent of other deployments. Never log the seed.
++	scheduleSeed := cfg.APIKey
++	if scheduleSeed == "" {
++		scheduleSeed = cfg.AuthDir
++	}
+ 	sch := scheduler.New(scheduler.Config{
+-		Pool:                p,
+-		Upstream:            up,
+-		CheckinHours:        cfg.Schedule.CheckinHours,
+-		TravelHours:         cfg.Schedule.TravelHours,
+-		ActivityHours:       cfg.Schedule.ActivityHours,
+-		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
+-		SchoolHours:         cfg.Schedule.SchoolHours,
+-		CatHours:            cfg.Schedule.CatHours,
+-		ActivityReportCount: cfg.Schedule.ActivityReportCount,
+-		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
+-		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+-		TravelDisabled:      !cfg.Schedule.TravelEnabled,
+-		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
+-		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
+-		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
+-		CatDisabled:         !cfg.Schedule.CatEnabled,
++		AccountDelayMinSeconds: cfg.Schedule.AccountDelayMinSeconds,
++		AccountDelayMaxSeconds: cfg.Schedule.AccountDelayMaxSeconds,
++		RandomDelayMinutes:     cfg.Schedule.RandomDelayMinutes,
++		RandomDelaySeed:        scheduleSeed,
++		Pool:                   p,
++		Upstream:               up,
++		CheckinHours:           cfg.Schedule.CheckinHours,
++		TravelHours:            cfg.Schedule.TravelHours,
++		ActivityHours:          cfg.Schedule.ActivityHours,
++		KeepaliveHours:         cfg.Schedule.KeepaliveHours,
++		SchoolHours:            cfg.Schedule.SchoolHours,
++		CatHours:               cfg.Schedule.CatHours,
++		ActivityReportCount:    cfg.Schedule.ActivityReportCount,
++		ExpiringSoonWindow:     cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
++		CheckinDisabled:        !cfg.Schedule.CheckinEnabled,
++		TravelDisabled:         !cfg.Schedule.TravelEnabled,
++		ActivityDisabled:       !cfg.Schedule.ActivityEnabled,
++		KeepaliveDisabled:      !cfg.Schedule.KeepaliveEnabled,
++		SchoolDisabled:         !cfg.Schedule.SchoolEnabled,
++		CatDisabled:            !cfg.Schedule.CatEnabled,
+ 	})
+ 	switch {
+ 	case !cfg.Schedule.CheckinEnabled:
+diff --git a/internal/config/random_schedule_test.go b/internal/config/random_schedule_test.go
+new file mode 100644
+index 0000000..ef5bdbd
+--- /dev/null
++++ b/internal/config/random_schedule_test.go
+@@ -0,0 +1,59 @@
++package config
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func TestRandomScheduleConfigDefaultAndBounds(t *testing.T) {
++	for _, minutes := range []int{0, 1, 30, 60} {
++		s := DefaultSchedule()
++		s.RandomDelayMinutes = minutes
++		if err := s.Normalize(); err != nil {
++			t.Fatalf("valid delay %d: %v", minutes, err)
++		}
++	}
++	for _, minutes := range []int{-1, 61} {
++		s := DefaultSchedule()
++		s.RandomDelayMinutes = minutes
++		if err := s.Normalize(); err == nil {
++			t.Fatalf("invalid delay %d accepted", minutes)
++		}
++	}
++	s := DefaultSchedule()
++	if err := json.Unmarshal([]byte(`{"checkin_hours":[9,21]}`), &s); err != nil {
++		t.Fatal(err)
++	}
++	if s.RandomDelayMinutes != 0 {
++		t.Fatal("old config unexpectedly enabled jitter")
++	}
++	if err := json.Unmarshal([]byte(`{"random_delay_minutes":60}`), &s); err != nil {
++		t.Fatal(err)
++	}
++	if s.RandomDelayMinutes != 60 {
++		t.Fatal("delay config was not loaded")
++	}
++}
++
++func TestAccountDelayConfigBoundsAndCompatibility(t *testing.T) {
++	for _, pair := range [][2]int{{0, 0}, {0, 120}, {30, 120}, {600, 600}} {
++		s := DefaultSchedule()
++		s.AccountDelayMinSeconds = pair[0]
++		s.AccountDelayMaxSeconds = pair[1]
++		if err := s.Normalize(); err != nil {
++			t.Fatalf("valid range %v: %v", pair, err)
++		}
++	}
++	for _, pair := range [][2]int{{-1, 120}, {30, 29}, {0, 601}, {0, -1}} {
++		s := DefaultSchedule()
++		s.AccountDelayMinSeconds = pair[0]
++		s.AccountDelayMaxSeconds = pair[1]
++		if err := s.Normalize(); err == nil {
++			t.Fatalf("invalid range accepted: %v", pair)
++		}
++	}
++	s := DefaultSchedule()
++	if s.AccountDelayMinSeconds != 0 || s.AccountDelayMaxSeconds != 0 {
++		t.Fatal("default enabled account staggering")
++	}
++}
+diff --git a/internal/config/schedule.go b/internal/config/schedule.go
+index aafc023..1a0a729 100644
+--- a/internal/config/schedule.go
++++ b/internal/config/schedule.go
+@@ -14,12 +14,17 @@ import "fmt"
+ // cmd/server 与 cmd/activity 共用本结构，默认值由 DefaultSchedule 填充、
+ // 缺省归一由 Normalize 完成——两命令走同一份语义，不再各自复制。
+ type Schedule struct {
+-	CheckinHours   []int `json:"checkin_hours"`   // [9,21]
+-	TravelHours    []int `json:"travel_hours"`    // [9,21]
+-	ActivityHours  []int `json:"activity_hours"`  // [10]
+-	KeepaliveHours []int `json:"keepalive_hours"` // [22]
+-	SchoolHours    []int `json:"school_hours"`    // [12] 开学季任务（迁移自 school/cat 两条系统 crontab）
+-	CatHours       []int `json:"cat_hours"`       // [1] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
++	AccountDelayMinSeconds int `json:"account_delay_min_seconds"`
++	AccountDelayMaxSeconds int `json:"account_delay_max_seconds"`
++	// RandomDelayMinutes spreads each enabled daily slot within its scheduled
++	// hour. Zero preserves the exact-hour schedule; the supported maximum is 60.
++	RandomDelayMinutes int   `json:"random_delay_minutes"`
++	CheckinHours       []int `json:"checkin_hours"`   // [9,21]
++	TravelHours        []int `json:"travel_hours"`    // [9,21]
++	ActivityHours      []int `json:"activity_hours"`  // [10]
++	KeepaliveHours     []int `json:"keepalive_hours"` // [22]
++	SchoolHours        []int `json:"school_hours"`    // [12] 开学季任务（迁移自 school/cat 两条系统 crontab）
++	CatHours           []int `json:"cat_hours"`       // [1] 夜猫窗口 23-08 CST，01:00 窗口内补 1 次
+ 	// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/SchoolEnabled/CatEnabled
+ 	// 显式禁用开关（缺省 true）。
+ 	//
+@@ -52,9 +57,9 @@ func DefaultSchedule() Schedule {
+ 		CheckinHours:        []int{9, 21},
+ 		TravelHours:         []int{9, 21},
+ 		ActivityHours:       []int{10},
+-		KeepaliveHours:       []int{22},
+-		SchoolHours:          []int{12},
+-		CatHours:             []int{1},
++		KeepaliveHours:      []int{22},
++		SchoolHours:         []int{12},
++		CatHours:            []int{1},
+ 		CheckinEnabled:      true,
+ 		TravelEnabled:       true,
+ 		ActivityEnabled:     true,
+@@ -74,6 +79,13 @@ func DefaultSchedule() Schedule {
+ // 注意这是「显式配 0 = 旧行为」的兼容语义，与 scheduler.New 的 <=0 → 1 归一一致；
+ // 「缺省 = 5」由 DefaultSchedule 在 Unmarshal 前置入，是另一条路径，两者不合并。
+ func (s *Schedule) Normalize() error {
++	if s.AccountDelayMinSeconds < 0 || s.AccountDelayMaxSeconds > 600 ||
++		s.AccountDelayMaxSeconds < s.AccountDelayMinSeconds {
++		return fmt.Errorf("schedule account delays require 0 <= min <= max <= 600 seconds")
++	}
++	if s.RandomDelayMinutes < 0 || s.RandomDelayMinutes > 60 {
++		return fmt.Errorf("schedule.random_delay_minutes must be between 0 and 60")
++	}
+ 	if len(s.CheckinHours) == 0 {
+ 		s.CheckinHours = []int{9, 21}
+ 	}
+diff --git a/internal/scheduler/random_schedule.go b/internal/scheduler/random_schedule.go
+new file mode 100644
+index 0000000..75826aa
+--- /dev/null
++++ b/internal/scheduler/random_schedule.go
+@@ -0,0 +1,76 @@
++package scheduler
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/binary"
++	"fmt"
++	"math/rand"
++	"time"
++)
++
++type scheduledAccountKey struct{}
++
++// accountGap adds jitter to the original minimum pacing, only on scheduled
++// traversals. Manual calls and a zero range keep their existing behavior.
++func (s *Scheduler) accountGap(ctx context.Context, base time.Duration) time.Duration {
++	if ctx.Value(scheduledAccountKey{}) != true || s.cfg.AccountDelayMaxSeconds <= 0 {
++		return base
++	}
++	lo, hi := s.cfg.AccountDelayMinSeconds, s.cfg.AccountDelayMaxSeconds
++	if lo < 0 || hi < lo || hi > 600 {
++		return base
++	}
++	seconds := lo + rand.Intn(hi-lo+1)
++	return base + time.Duration(seconds)*time.Second
++}
++
++func (s *Scheduler) accountScriptArgs(ctx context.Context, args []string) []string {
++	if ctx.Value(scheduledAccountKey{}) != true || s.cfg.AccountDelayMaxSeconds <= 0 {
++		return args
++	}
++	return append(args, "--account-delay-min", fmt.Sprint(s.cfg.AccountDelayMinSeconds),
++		"--account-delay-max", fmt.Sprint(s.cfg.AccountDelayMaxSeconds))
++}
++
++// scheduledSlot derives a daily random offset from a stable private seed. The
++// same slot keeps its time after a restart, while each date, hour, task kind and
++// deployment gets its own draw. There is no mutable random state to lose.
++func (s *Scheduler) scheduledSlot(day time.Time, hour int, kind taskKind) time.Time {
++	at := time.Date(day.Year(), day.Month(), day.Day(), hour, 0, 0, 0, day.Location())
++	minutes := s.cfg.RandomDelayMinutes
++	if minutes <= 0 {
++		return at
++	}
++	// Keep every draw inside its original hour and natural day. At 60 minutes
++	// the last possible offset is 59:59, avoiding overlap with the next slot.
++	if minutes > 60 {
++		minutes = 60
++	}
++	seconds := minutes * 60
++	if seconds >= 3600 {
++		seconds = 3599
++	}
++	identity := fmt.Sprintf("%s\x00%s\x00%d\x00%d", s.cfg.RandomDelaySeed,
++		at.Format("2006-01-02"), hour, kind)
++	digest := sha256.Sum256([]byte(identity))
++	offset := binary.BigEndian.Uint64(digest[:8]) % uint64(seconds+1)
++	return at.Add(time.Duration(offset) * time.Second)
++}
++
++func (s *Scheduler) nextScheduledFire(now time.Time, sch schedule) time.Time {
++	if s.cfg.RandomDelayMinutes <= 0 {
++		return nextFire(now, sch.hours)
++	}
++	var earliest time.Time
++	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
++	for i := 0; i < 2; i++ {
++		for _, hour := range sch.hours {
++			at := s.scheduledSlot(day.AddDate(0, 0, i), hour, sch.kind)
++			if at.After(now) && (earliest.IsZero() || at.Before(earliest)) {
++				earliest = at
++			}
++		}
++	}
++	return earliest
++}
+diff --git a/internal/scheduler/random_schedule_test.go b/internal/scheduler/random_schedule_test.go
+new file mode 100644
+index 0000000..86ab935
+--- /dev/null
++++ b/internal/scheduler/random_schedule_test.go
+@@ -0,0 +1,211 @@
++package scheduler
++
++import (
++	"context"
++	"sync/atomic"
++	"testing"
++	"time"
++	"workbuddy2api/internal/auth"
++)
++
++func TestScheduledAccountGapBoundsAndManualBypass(t *testing.T) {
++	s := New(Config{AccountDelayMinSeconds: 30, AccountDelayMaxSeconds: 120})
++	ctx := context.WithValue(context.Background(), scheduledAccountKey{}, true)
++	base := 800 * time.Millisecond
++	for i := 0; i < 100; i++ {
++		gap := s.accountGap(ctx, base)
++		if gap < base+30*time.Second || gap > base+120*time.Second {
++			t.Fatalf("gap out of range: %s", gap)
++		}
++	}
++	if got := s.accountGap(context.Background(), base); got != base {
++		t.Fatalf("manual pacing changed: %s", got)
++	}
++	s.cfg.AccountDelayMinSeconds, s.cfg.AccountDelayMaxSeconds = 0, 0
++	if got := s.accountGap(ctx, base); got != base {
++		t.Fatalf("zero range changed old pacing: %s", got)
++	}
++}
++
++func TestScheduledCheckinAccountWaitCanBeCancelled(t *testing.T) {
++	s, p := newCheckinS(t, &checkinStub{checkinBody: `{"code":0,"data":{}}`, resourceRemain: 100})
++	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	s.cfg.AccountDelayMinSeconds, s.cfg.AccountDelayMaxSeconds = 30, 120
++	ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), scheduledAccountKey{}, true), 100*time.Millisecond)
++	defer cancel()
++	started := time.Now()
++	out, err := s.checkinAll(ctx)
++	if err != context.DeadlineExceeded || len(out) != 1 {
++		t.Fatalf("cancelled batch: out=%v err=%v", out, err)
++	}
++	if time.Since(started) > time.Second {
++		t.Fatal("cancellation waited for random delay")
++	}
++	// Manual entry still processes both accounts immediately with the same config.
++	out, err = s.CheckinAll()
++	if err != nil || len(out) != 2 {
++		t.Fatalf("manual batch: out=%v err=%v", out, err)
++	}
++}
++
++func TestScheduledScriptsReceiveAccountRangeOnlyOnAutomaticEntry(t *testing.T) {
++	f := installFakeExec(t)
++	s := New(Config{AccountDelayMinSeconds: 30, AccountDelayMaxSeconds: 120})
++	s.RunSchoolNow()
++	if len(f.lastArgs) != 4 {
++		t.Fatalf("manual school flags changed: %v", f.lastArgs)
++	}
++	s.dispatch(context.Background(), taskSchool)
++	if len(f.lastArgs) != 8 || f.lastArgs[4] != "--account-delay-min" || f.lastArgs[5] != "30" || f.lastArgs[7] != "120" {
++		t.Fatalf("scheduled school flags missing: %v", f.lastArgs)
++	}
++	s.RunCatNow()
++	if len(f.lastArgs) != 5 {
++		t.Fatalf("manual cat flags changed: %v", f.lastArgs)
++	}
++	s.dispatch(context.Background(), taskCat)
++	if len(f.lastArgs) != 9 || f.lastArgs[5] != "--account-delay-min" {
++		t.Fatalf("scheduled cat flags missing: %v", f.lastArgs)
++	}
++}
++
++type spacingBatchCommand struct{ active, maximum, calls *atomic.Int32 }
++
++func (c *spacingBatchCommand) SetDir(string) {}
++func (c *spacingBatchCommand) Run() error {
++	active := c.active.Add(1)
++	for old := c.maximum.Load(); active > old; old = c.maximum.Load() {
++		if c.maximum.CompareAndSwap(old, active) {
++			break
++		}
++	}
++	time.Sleep(30 * time.Millisecond)
++	c.calls.Add(1)
++	c.active.Add(-1)
++	return nil
++}
++
++func TestStaggeredCoincidentTaskTypesDoNotOverlap(t *testing.T) {
++	var active, maximum, calls atomic.Int32
++	old := newScriptCmd
++	newScriptCmd = func(string, ...string) scriptRunner { return &spacingBatchCommand{&active, &maximum, &calls} }
++	t.Cleanup(func() { newScriptCmd = old })
++	s := New(Config{AccountDelayMinSeconds: 30, AccountDelayMaxSeconds: 120})
++	s.runBatch(context.Background(), []taskKind{taskSchool, taskCat})
++	if maximum.Load() != 1 || calls.Load() != 2 {
++		t.Fatalf("batches overlapped: max=%d calls=%d", maximum.Load(), calls.Load())
++	}
++}
++
++func jitterScheduler(minutes int) *Scheduler {
++	return New(Config{
++		RandomDelayMinutes: minutes, RandomDelaySeed: "synthetic-deployment",
++		CheckinHours: []int{9}, TravelDisabled: true, ActivityDisabled: true,
++		KeepaliveDisabled: true, SchoolDisabled: true, CatDisabled: true,
++	})
++}
++
++func TestRandomScheduleZeroPreservesExactHour(t *testing.T) {
++	s := jitterScheduler(0)
++	now := time.Date(2026, 10, 14, 8, 30, 0, 0, cstZone)
++	at, kinds := s.nextWake(now)
++	want := time.Date(2026, 10, 14, 9, 0, 0, 0, cstZone)
++	if !at.Equal(want) || len(kinds) != 1 || kinds[0] != taskCheckin {
++		t.Fatalf("zero jitter: at=%s kinds=%v", at, kinds)
++	}
++}
++
++func TestRandomScheduleStableAcrossRestartAndCatchup(t *testing.T) {
++	day := time.Date(2026, 10, 14, 0, 0, 0, 0, cstZone)
++	s := jitterScheduler(60)
++	at := s.scheduledSlot(day, 9, taskCheckin)
++	if !at.Equal(jitterScheduler(60).scheduledSlot(day, 9, taskCheckin)) {
++		t.Fatal("restart redrew the planned slot")
++	}
++	next, _ := s.nextWake(day)
++	due := s.dueSlots(day, at)
++	if !next.Equal(at) || len(due) != 1 || !due[0].planned.Equal(at) {
++		t.Fatalf("nextWake/dueSlots disagree: next=%s due=%v want=%s", next, due, at)
++	}
++	if due := s.dueSlots(at, at.Add(time.Minute)); len(due) != 0 {
++		t.Fatalf("already dispatched slot replayed: %v", due)
++	}
++}
++
++func TestRandomScheduleBoundsStayInOriginalHourAndDay(t *testing.T) {
++	day := time.Date(2026, 10, 14, 0, 0, 0, 0, cstZone)
++	for _, minutes := range []int{1, 30, 60, 1000000} {
++		s := jitterScheduler(minutes)
++		for d := 0; d < 30; d++ {
++			date := day.AddDate(0, 0, d)
++			for hour := 0; hour < 24; hour++ {
++				for kind := taskCheckin; kind <= taskCat; kind++ {
++					at := s.scheduledSlot(date, hour, kind)
++					if at.Hour() != hour || at.Format("2006-01-02") != date.Format("2006-01-02") {
++						t.Fatalf("crossed slot/day: minutes=%d date=%s at=%s", minutes, date, at)
++					}
++					base := time.Date(date.Year(), date.Month(), date.Day(), hour, 0, 0, 0, cstZone)
++					limit := time.Duration(minutes) * time.Minute
++					if minutes >= 60 {
++						limit = time.Hour - time.Second
++					}
++					if at.Sub(base) < 0 || at.Sub(base) > limit {
++						t.Fatalf("out of jitter bounds: at=%s base=%s limit=%s", at, base, limit)
++					}
++				}
++			}
++		}
++	}
++}
++
++func TestRandomScheduleNewDateTaskAndDeploymentDrawIndependently(t *testing.T) {
++	day := time.Date(2026, 10, 14, 0, 0, 0, 0, cstZone)
++	s := jitterScheduler(60)
++	at := s.scheduledSlot(day, 9, taskCheckin)
++	other := jitterScheduler(60)
++	other.cfg.RandomDelaySeed = "other-synthetic-deployment"
++	for name, actual := range map[string]time.Duration{
++		"date":       s.scheduledSlot(day.AddDate(0, 0, 1), 9, taskCheckin).Sub(day.AddDate(0, 0, 1).Add(9 * time.Hour)),
++		"task":       s.scheduledSlot(day, 9, taskTravel).Sub(day.Add(9 * time.Hour)),
++		"deployment": other.scheduledSlot(day, 9, taskCheckin).Sub(day.Add(9 * time.Hour)),
++	} {
++		if actual == at.Sub(day.Add(9*time.Hour)) {
++			t.Fatalf("fixture %s draw was unchanged", name)
++		}
++	}
++}
++
++func TestRandomScheduleRestartWithinHourStillFindsPendingSlot(t *testing.T) {
++	s := jitterScheduler(60)
++	day := time.Date(2026, 10, 14, 0, 0, 0, 0, cstZone)
++	at := s.scheduledSlot(day, 9, taskCheckin)
++	if !at.After(day.Add(9 * time.Hour)) {
++		t.Fatal("fixture must have a positive delay")
++	}
++	next, kinds := s.nextWake(at.Add(-time.Second))
++	if !next.Equal(at) || len(kinds) != 1 {
++		t.Fatalf("lost pending randomized slot: %s %v", next, kinds)
++	}
++	next, _ = s.nextWake(at)
++	if next.Format("2006-01-02") != "2026-10-15" {
++		t.Fatalf("slot replayed instead of tomorrow: %s", next)
++	}
++}
++
++func TestRandomScheduleDisabledTaskAndMultipleHours(t *testing.T) {
++	s := jitterScheduler(60)
++	s.cfg.CheckinDisabled = true
++	day := time.Date(2026, 10, 14, 0, 0, 0, 0, cstZone)
++	if at, kinds := s.nextWake(day); !at.IsZero() || len(kinds) != 0 {
++		t.Fatal("disabled task was scheduled")
++	}
++	if due := s.dueSlots(day, day.Add(24*time.Hour)); len(due) != 0 {
++		t.Fatal("disabled task caught up")
++	}
++	s.cfg.CheckinDisabled = false
++	s.cfg.CheckinHours = []int{9, 21}
++	due := s.dueSlots(day, day.Add(24*time.Hour))
++	if len(due) != 2 || due[0].planned.Hour() != 9 || due[1].planned.Hour() != 21 {
++		t.Fatalf("multiple-hour slots changed: %v", due)
++	}
++}
+diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
+index 3e382d6..a7b1777 100644
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -22,14 +22,18 @@ import (
+ // 任务开关用「禁用」命名而非「启用」：零值 Config 即六类任务都启用（hours 回落默认），
+ // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
+ type Config struct {
+-	Pool           *pool.Pool
+-	Upstream       *upstream.Client
+-	CheckinHours   []int // 默认 [9, 21]
+-	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
+-	ActivityHours  []int // 默认 [10]
+-	KeepaliveHours []int // 默认 [22]
+-	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
+-	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
++	AccountDelayMinSeconds int // scheduled accounts only; zero range keeps existing pacing
++	AccountDelayMaxSeconds int
++	RandomDelayMinutes     int    // 0 = exact hours; 1..60 = randomized slot offset
++	RandomDelaySeed        string // private stable deployment identity; never logged
++	Pool                   *pool.Pool
++	Upstream               *upstream.Client
++	CheckinHours           []int // 默认 [9, 21]
++	TravelHours            []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
++	ActivityHours          []int // 默认 [10]
++	KeepaliveHours         []int // 默认 [22]
++	SchoolHours            []int // 默认 [12]：开学季任务（迁移自系统 crontab）
++	CatHours               []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
+ 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
+ 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
+ 	ActivityReportCount int
+@@ -187,7 +191,7 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
+ 		if sch.disabled {
+ 			continue
+ 		}
+-		slots = append(slots, slot{nextFire(now, sch.hours), sch.kind})
++		slots = append(slots, slot{s.nextScheduledFire(now, sch), sch.kind})
+ 	}
+ 	var earliest time.Time
+ 	for _, sl := range slots {
+@@ -242,9 +246,9 @@ func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
+ // **墙钟**而整段跳过 —— 一天里最重要的一次签到就这么没了。
+ //
+ // 两个对策：
+-//   1. waitForSlot 分段小睡（≤ slotPoll）并在每段醒来时重新对墙钟；
+-//   2. Run 用 cursor（已派发的最后一个槽位）而不是 time.Now() 作为起点，睡眠跨过的
+-//      多个槽位按时间顺序逐个补跑（超出 catchupWindow 的老槽位不补）。
++//  1. waitForSlot 分段小睡（≤ slotPoll）并在每段醒来时重新对墙钟；
++//  2. Run 用 cursor（已派发的最后一个槽位）而不是 time.Now() 作为起点，睡眠跨过的
++//     多个槽位按时间顺序逐个补跑（超出 catchupWindow 的老槽位不补）。
+ var slotPoll = time.Minute
+ 
+ // nowFunc 取当前**墙钟**时间。抽成变量只为一件事：测试能拨表（模拟机器睡了一夜），
+@@ -296,8 +300,8 @@ func (s *Scheduler) dueSlots(cursor, now time.Time) []dueSlot {
+ 				continue
+ 			}
+ 			for _, h := range sch.hours {
+-				t := time.Date(day.Year(), day.Month(), day.Day(), h, 0, 0, 0, loc)
+-				if !t.After(start) || t.After(now) {
++				t := s.scheduledSlot(day, h, sch.kind)
++				if !t.After(cursor.Round(0)) || t.After(now) {
+ 					continue
+ 				}
+ 				out = append(out, dueSlot{planned: t, kinds: []taskKind{sch.kind}})
+@@ -371,6 +375,17 @@ func (s *Scheduler) Run(ctx context.Context) {
+ // runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
+ // 供 Run 主循环与测试使用；ctx 取消时由各任务内部的 sleepCtx 快速收尾。
+ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
++	// Account staggering also serializes coincident task types. Otherwise two
++	// independent batches can operate on different accounts at the same time.
++	if s.cfg.AccountDelayMaxSeconds > 0 {
++		for _, kind := range kinds {
++			if ctx.Err() != nil {
++				return
++			}
++			s.dispatch(ctx, kind)
++		}
++		return
++	}
+ 	var wg sync.WaitGroup
+ 	for _, k := range kinds {
+ 		wg.Add(1)
+@@ -386,25 +401,28 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
+ // 不影响其余任务继续执行（与现有各任务"单账号失败不阻断遍历"同口径）。
+ // ctx 传导给带账号间限速的遍历（取消时立即放弃剩余账号），纯脚本类任务不感知。
+ func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
++	ctx = context.WithValue(ctx, scheduledAccountKey{}, true)
+ 	switch k {
+ 	case taskCheckin:
+-		s.RunCheckinNow()
++		s.runCheckinNow(ctx)
+ 	case taskTravel:
+ 		s.runTravel(ctx)
+ 	case taskActivity:
+ 		s.runActivity(ctx)
+ 	case taskKeepalive:
+-		s.RunKeepaliveNow()
++		s.runKeepalive(ctx)
+ 	case taskSchool:
+-		s.RunSchoolNow()
++		s.runSchool(ctx)
+ 	case taskCat:
+-		s.RunCatNow()
++		s.runCat(ctx)
+ 	}
+ }
+ 
+ // RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。
+-func (s *Scheduler) RunCheckinNow() {
+-	if _, err := s.CheckinAll(); err != nil {
++func (s *Scheduler) RunCheckinNow() { s.runCheckinNow(context.Background()) }
++
++func (s *Scheduler) runCheckinNow(ctx context.Context) {
++	if _, err := s.checkinAll(ctx); err != nil {
+ 		log.Printf("scheduled checkin skipped: %v", err)
+ 	}
+ }
+@@ -416,6 +434,10 @@ func (s *Scheduler) RunCheckinNow() {
+ // session dead 走 Pool.NoteSessionDead 的**连续计数**语义（与 keepalive 一致）：
+ // 一次刷新失败不再立即杀号，连续 sessionDeadThreshold 次才禁用，刷新成功清计数。
+ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
++	return s.checkinAll(context.Background())
++}
++
++func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
+ 	if !s.checkinMu.TryLock() {
+ 		return nil, ErrBusy
+ 	}
+@@ -424,6 +446,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
+ 	statuses := s.cfg.Pool.List()
+ 	out := make([]CheckinOutcome, 0, len(statuses))
+ 	var okN, alreadyN, failN, skipN int
++	first := true
+ 	for _, st := range statuses {
+ 		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
+ 		if st.Disabled {
+@@ -448,6 +471,13 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
+ 			out = append(out, oc)
+ 			continue
+ 		}
++		if !first && !sleepCtx(ctx, s.accountGap(ctx, 0)) {
++			return out, ctx.Err()
++		}
++		if ctx.Err() != nil {
++			return out, ctx.Err()
++		}
++		first = false
+ 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
+ 		if a.NeedsRefresh(checkinRefreshSkew) {
+ 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+@@ -564,7 +594,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
+ 		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
+ 		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
+ 		if !first {
+-			if !sleepCtx(ctx, activityAccountDelay) {
++			if !sleepCtx(ctx, s.accountGap(ctx, activityAccountDelay)) {
+ 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
+ 			}
+ 		}
+@@ -788,7 +818,10 @@ func (s *Scheduler) markRewardClaimed(uid string) {
+ // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
+ // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
+ // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
+-func (s *Scheduler) RunKeepaliveNow() {
++func (s *Scheduler) RunKeepaliveNow() { s.runKeepalive(context.Background()) }
++
++func (s *Scheduler) runKeepalive(ctx context.Context) {
++	first := true
+ 	for _, st := range s.cfg.Pool.List() {
+ 		if st.Disabled {
+ 			continue
+@@ -797,6 +830,13 @@ func (s *Scheduler) RunKeepaliveNow() {
+ 		if a == nil || a.RefreshTokenValue() == "" {
+ 			continue
+ 		}
++		if !first && !sleepCtx(ctx, s.accountGap(ctx, 0)) {
++			return
++		}
++		if ctx.Err() != nil {
++			return
++		}
++		first = false
+ 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+ 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+ 			var ue *upstream.Error
+diff --git a/internal/scheduler/school.go b/internal/scheduler/school.go
+index 7703dba..3b199fc 100644
+--- a/internal/scheduler/school.go
++++ b/internal/scheduler/school.go
+@@ -7,6 +7,7 @@
+ package scheduler
+ 
+ import (
++	"context"
+ 	"log"
+ 	"os"
+ 	"os/exec"
+@@ -49,7 +50,10 @@ type scriptRunner interface {
+ type scriptCmd struct{ cmd *exec.Cmd }
+ 
+ func (c *scriptCmd) SetDir(dir string) { c.cmd.Dir = dir }
+-func (c *scriptCmd) Run() error        { return c.cmd.Run() }
++func (c *scriptCmd) SetContext(ctx context.Context) {
++	c.cmd = exec.CommandContext(ctx, c.cmd.Path, c.cmd.Args[1:]...)
++}
++func (c *scriptCmd) Run() error { return c.cmd.Run() }
+ 
+ // newScriptCmd 构建脚本子进程。包级变量便于测试注入 fake（installFakeExec 覆盖）。
+ // 工作目录由调用方 SetDir 显式设置仓库根。
+@@ -77,8 +81,18 @@ func pythonCmd() string {
+ // runScript 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
+ // 不影响调度主循环继续跑下一个时点。单命令失败不中断后续命令。
+ func runScript(name, root string, commands [][]string) {
++	runScriptContext(context.Background(), name, root, commands)
++}
++
++func runScriptContext(ctx context.Context, name, root string, commands [][]string) {
+ 	for _, cmdArgs := range commands {
++		if ctx.Err() != nil {
++			return
++		}
+ 		c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
++		if setter, ok := c.(interface{ SetContext(context.Context) }); ok {
++			setter.SetContext(ctx)
++		}
+ 		c.SetDir(root)
+ 		if err := c.Run(); err != nil {
+ 			log.Printf("WARN: %s (%s): %v", name, cmdArgs[1], err)
+@@ -91,19 +105,23 @@ func runScript(name, root string, commands [][]string) {
+ // RunSchoolNow 立即执行开学季任务：school_open_day_2026.py ALL --run --yes。
+ // 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
+ // 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
+-func (s *Scheduler) RunSchoolNow() {
++func (s *Scheduler) RunSchoolNow() { s.runSchool(context.Background()) }
++
++func (s *Scheduler) runSchool(ctx context.Context) {
+ 	root := repoRoot()
+-	runScript("school", root, [][]string{
+-		{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"},
++	runScriptContext(ctx, "school", root, [][]string{
++		s.accountScriptArgs(ctx, []string{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"}),
+ 	})
+ }
+ 
+ // RunCatNow 立即执行夜猫子任务：task_runner.py ALL --yes --only black_cat。
+ // black_cat 时段敏感：夜猫窗口 23:00–08:00 CST 内最多补 1 次（task_runner 内部
+ // 判定，非窗口期打印 skip 正常退出）。失败只记 WARN。
+-func (s *Scheduler) RunCatNow() {
++func (s *Scheduler) RunCatNow() { s.runCat(context.Background()) }
++
++func (s *Scheduler) runCat(ctx context.Context) {
+ 	root := repoRoot()
+-	runScript("cat", root, [][]string{
+-		{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"},
++	runScriptContext(ctx, "cat", root, [][]string{
++		s.accountScriptArgs(ctx, []string{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"}),
+ 	})
+ }
+diff --git a/internal/scheduler/travel.go b/internal/scheduler/travel.go
+index ed1ca93..c631612 100644
+--- a/internal/scheduler/travel.go
++++ b/internal/scheduler/travel.go
+@@ -83,7 +83,7 @@ func (s *Scheduler) runTravel(ctx context.Context) {
+ 			continue // D4 门控：global 无猫猫旅行体系，不发起任何上游调用
+ 		}
+ 		if !first {
+-			if !sleepCtx(ctx, travelAccountDelay) {
++			if !sleepCtx(ctx, s.accountGap(ctx, travelAccountDelay)) {
+ 				return // 优雅停机：不等限速睡满，剩余账号下轮再巡
+ 			}
+ 		}
+diff --git a/scripts/school_open_day_2026.py b/scripts/school_open_day_2026.py
+index 00abef1..4d91fb3 100644
+--- a/scripts/school_open_day_2026.py
++++ b/scripts/school_open_day_2026.py
+@@ -797,7 +797,9 @@ def main():
+     ap.add_argument("--token", default=None, help="显式覆盖 token（不同源凭证逃生门）")
+     ap.add_argument("--uid", default="", help="配合 --token 指定 uid（仅日志用）")
+     ap.add_argument("--gap", type=float, default=1.5, help="写动作间隔秒数（默认 1.5，最小 1.0）")
++    tc.add_account_spacing_arguments(ap)
+     a = ap.parse_args()
++    account_spacing = tc.account_spacing_from_args(a, ap)
+ 
+     if a.gap < 1.0:
+         a.gap = 1.0  # 写操作间隔 ≥1s
+@@ -844,6 +846,7 @@ def main():
+             print(f"[skip] {uid8} global realm 不适用 CN 任务")
+             stats["skip"] += 1
+             continue
++        account_spacing.wait()
+         try:
+             if a.lottery_only:
+                 lottery_account(auth, a, stats)
+diff --git a/scripts/task_common.py b/scripts/task_common.py
+index 1aa2f3d..185d14b 100644
+--- a/scripts/task_common.py
++++ b/scripts/task_common.py
+@@ -13,6 +13,7 @@
+   - 领养   : POST /activity/growth/buddy/agreement + /buddy/first（幂等，+300c+8e）
+ """
+ import json, os, time, glob, urllib.request, urllib.error
++import random
+ 
+ 
+ def _resolve_auths_dir() -> str:
+@@ -293,4 +294,33 @@ def chat_completion(auth, model_id="glm-5.2", prompt="hi", max_tokens=32,
+         t = e.read().decode("utf-8", "replace")
+         return e.code, t[:200]
+     except Exception as e:
+-        return -1, repr(e)[:200]
+\ No newline at end of file
++        return -1, repr(e)[:200]
++
++class AccountSpacing:
++    """Delay between eligible accounts; the first account runs immediately."""
++    def __init__(self, minimum=0, maximum=0):
++        if not 0 <= minimum <= maximum <= 600:
++            raise ValueError("account delays require 0 <= min <= max <= 600 seconds")
++        self.minimum, self.maximum = minimum, maximum
++        self.started = False
++
++    def wait(self):
++        if self.started and self.maximum > 0:
++            delay = random.SystemRandom().uniform(self.minimum, self.maximum)
++            print(f"account spacing: waiting {delay:.1f}s", flush=True)
++            time.sleep(delay)
++        self.started = True
++
++
++def add_account_spacing_arguments(parser):
++    parser.add_argument("--account-delay-min", type=int, default=0,
++                        help="Minimum delay between accounts in seconds (default 0)")
++    parser.add_argument("--account-delay-max", type=int, default=0,
++                        help="Maximum randomized account delay in seconds (0 disables)")
++
++
++def account_spacing_from_args(args, parser):
++    try:
++        return AccountSpacing(args.account_delay_min, args.account_delay_max)
++    except ValueError as exc:
++        parser.error(str(exc))
+diff --git a/scripts/task_runner.py b/scripts/task_runner.py
+index adbbed8..eca8612 100644
+--- a/scripts/task_runner.py
++++ b/scripts/task_runner.py
+@@ -1586,7 +1586,9 @@ def main():
+     ap.add_argument("--only-claim", action="store_true",
+                     help="只领奖不点亮（已完成任务直接 claim，已领幂等）")
+     ap.add_argument("--gap", type=float, default=1.0, help="动作间隔秒数（默认 1.0）")
++    tc.add_account_spacing_arguments(ap)
+     a = ap.parse_args()
++    account_spacing = tc.account_spacing_from_args(a, ap)
+ 
+     if a.gap < 1.0:
+         a.gap = 1.0  # 写操作间隔 ≥1s
+@@ -1627,6 +1629,7 @@ def main():
+             print(f"[skip] {uid8} global realm 不适用 CN 任务")
+             stats["skip"] += 1
+             continue
++        account_spacing.wait()
+         process_account(c, a, stats)
+ 
+     print_summary(stats)
+diff --git a/scripts/test_account_spacing.py b/scripts/test_account_spacing.py
+new file mode 100644
+index 0000000..19a13bf
+--- /dev/null
++++ b/scripts/test_account_spacing.py
+@@ -0,0 +1,75 @@
++import argparse
++import sys
++import unittest
++from unittest import mock
++
++import task_common as tc
++
++
++class AccountSpacingTest(unittest.TestCase):
++    def test_first_account_has_no_wait_and_later_accounts_use_random_range(self):
++        spacing = tc.AccountSpacing(30, 120)
++        rng = mock.Mock()
++        rng.uniform.side_effect = [31.5, 119.0]
++        with mock.patch.object(tc.random, 'SystemRandom', return_value=rng), \
++             mock.patch.object(tc.time, 'sleep') as sleep:
++            spacing.wait()
++            sleep.assert_not_called()
++            spacing.wait()
++            spacing.wait()
++        self.assertEqual(sleep.call_args_list, [mock.call(31.5), mock.call(119.0)])
++        self.assertEqual(rng.uniform.call_args_list, [mock.call(30,120), mock.call(30,120)])
++
++    def test_default_spacing_does_not_sleep_or_draw(self):
++        with mock.patch.object(tc.random, 'SystemRandom') as rng, \
++             mock.patch.object(tc.time, 'sleep') as sleep:
++            spacing = tc.AccountSpacing()
++            spacing.wait()
++            spacing.wait()
++        rng.assert_not_called()
++        sleep.assert_not_called()
++
++    def test_cli_rejects_bad_ranges_and_keeps_zero_defaults(self):
++        parser = argparse.ArgumentParser()
++        tc.add_account_spacing_arguments(parser)
++        defaults = tc.account_spacing_from_args(parser.parse_args([]),parser)
++        self.assertEqual((defaults.minimum, defaults.maximum),(0,0))
++        for minimum,maximum in [(-1,120),(30,29),(0,601)]:
++            with self.subTest(pair=(minimum,maximum)), self.assertRaises(ValueError):
++                tc.AccountSpacing(minimum,maximum)
++
++    def test_growth_task_batch_staggers_only_eligible_accounts(self):
++        import task_runner as runner
++        auths = {key: {'uid': key} for key in ('one','skip','two')}
++        with mock.patch.object(sys, 'argv', ['task_runner.py', 'one','skip','two',
++                '--yes','--only','black_cat','--account-delay-min','30','--account-delay-max','120']), \
++             mock.patch.object(tc, 'load_auth', side_effect=lambda key: auths[key]), \
++             mock.patch.object(tc, 'auth_is_global', side_effect=lambda a: a['uid']=='skip'), \
++             mock.patch.object(tc.random, 'SystemRandom') as rng, \
++             mock.patch.object(tc.time, 'sleep') as sleep, \
++             mock.patch.object(runner, 'process_account') as process:
++            rng.return_value.uniform.return_value = 31.5
++            runner.main()
++        self.assertEqual([call.args[0]['uid'] for call in process.call_args_list], ['one','two'])
++        sleep.assert_called_once_with(31.5)
++
++    def test_school_task_batch_staggers_only_eligible_accounts(self):
++        import school_open_day_2026 as school
++        auths = {key: {'uid': key} for key in ('one','skip','two')}
++        with mock.patch.object(sys, 'argv', ['school.py', 'one','skip','two',
++                '--run','--yes','--account-delay-min','30','--account-delay-max','120']), \
++             mock.patch.object(tc, 'load_auth', side_effect=lambda key: auths[key]), \
++             mock.patch.object(tc, 'auth_is_global', side_effect=lambda a: a['uid']=='skip'), \
++             mock.patch.object(tc.random, 'SystemRandom') as rng, \
++             mock.patch.object(tc.time, 'sleep') as sleep, \
++             mock.patch.object(school, 'run_account') as process:
++            rng.return_value.uniform.return_value = 119.0
++            with self.assertRaises(SystemExit) as exit:
++                school.main()
++            self.assertEqual(exit.exception.code,0)
++        self.assertEqual([call.args[0]['uid'] for call in process.call_args_list], ['one','two'])
++        sleep.assert_called_once_with(119.0)
++
++
++if __name__ == '__main__':
++    unittest.main()

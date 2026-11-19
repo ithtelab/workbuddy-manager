@@ -51,7 +51,8 @@ class StatsScopeTest(unittest.TestCase):
             {'uid': 'u-cn-1', 'nickname': 'cn号', 'realm': 'cn', 'file': 'a.json'},
             {'uid': 'u-glob-1', 'nickname': 'global号', 'realm': 'global', 'file': 'b.json'},
         ]
-        self._p = mock.patch.object(wb2api, 'list_auth_accounts', lambda: self._accounts)
+        self._p = mock.patch.object(
+            wb2api, 'list_auth_accounts', lambda auth_dir=None: self._accounts)
         self._p.start()
 
     def tearDown(self) -> None:

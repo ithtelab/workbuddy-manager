@@ -1,0 +1,160 @@
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -68,6 +75,11 @@ const notFoundCooldown = 60 * time.Second
+ // 抖动复用 backoff.go jitterDur（单一来源，不重复造轮子）。
+ const wafCooldownBase = 60 * time.Second
+ 
++// upstreamRestrictionCooldown 上游「账号异常行为」风控限制的软冷却时长。
++// 这类限制可申诉、会自行解除（现场观测同一账号数小时后恢复 200），
++// 而凭证本身有效 —— 因此只把它移出轮换，不 Disable、不清凭证。
++const upstreamRestrictionCooldown = 45 * time.Minute
++
+ // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
+ // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
+ // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
+@@ -1251,6 +1348,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 			// chatCompletions 已直接透传；防御调用同样不罚账号。
+ 			return
+ 		}
++		if upstream.IsUpstreamRestriction(body) {
++			// 11140 + 「账号存在异常行为，已被限制使用」→ 账号级风控限制（可申诉）。
++			// 与「request illegal / auth_forbidden」不同：限制会解除，凭证没坏 ——
++			// 软冷却期间退出轮换即可，48 分钟后再试，不要永久禁用。
++			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, upstreamRestrictionCooldown,
++				"upstream restriction ("+upstreamCodeLabel(body, uerr)+", appealable)")
++			return
++		}
+ 		if strings.Contains(lowerBody, "request illegal") {
+ 			// 理由里带**响应自己的码**（issue #201 缺陷 1：此前写死 11140，而真实响应
+ 			// 是 http 400 + code 11-128 —— 按 11140 去搜会把排障方向带偏）。
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -1189,6 +1189,26 @@ const (
+ // 文案两种语言都可能出现：中文「渠道校验」与英文 displayTips 的 channel verification
+ // / official client；`request illegal` 这类历史 msg 也可能随同一封套出现，所以不能
+ // 拿 msg 当判据。
++// IsUpstreamRestriction 判断响应是否是上游的「账号风控限制」（不是凭证失效）。
++//
++// 现场（2026-11-01，CN）：403 + `{"code":11140,"msg":"request illegal"}`，但封套里
++// displayMsg 明确写着「账号存在异常行为，已被限制使用」、displayTips 让用户「提交反馈
++// 申诉」。这类限制是**可申诉、会自行解除**的账号级风控，不是 OAuth 凭证被拒 ——
++// 按永久禁用处理会把还能救回来的号直接踢出池子（现场 6 个号被误标为「需重新登录」）。
++//
++// 只认带「异常行为 / unusual activity」话术的 11140；不带这层话术的
++// `request illegal`（历史上 global 的 auth_forbidden）仍走原有硬禁用策略。
++func IsUpstreamRestriction(body string) bool {
++	if !strings.Contains(body, "11140") {
++		return false
++	}
++	lower := strings.ToLower(body)
++	return strings.Contains(lower, "unusual activity") ||
++		strings.Contains(body, "异常行为") ||
++		strings.Contains(body, "異常行為") ||
++		strings.Contains(lower, "abnormal")
++}
++
+ func IsChannelCheck(body string) bool {
+ 	lower := strings.ToLower(body)
+ 	if !codeMarker(lower, "11128") && !codeMarker(lower, "11-128") {
+--- /dev/null
++++ b/internal/upstream/restriction_test.go
+@@ -0,0 +1,45 @@
++package upstream
++
++import "testing"
++
++// 11140 + 「账号存在异常行为」话术 → 账号级风控限制（可申诉），不是凭证失效。
++func TestIsUpstreamRestriction(t *testing.T) {
++	cases := []struct {
++		name string
++		body string
++		want bool
++	}{
++		{
++			name: "CN 风控限制（中文话术）",
++			body: `{"code":11140,"msg":"request illegal","displayMsg":{"zh":"账号存在异常行为，已被限制使用"},"displayTips":{"zh":"系统检测到该账号存在异常使用行为，如需申诉请提交反馈"}}`,
++			want: true,
++		},
++		{
++			name: "英文 unusual activity",
++			body: `{"code":11140,"msg":"request illegal","displayMsg":{"en":"Your account has been restricted due to unusual activity"}}`,
++			want: true,
++		},
++		{
++			name: "繁体 異常行為",
++			body: `{"code":11140,"msg":"request illegal","displayMsg":{"zh-hant":"帳號存在異常行為，已被限制使用"}}`,
++			want: true,
++		},
++		{
++			name: "11140 但无风控话术（历史 auth_forbidden）→ 仍按原策略",
++			body: `{"code":11140,"msg":"request illegal"}`,
++			want: false,
++		},
++		{
++			name: "11-128 渠道校验不算风控限制",
++			body: `{"code":11-128,"msg":"Illegal API invocation from an unapproved channel","displayMsg":{"zh":"账号存在异常行为"}}`,
++			want: false,
++		},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			if got := IsUpstreamRestriction(c.body); got != c.want {
++				t.Fatalf("IsUpstreamRestriction=%v want %v", got, c.want)
++			}
++		})
++	}
++}
+--- /dev/null
++++ b/internal/server/restriction_cooldown_test.go
+@@ -0,0 +1,51 @@
++package server
++
++import (
++	"strings"
++	"testing"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/pool"
++	"workbuddy2api/internal/upstream"
++)
++
++// 11140 + 「账号存在异常行为」= 账号级风控限制 → 软冷却（不 Disable、不清凭证）。
++func TestApplyErrorPolicyUpstreamRestrictionCools(t *testing.T) {
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	h := NewHandler(Config{Pool: p})
++
++	body := `{"code":11140,"msg":"request illegal","displayMsg":{"zh":"账号存在异常行为，已被限制使用"},"displayTips":{"zh":"如需申诉请提交反馈"}}`
++	h.applyErrorPolicy("u1", upstream.ErrAccountFault, body, "glm-5.2", nil)
++
++	st, ok := p.Status("u1")
++	if !ok {
++		t.Fatal("账号不存在")
++	}
++	if st.Disabled {
++		t.Fatalf("风控限制不应永久禁用: %+v", st)
++	}
++	if !st.Cooling {
++		t.Fatalf("风控限制应进入软冷却: %+v", st)
++	}
++	if !strings.Contains(st.Reason, "upstream restriction") || !strings.Contains(st.Reason, "appealable") {
++		t.Fatalf("冷却理由应说明是上游限制且可申诉, got %q", st.Reason)
++	}
++	// 冷却时长取 upstreamRestrictionCooldown（45m），明显长于渠道校验的 30s。
++	if st.CoolRemaining < int64((30 * 60)) {
++		t.Fatalf("冷却时长过短: %d 秒", st.CoolRemaining)
++	}
++}
++
++// 不带风控话术的 11140 仍按原有策略硬禁用（历史 auth_forbidden 语义不变）。
++func TestApplyErrorPolicyPlainRequestIllegalStillDisables(t *testing.T) {
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	h := NewHandler(Config{Pool: p})
++
++	h.applyErrorPolicy("u1", upstream.ErrAccountFault, `{"code":11140,"msg":"request illegal"}`, "glm-5.2", nil)
++	st, _ := p.Status("u1")
++	if !st.Disabled {
++		t.Fatalf("无风控话术的 request illegal 应仍禁用: %+v", st)
++	}
++}

@@ -11,3 +11,8 @@
 # 在任何平台解压都是可用的。不加这条的话，Linux 检出会是 LF，用户下到的包
 # 里就是 LF-only 的 .cmd。
 *.cmd text eol=crlf
+
+# Patch context contains significant whitespace and CRLF from the bundled
+# upstream snapshot. Check patch applicability instead of treating its context
+# markers as trailing whitespace in ordinary source code.
+dev/upstream-patches/*.patch -whitespace

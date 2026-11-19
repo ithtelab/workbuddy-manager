@@ -116,6 +116,14 @@ export const notify = {
   warn: (message: string, description?: string) => show('warning', message, description, 5200),
   /** 中性提示 */
   info: (message: string, description?: string) => show('info', message, description),
+  /**
+   * 关掉某条提示（用上面几个方法返回的 id）。
+   *
+   * 用途是「进行中 → 结果」的替换：先弹一条「正在拉取」，拿到结果后关掉它再弹
+   * 成功/失败，否则界面上会同时挂着「已经拉完了」和「正在拉取」两条相反的提示。
+   * 直接把 sonner 暴露给页面也可以，但那等于各页自己拼提示样式，这里收一道口子。
+   */
+  dismiss: (id: string | number) => toast.dismiss(id),
 };
 
 export {toast};

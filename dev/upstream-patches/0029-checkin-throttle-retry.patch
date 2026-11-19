@@ -1,0 +1,337 @@
+diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -427,6 +427,54 @@
+ 	}
+ }
+ 
++// checkinAccountDelay 相邻账号之间的最小间隔（issue #256）。
++//
++// 12 个账号一轮里，3 个国内版的签到请求落在 3 秒窗口内，上游直接回
++// `http 500 {"code":10001,"msg":"签到失败，请稍后重试"}`；同一批账号当天稍后
++// 手动单独点击全部成功，因此不是账号问题而是短时并发被限流。串行 + 固定间隔
++// 把一轮 12 个号摊到 30 秒以上，远低于上游限流窗口。
++// 配置了 account-delay-min/max 的定时遍历会在此基础上再叠加随机抖动（accountGap）。
++// 测试可置 0。
++var checkinAccountDelay = 3 * time.Second
++
++// checkinRetryDelays 签到遇到上游瞬时拒绝时的退避序列（issue #256）。
++//
++// 只对 HTTP 5xx 与业务码 10001 生效；"今天已签到"（同样是 10001）在判定前已按
++// 幂等成功处理，不会走到这里。重试次数 = len(checkinRetryDelays)，全部失败才
++// 记 fail_checkin。测试可置空。
++var checkinRetryDelays = []time.Duration{5 * time.Second, 15 * time.Second, 60 * time.Second}
++
++// checkinRetryable 报告签到错误是否属于上游瞬时拒绝（值得退避重试）。
++// 单号手动签到都能成功而批量偶发失败，说明 10001 在这里表达的是"稍后重试"，
++// 而不是账号或参数问题——这类错误直接记 fail 只能等下一轮定时，白白错过当天。
++func checkinRetryable(err error) bool {
++	var ue *upstream.Error
++	if !errors.As(err, &ue) {
++		return false
++	}
++	if ue.Status >= 500 && ue.Status <= 599 {
++		return true
++	}
++	return upstream.CodeOf(ue.Msg) == "10001"
++}
++
++// dailyCheckinWithRetry 执行签到，遇到上游瞬时失败（HTTP 5xx / code 10001）
++// 按 checkinRetryDelays 退避重试；ctx 取消立即返回最后一次错误。
++func (s *Scheduler) dailyCheckinWithRetry(ctx context.Context, a *auth.Auth, label string) error {
++	err := s.cfg.Upstream.DailyCheckin(a)
++	for i, delay := range checkinRetryDelays {
++		if err == nil || upstream.IsAlreadyCheckin(err) || !checkinRetryable(err) {
++			return err
++		}
++		log.Printf("checkin %s: %v — %s 后重试(%d/%d)", label, err, delay, i+1, len(checkinRetryDelays))
++		if !sleepCtx(ctx, delay) {
++			return err
++		}
++		err = s.cfg.Upstream.DailyCheckin(a)
++	}
++	return err
++}
++
+ // CheckinAll 全量签到：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。
+ // 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
+ // 同一时刻只允许一次签到在跑，重复调用返回 ErrBusy（防止手动触发与定时撞车重复打上游）。
+@@ -445,8 +493,17 @@
+ 
+ 	statuses := s.cfg.Pool.List()
+ 	out := make([]CheckinOutcome, 0, len(statuses))
+-	var okN, alreadyN, failN, skipN int
++	var okN, alreadyN, failCheckinN, failResourceN, skipN int
+ 	first := true
++	// pace 相邻账号之间的间隔：签到与只读余额查询都会打上游，global 账号也要限速。
++	// 返回 false 表示 ctx 已取消。
++	pace := func() bool {
++		if first {
++			first = false
++			return true
++		}
++		return sleepCtx(ctx, s.accountGap(ctx, checkinAccountDelay))
++	}
+ 	for _, st := range statuses {
+ 		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
+ 		if st.Disabled {
+@@ -473,6 +530,9 @@
+ 			// 因子对 global 完全失效，选号退化成纯轮询（issue #228）。
+ 			// UserResourceDetailed 只调 billing/meter 只读接口，不碰签到，
+ 			// 风控语义与 D4 门控一致。
++			if !pace() {
++				return out, ctx.Err()
++			}
+ 			if remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow); err != nil {
+ 				log.Printf("user-resource(global) %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+ 			} else {
+@@ -483,13 +543,12 @@
+ 			out = append(out, oc)
+ 			continue
+ 		}
+-		if !first && !sleepCtx(ctx, s.accountGap(ctx, 0)) {
++		if !pace() {
+ 			return out, ctx.Err()
+ 		}
+ 		if ctx.Err() != nil {
+ 			return out, ctx.Err()
+ 		}
+-		first = false
+ 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
+ 		if a.NeedsRefresh(checkinRefreshSkew) {
+ 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+@@ -504,7 +563,7 @@
+ 				// 会让本可成功的签到被白白跳过）；真正过期才判定失败。
+ 				if a.NeedsRefresh(0) {
+ 					oc.Status, oc.Detail = CheckinFail, "refresh: "+err.Error()
+-					failN++
++					failCheckinN++
+ 					out = append(out, oc)
+ 					continue
+ 				}
+@@ -517,7 +576,8 @@
+ 			}
+ 		}
+ 		// 签到返回错误（含"今天已签到"）也继续查余额：余额恢复即可解冻账号。
+-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
++		// 瞬时失败（HTTP 5xx / 10001）先在原地退避重试，避免错过当天签到。
++		if err := s.dailyCheckinWithRetry(ctx, a, logfmt.Label(st.UID, st.Nickname)); err != nil {
+ 			if upstream.IsAlreadyCheckin(err) {
+ 				// "今天已签到"是幂等成功，不是错误：不填 detail，免得回执里
+ 				// 出现一整段 400 报文、被误读成签到失败。
+@@ -537,7 +597,7 @@
+ 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+ 			oc.Status = CheckinFail
+ 			oc.Detail = joinDetail(oc.Detail, "resource: "+err.Error())
+-			failN++
++			failResourceN++
+ 			out = append(out, oc)
+ 			continue
+ 		}
+@@ -550,12 +610,14 @@
+ 		case CheckinAlready:
+ 			alreadyN++
+ 		default:
+-			failN++
++			failCheckinN++
+ 		}
+ 		out = append(out, oc)
+ 	}
+-	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
+-		len(statuses), okN, alreadyN, failN, skipN)
++	// fail 保留原有语义（签到 + 余额查询失败合计）供既有解析器/面板统计口径不变；
++	// 末尾追加拆分字段，排障时能直接区分「上游限流」与「账号/余额异常」。
++	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d fail_checkin=%d fail_resource=%d",
++		len(statuses), okN, alreadyN, failCheckinN+failResourceN, skipN, failCheckinN, failResourceN)
+ 	return out, nil
+ }
+ 
+diff --git a/internal/scheduler/scheduler_test.go b/internal/scheduler/scheduler_test.go
+--- a/internal/scheduler/scheduler_test.go
++++ b/internal/scheduler/scheduler_test.go
+@@ -17,6 +17,14 @@
+ 	"workbuddy2api/internal/pool"
+ 	"workbuddy2api/internal/upstream"
+ )
++
++// TestMain 统一关掉签到账号间隔与退避等待：默认值面向生产（3s / 5s+15s+60s），
++// 直接带进测试会让 500 响应类用例白等几十秒。需要验证节奏/重试的用例自行临时改回。
++func TestMain(m *testing.M) {
++	checkinAccountDelay = 0
++	checkinRetryDelays = nil
++	os.Exit(m.Run())
++}
+ 
+ func TestNextFire(t *testing.T) {
+ 	loc := time.Local
+@@ -487,6 +495,125 @@
+ 	}
+ }
+ 
++// TestCheckinRetryTransient10001 issue #256：上游 500 + code 10001"签到失败，
++// 请稍后重试"属于短时限流，退避重试后成功，不应直接记 fail 等下一轮定时。
++func TestCheckinRetryTransient10001(t *testing.T) {
++	var calls atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch {
++		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
++			if calls.Add(1) < 3 {
++				w.WriteHeader(500)
++				w.Write([]byte(`{"code":10001,"msg":"签到失败，请稍后重试","requestId":"x"}`))
++				return
++			}
++			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
++		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
++			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
++		default:
++			http.Error(w, "not found", 404)
++		}
++	}))
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++
++	oldRetry := checkinRetryDelays
++	checkinRetryDelays = []time.Duration{time.Millisecond, time.Millisecond}
++	t.Cleanup(func() { checkinRetryDelays = oldRetry })
++
++	out, err := s.CheckinAll()
++	if err != nil {
++		t.Fatalf("err=%v", err)
++	}
++	if got := calls.Load(); got != 3 {
++		t.Errorf("daily-checkin calls=%d want 3（前两次 10001 退避重试）", got)
++	}
++	if out[0].Status != CheckinOK {
++		t.Errorf("status=%q want ok（重试后成功）", out[0].Status)
++	}
++}
++
++// TestCheckinNoRetryOnAlready "今天已签到"是幂等成功，不能被当成可重试的 10001。
++func TestCheckinNoRetryOnAlready(t *testing.T) {
++	stub := &checkinStub{
++		checkinBody:    `{"code":10001,"msg":"今天已签到"}`,
++		resourceRemain: 300,
++	}
++	s, _ := newCheckinS(t, stub)
++
++	oldRetry := checkinRetryDelays
++	checkinRetryDelays = []time.Duration{time.Millisecond}
++	t.Cleanup(func() { checkinRetryDelays = oldRetry })
++
++	out, err := s.CheckinAll()
++	if err != nil {
++		t.Fatalf("err=%v", err)
++	}
++	if out[0].Status != CheckinAlready {
++		t.Errorf("status=%q want already", out[0].Status)
++	}
++}
++
++// TestCheckinNoRetryOnHardFailure 非瞬时错误（业务码 10000 等）不重试，直接记 fail。
++func TestCheckinNoRetryOnHardFailure(t *testing.T) {
++	var calls atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch {
++		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
++			calls.Add(1)
++			w.WriteHeader(400)
++			w.Write([]byte(`{"code":10000,"msg":"参数错误"}`))
++		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
++			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":1000,"CycleCapacityRemain":100,"CycleCapacityUsed":0}]}}}}`))
++		default:
++			http.Error(w, "not found", 404)
++		}
++	}))
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++
++	oldRetry := checkinRetryDelays
++	checkinRetryDelays = []time.Duration{time.Millisecond}
++	t.Cleanup(func() { checkinRetryDelays = oldRetry })
++
++	out, _ := s.CheckinAll()
++	if got := calls.Load(); got != 1 {
++		t.Errorf("daily-checkin calls=%d want 1（10000 不重试）", got)
++	}
++	if out[0].Status != CheckinFail {
++		t.Errorf("status=%q want fail", out[0].Status)
++	}
++}
++
++// TestCheckinRetryableClassification 只有 HTTP 5xx 与业务码 10001 才值得重试。
++func TestCheckinRetryableClassification(t *testing.T) {
++	cases := []struct {
++		name string
++		err  error
++		want bool
++	}{
++		{"http500", &upstream.Error{Kind: upstream.ErrServer, Status: 500, Msg: `{"code":10001,"msg":"签到失败，请稍后重试"}`}, true},
++		{"http502-empty", &upstream.Error{Kind: upstream.ErrServer, Status: 502, Msg: ``}, true},
++		{"code10001", &upstream.Error{Kind: upstream.ErrClient, Status: 400, Msg: `{"code":10001,"msg":"签到失败，请稍后重试"}`}, true},
++		{"code10000", &upstream.Error{Kind: upstream.ErrClient, Status: 400, Msg: `{"code":10000,"msg":"参数错误"}`}, false},
++		{"code12153", &upstream.Error{Kind: upstream.ErrSessionDead, Status: 401, Msg: `{"code":12153,"msg":"Offline user session not found"}`}, false},
++		{"plain", errors.New("dial tcp: timeout"), false},
++	}
++	for _, c := range cases {
++		if got := checkinRetryable(c.err); got != c.want {
++			t.Errorf("%s: retryable=%v want %v", c.name, got, c.want)
++		}
++	}
++}
++
+ // TestCheckinAllSkipsDisabled 禁用账号记 skipped，不参与签到。
+ func TestCheckinAllSkipsDisabled(t *testing.T) {
+ 	stub := &checkinStub{checkinBody: `{"code":0,"msg":"ok","data":{}}`, resourceRemain: 100}
+@@ -643,28 +770,28 @@
+ // 老 CN 文件（空 domain，无 realm 键）→ cn；再次 refresh 不改变已补的标识（幂等）。
+ func TestRunKeepaliveBackfillsRealm(t *testing.T) {
+ 	cases := []struct {
+-		name       string
+-		fixture    string
+-		filename   string
+-		wantRealm  string
++		name      string
++		fixture   string
++		filename  string
++		wantRealm string
+ 	}{
+ 		{
+-			name: "老 global 落盘补 global",
+-			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`,
+-			filename:   "workbuddy-g1.json",
+-			wantRealm:  "global",
++			name:      "老 global 落盘补 global",
++			fixture:   `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`,
++			filename:  "workbuddy-g1.json",
++			wantRealm: "global",
+ 		},
+ 		{
+-			name: "老 CN 空 domain 落盘补 cn",
+-			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":""},"account":{"uid":"c1"}}`,
+-			filename:   "workbuddy-c1.json",
+-			wantRealm:  "cn",
++			name:      "老 CN 空 domain 落盘补 cn",
++			fixture:   `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":""},"account":{"uid":"c1"}}`,
++			filename:  "workbuddy-c1.json",
++			wantRealm: "cn",
+ 		},
+ 		{
+-			name: "已有 realm 不被覆盖——global domain 显式 cn 保持 cn",
+-			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai","realm":"cn"},"account":{"uid":"c2"}}`,
+-			filename:   "workbuddy-c2.json",
+-			wantRealm:  "cn",
++			name:      "已有 realm 不被覆盖——global domain 显式 cn 保持 cn",
++			fixture:   `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai","realm":"cn"},"account":{"uid":"c2"}}`,
++			filename:  "workbuddy-c2.json",
++			wantRealm: "cn",
+ 		},
+ 	}
+ 	for _, c := range cases {

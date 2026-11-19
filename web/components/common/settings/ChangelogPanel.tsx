@@ -182,7 +182,7 @@ function VersionBlock({
                 >
                   {sectionLabel(sec.title, t)}
                 </span>
-                <span className="text-[10px] text-muted-foreground/70">
+                <span className="text-[11px] text-muted-foreground">
                   {t('changelog.items', {count: sec.items.length, n: sec.items.length})}
                 </span>
               </div>
@@ -190,12 +190,12 @@ function VersionBlock({
             </div>
           ))}
           {isCurrent && currentVersion && !unreleased && (
-            <div className="pt-0.5 text-[10px] text-muted-foreground/70">
+            <div className="pt-0.5 text-[11px] text-muted-foreground">
               {t('changelog.thisIsCurrent')}
             </div>
           )}
           {index === 0 && !unreleased && (
-            <div className="pt-0.5 text-[10px] text-muted-foreground/70">
+            <div className="pt-0.5 text-[11px] text-muted-foreground">
               {t('changelog.seeAll')}
             </div>
           )}

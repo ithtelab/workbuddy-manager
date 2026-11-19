@@ -21,6 +21,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from server import config, db  # noqa: E402
 
 
+_HASH_SEQ = 0
+
+
+def _uniq_hash() -> str:
+    """每次调用返回唯一 hash。
+
+    `api_keys.key_hash` 有唯一索引（issue #447 防并发重复），而下面这些测试辅助
+    会被同一用例调用多次、每次都插一行 —— 写死同一个字面量会撞索引。测试并不
+    关心 hash 取什么值，唯一即可。
+    """
+    global _HASH_SEQ
+    _HASH_SEQ += 1
+    return f'h{int(__import__("time").time() * 1e6)}-{_HASH_SEQ}'
+
+
+
 def local_midnight_plus(minutes: int) -> int:
     """本地今天 00:minutes（在 UTC+8 下其 UTC 日期是前一天）。"""
     lt = time.localtime()
@@ -49,7 +65,7 @@ class UsageTimezone(unittest.TestCase):
         db.execute(
             'INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, '
             'ip_allowlist, models, quota, used_tokens, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-            ('k', 'h', 'wbk_abc', 1, None, 0, '[]', '[]', 0, 0, ts),
+            ('k', _uniq_hash(), 'wbk_abc', 1, None, 0, '[]', '[]', 0, 0, ts),
         )
         db.execute(
             'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '

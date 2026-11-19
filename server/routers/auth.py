@@ -42,12 +42,19 @@ async def login(request: Request) -> JSONResponse:
 
     cfg = security.load_users()
     user = next((u for u in cfg.get('users', []) if u.get('username') == username), None)
-    if not user or not security.verify_pwd(password, user.get('pwd_hash', '')):
+    # 用户不存在时也跑一遍 PBKDF2（对哑哈希）：短路跳过会让响应快慢暴露
+    # 用户名是否存在（260000 轮是毫秒级的时间差，公网可测）。
+    if user:
+        creds_ok = security.verify_pwd(password, user.get('pwd_hash', ''))
+    else:
+        security.dummy_verify(password)
+        creds_ok = False
+    if not creds_ok:
         # 同时记 IP 与用户名：前者防单机爆破，后者防换 IP 打同一账号
         security.record_fail(ip, username)
         # 登录失败也要留痕：本次事故中攻击者拿到了会话，但服务端没有任何记录
         security.audit({'username': username or '(空)'}, 'login_failed', username,
-                       f'来源 {ip}')
+                       f'来源 {ip}', ip=ip)
         raise HTTPException(status_code=401, detail='用户名或密码错误')
 
     security.clear_fail(ip, username)
@@ -60,7 +67,7 @@ async def login(request: Request) -> JSONResponse:
         logger.warning(warn)
     # orig 缺省 = 现在（首次登录）：这次是会话的**起点**，后续续期不会推后它。
     token = security.issue_token(username, user.get('role', 'viewer'))
-    security.audit(user, 'login', username, f'来源 {ip}')
+    security.audit(user, 'login', username, f'来源 {ip}', ip=ip)
     resp = JSONResponse({'ok': True, 'username': username, 'role': user.get('role', 'viewer')})
     resp.set_cookie(
         config.COOKIE_NAME,
@@ -88,7 +95,7 @@ def me(user: dict = Depends(security.current_user)) -> dict:
 
 @router.post('/sessions/revoke')
 def revoke_own_sessions(request: Request,
-                        user: dict = Depends(security.require_admin)) -> dict:
+                        user: dict = Depends(security.require_session_admin)) -> dict:
     """吊销**当前用户**的全部会话（含本机这次），并清除本机 cookie。
 
     用途：怀疑会话被盗用（在别人电脑上登录过、旧设备没退出、备份里有 cookie）时，
@@ -106,7 +113,8 @@ def revoke_own_sessions(request: Request,
     if not username:
         raise HTTPException(status_code=401, detail='未登录')
     security.revoke_sessions(username)
-    security.audit(user, 'revoke_sessions', username, f'来源 {client_ip(request)}')
+    ip = client_ip(request)
+    security.audit(user, 'revoke_sessions', username, f'来源 {ip}', ip=ip)
     resp = JSONResponse({'ok': True, 'relogin_required': True})
     resp.delete_cookie(config.COOKIE_NAME, path='/')
     return resp

@@ -18,8 +18,12 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import tempfile
+import time
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -96,8 +100,100 @@ class UpdateCheckSemanticsTest(unittest.TestCase):
         self.assertTrue(has_update, '旧缓存确实会造成误报 —— 所以更新后要清')
 
 
-if __name__ == '__main__':
-    unittest.main()
+class _Rep:
+    """轻量 Reporter：只收日志。"""
+
+    def __init__(self) -> None:
+        self.lines: list[tuple[str, str]] = []
+
+    def log(self, message: str, level: str = 'info') -> None:
+        self.lines.append((level, message))
+
+    def set_integrity(self, status: str, digest: str = '') -> None:  # noqa: D102
+        pass
+
+    def text(self) -> str:
+        return '\n'.join(m for _, m in self.lines)
+
+
+class SigReadyAwarenessTest(unittest.TestCase):
+    """新版本已发布但产物未就位时，界面要**提前**说清（issue #127/#129）。
+
+    报障：两个用户在「版本已可见、产物还没上传」的窗口期点了更新，被拒绝。信息
+    本身没错，但用户是在点下去之后才知道的，而且那句话读起来像发布流程坏了 ——
+    实际该做的是等几分钟再试。所以版本检查要带回「产物是否就位」，界面先说清
+    并把按钮收起来。
+    """
+
+    def _fetch_with(self, assets: list[dict]):
+        from server.services import updater
+        rel = {'tag_name': 'v9.9.9', 'html_url': 'https://example.invalid/r',
+               'assets': assets}
+        with mock.patch.object(updater, '_gh_get', side_effect=[rel, {}, []]), \
+             mock.patch.object(updater, '_write_cache'):
+            return updater._fetch_remote_versions()
+
+    def test_release_without_archive_is_not_ready(self) -> None:
+        out = self._fetch_with([{'name': 'workbuddy-manager-v9.9.9.zip'}])
+        self.assertIs(out['manager']['assets_ready'], False,
+                      '附件里没有 .tar.gz 时必须标成「未就绪」，否则界面照样放行')
+
+    def test_release_with_archive_is_ready(self) -> None:
+        out = self._fetch_with([{'name': 'workbuddy-manager-v9.9.9.tar.gz'},
+                                {'name': 'workbuddy-manager-v9.9.9.zip'}])
+        self.assertIs(out['manager']['assets_ready'], True)
+
+    def test_failed_fetch_leaves_assets_unknown(self) -> None:
+        """查询失败时不能反过来标成「未就绪」——那是把网络问题说成发布问题。"""
+        from server.services import updater
+        with mock.patch.object(updater, '_gh_get', side_effect=OSError('boom')), \
+             mock.patch.object(updater, '_write_cache'):
+            out = updater._fetch_remote_versions()
+        self.assertIsNone(out['manager']['assets_ready'])
+
+    def test_assets_pending_shortens_cache_ttl(self) -> None:
+        """产物未就绪时别把结论缓存 6 小时：产物一上传，界面就该恢复。"""
+        from server.services import updater
+        cache = {'checked_at': int(time.time()) - 400,          # 6 分钟前
+                 'manager': {'latest': 'v9.9.9', 'url': '', 'assets_ready': False},
+                 'upstream': {'latest': '', 'date': '', 'subject': ''}}
+        calls: list[str] = []
+
+        def fake_gh(url):
+            calls.append(url)
+            if '/releases/latest' in url:
+                return {'tag_name': 'v9.9.9', 'html_url': '',
+                        'assets': [{'name': 'x.tar.gz'}]}
+            return {}
+
+        with mock.patch.object(updater, '_read_cache', return_value=dict(cache)), \
+             mock.patch.object(updater, '_write_cache'), \
+             mock.patch.object(updater, '_gh_get', side_effect=fake_gh):
+            out = updater.check_updates()
+        self.assertTrue(calls, '产物未就绪时 6 分钟的旧结论应触发重查（短 TTL）')
+        self.assertIs(out['manager']['assets_ready'], True, '重查后应已就绪')
+
+    def test_ready_result_keeps_long_ttl(self) -> None:
+        """正对照：已就绪的结论照旧吃 6 小时缓存，别每次进页面都打 GitHub。"""
+        from server.services import updater
+        cache = {'checked_at': int(time.time()) - 400,
+                 'manager': {'latest': 'v9.9.9', 'url': '', 'assets_ready': True},
+                 'upstream': {'latest': '', 'date': '', 'subject': ''}}
+        calls: list[str] = []
+        with mock.patch.object(updater, '_read_cache', return_value=dict(cache)), \
+             mock.patch.object(updater, '_write_cache'), \
+             mock.patch.object(updater, '_gh_get',
+                               side_effect=lambda url: calls.append(url) or {}):
+            updater.check_updates()
+        self.assertEqual(calls, [], '已就绪且没过期时不该重查')
+
+    def test_ui_says_it_and_holds_the_button(self) -> None:
+        """界面级守卫：提示要出现，按钮要拦住（否则提示只是装饰）。"""
+        src = (_ROOT / 'web' / 'components' / 'common' / 'settings'
+               / 'UpdatePanel.tsx').read_text(encoding='utf-8')
+        self.assertIn("t('updatePanel.assetsPending')", src, '缺少「产物未就位」的提示')
+        self.assertRegex(src, r'disabled=\{[^}]*check\.manager\.assets_ready === false',
+                         '产物未就位时更新按钮仍然可点 —— 用户点下去必然 404')
 
 
 class DeployDiffMessageTest(unittest.TestCase):
@@ -138,20 +234,20 @@ class DeployDiffMessageTest(unittest.TestCase):
 
     def test_modified_plain_file_needs_no_alarm(self) -> None:
         out = self._run(['install.sh'], [])
-        self.assertNotIn('验签相关文件', out)
+        self.assertNotIn('包含更新器自身', out)
         self.assertIn('按需覆盖', out)
 
-    def test_modified_trust_anchor_warns_loudly(self) -> None:
-        """改 update.py / 公钥必须显式警告 —— 那是信任锚。"""
-        for f in ('update.py', 'release-signing-key.pub', 'nested/update.py'):
+    def test_modified_updater_warns_loudly(self) -> None:
+        """改 update.py 必须显式点出来 —— 它决定「文件装到哪、服务怎么重启」。"""
+        for f in ('update.py', 'nested/update.py'):
             out = self._run([f], [])
-            self.assertIn('验签相关文件', out, f'{f} 是信任锚，必须警告')
-            self.assertIn('人工确认', out)
+            self.assertIn('包含更新器自身', out, f'{f} 必须被单独点出来')
+            self.assertIn('比对一眼', out)
 
     def test_anchor_warning_wins_over_plain(self) -> None:
         """同时有普通与信任锚改动时，必须报最严重的那一档。"""
         out = self._run(['install.sh', 'update.py'], ['check-upstream.sh'])
-        self.assertIn('验签相关文件', out)
+        self.assertIn('包含更新器自身', out)
         self.assertIn('update.py', out)
 
 

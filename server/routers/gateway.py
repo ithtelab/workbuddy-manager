@@ -1,15 +1,22 @@
 """对外反代网关：密钥鉴权 → IP 管控 → 模型映射 → 转发 → 计量落库。"""
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import re
+from urllib.parse import urlsplit
 import logging
+import threading
 import time
+import uuid
 
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import config, db, iputil, keysvc
+from .. import config, db, iputil, keysvc, upstreamsvc
+from ..services import modelcatalog, modelmap, proxyroutes, tap as tap_svc
 from ..config import _env_int
 from ..routers.security import get_config as get_security_config
 
@@ -18,8 +25,71 @@ logger = logging.getLogger('workbuddy.gateway')
 router = APIRouter(tags=['gateway'])
 
 
+# 上游 6004 的重置文案：「将在 2026-10-29 16:21:07 UTC+8 重置」。时区后缀必须
+# 一起匹配：面板进程可能跑在 UTC 或别的时区，只按本地时间算会差出整小时级
+# （最坏被 86400 上限截成 1 天，等于让客户端白等一天）。
+_RETRY_AT_RE = re.compile(
+    r'将在\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})'
+    r'(?:\s*UTC\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?)?')
+
+
+def _retry_after_seconds(text: str | None) -> int | None:
+    """把上游 429 文案里的「将在 YYYY-MM-DD HH:MM:SS [UTC±N] 重置」换成秒数。
+
+    上游 6004 的正文自带重置墙钟，客户端却只能从中文里自己抠——退回给它们一个
+    标准头，重试节奏由协议决定，不靠猜。**时区以文案里的 `UTC±N` 为准**（缺省
+    才按面板本地时间），否则面板跑在 UTC 时算出的间隔会整体差 8 小时。
+    """
+    if not text:
+        return None
+    match = _RETRY_AT_RE.search(text)
+    if not match:
+        return None
+    try:
+        import datetime as _dt
+        y, mo, d, h, mi, sec = (int(g) for g in match.groups()[:6])
+        sign, hours, minutes = match.group(7), match.group(8), match.group(9)
+        tz = None
+        if sign:
+            offset = _dt.timedelta(hours=int(hours), minutes=int(minutes or 0))
+            tz = _dt.timezone(-offset if sign == '-' else offset)
+        when = _dt.datetime(y, mo, d, h, mi, sec, tzinfo=tz)
+        now = _dt.datetime.now(tz) if tz is not None else _dt.datetime.now()
+    except (TypeError, ValueError):
+        return None
+    delta = (when - now).total_seconds()
+    if delta <= 1:
+        return None
+    return int(min(delta, 86400))
+
+
+def _retry_after_header(seconds: int | None) -> dict[str, str] | None:
+    if not seconds or seconds <= 0:
+        return None
+    return {'Retry-After': str(int(seconds))}
+
+
+def _model_missing_body(payload: object, text: str) -> dict | None:
+    """上游把「该模型在所有账号上都不存在」（11102）包成 503 时改判 404。
+
+    重试无意义（换多少账号都没有这个模型），而 5xx 会让客户端反复重试、也把
+    排障方向带到「号池挂了」。只在文案确实来自 11102 时改判，其余原样透传。
+    """
+    if not text or ('11102' not in text and 'service info not found' not in text):
+        return None
+    err = payload.get('error') if isinstance(payload, dict) else None
+    message = str(err.get('message') or '') if isinstance(err, dict) else ''
+    body: dict = {'error': {'message': message or text[:500],
+                            'type': 'invalid_request_error',
+                            'code': 'model_not_found'}}
+    if isinstance(err, dict) and err.get('gateway_hint'):
+        body['error']['gateway_hint'] = err['gateway_hint']
+    return body
+
+
 def _oai_error(message: str, status: int = 400, err_type: str = 'invalid_request_error',
-               code: str | None = None, hint: str | None = None) -> JSONResponse:
+               code: str | None = None, hint: str | None = None,
+               retry_after: int | None = None) -> JSONResponse:
     """OpenAI 形状的错误体。
 
     `hint` 对应上游 2026-09-16 新增的 `error.gateway_hint`：与 message **并列**的
@@ -33,7 +103,8 @@ def _oai_error(message: str, status: int = 400, err_type: str = 'invalid_request
     err: dict = {'message': message, 'type': err_type, 'code': code}
     if hint:
         err['gateway_hint'] = hint
-    return JSONResponse({'error': err}, status_code=status)
+    return JSONResponse({'error': err}, status_code=status,
+                        headers=_retry_after_header(retry_after))
 
 
 def _bearer(request: Request) -> str:
@@ -60,8 +131,13 @@ def _bearer(request: Request) -> str:
 # （见 max_body_bytes），这样升级顺序不受限：先升哪边都不会出现「一边说 256MB
 # 另一边 413」的错配。
 _BODY_LIMIT_TTL = 10
-_body_limit_cache: dict[str, float | int] = {'at': 0.0, 'bytes': 0}
+_body_limit_cache: dict[str, float | int] = {'at': 0.0, 'bytes': 0, 'source': ''}
 DEFAULT_MAX_BODY_MB = _env_int('WB_GATEWAY_MAX_BODY_MB', 32)
+# 上限是**谁**定的：'upstream'（旧版上游 config.json 的 server.max_body_mb）/
+# 'env'（本端 WB_GATEWAY_MAX_BODY_MB）/ ''（默认值）。
+# 为什么要记它：413 的提示必须告诉用户「该去哪改」。issue #180 里用户按旧文案
+# 改了环境变量却毫无效果 —— 因为上限其实来自上游配置，文案指错了地方。
+_BODY_LIMIT_SOURCE: dict[str, str] = {'value': ''}
 
 
 def max_body_bytes() -> int:
@@ -78,25 +154,90 @@ def max_body_bytes() -> int:
     if cached and now - float(_body_limit_cache['at']) < _BODY_LIMIT_TTL:
         return cached
     limit = DEFAULT_MAX_BODY_MB * 1024 * 1024
+    source = 'env' if _env_set('WB_GATEWAY_MAX_BODY_MB') else ''
     try:
         cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
         mb = int((cfg.get('server') or {}).get('max_body_mb') or 0)
         if mb > 0:
             limit = mb * 1024 * 1024
+            source = 'upstream'
     except Exception:  # noqa: BLE001
         # 配置读不到就沿用默认值：网关不能因为读不到配置而拒绝服务
         pass
     _body_limit_cache['at'] = now
     _body_limit_cache['bytes'] = limit
+    _body_limit_cache['source'] = source
+    _BODY_LIMIT_SOURCE['value'] = source
     return limit
 
 
+def _env_set(name: str) -> bool:
+    value = (os.environ.get(name) or '').strip()
+    return value != ''
+
+# ── max_tokens 上限钳制 ────────────────────────────────────────────
+#
+# 上游的 `Request.max_tokens` 是 **int32**（上限 2147483647）。超出后上游拒绝时
+# 不是回 400，而是把它包成 `no_healthy_account` + 503——客户端据此以为「服务暂时
+# 不可用」而重试，但参数越界重试多少次都一样失败。
+#
+# 实测触发来源：有客户端按「剩余额度 → max_tokens」做减法（形如 `1e10 - 已消耗`，
+# 约 99.99 亿，是 int32 上限的 4.66 倍）。这类值是**算出来的**、不是用户填的，
+# 客户端那侧的换算逻辑我们改不到，只能由网关兜住。
+#
+# 阈值取 1e6：上游 /v1/models 里最大的 max_output_tokens 实测为 131072，
+# 1e6 有约 7 倍余量，不会误伤正常请求，又能挡住这类减法式产物。
+MAX_TOKENS_CEILING = 1_000_000
+
+# 一并钳制的字段：三种协议各自的输出上限字段名。
+# `max_completion_tokens` 是 OpenAI 较新的名字（o-series / gpt-5 时代取代
+# `max_tokens`），部分客户端已默认用它；上游同样按 int32 读，实测越界时一样
+# 回 503。网关是透传的，客户端发什么就转发什么，故必须一并兜住。
+_MAX_TOKENS_FIELDS = ('max_tokens', 'max_completion_tokens', 'max_output_tokens')
+
+
+def clamp_max_tokens(body: dict) -> None:
+    """原地钳制请求体里的输出上限字段（见 _MAX_TOKENS_FIELDS）。
+
+    为什么是**原地改**而不是返回新 dict：`_chat` 与两个协议层都是拿到 body 后
+    直接转发，原地把越界值压回上限，调用方无需改动其余逻辑。
+
+    非数字一律**原样保留**（不猜测、不置默认）：把它交回上游去判，网关不替
+    上游做协议决定——历史上替上游兜底过的字段都留下了难以回溯的偏差。
+    """
+    if not isinstance(body, dict):
+        return
+    for field in _MAX_TOKENS_FIELDS:
+        value = body.get(field)
+        # bool 是 int 的子类，必须排除；None 交给上游按「未提供」处理
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if value <= MAX_TOKENS_CEILING:
+            continue
+        body[field] = MAX_TOKENS_CEILING
+
+
 def _payload_too_large(limit: int) -> JSONResponse:
+    """413 的正文必须说清「上限是多少、谁定的、该去哪改」。
+
+    issue #180 的教训：以前不管上限从哪来都写「由环境变量 WB_GATEWAY_MAX_BODY_MB
+    决定」—— 而用户的上游是旧版、config.json 里还留着 `server.max_body_mb`，
+    面板**优先**听它，于是用户改了环境变量毫无效果，还以为面板不认这个配置。
+    """
     mb = limit // 1024 // 1024
+    source = _BODY_LIMIT_SOURCE.get('value') or ''
+    if source == 'upstream':
+        where = ('该上限来自**上游** config.json 的 server.max_body_mb（你的上游是旧版、'
+                 '还认这个键；面板优先听它，所以改环境变量不生效）：把那个值调大并重启上游，'
+                 '或者删掉该键，让面板改用环境变量 WB_GATEWAY_MAX_BODY_MB')
+    elif source == 'env':
+        where = ('该上限来自环境变量 WB_GATEWAY_MAX_BODY_MB（改完要重启面板）')
+    else:
+        where = ('当前用的是默认上限；可在 .env 里设 WB_GATEWAY_MAX_BODY_MB 提高'
+                 '（改完要重启面板）')
     return _oai_error(
-        f'请求体超过 {mb} MB 上限：请压缩内容（精简上下文或附件）。'
-        f'该上限由本网关设置（环境变量 WB_GATEWAY_MAX_BODY_MB），'
-        f'上游自 9d1a21b 起已不再限制请求体大小',
+        f'请求体超过 {mb} MB 上限：请压缩内容（精简上下文或附件），或提高上限。'
+        f'{where}。上游自 9d1a21b 起已不再限制请求体大小',
         413, 'invalid_request_error', 'payload_too_large',
     )
 
@@ -174,6 +315,61 @@ def _rate_limited(key: dict) -> tuple[bool, int]:
     return limited, len(hits)
 
 
+# ── 未鉴权入口的入站日志采样 ─────────────────────────────
+# 「没有密钥」「密钥不认识」这两条路径**在校验密钥之前**就写库，任何匿名者都能
+# 触发（`/v1/chat/completions` 与 `/v1/usage` 都是这样）。攻击者只要写个循环
+# 用随机 token 打过来，就能以每请求一行的速度把 `ip_access_logs` 的两万行窗口
+# 顶掉——真正该看的扫描记录反而被自己人（同一个人）挤了出去，外加持续的写盘与
+# 行数清理开销。这是**匿名写放大**，与 `_log_ip` 里清洗/截断防的是同一类问题。
+#
+# 做法：按 (来源 IP, 原因) 做**窗口内计数**，前 N 次照常逐条记录（保留细节：
+# 路径、UA 都不一样，排查时有用），超出的折叠掉，并在本窗口第一次折叠时写一条
+# `key_auth_flood` 汇总行——运维能看到「这个 IP 在这一分钟里刷了更多」，但库里
+# 每分钟最多 N+1 行/IP。折叠不是丢弃信号，而是把「很多条一样的东西」压成一条
+# 仍能看出发生了什么的记录。
+#
+# 只对这两个**未鉴权可达**的原因采样：`ip_blocked` / `rate_limited` / 密钥层
+# 拒绝都要求先拿出一把已知密钥，写放大的成本已经由密钥本身承担，采样反而会
+# 藏掉「某把密钥被反复拒绝」的线索。
+#
+# 计数在进程内存里（与上面的每密钥限流同一口径）：单实例足够；`workers > 1`
+# 时每个进程各自计数，上限按进程数放大——仍然有界，可接受。
+_AUTH_FAIL_REASONS = frozenset({'missing_key', 'invalid_key'})
+_AUTH_LOG_WINDOW = 60
+_AUTH_LOG_PER_WINDOW = max(1, _env_int('WB_AUTH_LOG_PER_MIN', 5))
+# 计数表的硬上限。大量不同来源 IP 在同一个窗口内各打一次时，过期清理
+# 永远不会被触发（每个 state 的计数都停在 1）；必须有一个不依赖计数的上限。
+_AUTH_LOG_MAX_ENTRIES = 8192
+# (ip, reason) -> [窗口起点, 本窗次数, 是否已写过汇总行]
+_auth_log_state: dict[tuple[str, str], list] = {}
+_auth_log_lock = threading.Lock()
+
+
+def _auth_log_verdict(ip: str, reason: str) -> str:
+    """返回 'log'（逐条记录）/ 'flood'（写一条汇总行）/ 'drop'（折叠掉）。"""
+    now = time.time()
+    key = (ip, reason)
+    with _auth_log_lock:
+        state = _auth_log_state.get(key)
+        if not state or now - state[0] >= _AUTH_LOG_WINDOW:
+            state = [now, 0, False]
+            _auth_log_state[key] = state
+        state[1] += 1
+        # 硬上限：大量不同来源 IP 各打一次时，按 state 计数的过期清理永远
+        # 轮不到（每个计数都是 1），字典会无界增长。超过上限就清空重来——
+        # 宁可少采样一小段，也不让外部输入把进程内存撑爆。
+        if len(_auth_log_state) > _AUTH_LOG_MAX_ENTRIES:
+            _auth_log_state.clear()
+            state = [now, 1, False]
+            _auth_log_state[key] = state
+        if state[1] <= _AUTH_LOG_PER_WINDOW:
+            return 'log'
+        if not state[2]:
+            state[2] = True
+            return 'flood'
+        return 'drop'
+
+
 def _log_ip(ip: str, path: str, blocked: bool, ua: str | None,
             reason: str | None = None) -> None:
     """记录一次入站访问。**默认只记拦截**，放行不记（见下）。
@@ -205,9 +401,19 @@ def _log_ip(ip: str, path: str, blocked: bool, ua: str | None,
         污染事后排查（实测确认）。
       * 写入走 `db.add_ip_access_log`，由它负责行数上限（超出就丢最旧的），
         避免表无限增长直到磁盘写满。
+      * 「没有密钥」「密钥不认识」这两种**匿名可达**的原因再做一层窗口采样
+        （见 `_auth_log_verdict`）：每 IP 每分钟前几条照常记，其余折叠成一条
+        `key_auth_flood`。所以「一次都没记」不会发生，被折叠的那部分仍留了
+        一条能看出「这个 IP 在刷」的记录。
     """
     if not blocked and not config.AUDIT_ALL_ACCESS:
         return
+    if reason and reason in _AUTH_FAIL_REASONS:
+        verdict = _auth_log_verdict(ip, reason)
+        if verdict == 'drop':
+            return
+        if verdict == 'flood':
+            reason = 'key_auth_flood'
     db.add_ip_access_log(ip, path, blocked, ua, reason)
 
 
@@ -253,11 +459,156 @@ def _usage_credit(usage: dict | None) -> float | None:
     return val if val >= 0 else None
 
 
-def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None) -> None:
+def _usage_cache(usage: dict | None) -> tuple[int | None, int | None, int | None]:
+    """从 usage 里取提示词缓存的三段 token（issue #69）。
+
+    腾讯在流式末帧 usage 里给 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`
+    / `prompt_cache_write_tokens`；**上游自己的缓存统计就是从这三个字段来的**
+    （其 `/v1/stats` 的 cache_hit_rate 同源），所以我们不必自己估算。
+
+    三个都要能区分「没给」与「给了 0」：老上游不给 = None（界面上显示「—」），
+    给了 0 = 这次真的没命中缓存。混为一谈会让用户以为缓存生效了。
+    """
+
+    def _one(name: str) -> int | None:
+        if not isinstance(usage, dict):
+            return None
+        raw = usage.get(name)
+        # bool 是 int 的子类，`True` 不能当成 1 个 token
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return val if val >= 0 else None
+
+    return (_one('prompt_cache_hit_tokens'),
+            _one('prompt_cache_miss_tokens'),
+            _one('prompt_cache_write_tokens'))
+
+
+# 客户端渠道归类（issue #233）：只用于日志可观测性，**不改变转发行为**。
+#
+# 为什么要它：429 / 6004 是账号级或模型级冷却，出问题时最想知道「是哪类客户端
+# 把号打冷的」。UA 是唯一无需客户端配合就能拿到的来源维度；归类宁可粗、不可猜错：
+# 认不出就记 other，不把「可能是」写成「就是」。
+def client_channel(ua: str | None) -> str:
+    text = (ua or '').strip().lower()
+    if not text:
+        return 'unknown'
+    if 'codex' in text:
+        return 'codex'
+    if 'claude' in text or 'anthropic' in text:
+        # UA 实际有 `claude-code/…`、`claude-cli/2.0.1 (external, cli)`、
+        # `claude_cli/…` 几种写法；早先只认前两种，于是**真正的 Claude Code CLI**
+        # 在请求日志里被记成 other（轨迹页的同类守卫实测发现）。
+        return 'claude-code'
+    if 'deepseek' in text or 'dsh' in text:
+        return 'dsh'
+    if 'vscode' in text or 'visual studio code' in text or 'cursor' in text:
+        return 'vscode'
+    if 'jetbrains' in text or 'intellij' in text:
+        return 'jetbrains'
+    if 'workbuddy' in text:
+        return 'wb'
+    if 'mozilla' in text or 'chrome/' in text or 'safari/' in text or 'edg/' in text:
+        return 'web'
+    if any(k in text for k in ('python', 'httpx', 'requests/', 'curl/', 'node-fetch',
+                               'axios', 'okhttp', 'go-http-client')):
+        return 'api'
+    return 'other'
+
+
+def _image_part_to_openai(part: dict) -> dict | None:
+    """把常见的「非标准图片 part」归一成 OpenAI 的 image_url 形态（issue #134）。
+
+    各家客户端写法不一，上游只认 `{"type":"image_url","image_url":{"url":...}}`：
+      · `{"type":"input_image","image_url":"data:..."}`（Responses 风格混进 chat）
+      · `{"type":"image_url","image_url":"https://..."}`（url 直接给字符串）
+      · Anthropic 风格 `{"type":"image","source":{"type":"base64",...}}`
+    认不出的原样返回 None（调用方保持原 part 不动），不做有损改写。
+    """
+    kind = part.get('type')
+
+    def _url_of(value: object) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            inner = value.get('url')
+            return inner if isinstance(inner, str) else ''
+        return ''
+
+    if kind in ('input_image', 'image_url'):
+        url = _url_of(part.get('image_url')) or _url_of(part.get('url'))
+        if url:
+            return {'type': 'image_url', 'image_url': {'url': url}}
+        return None
+    if kind == 'image':
+        source = part.get('source')
+        if isinstance(source, dict):
+            stype = str(source.get('type') or '')
+            if stype == 'base64':
+                media = str(source.get('media_type') or 'image/png')
+                data = source.get('data')
+                if isinstance(data, str) and data:
+                    return {'type': 'image_url',
+                            'image_url': {'url': f'data:{media};base64,{data}'}}
+            elif stype == 'url':
+                url = _url_of(source.get('url'))
+                if url:
+                    return {'type': 'image_url', 'image_url': {'url': url}}
+    return None
+
+
+def normalize_chat_images(body: object) -> int:
+    """就地归一 chat 请求里的图片 part，返回改写的数量。
+
+    只动 `messages[*].content` 里的**列表**；字符串内容与其他字段一字不改。
+    客户端发图失败时最常见的形态是 url 直接给字符串或 input_image 混用，
+    上游解析不了就整条 400，这里换成标准形态即可（issue #134）。
+    """
+    if not isinstance(body, dict):
+        return 0
+    messages = body.get('messages')
+    if not isinstance(messages, list):
+        return 0
+    changed = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get('content')
+        if not isinstance(content, list):
+            continue
+        for idx, part in enumerate(content):
+            if not isinstance(part, dict):
+                continue
+            fixed = _image_part_to_openai(part)
+            if fixed is not None and fixed != part:
+                content[idx] = fixed
+                changed += 1
+    return changed
+
+
+def _account_expected_after_error(exc: Exception) -> bool:
+    """只排除明确未发送到上游的错误；读/写超时或协议错误可能已选账号。
+
+    ConnectError 覆盖 DNS、连接拒绝和建连失败；ConnectTimeout / PoolTimeout
+    分别发生在建连与取得连接前。不能按 502 或所有 TransportError 一刀切。
+    """
+    return not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+
+
+def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, effort: str | None = None, account_expected: bool = True) -> None:
     """记录调用日志与用量。
 
     credit 为上游返回的真实扣费（usage.credit）。None 表示上游没给，
     与「扣了 0」是两回事，因此用 NULL 存而不是 0。
+
+    `usage` 可以直接把上游那份 usage 传进来：扣费与**提示词缓存三段**都从它里面取
+    （issue #69）。之所以整份传进来而不是在各调用点各取一遍——四条协议路径
+    （chat 流式/非流式、Responses、Anthropic）都各自有一份 usage，分开取迟早漏一处，
+    而漏的表现是「某个协议的缓存统计永远是空的」。传 `credit` 仍然有效（显式值优先）。
 
     first_token 为首字延迟（毫秒）。None 表示未采集到：非流式请求本来就没有
     中间过程，历史记录也没这个值，因此同样用 NULL 存，而不是 0。
@@ -266,6 +617,13 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
     （曾因统计函数缺失导致流式响应在收尾阶段中断，客户端看到
     内容正常但报 terminated）。因此这里整体兜底。
     """
+    if credit is None:
+        credit = _usage_credit(usage)
+    cache_hit, cache_miss, cache_write = _usage_cache(usage)
+    # 日志与用量统计必须用**同一个时刻**（issue #380）：费用按调用时刻的价目
+    # 与峰谷档计价，两处各取一次 time.time() 会在整点/整点边界上算出两个价。
+    log_ts = int(time.time())
+
     try:
         # realm 由**实际发往上游的模型名**判定（上游按 `cn:` / `global:` 前缀路由）：
         # 它决定这次调用实际走了哪个账号池，也是界面按版本切换日志/统计的依据。
@@ -285,11 +643,12 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
         model_clean = db._clean(model, 128)
         realm = db.realm_of_model(db._clean(mapped, 128) or model_clean)
         db.add_request_log(
-            ts=int(time.time()),
+            ts=log_ts,
             key_id=key['id'] if key else None,
             ip=db._clean(ip, 64),
             model=model_clean,
             mapped_model=db._clean(mapped, 128),
+            account_expected=int(account_expected and bool(model_clean or mapped)),
             status=status,
             prompt_tokens=pt,
             completion_tokens=ct,
@@ -300,6 +659,13 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             stream=1 if stream else 0,
             credit=credit,
             realm=realm,
+            cache_hit_tokens=cache_hit,
+            cache_miss_tokens=cache_miss,
+            cache_write_tokens=cache_write,
+            # 思考强度只作展示：客户端传什么记什么，不做推断（NULL=没传/旧记录）。
+            effort=db._clean(effort, 16) if effort else None,
+            # 客户端渠道（issue #233）：UA 归类，供日志页按来源排查限流来源。
+            channel=client_channel(ua),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning('写入请求日志失败（不影响请求）: %s', exc)
@@ -312,9 +678,31 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             # 原先只记 token，积分用量就永远是 0，超限判定无从谈起。
             keysvc.touch(key, ip, total, credit)
             if total or credit:
-                db.bump_usage(key['id'], model_clean, pt, ct, credit, realm=realm)
+                # cache 两段与时刻一并传入（issue #380）：费用要按命中价 /
+                # 未命中价、以及高峰 / 空闲两档分别计价，缺任一样就只能估成
+                # 「整段输入按未命中价」，长对话会高估好几倍。
+                db.bump_usage(key['id'], model_clean, pt, ct, credit, realm=realm,
+                              cache_hit=cache_hit, cache_miss=cache_miss,
+                              ts=log_ts)
         except Exception as exc:  # noqa: BLE001
             logger.warning('累计用量失败（不影响请求）: %s', exc)
+
+
+def _global_ip_blocked(ip: str) -> bool:
+    """全局入站 IP 规则是否拦截该来源（未启用安全策略时恒为放行）。
+
+    从 `_authorize` 抽出：`/v1/usage` 与调用路径必须同口径——它虽是只读端点，
+    但同样暴露密钥元数据与余量，被全局黑名单拦住的来源不该换条路就能查
+    （2026-10-21 安全检查 L4）。
+    """
+    sec = get_security_config()
+    if not sec.get('enabled'):
+        return False
+    rules = [
+        {'kind': r['kind'], 'cidr': r['cidr']}
+        for r in db.query('SELECT kind, cidr FROM ip_rules')
+    ]
+    return not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist'))
 
 
 def _authorize(request: Request, model: str | None,
@@ -351,16 +739,11 @@ def _authorize(request: Request, model: str | None,
     mapped = _map_model(model) if mapped is None else mapped
 
     # 全局入站 IP 规则
-    sec = get_security_config()
-    if sec.get('enabled'):
-        rules = [
-            {'kind': r['kind'], 'cidr': r['cidr']}
-            for r in db.query('SELECT kind, cidr FROM ip_rules')
-        ]
-        if not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist')):
-            _log_ip(ip, path, True, ua, 'ip_blocked')
-            _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
-            return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
+    if _global_ip_blocked(ip):
+        _log_ip(ip, path, True, ua, 'ip_blocked')
+        _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False,
+                account_expected=False)
+        return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
     # 注意这一行**在密钥校验之前**：密钥层面的拒绝（停用 / 过期 / 配额用尽 /
     # 模型与版本不符 / IP 白名单）发生在这之后，若就这样返回，日志里会显示
@@ -373,21 +756,26 @@ def _authorize(request: Request, model: str | None,
         # 把 401/403 统一显示成「API 密钥无效」，一律 403 会把「密钥版本不匹配」
         # 这种配置问题说成密钥坏了，用户便反复重建密钥（issue #18）。
         _record(key, ip, model or '', mapped or '',
-                getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False)
+                getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False,
+                account_expected=False)
         _log_ip(ip, path, True, ua, _key_reject_code(reason, is_model_list))
+        reject_status = getattr(reason, 'status', 403)
         return None, ip, _oai_error(
             reason,
-            getattr(reason, 'status', 403),
+            reject_status,
             getattr(reason, 'err_type', 'permission_error'),
             getattr(reason, 'code', 'forbidden'),
+            retry_after=60 if reject_status == 429 else None,
         )
 
     limited, count = _rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{RATE_WINDOW}s 内超过 {RATE_MAX_PER_MIN} 次）'
-        _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
+        _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False,
+                account_expected=False)
         _log_ip(ip, path, True, ua, 'rate_limited')
-        return None, ip, _oai_error(msg, 429, 'rate_limit_error', 'rate_limit_exceeded')
+        return None, ip, _oai_error(msg, 429, 'rate_limit_error', 'rate_limit_exceeded',
+                                    retry_after=RATE_WINDOW)
 
     _log_ip(ip, path, False, ua)
     return key, ip, None
@@ -407,26 +795,87 @@ def _key_reject_code(reason: object, is_model_list: bool) -> str:
 
 
 def _map_model(model: str | None) -> str | None:
-    """「模型映射」查表：别名 → 真名；没有映射时原样返回。
+    """「模型映射」查表：别名 → 真名；没命中就落到**兜底模型**（issue #173），
+    两者都没有时原样返回。
 
     设置坏掉（存成了非对象）时按「没有映射」处理，**不能让整个网关 5xx**：
     映射是可选的便利功能，坏数据只该影响它自己那一项，不连坐（与
     `db._json_list` 对非法 JSON 列的处理同一原则）。
+
+    语义集中在 `services/modelmap`，这里只取结果：白名单补条目与别名校验走同一份
+    实现 —— 三处各写一遍必然漂移，而漂移出来的错位（能调用、但客户端的模型清单里
+    没有它）只有用户能发现。
     """
-    if not model:
-        return model
-    mapping = db.get_setting('model_map', {}) or {}
-    if not isinstance(mapping, dict):
-        return model
-    return mapping.get(model, model)
+    return modelmap.target_for(db.get_setting('model_map', {}) or {}, model)
 
 
-def _upstream_headers() -> dict:
+def _upstream_headers(upstream: dict | None = None) -> dict:
+    """转发时用的请求头；`upstream` 为空 = 默认上游。
+
+    多上游（密钥绑定上游）之后，请求头**必须按密钥解析出来的上游来构造** ——
+    拿错上游的 api_key 会打到别的账号池上，而这正是本功能要隔离的东西。
+    默认参数只为兼容「没有密钥」的调用方（探活 / 管理端调试台）。
+    """
+    up = upstream if upstream is not None else upstreamsvc.default_upstream()
     headers = {'Content-Type': 'application/json'}
-    api_key = config.upstream_api_key()
+    # 分组把 api_key 留空、且地址与默认上游相同时沿用默认那把（见
+    # upstreamsvc.forward_api_key）——「添加分组」只填名称就是这个形态，
+    # 不沿用的话绑定这类分组的密钥一调用就吃上游 401。
+    api_key = upstreamsvc.forward_api_key(up)
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
     return headers
+
+
+def _upstream_hint(upstream: dict | None) -> str:
+    """502/503 时补一句「本次打的是哪个上游、这一跳会不会走出口代理」。
+
+    为什么要有（issue #167：两位用户都报「直接 curl 上游是通的、经面板全 502」）：
+    原来的报错只有异常文本，看不出面板往哪打的、中间有没有代理。而最常见的两种成因
+    恰恰要靠这两条信息才能自查：
+
+      · 上游地址 / 端口填错（面板打的是配置里那个地址，不是你以为的那个）；
+      · **上游地址写成公网域名、同时又配了出口代理**：面板→上游这一跳会走代理，
+        代理绕不回你自己那台机器，于是全 502 —— 而内网与本机地址是自动直连的。
+
+    `_is_internal_host` 与转发用的判断是同一个函数，所以这里说的「会走代理」就是
+    真实行为，不是提示语里另算一套。
+    """
+    up = upstream or upstreamsvc.default_upstream()
+    base = str(up.get('base_url') or '').strip()
+    if not base:
+        return ''
+    try:
+        host = urlsplit(base).hostname
+    except ValueError:
+        host = None
+    proxy = config.effective_http_proxy()
+    if proxy and host:
+        if config._is_internal_host(host):       # noqa: SLF001 —— 与转发判断同一份实现
+            return f'（本次请求的上游：{base}；该地址属内网/本机，这一跳直连）'
+        masked = proxyroutes.mask_url(proxy)
+        return (f'（本次请求的上游：{base}；这一跳会经出口代理 {masked} —— '
+                f'代理到不了这个地址就会 502）')
+    return f'（本次请求的上游：{base}）'
+
+
+def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
+                  ua: str | None) -> tuple[dict | None, JSONResponse | None]:
+    """按密钥解析本次请求该走哪个上游；不可用时返回**明确报错**。
+
+    不静默回落默认上游的原因见 upstreamsvc 模块注释第 2 条：那把密钥本应只碰
+    某个分组的账号，回落到默认上游会让它打到全池——隔离失效而且无人察觉。
+    失败同时记一条请求日志（503 + 原因），排障的人第一时间就能看到。
+    """
+    try:
+        return upstreamsvc.resolve_for_key(key), None
+    except upstreamsvc.UpstreamUnavailable as exc:
+        _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False,
+                account_expected=False)
+        # 这里不加 _upstream_hint：本函数讲的是「密钥绑定的上游不可用」，作用域里
+        # 也没有那个上游对象 —— 报出默认上游的地址只会把人带偏（异常文本已经说清
+        # 是哪个分组、该启用还是改绑）。
+        return None, _oai_error(str(exc), 503, 'api_error', 'upstream_unavailable')
 
 
 def _scan_sse(pending: str, usage: dict) -> tuple[str, bool]:
@@ -466,6 +915,87 @@ def _scan_sse(pending: str, usage: dict) -> tuple[str, bool]:
     return pending, saw_content
 
 
+# ── 密钥自查用量（issue #137）─────────────────────────────
+# 拿密钥自身鉴权、只回这把密钥自己的数字，**只读面板已记录的值、不触发任何上游请求**
+# （否则「查一下还剩多少」会变成一次真实调用，反过来加剧额度消耗与限流）。
+#
+# 有意**不套用**调用时的那套校验（额度用尽 / 已过期 / 被停用 / IP 白名单）：恰恰是
+# 在调不动的时候，用户最需要看到「还剩多少、为什么调不动」。密钥本身已证明归属，
+# 这里只暴露它自己的元数据，把状态如实回给调用方，而不是再甩一个 401。
+@router.get('/v1/usage')
+def key_usage(request: Request):
+    ip = iputil.client_ip(request)
+    ua = request.headers.get('user-agent')
+    path = request.url.path
+    token = _bearer(request)
+    # 认不出调用方的访问仍要进**入站日志**：这条路径与其它网关入口一样是
+    # 未鉴权可达的，漏记会让「谁在扫我」少一块（安全审计口径，见 `_log_ip`）。
+    if not token:
+        _log_ip(ip, path, True, ua, 'missing_key')
+        return _oai_error('缺少 API Key，请在 Authorization 头中提供 Bearer 令牌',
+                          401, 'authentication_error', 'missing_api_key')
+    key = keysvc.resolve(token)
+    if not key:
+        _log_ip(ip, path, True, ua, 'invalid_key')
+        return _oai_error('API Key 无效', 401, 'authentication_error', 'invalid_api_key')
+
+    # 全局入站 IP 规则：与其他 /v1 入口同口径（见 _global_ip_blocked 的说明）。
+    if _global_ip_blocked(ip):
+        _log_ip(ip, path, True, ua, 'ip_blocked')
+        _record(key, ip, '', '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+        return _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
+
+    def allowance(limit, used, *, integral: bool = True) -> dict:
+        """额度三元组。**积分是小数、token 是整数**，必须分开处理（issue #450）。
+
+        历史上这里对两者都用 `int()`：`quota_credit=0.5`、`used_credit=0.04`
+        被截成 `int(0.5)=0` / `int(0.04)=0`，于是 limit 变成 None（被当成「不限」）、
+        used 恒为 0 —— 面板上明明有额度与消耗，`/v1/usage` 却一路报空。
+        """
+        if integral:
+            used_n: int | float = int(used or 0)
+            limit_n: int | float = int(limit or 0)
+        else:
+            used_n = round(float(used or 0), 6)
+            limit_n = round(float(limit or 0), 6)
+        return {
+            'used': used_n,
+            'limit': limit_n or None,          # None = 不限制
+            'remaining': (max(0, limit_n - used_n) if limit_n else None)
+                         if integral else
+                         (round(max(0.0, limit_n - used_n), 6) if limit_n else None),
+        }
+
+    now = int(time.time())
+    expires_at = int(key.get('expires_at') or 0)
+    # 记一行**请求日志**（与 `/v1/models` 同口径，0 token）：否则一把密钥被
+    # 监控脚本每分钟轮询查用量时，运维在「请求日志」里完全看不出流量从哪来。
+    # 这一行经 `_record` 顺带把「最近使用」与「来源 IP」留痕——与模型列表页、
+    # 面板 API 令牌一致；但 token / 积分消耗**一分不记**（记账口径只认真实调用）。
+    _record(key, ip, '', '', 200, 0, 0, 0, ua, None, False)
+    return {
+        'object': 'key.usage',
+        'key': {
+            'name': key.get('name') or '',
+            'prefix': key.get('prefix') or '',
+            'realm': key.get('realm') or '',
+            'enabled': bool(key.get('enabled')),
+            'expires_at': expires_at,
+            'expired': bool(expires_at and now >= expires_at),
+            'models': list(key.get('models') or []),
+        },
+        'tokens': allowance(key.get('quota'), key.get('used_tokens')),
+        # 积分是**小数**（0.04 这类），按整数转型会被截成 0（issue #450）
+        'credits': allowance(key.get('quota_credit'), key.get('used_credit'), integral=False),
+        # 今日 token（本地日期，次日 0 点恢复）；limit 为 None = 不限
+        'daily_tokens': allowance(key.get('daily_quota'), key.get('daily_used_tokens')),
+        'last_used_at': int(key.get('last_used_at') or 0),
+        # 这几个数字是面板**已记录**的值，读取时刻即 snapshot_at；不是向上游现问的。
+        'snapshot_at': now,
+        'data_source': 'panel-recorded',
+    }
+
+
 # ── 模型列表 ─────────────────────────────────────────────
 # 列表按密钥的版本归属过滤：国际版密钥只看到 `global:` 条目、国内版密钥只看到
 # 其余条目（限定了版本的密钥看不到另一版本，免得挑出一个注定 403 的模型）。
@@ -475,13 +1005,29 @@ async def list_models(request: Request):
     key, ip, err = _authorize(request, None, is_model_list=True)
     if err:
         return err
+    # 模型列表也按密钥的上游取：不同上游的模型清单未必一致（版本 / 部署差异），
+    # 拿默认上游的清单给一把绑定了别的上游的密钥，会给出它其实调不了的模型。
+    upstream, upstream_err = _upstream_for(
+        key, ip=ip, model='', mapped='', ua=request.headers.get('user-agent'))
+    if upstream_err:
+        return upstream_err
     started = time.time()
     try:
         async with config.http_client(30, connect=3) as client:
-            resp = await client.get(f'{config.WB2API_BASE}/v1/models', headers=_upstream_headers())
+            resp = await client.get(f'{upstream["base_url"]}/v1/models',
+                                    headers=_upstream_headers(upstream))
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', resp.status_code, 0, 0, latency, request.headers.get('user-agent'), None, False)
         payload = _scope_models(resp.json(), key)
+        # 目录收缩（issue #239）：上游模型表可能仍列着腾讯已经下架的 id，
+        # 客户端选中后才 503。模型中心直连腾讯的目录是当前可用的权威清单，
+        # 取得到且来源是腾讯时按它裁一次；取不到就原样透传。
+        payload = await _drop_models_outside_catalog(payload, key)
+        # 能力字段兜底（issue #211）：随包上游的版本可能比面板旧 —— 补丁只在上游
+        # 侧时，下游经面板拿到的清单仍缺字段，客户端会整条跳过模型。
+        payload = _listing_compat_models(payload)
+        # 国内版 id 去掉 `cn:` 前缀，与模型中心显示的名字一致（裸名 = 国内版）。
+        payload = _bare_cn_model_ids(payload)
         # Anthropic 客户端（Claude Code 等）也会调这个路径，但期望的结构不同
         if request.headers.get('anthropic-version'):
             payload = _as_anthropic_models(payload)
@@ -489,7 +1035,7 @@ async def list_models(request: Request):
     except Exception as exc:  # noqa: BLE001
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', 502, 0, 0, latency, request.headers.get('user-agent'), str(exc), False)
-        return _oai_error(f'上游不可用: {exc}', 502, 'api_error', 'upstream_unavailable')
+        return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
 
 def _as_anthropic_models(payload: object) -> object:
@@ -540,6 +1086,10 @@ def _alias_entries(items: list, allow: list[str]) -> list[dict]:
 
     条目取别名所指模型的信息，只把 `id` 换成别名——**那才是客户端要发的名字**
     （发清单里的真名会被白名单拒掉）。
+
+    解析走 `modelmap.target_for`（含兜底，issue #173）：配了兜底模型之后，白名单里
+    任意名字**都调得通**，那就不该只在没有兜底时补条目 —— 否则客户端拿到的清单里
+    缺了那个名字，用户会以为"白名单没生效"，而其实是清单没列。
     """
     mapping = db.get_setting('model_map', {}) or {}
     if not isinstance(mapping, dict) or not mapping:
@@ -555,13 +1105,89 @@ def _alias_entries(items: list, allow: list[str]) -> list[dict]:
         # 本身就是清单里的模型 → 上面的白名单裁剪已保留它，不重复添加
         if not name or name in seen or name in by_bare:
             continue
-        target = mapping.get(name)
+        target = modelmap.target_for(mapping, name)
         src = by_bare.get(keysvc._bare_model(target)) if target else None
         if not src:
             continue          # 别名指向的模型不在本版本清单里 → 调不通，不给
         out.append({**src, 'id': name})
         seen.add(name)
     return out
+
+
+def _catalog_model_key(model: object) -> str:
+    """模型名的跨源比对键：去掉 `cn:` / `global:` 前缀。
+
+    两个来源的前缀口径不同：上游清单国际版带 `global:`，模型中心直连腾讯
+    给的是裸名。同一把密钥只看一个版本，所以去掉前缀比对不会把两版同名
+    模型混在一起（版本维度由 `_model_realm_of` 先筛过）。
+    """
+    raw = keysvc._bare_model(model)
+    return raw[7:] if raw.lower().startswith('global:') else raw
+
+
+def _filter_catalog_models(payload: object, key: dict | None,
+                           realm: str, catalog_ids: set[str]) -> object:
+    """按模型中心的实时目录裁掉已下架的 id（issue #239）。
+
+    上游 `/v1/models` 的表里仍留着腾讯已经收缩掉的旧模型；下游把它当选择器，
+    选中后才 503。模型中心直连腾讯的目录是当前可用的权威清单，取得到时以它
+    为准。白名单里的**别名**要继续保留（它指向的模型仍在目录里）。
+    """
+    if not isinstance(payload, dict) or not catalog_ids:
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    key = key or {}
+    mapping = db.get_setting('model_map', {}) or {}
+    aliases: set[str] = set()
+    for raw in key.get('models') or []:
+        name = keysvc._bare_model(raw)
+        target = modelmap.target_for(mapping, name)
+        if target and _catalog_model_key(target) in catalog_ids:
+            aliases.add(_catalog_model_key(name))
+    kept: list = []
+    for m in items:
+        if not isinstance(m, dict) or not m.get('id'):
+            kept.append(m)
+            continue
+        if realm and _model_realm_of(m) != realm:
+            kept.append(m)
+            continue
+        mid = _catalog_model_key(m.get('id'))
+        if mid in catalog_ids or mid in aliases:
+            kept.append(m)
+    return {**payload, 'data': kept}
+
+
+async def _drop_models_outside_catalog(payload: object, key: dict | None) -> object:
+    """取该版本的模型中心目录并裁掉已下架模型；取不到就原样返回。
+
+    目录走 `modelcatalog.catalog()`（5 分钟缓存，来源可能是直连腾讯，也可能
+    是上游回退）。**只有来源是腾讯时才裁**：上游回退本身就是同一份旧表，
+    拿它裁等于没裁。超时/异常一律放弃裁剪，不能因为目录取不到就把列表清空。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    realm = keysvc._norm_realm((key or {}).get('realm'))
+    # 未限定版本的密钥同样要裁（issue #407）：它看到的是上游全部条目，下架模型
+    # 混在里面，客户端选中才失败。两个版本的目录都取到「腾讯直连」这一权威来源时
+    # 取并集比对；任一版本取不到就不裁，避免把另一版的模型误删。
+    realms = [realm] if realm in ('cn', 'global') else ['cn', 'global']
+    ids: set[str] = set()
+    for r in realms:
+        try:
+            cat = await asyncio.wait_for(modelcatalog.catalog(r), timeout=5)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug('模型目录裁剪跳过：%s', exc)
+            return payload
+        if cat.get('source') != 'tencent':
+            return payload
+        ids |= {_catalog_model_key(m.get('id')) for m in (cat.get('models') or [])
+                if isinstance(m, dict) and m.get('id')}
+    if not ids:
+        return payload
+    return _filter_catalog_models(payload, key, realm, ids)
 
 
 def _scope_models(payload: object, key: dict | None) -> object:
@@ -600,11 +1226,98 @@ def _scope_models(payload: object, key: dict | None) -> object:
     return {**payload, 'data': scoped}
 
 
+def _bare_cn_model_ids(payload: object) -> object:
+    """`/v1/models` 里国内版模型的 id 去掉 `cn:` 前缀，**保留 `global:`**。
+
+    模型中心早已只显示腾讯自带的裸名（`deepseek-v4.1-flash`），但网关的
+    `/v1/models` 仍原样透出上游的 `cn:deepseek-v4.1-flash`：用户在面板上看到
+    的名字和客户端拉到的名字对不上。更实际的问题是 Cherry Studio 等客户端按
+    模型 id 识别推理档位 / 多模态等能力，`cn:xxx` 认不出，推理档位选项直接不出现。
+
+    口径与 `keysvc._bare_model` 一致：上游 `resolveModel` 把裸名当国内版，所以
+    去 `cn:` 安全；`global:` 去掉会被路由到国内账号池，绝不能动。带 `cn:` 的
+    旧调用不受影响（调用侧照旧接受两种写法，白名单也两种都认）。
+
+    去前缀后若与已有条目同名（上游同时列了裸名与 `cn:` 名），只保留一条，
+    取字段更全的那条，免得客户端里出现两个一样的模型。认不出的结构原样透传。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    out: list = []
+    index: dict[str, int] = {}
+    for m in items:
+        if not isinstance(m, dict) or not isinstance(m.get('id'), str) or not m['id']:
+            out.append(m)
+            continue
+        mid = keysvc._bare_model(m['id'])
+        entry = m if mid == m['id'] else {**m, 'id': mid}
+        if mid in index:
+            if len(entry) > len(out[index[mid]]):
+                out[index[mid]] = entry
+            continue
+        index[mid] = len(out)
+        out.append(entry)
+    return {**payload, 'data': out}
+
+
+def _listing_compat_models(payload: object) -> object:
+    """补齐第三方模型目录客户端要读的能力字段（issue #211）。
+
+    上游从 #156 起在它自己的 `/v1/models` 里补了 `modalities` /
+    `supported_reasoning_levels`。但面板是**独立进程**，随包分发的上游可能比面板
+    旧（补丁只打在上游），于是下游经面板拿到的清单仍缺字段 —— 报告人的 Magpie
+    就是这样整条跳过模型、看不到多模态与推理档位的。
+
+    这里在面板侧再补一遍，口径与上游的 `addListingCompat` 一致，且**只增不改**：
+
+      · `modalities`：缺字段时补 `{"input": ["text"] + (["image"] if
+        supports_images)}`。文本是所有模型都有的能力；缺整个字段会让客户端
+        直接跳过（这正是 #211 的现场）；
+      · `supported_reasoning_levels`：缺字段且有 `reasoning_supported_efforts`
+        时派生成 `[{"effort": e}]`；没有档位就不编造；
+      · `supports_reasoning`：有档位而字段缺失时补 `true`。
+
+    认不出的结构（不是 `{data:[...]}`）原样透传 —— 不在看不懂的响应上动手脚。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    out: list = []
+    for m in items:
+        if not isinstance(m, dict) or not m.get('id'):
+            out.append(m)
+            continue
+        entry = dict(m)
+        if 'modalities' not in entry:
+            inputs = ['text']
+            if entry.get('supports_images') is True:
+                inputs.append('image')
+            entry['modalities'] = {'input': inputs}
+        efforts = entry.get('reasoning_supported_efforts')
+        if 'supported_reasoning_levels' not in entry and isinstance(efforts, list):
+            levels = [{'effort': e} for e in efforts if isinstance(e, str) and e]
+            if levels:
+                entry['supported_reasoning_levels'] = levels
+                entry.setdefault('supports_reasoning', True)
+        out.append(entry)
+    return {**payload, 'data': out}
+
+
 # ── 对话补全（v1 / v2）──────────────────────────────────
 async def _chat(request: Request, upstream_path: str):
     body, err = await _read_json_body(request)
     if err:
         return err
+    # 客户端原样发出的那份请求体：**在任何改写之前**深拷贝。
+    # 后面的模型映射、max_tokens 钳制、图片归一、stream_options 注入都会就地
+    # 改动 `body`，改完就再也拿不到「客户端到底发了什么」——而抓包页的
+    # 「客户端视角」正是要看这一份，和网关改写后的那份对着看。
+    client_body = tap_svc.snapshot(body)
 
     requested_model = body.get('model') if isinstance(body, dict) else None
     # model 必须是字符串：非字符串（对象/数组/数字）会让后面的 _map_model 与
@@ -622,6 +1335,22 @@ async def _chat(request: Request, upstream_path: str):
     if mapped:
         body['model'] = mapped
 
+    # 越界的 max_tokens 会被上游包装成 503（见 clamp_max_tokens 的说明），
+    # 鉴权后、转发前压回上限。
+    clamp_max_tokens(body)
+
+    # 图片 part 归一（issue #134）：把 input_image / image_url 字符串 /
+    # Anthropic source 形态改写成上游认的标准形态；认不出的原样保留。
+    normalize_chat_images(body)
+
+    # 思考强度（reasoning_effort）：仅用于日志展示，**不改写请求体**——
+    # 档位归一化/降级由上游网关负责，面板只记录客户端实际传了什么。
+    effort = None
+    if isinstance(body, dict):
+        raw_effort = body.get('reasoning_effort')
+        if isinstance(raw_effort, str) and raw_effort.strip():
+            effort = raw_effort.strip()[:16]
+
     stream = bool(isinstance(body, dict) and body.get('stream'))
     if stream:
         # 让上游在最后一个 chunk 返回 usage，便于精确计量
@@ -629,14 +1358,28 @@ async def _chat(request: Request, upstream_path: str):
         if isinstance(body['stream_options'], dict):
             body['stream_options'].setdefault('include_usage', True)
 
-    url = f'{config.WB2API_BASE}{upstream_path}'
     ua = request.headers.get('user-agent')
+    upstream, upstream_err = _upstream_for(key, ip=ip, model=requested_model or '',
+                                           mapped=mapped or '', ua=ua)
+    if upstream_err:
+        return upstream_err
+    url = f'{upstream["base_url"]}{upstream_path}'
+    # 转发头只构造一次：既给 httpx，也给抓包（「网关发了什么请求头」是双视角的
+    # 一半，另一处再造一份就可能与真正发出去的不一致）。
+    up_headers = _upstream_headers(upstream)
+    # 关联键：上游开启出站转储后，会把「它发往腾讯」的请求 / 响应按这个头落两行，
+    # 管理端的「腾讯视角」据此精确对回这一轮（不靠时间窗猜）。
+    # 关联键只服务抓包：关闭时不发这个头，交给上游自己按会话生成 32 位 ID。
+    # 开着时也用 32 位 hex（与上游/官方客户端同形），16 位会改变出站头的形状。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=body, headers=_upstream_headers())
+                resp = await client.post(url, json=body, headers=up_headers)
             latency = int((time.time() - started) * 1000)
             usage = {}
             try:
@@ -647,31 +1390,92 @@ async def _chat(request: Request, upstream_path: str):
             pt = int(usage.get('prompt_tokens') or 0)
             ct = int(usage.get('completion_tokens') or 0)
             error = None if resp.status_code < 400 else (str(data)[:500] if data is not None else resp.text[:500])
+            # 只在出错时读一次正文：成功路径不该为了「万一要改判」去碰 .text
+            #（那会让只有 json() 的响应对象直接炸，也白读一遍大响应体）。
+            text_repr = resp.text[:2000] if resp.status_code >= 400 else ''
+            missing = _model_missing_body(data, text_repr) if resp.status_code >= 500 else None
+            # 记账用「实际回给客户端的」状态码：11102 改判成 404 之后，日志里再写
+            # 503 会让人以为号池挂了（与响应体不一致）。
+            rec_status = 404 if missing is not None else resp.status_code
             _record(
-                key, ip, requested_model or '', mapped or '', resp.status_code, pt, ct,
-                latency, ua, error, False, credit=_usage_credit(usage),
+                key, ip, requested_model or '', mapped or '', rec_status, pt, ct,
+                latency, ua, error, False, usage=usage, effort=effort,
             )
+            # 抓包（Trace Tap）：在记账之后、响应返回之前落库。放在这里而不是
+            # 转发之前，是因为非流式要拿到完整响应体才算「这一轮到底回了什么」。
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path=upstream_path, protocol='chat', status=rec_status,
+                latency_ms=latency, stream=False, payload=data, usage=usage,
+                error=error, upstream_body=body, upstream_headers=up_headers,
+                trace_id=trace_id,
+            )
+            if missing is not None:
+                return JSONResponse(missing, status_code=404)
+            retry_after = None
+            if resp.status_code == 429 and data is not None:
+                retry_after = _retry_after_seconds(json.dumps(data, ensure_ascii=False))
+            headers = _retry_after_header(retry_after)
             if data is not None:
-                return JSONResponse(data, status_code=resp.status_code)
-            return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}}, status_code=resp.status_code)
+                return JSONResponse(data, status_code=resp.status_code, headers=headers)
+            return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}},
+                                status_code=resp.status_code, headers=headers)
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False)
-            return _oai_error(f'上游不可用: {exc}', 502, 'api_error', 'upstream_unavailable')
+            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                    account_expected=_account_expected_after_error(exc))
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path=upstream_path, protocol='chat', status=502, latency_ms=latency,
+                stream=False, error=str(exc), upstream_body=body,
+                upstream_headers=up_headers, trace_id=trace_id,
+            )
+            return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     # 流式转发
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
-        req = client.build_request('POST', url, json=body, headers=_upstream_headers())
+        req = client.build_request('POST', url, json=body, headers=up_headers)
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True)
-        return _oai_error(f'上游不可用: {exc}', 502, 'api_error', 'upstream_unavailable')
+        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True, effort=effort,
+                account_expected=_account_expected_after_error(exc))
+        return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     status_code = resp.status_code
     content_type = resp.headers.get('content-type', 'text/event-stream')
+
+    # 上游的 4xx/5xx 不是 SSE（正文是一小段 JSON），原先按流原样透传：客户端
+    # 拿不到 Retry-After，11102 也只能以 503 出现。这里读完整段错误体后按 JSON
+    # 返回，状态码与文案保持上游原样（唯一的例外是 11102 → 404）。
+    if status_code >= 400:
+        raw = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        text = raw.decode('utf-8', errors='replace')
+        try:
+            payload: object = json.loads(text)
+        except Exception:  # noqa: BLE001
+            payload = None
+        latency = int((time.time() - started) * 1000)
+        missing = _model_missing_body(payload, text) if status_code >= 500 else None
+        rec_status = 404 if missing is not None else status_code
+        _record(key, ip, requested_model or '', mapped or '', rec_status, 0, 0,
+                latency, ua, text[:500], True, effort=effort)
+        if missing is not None:
+            return JSONResponse(missing, status_code=404)
+        headers = _retry_after_header(
+            _retry_after_seconds(text) if status_code == 429 else None)
+        if payload is not None:
+            return JSONResponse(payload, status_code=status_code, headers=headers)
+        return JSONResponse({'error': {'message': text[:1000], 'type': 'api_error'}},
+                            status_code=status_code, headers=headers)
+
+    # 抓包用的原始流缓冲。与 `pending` 分开：`pending` 会被 _scan_sse 消费掉
+    # （它只保留残缺的最后一行），照它入库会丢掉前面所有数据帧。
+    raw_stream = tap_svc.RawStream()
 
     async def generator():
         usage: dict = {}
@@ -682,8 +1486,10 @@ async def _chat(request: Request, upstream_path: str):
         first_token_ms: int | None = None
         try:
             async for chunk in resp.aiter_bytes():
+                piece = chunk.decode('utf-8', errors='ignore')
+                raw_stream.feed(piece)
                 if status_code >= 400:
-                    pending += chunk.decode('utf-8', errors='ignore')
+                    pending += piece
                     # 有数据就留一份：早先要等到 4000 字节才取，而上游的错误体
                     # 通常只有几百字节 → error_text 恒为空，**错误被静默丢弃**：
                     # 客户端看得到（原样透传），管理端日志却什么都不记，用户来问
@@ -692,7 +1498,7 @@ async def _chat(request: Request, upstream_path: str):
                         error_text = pending[:500]
                     yield chunk
                     continue
-                pending += chunk.decode('utf-8', errors='ignore')
+                pending += piece
                 pending, saw_content = _scan_sse(pending, usage)
                 if saw_content and first_token_ms is None:
                     first_token_ms = int((time.time() - started) * 1000)
@@ -705,8 +1511,15 @@ async def _chat(request: Request, upstream_path: str):
             ct = int(usage.get('completion_tokens') or 0)
             _record(
                 key, ip, requested_model or '', mapped or '', status_code, pt, ct,
-                latency, ua, error_text, True, credit=_usage_credit(usage),
-                first_token=first_token_ms,
+                latency, ua, error_text, True, usage=usage,
+                first_token=first_token_ms, effort=effort,
+            )
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path=upstream_path, protocol='chat', status=status_code,
+                latency_ms=latency, first_token_ms=first_token_ms, stream=True,
+                text=raw_stream.text(), usage=usage, error=error_text,
+                upstream_body=body, upstream_headers=up_headers, trace_id=trace_id,
             )
 
     return StreamingResponse(generator(), status_code=status_code, media_type=content_type)
@@ -738,3 +1551,143 @@ async def gateway_health() -> dict:
     except Exception:  # noqa: BLE001
         # 不回异常详情：那会暴露上游地址与网络拓扑
         return {'service': 'workbuddy-manager', 'upstream_ok': False}
+
+
+# ── agenttool web search 透传（/v1/tools/search）────────────────
+# 把下游的 web_search 请求原样转发到上游网关的 agenttool 搜索端点
+# （workbuddy2api 0057-web-search-tool.patch：账号池轮转 + 15001 配额冷却）。
+#
+# 为什么加这条路由：DSH 的 web-search-workbuddy 插件用**同一把密钥**既调模型
+# （/v1/chat/completions）又调搜索——密钥体系一把钥匙走全部数据面，搜索不该
+# 另立凭证。manager 在这里只做：鉴权（_authorize）→ 按密钥解析上游
+# （_upstream_for，多分组隔离语义与 chat 一致）→ 换上游 api_key 转发 → 记账。
+#
+# 协议是「透传」不是「翻译」：上游的信封（code/results/total_results/…）原样
+# 回给客户端，非 15001 的业务码也原样透传——过滤语义由调用方决定（与 chat 的
+# error-passthrough 同哲学）。请求体同理：只校验已知参数，不改写、不删字段，
+# 未知字段也原样放行（兼容后续 agenttool 参数扩展）。
+SEARCH_UPSTREAM_PATH = '/v1/tools/search'
+
+# agenttool/v1/search 支持的全部可选参数（0057 网关 toolSearchRequest 同款）。
+# freshness：d1=一天内 / m1=一月内 / y1=一年内；空串等同不传。
+SEARCH_FRESHNESS_VALUES = ('', 'd1', 'm1', 'y1')
+SEARCH_MAX_RESULTS_BOUND = 20
+
+
+def _validate_search_params(body: object) -> str | None:
+    """校验 /v1/tools/search 的入站参数，返回错误描述；None 表示合法。
+
+    只校验、不改写 body：校验通过后 body 原样转发给 0057 网关，由网关负责
+    max_results 兜底、blocked_domains 拼 `-site:` 进 query、以及 agenttool
+    上游请求体的组装。非法参数在 manager 层早失败，不消耗账号池搜索配额。
+    """
+    if not isinstance(body, dict):
+        return '请求体必须是 JSON 对象'
+    if not isinstance(body.get('query'), str):
+        return 'query 必须是字符串'
+    if 'type' in body and body['type'] != 'text2text':
+        return 'type 必须是 "text2text"'
+    if 'max_results' in body:
+        value = body['max_results']
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= SEARCH_MAX_RESULTS_BOUND:
+            return f'max_results 必须是 1..{SEARCH_MAX_RESULTS_BOUND} 的整数'
+    for key in ('allowed_domains', 'blocked_domains'):
+        if key in body:
+            value = body[key]
+            if not isinstance(value, list) or any(not isinstance(d, str) for d in value):
+                return f'{key} 必须是字符串数组'
+    if 'freshness' in body:
+        value = body['freshness']
+        if not isinstance(value, str) or value not in SEARCH_FRESHNESS_VALUES:
+            return 'freshness 必须是 d1 | m1 | y1'
+    return None
+
+
+@router.post('/v1/tools/search')
+async def tools_search(request: Request):
+    ip = iputil.client_ip(request)
+    ua = request.headers.get('user-agent')
+    path = request.url.path
+    # 入站鉴权与 chat 同管线（wbk_ 密钥 / IP 规则 / 频控）。搜索没有模型维度，
+    # 因此走 is_model_list=True 口径（与 /v1/models 同理）：版本归属与模型白名单
+    # 在这种「不带 model 的数据面调用」上不拦——拦了会让限定版本的密钥连搜索都
+    # 用不了；真正的隔离由上游网关的账号池把关（realm 由上游按账号侧决定）。
+    key, ip, err = _authorize(request, None, is_model_list=True)
+    if err:
+        return err
+
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, '请求体不是合法 JSON', False,
+                account_expected=False)
+        return _oai_error('请求体必须是 JSON 对象', 400, 'invalid_request_error', 'invalid_body')
+
+    if not isinstance(body, dict):
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, '请求体不是 JSON 对象', False,
+                account_expected=False)
+        return _oai_error('请求体必须是 JSON 对象', 400, 'invalid_request_error', 'invalid_body')
+
+    query = str(body.get('query') or '').strip()
+    if not isinstance(body.get('query'), str) or not query:
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, 'query 为空或非字符串', False,
+                account_expected=False)
+        return _oai_error('query 不能为空且必须是字符串', 400, 'invalid_request_error', 'empty_query')
+
+    # agenttool 全参数入站校验（type / max_results / allowed_domains /
+    # blocked_domains / freshness）。合法 body 原样转发，不重命名、不删字段。
+    param_error = _validate_search_params(body)
+    if param_error:
+        _record(key, ip, '', '', 400, 0, 0, 0, ua, f'搜索参数非法: {param_error}', False,
+                account_expected=False)
+        return _oai_error(param_error, 400, 'invalid_request_error', 'invalid_search_params')
+
+    upstream, upstream_err = _upstream_for(key, ip=ip, model='', mapped='', ua=ua)
+    if upstream_err:
+        return upstream_err
+    url = f'{upstream["base_url"]}{SEARCH_UPSTREAM_PATH}'
+    up_headers = _upstream_headers(upstream)
+    # 出站转储关联键：与 chat 同协议（上游开启转储后按它落两行，双视角对回）。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
+
+    started = time.time()
+    try:
+        async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
+            resp = await client.post(url, json=body, headers=up_headers)
+        latency = int((time.time() - started) * 1000)
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001
+            data = None
+        # 记账：搜索没有 token 计量（上游 agenttool 不回 usage），0/0 与
+        # /v1/models、/v1/usage 的口径一致；错误时透传上游原文前 500 字。
+        error = None if resp.status_code < 400 else (
+            str(data)[:500] if data is not None else resp.text[:500])
+        # 客户端语义化：全池 15001 时上游网关回 429 + quota_web_search，
+        # 原样透传（客户端按 code 路由提示语）。
+        _record(key, ip, '', '', resp.status_code, 0, 0, latency, ua, error, False)
+        tap_svc.capture(
+            body=body, headers=request.headers.items(), key=key, ua=ua,
+            path=SEARCH_UPSTREAM_PATH, protocol='chat', status=resp.status_code,
+            latency_ms=latency, stream=False, payload=data,
+            error=error, upstream_body=body, upstream_headers=up_headers,
+            trace_id=trace_id,
+        )
+        if data is not None:
+            return JSONResponse(data, status_code=resp.status_code)
+        return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}},
+                            status_code=resp.status_code)
+    except Exception as exc:  # noqa: BLE001
+        latency = int((time.time() - started) * 1000)
+        _record(key, ip, '', '', 502, 0, 0, latency, ua, str(exc), False,
+                account_expected=False)
+        tap_svc.capture(
+            body=body, headers=request.headers.items(), key=key, ua=ua,
+            path=SEARCH_UPSTREAM_PATH, protocol='chat', status=502,
+            latency_ms=latency, stream=False, error=str(exc),
+            upstream_body=body, upstream_headers=up_headers, trace_id=trace_id,
+        )
+        return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502,
+                          'api_error', 'upstream_unavailable')

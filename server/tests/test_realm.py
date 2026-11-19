@@ -68,24 +68,28 @@ class EndpointTest(unittest.TestCase):
         self.assertEqual(realm.billing_base('global'), 'https://www.workbuddy.ai')
 
     def test_chat_paths(self) -> None:
-        """两个版本都固定 `/v2`（上游 #119）。
+        """`/v2` 仍是**主路径**，`/console` 只在渠道校验时兜底（2026-10-17）。
 
         国际版曾以 `/console` 优先，但那个端点上挂了腾讯云 WAF 的请求体内容规则：
         正文里出现反引号 `printf` / `whoami` 等命令执行特征会被确定性拦成 403
-        ——用户只是问一句 shell 命令就中招。`/v2` 是同一 base 下的等价端点，不挂
-        该规则。
+        ——用户只是问一句 shell 命令就中招。`/v2` 是同一 base 下的等价端点，不挂该规则，
+        所以**主路径不变**。
 
-        这条断言的意义不是「路径长什么样」，而是**我们的探测打的端点必须与上游
-        转发用的端点一致**：否则某天 `/console` 真被 WAF 封死时，我们的「测活」
-        会告诉用户账号不可用，而实际上游转发一切正常。
+        2026-10-17 加回 `/console` 做兜底：上游给 /v2 加了渠道强校验（被校验到的请求回
+        「没通过渠道校验」），而官方客户端走的 /console 放行 —— 用户实测换过去就恢复。
+        触发条件**只有渠道校验**（不是 404/405），所以上面那条 WAF 规则只在兜底路径上
+        才可能碰到。
+
+        这条断言的意义不是「路径长什么样」，而是**我们的探测打的端点必须与上游转发用的
+        端点一致**：否则某天 /v2 真被渠道校验拦死时，我们的「测活」会告诉用户账号不可用，
+        而实际上游转发一切正常（反过来也一样）。
         """
-        self.assertEqual(realm.chat_paths('cn'), ['/v2/chat/completions'])
-        self.assertEqual(realm.chat_paths('global'), ['/v2/chat/completions'])
         for r in ('cn', 'global'):
-            self.assertNotIn(
-                '/console/chat/completions', realm.chat_paths(r),
-                '不得再走 /console：该端点挂 WAF 内容规则，含命令特征的消息会被 403',
-            )
+            paths = realm.chat_paths(r)
+            self.assertEqual(paths[0], '/v2/chat/completions',
+                             '主路径必须是 /v2（/console 挂 WAF 内容规则，只能当兜底）')
+            self.assertEqual(paths[1:], ['/console/chat/completions'],
+                             '兜底路径要存在且只有它一条，与上游 chatPaths 同序')
 
     def test_billing_path_order_is_reversed(self) -> None:
         """国际版无 /v2 前缀优先，国内版只有 /v2——两者顺序相反，照上游实现。"""

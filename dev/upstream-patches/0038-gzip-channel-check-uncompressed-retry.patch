@@ -1,0 +1,85 @@
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -1337,6 +1337,21 @@
+ 			// 失败仍按下面原有逻辑返回，由 handler 决定怎么罚号 —— 那时也**不该禁用**
+ 			// （见 handler 的 ErrAccountFault 分支）。
+ 			if IsChannelCheck(string(raw)) {
++				// 压缩请求体本身就是一条「不像官方客户端」的信号（issue #303：
++				// DSH 长上下文被 gzip 后稳定吃 11128，同一 body 不压缩即 200）。
++				// 命中渠道校验时**先**去掉压缩重发同一条路径：gzip 只是省带宽的
++				// 优化，不值得为它换来一整轮失败。这一步放在 markChannelBlocked
++				// 之前 —— 去掉压缩后成功就说明账号没问题，不该给它留下「渠道受限」
++				// 记忆（否则后续 10 分钟白走 /console）。
++				if contentEncoding != "" && !gzipRetried {
++					gzipRetried = true
++					contentEncoding = ""
++					outBody = prepared
++					log.Printf("WARN: [upstream] chat_stream acct=%s: 渠道校验命中且请求体是压缩的，改用未压缩重试",
++						logfmt.Label(a.UID, a.Nickname))
++					i--
++					continue
++				}
+ 				// 记下这个账号被渠道校验拦过：后续请求优先走 /console（issue #296），
+ 				// 不必每次都先撞一次 /v2。TTL 到期自动回落，上游策略变化后不会卡在
+ 				// 次优路径上。
+diff --git a/internal/upstream/gzip_body_test.go b/internal/upstream/gzip_body_test.go
+--- a/internal/upstream/gzip_body_test.go
++++ b/internal/upstream/gzip_body_test.go
+@@ -5,6 +5,8 @@
+ 	"compress/gzip"
+ 	"io"
+ 	"net/http"
++	"net/http/httptest"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -143,3 +145,47 @@
+ 		t.Fatalf("calls=%d want 3（/v2、/console、重发一次）", calls)
+ 	}
+ }
++
++// TestChannelCheckFallsBackToUncompressed 压缩请求体命中渠道校验时，先去压缩重试
++// 同一条路径（issue #303：DSH 长上下文 gzip 后稳定 11128，不压缩即 200）。
++func TestChannelCheckFallsBackToUncompressed(t *testing.T) {
++	channel := `{"code":11128,"msg":"request illegal","displayTips":{"en":"This channel verification failed"}}`
++	var gotEncoding []string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		enc := r.Header.Get("Content-Encoding")
++		gotEncoding = append(gotEncoding, enc)
++		if enc == "gzip" {
++			w.Header().Set("Content-Type", "application/json")
++			w.WriteHeader(http.StatusBadRequest)
++			_, _ = w.Write([]byte(channel))
++			return
++		}
++		w.Header().Set("Content-Type", "text/event-stream")
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
++	}))
++	defer srv.Close()
++
++	c := New()
++	c.GzipBody = true
++	c.ChatBaseCN = srv.URL
++	acct := &auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}
++	big := `{"model":"m","messages":[{"role":"user","content":"` +
++		strings.Repeat("上下文", 30000) + `"}]}`
++	body, status, raw, err := c.ChatStream(acct, []byte(big), "", ChatMeta{})
++	if err != nil {
++		t.Fatalf("status=%d err=%v body=%s", status, err, raw)
++	}
++	if status != http.StatusOK {
++		t.Fatalf("status=%d body=%s", status, raw)
++	}
++	if body != nil {
++		body.Close()
++	}
++	if len(gotEncoding) != 2 || gotEncoding[0] != "gzip" || gotEncoding[1] != "" {
++		t.Fatalf("应当先发压缩、再去压缩重试，实际 Content-Encoding 序列=%v", gotEncoding)
++	}
++	if c.channelBlockedFor("u1") {
++		t.Fatal("压缩重试成功的请求不该把账号标记成渠道受限")
++	}
++}

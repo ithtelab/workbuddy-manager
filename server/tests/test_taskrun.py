@@ -125,10 +125,40 @@ class AvailabilityTest(unittest.TestCase):
         self.assertIn('workbuddy2api', why, '要说清这是上游的脚本')
 
     def test_refuses_to_start_when_unavailable(self) -> None:
-        with mock.patch.object(taskrun, 'available', lambda: (False, '脚本不在')):
+        # _prepare 会把分组的账号目录传进来（issue #274），lambda 必须收下它
+        with mock.patch.object(taskrun, 'available',
+                               lambda auth_dir=None: (False, '脚本不在')):
             ok, msg = taskrun.start('claim', 'ALL')
         self.assertFalse(ok)
         self.assertIn('脚本不在', msg)
+
+    def test_available_checks_the_selected_group_dir(self) -> None:
+        """分组任务要按**该分组**的账号目录判断可用性（issue #274）。"""
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / 'task_runner.py'
+            script.write_text('# stub\n', encoding='utf-8')
+            missing = Path(td) / 'missing'
+            with mock.patch.object(taskrun, '_script_path', return_value=script):
+                ok, why = taskrun.available(missing)
+                self.assertFalse(ok)
+                self.assertIn(str(missing), why)
+                ok, _ = taskrun.available(td)
+                self.assertTrue(ok)
+
+    def test_prepare_carries_group_auth_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / 'task_runner.py'
+            script.write_text('# stub\n', encoding='utf-8')
+            prev = taskrun._state['running']
+            taskrun._state['running'] = False
+            try:
+                with mock.patch.object(taskrun, '_script_path', return_value=script):
+                    ok, payload = taskrun._prepare('claim', 'ALL', td, '分组B')
+            finally:
+                taskrun._state['running'] = prev
+        self.assertTrue(ok, payload)
+        self.assertEqual(payload['auth_dir'], str(Path(td)))
+        self.assertEqual(payload['group'], '分组B')
 
 
 class ScriptExtractionTest(unittest.TestCase):
@@ -516,6 +546,10 @@ class EventLoopResponsivenessTest(unittest.TestCase):
                     await asyncio.sleep(0.05)
 
             hb = asyncio.create_task(beat())
+            # 先让心跳跑一次再开始计时：`delay=0` 的占位调用可能在调度器还没轮到
+            # 心跳任务时就返回，那一轮 ticks 会是 0（CI 上实测偶发）。这不是被测
+            # 行为，只是起跑顺序，所以显式让出一次。
+            await asyncio.sleep(0.01)
             with mock.patch('subprocess.run', side_effect=self._slow_docker(delay)):
                 await coro_factory()
             stop.set()
@@ -805,6 +839,118 @@ class SchedulerOnlyClaimsTest(unittest.TestCase):
                                    side_effect=lambda m, t: (calls.append((m, t)), (True, 'ok'))[1])):
             asyncio.run(self._one_tick())
         self.assertEqual(calls, [], '未启用时不该触发')
+
+
+class ChildStdioEncodingTest(unittest.TestCase):
+    """任务子进程必须按 UTF-8 说话（issue #147）。
+
+    报障：Windows 中文区域原生部署下，账号昵称里带 emoji（🏅）时任务一个账号都没跑
+    就退出——脚本 `print(f"== {uid8} ({auth['nick']}) ==")` 那一行，Python 默认按
+    ANSI 代码页（cp936）编码 stdout，emoji 编不出去 → `UnicodeEncodeError`。
+    面板这侧读回来时用的是 UTF-8，两端本来就该是同一个编码。
+
+    这里分两层验：
+      · 环境形状：子进程环境里必须有 PYTHONUTF8 / PYTHONIOENCODING；
+      · 真实效果：**故意让继承来的环境说 cp936**，脚本打印 emoji 仍要跑完。
+        没有上面那两行时，子进程会照继承值走 cp936 → 崩（这条测试就是反证）。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.script = self.root / 'fake_task.py'
+        self._orig_auth = config.AUTH_DIR
+        config.AUTH_DIR = self.root
+        self._patch = mock.patch.object(taskrun, '_script_path', lambda: self.script)
+        self._patch.start()
+
+    def tearDown(self) -> None:
+        self._patch.stop()
+        config.AUTH_DIR = self._orig_auth
+        try:
+            self._tmp.cleanup()
+        except PermissionError:
+            pass
+
+    def test_child_env_pins_utf8_stdio(self) -> None:
+        captured: dict = {}
+
+        class _Stdout:
+            """最小 stdout：立刻 EOF，让 pump 正常收尾（不给它制造异常路径）。"""
+
+            async def readline(self):
+                return b''
+
+        class _Proc:
+            stdout = _Stdout()
+            returncode = 0
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*argv, **kwargs):  # noqa: ANN001
+            captured.update(kwargs)
+            return _Proc()
+
+        with mock.patch.object(asyncio, 'create_subprocess_exec', fake_exec):
+            asyncio.run(taskrun._run(taskrun.build_command('preview', 'ALL'),
+                                     'preview', 'ALL'))
+        env = captured.get('env') or {}
+        self.assertEqual(env.get('PYTHONUTF8'), '1',
+                         '子进程没开 UTF-8 模式 —— Windows 上会按 ANSI 代码页编码输出')
+        self.assertTrue(str(env.get('PYTHONIOENCODING', '')).startswith('utf-8'),
+                        f'PYTHONIOENCODING={env.get("PYTHONIOENCODING")!r}，应为 utf-8')
+
+    def test_emoji_nickname_survives_a_cp936_inherited_env(self) -> None:
+        """继承环境故意说自己用 cp936：面板传下去的 UTF-8 必须压过它。"""
+        self.script.write_text(
+            'print("\U0001f3c5 昵称带奖牌的任务开始")\n'
+            'print("task_runner done: ok=1")\n',
+            encoding='utf-8')
+        inherited = {**taskrun.os_environ(),
+                     'PYTHONIOENCODING': 'cp936', 'PYTHONUTF8': '0'}
+        with mock.patch.object(taskrun, 'os_environ', lambda: inherited):
+            asyncio.run(taskrun._run(taskrun.build_command('preview', 'ALL'),
+                                     'preview', 'ALL'))
+        text = '\n'.join(str(line) for line in taskrun.status().get('lines', []))
+        self.assertNotIn('UnicodeEncodeError', text,
+                         f'子进程仍在按 cp936 编码输出（issue #147 复发）：\n{text[-400:]}')
+        self.assertIn('\U0001f3c5', text, 'emoji 没原样传回来（说明编码对不上）')
+        self.assertIn('done: ok=1', text, '任务没跑完')
+
+
+class ForceUtf8StdioTest(unittest.TestCase):
+    """面板自身的标准输出也要钉成 UTF-8（同族故障：日志里带 emoji）。"""
+
+    def test_reconfigures_with_utf8_and_replace(self) -> None:
+        from server.stdio_utf8 import force_utf8_stdio
+        calls: list[dict] = []
+
+        class _Stream:
+            def reconfigure(self, **kw):  # noqa: ANN003
+                calls.append(kw)
+
+        force_utf8_stdio((_Stream(), _Stream()))
+        self.assertEqual(len(calls), 2)
+        for kw in calls:
+            self.assertEqual(kw.get('encoding'), 'utf-8')
+            self.assertEqual(kw.get('errors'), 'replace',
+                             'errors=replace 是兜底：宁可打成 ? 也不能死在日志上')
+
+    def test_tolerates_streams_without_reconfigure(self) -> None:
+        """StringIO 之类的流没有 reconfigure —— 不能因此抛异常。"""
+        import io as _io
+        from server.stdio_utf8 import force_utf8_stdio
+        force_utf8_stdio((_io.StringIO(),))
+
+    def test_main_calls_it_at_import(self) -> None:
+        """入口必须真的调用它（否则上面两条只是测了个没人用的函数）。"""
+        src = (Path(__file__).resolve().parents[2] / 'server' / 'main.py').read_text(encoding='utf-8')
+        self.assertIn('force_utf8_stdio()', src)
+
+
+if __name__ == '__main__':
+    unittest.main()
 
 
 if __name__ == '__main__':

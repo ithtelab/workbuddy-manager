@@ -176,6 +176,19 @@ class AnthropicRoundTripTest(unittest.TestCase):
         self.assertEqual(block['thinking'], REASONING)
         self.assertTrue(block.get('signature'), 'thinking 块没有 signature')
 
+    def test_thinking_block_emitted_for_adaptive(self) -> None:
+        """`type=adaptive` 的请求同样要拿到 thinking 块（评审补）。
+
+        上一条只钉了判定函数，这条钉**行为**：新版 Claude Code 对不在它能力表里的
+        模型名一律发 adaptive，若只在判定上认、却没走到回传那一跳，问题照旧
+        （用户看到的就是「思考过程不可见、thinking_tokens 恒为 0」）。
+        """
+        self.assertTrue(A._thinking_enabled({'thinking': {'type': 'adaptive'}}),
+                        '前提：adaptive 应判定为已启用')
+        obj = A.to_anthropic_response(_upstream_response(), 'm', thinking=True)
+        types = [b['type'] for b in obj['content']]
+        self.assertIn('thinking', types, f'adaptive 下没有 thinking 块：{types}')
+
     def test_thinking_block_omitted_when_not_enabled(self) -> None:
         """没启用思考的客户端不该收到 thinking 块（严格客户端会当成异常）。"""
         obj = A.to_anthropic_response(_upstream_response(), 'm', thinking=False)
@@ -272,11 +285,24 @@ class AnthropicRoundTripTest(unittest.TestCase):
 
 
 class ThinkingEnabledDetectionTest(unittest.TestCase):
-    """`thinking.type == 'enabled'` 的判定（含畸形值）。"""
+    """`thinking.type` 是否算「启用思考」的判定（含畸形值）。"""
 
     def test_enabled(self) -> None:
         self.assertTrue(A._thinking_enabled({'thinking': {'type': 'enabled'}}))
         self.assertTrue(A._thinking_enabled({'thinking': {'type': 'ENABLED'}}))
+
+    def test_adaptive_counts_as_enabled(self) -> None:
+        """`adaptive` 必须与 `enabled` 同等对待。
+
+        新版 Claude Code 对**不在它官方能力表里**的模型名一律发
+        `{'type': 'adaptive'}`（网关后面挂的第三方模型全部落进这一类）。
+        只认 `enabled` 时，上游照常返回 `reasoning_content`，却在网关这一跳
+        被整段丢弃 —— 现象是「思考过程不可见、`thinking_tokens` 恒为 0」。
+        """
+        self.assertTrue(A._thinking_enabled({'thinking': {'type': 'adaptive'}}))
+        self.assertTrue(A._thinking_enabled({'thinking': {'type': 'ADAPTIVE'}}))
+        self.assertTrue(A._thinking_enabled(
+            {'thinking': {'type': 'adaptive', 'display': 'omitted'}}))
 
     def test_not_enabled(self) -> None:
         for body in ({}, {'thinking': None}, {'thinking': {}},

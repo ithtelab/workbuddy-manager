@@ -1,4 +1,16 @@
 fastapi>=0.115.0
+python-multipart>=0.0.9
 uvicorn[standard]>=0.30.0
 httpx>=0.27.0
+# SOCKS5 代理支持（httpx 的 socks extra 就是它）。代理线路与 WB_HTTP_PROXY
+# 都可以填 socks5://，而住宅代理服务商给的凭据常常就是 socks5 写法（实测
+# ProxyLane 直接给的是 socks5://）。缺了它 httpx 会抛
+# 「ImportError: Using SOCKS proxy, but the 'socksio' package is not installed」——
+# 用户看到的是「装了 socksio 才能用」，而不是「代理不通」。
+socksio>=1.0.0
 pydantic>=2.7.0
+# PostgreSQL 异地备份的驱动（见 services/pgsync）。装成 [binary] 是为了拿到
+# 预编译的 libpq —— 纯 Python 版要求目标机上已有 libpq，而面板的部署环境
+# （容器 / systemd / Windows 原生）不保证有。用不到这个功能的部署不受影响：
+# 驱动是**按需导入**的，没装也能正常启动，只是备份页会提示去装。
+psycopg[binary]>=3.1

@@ -6,6 +6,6 @@ contact_links:
   - name: 更新日志
     url: https://github.com/ithtelab/workbuddy-manager/blob/main/CHANGELOG.md
     about: 查看各版本的新增、修复与变更，以及计划中的功能
-  - name: 上游项目 workbuddy2api
-    url: https://github.com/Sliverkiss/workbuddy2api
-    about: 账号池与令牌刷新由上游负责，相关问题请在其仓库反馈
+  - name: 上游源码（随发布包分发）
+    url: https://github.com/ithtelab/workbuddy-manager/blob/main/deploy/README.md
+    about: 账号池与令牌刷新由上游 workbuddy2api 负责；源码随本项目的发布包分发，部署方式见部署指南

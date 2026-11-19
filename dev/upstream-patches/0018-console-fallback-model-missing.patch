@@ -1,0 +1,194 @@
+diff --git a/internal/server/channel_check_test.go b/internal/server/channel_check_test.go
+index 0cf4573..d81a9fc 100644
+--- a/internal/server/channel_check_test.go
++++ b/internal/server/channel_check_test.go
+@@ -105,3 +105,40 @@ func TestChatChannelCheckNeverDisables(t *testing.T) {
+ 		t.Errorf("冷却原因应写明是渠道校验，便于排障：%q", st.Reason)
+ 	}
+ }
++
++// issue #245：回退到 /console 拿到的 11102 不得写 (账号,模型) 负缓存。
++//
++// 现场：15 个号跑几小时后全部软冷却、所有请求 503。原因是回退路径的 11102 被当成
++// 「该账号缺这个模型」，写了 6 小时模型级冷却，逐个账号轮过去就把整池打穿。
++func TestConsoleFallbackModelMissingDoesNotBlockModel(t *testing.T) {
++	up := &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			if strings.Contains(r.URL.Path, "/console/chat/completions") {
++				return sseResponse(400, `{"code":11102,"msg":"model [glm-5.2] service info not found"}`), nil
++			}
++			return sseResponse(400, channelCheckBody()), nil
++		})},
++		ChatBaseCN:    "https://fake.example",
++		BillingBaseCN: "https://fake.example",
++	}
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 600 * time.Second})
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
++	if rec.Code == 200 {
++		t.Fatalf("上游两条路径都失败，不该返回 200：%s", rec.Body.String())
++	}
++
++	st, _ := p.Status("u1")
++	if len(st.RateLimitedModels) != 0 {
++		t.Errorf("回退路径的 11102 不该写模型冷却，got %+v", st.RateLimitedModels)
++	}
++	if st.ConsecutiveFails != 0 {
++		t.Errorf("失败的是路径不是账号，不该喂连败计数，got %d", st.ConsecutiveFails)
++	}
++	if st.Cooling || st.Disabled {
++		t.Errorf("账号不该被冷却/禁用: cooling=%v disabled=%v", st.Cooling, st.Disabled)
++	}
++}
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 9993e9e..9e9c871 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -1073,6 +1073,8 @@ func rotateBackoff(i int, ctx context.Context) bool {
+ //     达到 breakerThreshold 触发熔断（指数退避）。
+ //   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让（复用 modelCooldowns
+ //     机制，Until=指数退避 TTL，选号侧 healthyForModel 避开，切模型即可用）。
++//   - ErrFallbackModelMissing → 回退路径上的 11102（issue #245）：零动作（不冷却/不熔断/
++//     不 NoteError），仍然轮转 —— 失败的是路径不是账号，写成模型级冷却会把整池打穿。
+ //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
+ //     额外喂连败计数（NoteFailures，issue #114）：未知 4xx 连败 N 次临时出池——
+ //     「不知道原因的兜底」，与冷却「知道原因的惩罚」并存取更长者不叠加（health
+@@ -1218,6 +1220,11 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		// 有问题（网关截断已由 413 消灭，剩余为客户端畸形 JSON）。换了账号照样 400，
+ 		// 不罚账号（无冷却/熔断/NoteError，同 ErrContentBlocked 待遇）；但**仍然轮转**
+ 		// ——不同账号可能有不同的模型权限，值得换号再试一次。
++	case upstream.ErrFallbackModelMissing:
++		// 回退路径（/console）报的 11102（issue #245）：只说明「这条路径没有这个模型」，
++		// 不是「该账号缺这个模型」。零动作（不冷却/不熔断/不 NoteError），仍然轮转 ——
++		// 换个号可能压根不需要回退（渠道校验与账号灰度有关），而写成模型级冷却会让
++		// 十几个号轮一圈就把整池打满，对外变成 503 no_healthy_account。
+ 	case upstream.ErrModelBlocked:
+ 		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
+ 		// （与 6004 同域），写 modelCooldowns[model]，Until 为指数退避 TTL（6h 起、封顶
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index e9b155e..f4aa73b 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -42,6 +42,11 @@ const (
+ 	// ErrEmptyMessage 11151「a message has empty content」→ 请求级错误：同 body 换
+ 	// 任何账号都是同一结果，换号只会白扔健康号配额、最后把 400 包装成 503（issue #203）。
+ 	ErrEmptyMessage
++	// ErrFallbackModelMissing 回退路径（/console）报的 11102（issue #245）→ 请求级
++	// 错误：它只说明「这条路径没有这个模型」，不构成「该账号缺这个模型」的证据。
++	// 不能落 ErrModelBlocked —— handler 会写 6 小时 (账号,模型) 负缓存，十几个号轮
++	// 一圈就是整池 503；也不该按 ErrClient 喂连败计数（失败的是路径不是账号）。
++	ErrFallbackModelMissing
+ )
+ 
+ func (k ErrKind) String() string {
+@@ -74,6 +79,8 @@ func (k ErrKind) String() string {
+ 		return "empty_message"
+ 	case ErrToolCallMismatch:
+ 		return "tool_call_mismatch"
++	case ErrFallbackModelMissing:
++		return "fallback_model_missing"
+ 	case ErrClient:
+ 		return "client"
+ 	default:
+@@ -1239,6 +1246,16 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 			kind := Classify(resp.StatusCode, string(raw))
+ 			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
+ 				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
++			// 回退路径上的 11102 降级（issue #245）：能走到 /console 是因为 /v2 判了渠道
++			// 校验，而 /console 本来就可能不提供这个模型 —— 11102 只说明「这条路径没有」，
++			// 不是「该账号缺这个模型」。照 ErrModelBlocked 处理，handler 会写 (账号,模型)
++			// 6 小时负缓存，逐个账号轮过去就是整池 503 no_healthy_account，比不换路径更糟。
++			// 也不按 ErrClient 处理：连败计数是账号健康信号，这里失败的是路径不是账号。
++			if i > 0 && kind == ErrModelBlocked {
++				log.Printf("WARN: [upstream] chat_stream acct=%s: 回退路径 %s 报 %s，按请求级处理（不写模型冷却）",
++					logfmt.Label(a.UID, a.Nickname), path, kind)
++				kind = ErrFallbackModelMissing
++			}
+ 			// 路径级拒绝 → 换下一个候选路径再试，**不**把它当账号问题。
+ 			//   · 渠道校验（11128/11-128）：/v2 新增强校验，/console 放行（见 chatPaths）；
+ 			// 触发条件**只有渠道校验**：404/405 不回落是 #119 的刻意取舍（/console 挂
+diff --git a/internal/upstream/fallback_model_missing_test.go b/internal/upstream/fallback_model_missing_test.go
+new file mode 100644
+index 0000000..c170a35
+--- /dev/null
++++ b/internal/upstream/fallback_model_missing_test.go
+@@ -0,0 +1,76 @@
++package upstream
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"workbuddy2api/internal/auth"
++)
++
++// issue #245：/v2 判渠道校验、回退 /console 之后拿到的 11102 不能升级成 model_blocked。
++//
++// 现场：15 个号跑几小时后全部软冷却、所有请求 503，日志里 11-128 与 11102 混在一起。
++// 11102 走 BlockModelBackoff（TTL 6 小时起），于是「换接口重试」这一步的净效果变成
++// 「把账号锁 6 小时」——几个号轮转过去，整池就红了。
++//
++// 回退路径上的 11102 只说明「这条路径没有这个模型」：我们是因为 /v2 判了渠道校验才
++// 换过去的，/console 本来就可能不提供这个模型，这不构成「该账号缺这个模型」的证据。
++func TestConsoleFallbackModelMissingIsRequestLevel(t *testing.T) {
++	var paths []string
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		paths = append(paths, r.URL.Path)
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusBadRequest)
++		if strings.Contains(r.URL.Path, "/console/chat/completions") {
++			_, _ = w.Write([]byte(`{"code":11102,"msg":"model [deepseek-v4.1-flash] service info not found"}`))
++			return
++		}
++		_, _ = w.Write([]byte(channelBody))
++	}))
++	defer srv.Close()
++
++	c := New()
++	c.ChatBaseCN = srv.URL
++	acct := &auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}
++	_, status, raw, err := c.ChatStream(acct,
++		[]byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})
++	if status != http.StatusBadRequest {
++		t.Fatalf("status=%d body=%s", status, raw)
++	}
++	ue, ok := err.(*Error)
++	if !ok {
++		t.Fatalf("应返回分类信封，got %T (%v)", err, err)
++	}
++	if ue.Kind != ErrFallbackModelMissing {
++		t.Fatalf("回退路径的 11102 应归请求级（ErrFallbackModelMissing），got %v", ue.Kind)
++	}
++	if len(paths) != 2 || !strings.Contains(paths[0], "/v2/") || !strings.Contains(paths[1], "/console/") {
++		t.Fatalf("应当先在 /v2 被拒再换 /console，实际路径=%v", paths)
++	}
++}
++
++// 主路径自己报 11102 仍是 (账号,模型) 负缓存：那是「该后端确实没有这个模型」的
++// 确定性答复，与回退路径的语义不同。这条用例防止把降级写宽了。
++func TestPrimaryPathModelMissingStaysModelBlocked(t *testing.T) {
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusBadRequest)
++		_, _ = w.Write([]byte(`{"code":11102,"msg":"model [glm-5.2] service info not found"}`))
++	}))
++	defer srv.Close()
++
++	c := New()
++	c.ChatBaseCN = srv.URL
++	acct := &auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}
++	_, _, _, err := c.ChatStream(acct,
++		[]byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`), "", ChatMeta{})
++	ue, ok := err.(*Error)
++	if !ok {
++		t.Fatalf("应返回分类信封，got %T (%v)", err, err)
++	}
++	if ue.Kind != ErrModelBlocked {
++		t.Fatalf("主路径的 11102 应保持 ErrModelBlocked，got %v", ue.Kind)
++	}
++}

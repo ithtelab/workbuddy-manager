@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>弹窗限高/滚动结构探针</title>
+<link rel="stylesheet" href="../web/out/_next/static/css/8c6c4f85ca9e12fc.css">
+<link rel="stylesheet" href="../web/out/_next/static/css/7fc7e57e6734b089.css">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px; font: 12px/1.5 system-ui, sans-serif;
+         background: #f6f7f9; color: #111; display: flex; gap: 12px; }
+  .col { width: 380px; }
+  h2 { font-size: 13px; margin: 0 0 6px; }
+  .note { color: #666; margin: 0 0 6px; font-size: 11px; }
+  /* 弹窗容器：限高 + overflow:hidden（DialogContent 基类就是这么写的） */
+  .dialog { background: #fff; border: 1px solid #d5d8dd; border-radius: 12px;
+            overflow: hidden; max-height: 420px; }
+  .dialog.grid { display: grid; }
+  .dialog.flex { display: flex; flex-direction: column; }
+  .hdr { padding: 12px 16px; font-weight: 600; background: #fff; }
+  .ftr { padding: 12px 16px; background: #fff; }
+  .ftr button { padding: 6px 14px; border-radius: 999px; border: 0;
+                background: #2563eb; color: #fff; }
+  /* 主体限高：和页面里那句 max-h-[min(560px,calc(100dvh-14rem))] 等价 */
+  .body-radix { position: relative; overflow: hidden; max-height: 200px; }
+  .body-radix.flex1 { min-height: 0; flex: 1 1 0%; }
+  /* Radix 的 Viewport：height:100% + overflow:scroll */
+  .vp { height: 100%; width: 100%; overflow: scroll; }
+  .body-plain { max-height: 200px; overflow-y: auto; }
+  .filler { padding: 10px 16px; }
+  .line { padding: 2px 0; color: #333; }
+  .verdict { margin-top: 6px; padding: 6px 8px; border-radius: 6px;
+             font-family: ui-monospace, monospace; font-size: 11px; }
+  .bad { background: #fee2e2; color: #991b1b; }
+  .good { background: #dcfce7; color: #166534; }
+</style>
+</head>
+<body>
+
+<div class="col">
+  <h2>A · 现状：grid 容器 + Radix ScrollArea（仅 max-height）</h2>
+  <p class="note">页面里现在就是这个结构。</p>
+  <div class="dialog grid" id="A">
+    <div class="hdr">密钥创建成功（header）</div>
+    <div class="body-radix" id="A-root">
+      <div class="vp" id="A-vp">
+        <div class="filler">
+          <div id="A-long"></div>
+        </div>
+      </div>
+    </div>
+    <div class="ftr" id="A-ftr"><button>我已保存</button></div>
+  </div>
+  <div class="verdict" id="A-out">…</div>
+</div>
+
+<div class="col">
+  <h2>B · 普通 div + overflow-y:auto</h2>
+  <p class="note">原生滚动容器，不依赖百分比高度能否解析。</p>
+  <div class="dialog grid" id="B">
+    <div class="hdr">密钥创建成功（header）</div>
+    <div class="body-plain" id="B-body">
+      <div class="filler"><div id="B-long"></div></div>
+    </div>
+    <div class="ftr" id="B-ftr"><button>我已保存</button></div>
+  </div>
+  <div class="verdict" id="B-out">…</div>
+</div>
+
+<div class="col">
+  <h2>C · flex-col 容器 + Radix ScrollArea（flex-1 + min-h-0）</h2>
+  <p class="note">让主体拿到确定高度，百分比高度才有得解析。</p>
+  <div class="dialog flex" id="C">
+    <div class="hdr">密钥创建成功（header）</div>
+    <div class="body-radix flex1" id="C-root">
+      <div class="vp" id="C-vp">
+        <div class="filler"><div id="C-long"></div></div>
+      </div>
+    </div>
+    <div class="ftr" id="C-ftr"><button>我已保存</button></div>
+  </div>
+  <div class="verdict" id="C-out">…</div>
+</div>
+
+<script>
+  // 造一段够长的内容（模拟密钥 + JSON + 导入区）
+  const lines = [];
+  for (let i = 1; i <= 28; i++) lines.push(`"line-${i}": "xxxxxxxxxxxxxxxxxxxxxxxx",`);
+  for (const id of ['A-long', 'B-long', 'C-long']) {
+    document.getElementById(id).innerHTML =
+        lines.map((t) => `<div class="line">${t}</div>`).join('');
+  }
+
+  function report(tag, dialogId, scrollerId, vpId) {
+    const dialog = document.getElementById(dialogId);
+    const scroller = document.getElementById(scrollerId);
+    const vp = vpId ? document.getElementById(vpId) : null;
+    const ftr = document.getElementById(dialogId + '-ftr');
+    const d = dialog.getBoundingClientRect();
+    const f = ftr.getBoundingClientRect();
+    const s = scroller.getBoundingClientRect();
+    const footerVisible = f.bottom <= d.bottom + 0.5;
+    const scrolled = vp ? vp.scrollHeight > vp.clientHeight + 1
+                        : scroller.scrollHeight > scroller.clientHeight + 1;
+    const bodyH = Math.round(s.height);
+    const ok = footerVisible && scrolled;
+    const el = document.getElementById(dialogId + '-out');
+    el.className = 'verdict ' + (ok ? 'good' : 'bad');
+    el.textContent =
+        `footer可见=${footerVisible} 主体可滚动=${scrolled} 主体高=${bodyH}px `
+      + `内容高=${vp ? vp.scrollHeight : scroller.scrollHeight}px`;
+  }
+
+  report('A', 'A', 'A-root', 'A-vp');
+  report('B', 'B', 'B-body', null);
+  report('C', 'C', 'C-root', 'C-vp');
+</script>
+</body>
+</html>

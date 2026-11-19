@@ -1,0 +1,913 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index 9fe8372..0d570df 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -4,6 +4,7 @@ package main
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"net/url"
+ 	"os"
+ 	"strconv"
+ 	"strings"
+@@ -20,6 +21,13 @@ type Config struct {
+ 	AuthDir   string `json:"auth_dir"`   // ./auths
+ 	StateFile string `json:"state_file"` // ./data/state.json
+ 
++	// Proxies 账号级出口线路表：线路名 → 代理地址（http / https / socks5 / socks5h）。
++	//
++	// 面板会给账号绑一条线路（auths/*.json 顶层 `proxy` 写的是**线路名**），这个名字
++	// 在这里解析成地址；线路名查不到时上游**明确报错、不静默直连**（静默直连等于
++	// 「以为隔离了其实没隔离」，见 upstream.TransportFor）。
++	Proxies map[string]string `json:"proxies"`
++
+ 	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
+ 
+ 	Cooldown struct {
+@@ -255,6 +263,12 @@ func applyEnv(c *Config) {
+ 	if v := os.Getenv("WB2A_CREDIT_EXHAUSTED"); v != "" {
+ 		c.Cooldown.CreditExhausted = v
+ 	}
++	if v := strings.TrimSpace(os.Getenv("WB2A_PROXIES")); v != "" {
++		var table map[string]string
++		if err := json.Unmarshal([]byte(v), &table); err == nil {
++			c.Proxies = table
++		}
++	}
+ 	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
+ 		if n, err := strconv.Atoi(v); err == nil {
+ 			c.Upstream.TimeoutSeconds = n
+@@ -326,6 +340,34 @@ func (c *Config) normalize() error {
+ 	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
+ 		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
+ 	}
++	// 出口线路表：名字与地址都去空白；scheme 只认 http/https/socks5/socks5h。
++	// 这里**启动即校验**：地址写错时让上游起不来（带明确提示），比跑起来以后每个
++	// 请求都失败容易发现得多；线路名查不到（账号引用了不存在的名字）则在用时明确报错。
++	if len(c.Proxies) > 0 {
++		clean := make(map[string]string, len(c.Proxies))
++		for name, addr := range c.Proxies {
++			n := strings.TrimSpace(name)
++			v := strings.TrimSpace(addr)
++			if n == "" || v == "" {
++				continue
++			}
++			u, err := url.Parse(v)
++			if err != nil {
++				return fmt.Errorf("proxies[%s]: %w", n, err)
++			}
++			switch strings.ToLower(u.Scheme) {
++			case "http", "https", "socks5", "socks5h":
++			default:
++				return fmt.Errorf("proxies[%s]: 不支持的协议 %q（只能是 http/https/socks5/socks5h）", n, u.Scheme)
++			}
++			if u.Host == "" {
++				return fmt.Errorf("proxies[%s]: 地址缺少主机名（%q）", n, v)
++			}
++			clean[n] = v
++		}
++		c.Proxies = clean
++	}
++
+ 	// 积分耗尽后的冷却时长（issue #78）：空 = 保持「硬冷却到次日 04:00」的旧行为；
+ 	// 填了必须是正时长（负值会让冷却立即到期，等于没冷却 —— 与其静默放行，不如报错）。
+ 	if v := strings.TrimSpace(c.Cooldown.CreditExhausted); v == "" {
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index ba22f2b..ca5a055 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -9,6 +9,7 @@ import (
+ 	"os"
+ 	"os/signal"
+ 	"path/filepath"
++	"strings"
+ 	"syscall"
+ 	"time"
+ 
+@@ -83,6 +84,14 @@ func main() {
+ 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
+ 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
+ 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
++	// 账号级出口线路（issue #210）：面板绑在线路名上，这里把名字解析成地址。
++	upstream.ConfigureProxies(cfg.Proxies)
++	if names := upstream.RouteNames(); len(names) > 0 {
++		log.Printf("出口线路已加载：%d 条（%s）—— 账号绑定的线路名按它解析",
++			len(names), strings.Join(names, ", "))
++	} else {
++		log.Printf("未配置出口线路（config.json 的 proxies 段）：账号绑定的线路名会明确报错，不会静默直连")
++	}
+ 	p.SetCreditExhausted(cfg.CreditExhaustedDur)       // 积分耗尽后的冷却时长（credit_exhausted，0 = 旧行为）               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+ 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+ 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+diff --git a/internal/auth/auth.go b/internal/auth/auth.go
+index 9f1ca50..18f6c31 100644
+--- a/internal/auth/auth.go
++++ b/internal/auth/auth.go
+@@ -31,12 +31,20 @@ type Auth struct {
+ 	//
+ 	// 命名注记：Go 不允许字段与方法同名，持久化字段用未导出 realm，计算访问器用
+ 	// 导出的 Realm()（跨包调用全部走方法）。Parse/SaveAtomic/login 在包内读写字段。
+-	realm          string
+-	UID            string
+-	EnterpriseID   string
+-	Nickname       string
+-	FilePath       string // 来源文件；refresh 后原子写回此处
++	realm        string
++	UID          string
++	EnterpriseID string
++	Nickname     string
++	FilePath     string // 来源文件；refresh 后原子写回此处
+ 
++	// ProxyName 账号级出口线路**名**（不是地址），来源 auth 文件顶层 `proxy` 字段，
++	// 由面板的「出口线路」功能写入；线路名 → 代理地址的映射在上游 config.json 的
++	// `proxies` 里。空 = 跟随进程级代理（WB_HTTP_PROXY / 环境变量）。
++	//
++	// 为什么存在这个字段：面板早就能给账号绑线路，但上游此前完全不读它 —— 于是
++	// 「每个号一条出口」只是界面上看起来生效，真正的对话流量还是全池共用宿主出口
++	// （多号同 IP 容易被平台关联）。现在上游按它选 transport（见 upstream.TransportFor）。
++	ProxyName string
+ 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
+ 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
+ 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
+@@ -230,6 +238,8 @@ func Parse(raw []byte) (*Auth, error) {
+ 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用）。
+ 			// 放在 auth 段之外，手写时无需嵌进 auth 对象，降低配置门槛。
+ 			DeviceToken string `json:"device_token"`
++			// Proxy 顶层 proxy（线路名，面板写入；见 Auth.ProxyName）。
++			Proxy string `json:"proxy"`
+ 		}
+ 		if err := json.Unmarshal(raw, &n); err != nil {
+ 			return nil, fmt.Errorf("storage_parse_error: %w", err)
+@@ -244,6 +254,7 @@ func Parse(raw []byte) (*Auth, error) {
+ 			EnterpriseID: n.Account.EnterpriseID,
+ 			Nickname:     n.Account.Nickname,
+ 			DeviceToken:  n.DeviceToken,
++			ProxyName:    strings.TrimSpace(n.Proxy),
+ 		}
+ 	} else {
+ 		var f struct {
+@@ -256,6 +267,7 @@ func Parse(raw []byte) (*Auth, error) {
+ 			EnterpriseID string `json:"enterpriseId"`
+ 			Nickname     string `json:"nickname"`
+ 			DeviceToken  string `json:"device_token"`
++			Proxy        string `json:"proxy"`
+ 		}
+ 		if err := json.Unmarshal(raw, &f); err != nil {
+ 			return nil, fmt.Errorf("storage_parse_error: %w", err)
+@@ -270,6 +282,7 @@ func Parse(raw []byte) (*Auth, error) {
+ 			EnterpriseID: f.EnterpriseID,
+ 			Nickname:     f.Nickname,
+ 			DeviceToken:  f.DeviceToken,
++			ProxyName:    strings.TrimSpace(f.Proxy),
+ 		}
+ 	}
+ 	if strings.TrimSpace(a.AccessToken) == "" {
+@@ -309,6 +322,12 @@ func (a *Auth) SaveAtomic() error {
+ 	if a.DeviceToken != "" {
+ 		doc["device_token"] = a.DeviceToken
+ 	}
++	// ProxyName 同理非空才写回：**刷新 token 会整份重建文件**，不保留就等于把面板
++	// 绑好的出口线路静默解绑（出口随之改变，而这类变化没人会发现）。空值不写，
++	// 避免在没绑线路的文件里引入空键。
++	if a.ProxyName != "" {
++		doc["proxy"] = a.ProxyName
++	}
+ 	raw, err := json.MarshalIndent(doc, "", "  ")
+ 	if err != nil {
+ 		return err
+diff --git a/internal/auth/proxy_field_test.go b/internal/auth/proxy_field_test.go
+new file mode 100644
+index 0000000..6cd025b
+--- /dev/null
++++ b/internal/auth/proxy_field_test.go
+@@ -0,0 +1,93 @@
++package auth
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// 账号级出口线路名（issue #210）：面板写在 auths/*.json 顶层 `proxy`，
++// 上游必须解析出来（并刷新 token 时保留，否则等于静默解绑）。
++func TestParseProxyName(t *testing.T) {
++	nested := []byte(`{"auth":{"accessToken":"at","refreshToken":"rt","expiresAt":1,"domain":"d","realm":"cn"},
++		"account":{"uid":"u1","nickname":"n"},"proxy":"route-a"}`)
++	a, err := Parse(nested)
++	if err != nil {
++		t.Fatalf("nested parse: %v", err)
++	}
++	if a.ProxyName != "route-a" {
++		t.Errorf("嵌套形的顶层 proxy 没解析出来：%q", a.ProxyName)
++	}
++
++	flat := []byte(`{"accessToken":"at","expiresAt":1,"uid":"u2","proxy":"  route-b  "}`)
++	b, err := Parse(flat)
++	if err != nil {
++		t.Fatalf("flat parse: %v", err)
++	}
++	if b.ProxyName != "route-b" {
++		t.Errorf("扁平形的 proxy 没解析（且应去空白）：%q", b.ProxyName)
++	}
++
++	none := []byte(`{"accessToken":"at","expiresAt":1,"uid":"u3"}`)
++	c, err := Parse(none)
++	if err != nil {
++		t.Fatalf("no-proxy parse: %v", err)
++	}
++	if c.ProxyName != "" {
++		t.Errorf("没写 proxy 时不该编造：%q", c.ProxyName)
++	}
++}
++
++func TestSaveAtomicPreservesProxyName(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "workbuddy-u1.json")
++	if err := os.WriteFile(path, []byte(`{"accessToken":"old","expiresAt":1,"uid":"u1","proxy":"route-a"}`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	a, err := Parse(mustRead(t, path))
++	if err != nil {
++		t.Fatal(err)
++	}
++	a.FilePath = path
++	a.AccessToken = "new-token" // 模拟刷新后的写回
++	if err := a.SaveAtomic(); err != nil {
++		t.Fatalf("save: %v", err)
++	}
++	var doc map[string]any
++	if err := json.Unmarshal(mustRead(t, path), &doc); err != nil {
++		t.Fatal(err)
++	}
++	if doc["proxy"] != "route-a" {
++		t.Errorf("刷新 token 后线路绑定丢了（doc=%v）—— 出口会静默改变", doc)
++	}
++
++	// 未绑线路的账号：写回时不该凭空多出 proxy 键
++	path2 := filepath.Join(dir, "workbuddy-u2.json")
++	if err := os.WriteFile(path2, []byte(`{"accessToken":"old","expiresAt":1,"uid":"u2"}`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	b, _ := Parse(mustRead(t, path2))
++	b.FilePath = path2
++	b.AccessToken = "new"
++	if err := b.SaveAtomic(); err != nil {
++		t.Fatal(err)
++	}
++	var doc2 map[string]any
++	_ = json.Unmarshal(mustRead(t, path2), &doc2)
++	if _, ok := doc2["proxy"]; ok {
++		t.Errorf("没绑线路的账号被写入了空 proxy 键：%v", doc2)
++	}
++}
++
++func mustRead(t *testing.T, p string) []byte {
++	t.Helper()
++	raw, err := os.ReadFile(p)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return raw
++}
++
++var _ = strings.TrimSpace
+diff --git a/internal/server/empty_message_test.go b/internal/server/empty_message_test.go
+new file mode 100644
+index 0000000..5299fed
+--- /dev/null
++++ b/internal/server/empty_message_test.go
+@@ -0,0 +1,79 @@
++package server
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/upstream"
++)
++
++// 11151「对话里有空消息」→ **400 透传**，不是 503（issue #203）。
++//
++// 以前它落通用 4xx：只换号不罚号，轮完一圈拿 503 收场 —— 客户端看到「服务暂时不可用」，
++// 而真实原因只是对话里有一条空消息（同 body 换任何账号结果都一样）。
++var emptyMsgBody = `{"code":11151,"msg":"a message has empty content, please check the conversation history and retry","requestId":"r1"}`
++
++func TestEmptyMessageReturns400WithoutRotating(t *testing.T) {
++	calls := 0
++	up := &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			calls++
++			return &http.Response{
++				StatusCode: 400,
++				Header:     http.Header{"Content-Type": []string{"application/json"}},
++				Body:       io.NopCloser(strings.NewReader(emptyMsgBody)),
++			}, nil
++		})},
++		ChatBaseCN:    "https://fake.example",
++		BillingBaseCN: "https://fake.example",
++	}
++	p := testPoolWith(
++		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
++	)
++	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 600 * time.Second})
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":""}]}`)))
++
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("应回 400（请求内容问题），got %d body=%s", rec.Code, rec.Body.String())
++	}
++	if calls != 1 {
++		t.Errorf("不该轮转（同一 body 换号结果不变，白扔配额）：上游被调用了 %d 次", calls)
++	}
++	if !strings.Contains(rec.Body.String(), "11151") {
++		t.Errorf("应透传上游原文（含 code，客户端按它自查）：%s", rec.Body.String())
++	}
++	// 不罚号：两个号都不该被冷却/禁用
++	for _, uid := range []string{"u1", "u2"} {
++		st, _ := p.Status(uid)
++		if st.Cooling || st.Disabled {
++			t.Errorf("%s 不该被罚（这是请求的问题）：%+v", uid, st)
++		}
++	}
++}
++
++func TestClassifyEmptyMessage(t *testing.T) {
++	for _, body := range []string{
++		emptyMsgBody,
++		`{"code":"11151","msg":"empty"}`,        // 字符串码
++		`{"code":11151,"msg":"x"}`,              // 紧凑含空格差
++		`{"msg":"a message has empty content"}`, // 只有文案
++		`{"code":0,"msg":"存在空白消息，请补全后重试"}`,      // 中文文案
++	} {
++		if got := upstream.Classify(400, body); got != upstream.ErrEmptyMessage {
++			t.Errorf("Classify(%q)=%v want ErrEmptyMessage", body, got)
++		}
++	}
++	// 内容审核的 11-128 不该被这条规则吞掉（那是另一类，要降级重试）
++	if got := upstream.Classify(400, `{"code":11-128,"msg":"blocked by security policy"}`); got == upstream.ErrEmptyMessage {
++		t.Error("内容审核被误判成空消息")
++	}
++}
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index c2ac50e..e8c4997 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -419,7 +419,7 @@ func (h *Handler) modelList() []map[string]any {
+ 				}
+ 			}
+ 			addListingCompat(entry)
+-		out = append(out, entry)
++			out = append(out, entry)
+ 		}
+ 	}
+ 	return out
+@@ -841,6 +841,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				st.status = http.StatusBadRequest
+ 				return
+ 			}
++			// 11151「对话里有空消息」：请求内容的问题（同一 body 换任何号都一样）。
++			// 以前它落通用 4xx → 只换号不罚号，轮一圈后拿 503 收场（issue #203：客户端
++			// 看到「服务暂时不可用」，而真实原因只是某条消息内容为空）。这里直接 400 +
++			// 上游原文（含 code/requestId，客户端按它自查），不罚号、不轮转。
++			if kind == upstream.ErrEmptyMessage {
++				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
++				fail(acct.UID)
++				msg := string(respBody)
++				if strings.TrimSpace(msg) == "" {
++					msg = "a message in the conversation has empty content"
++				}
++				writeOpenAIErrorHint(w, http.StatusBadRequest, "empty_message", msg,
++					h.hintOf(kind, string(respBody), bareModel, reqHasImage, uerr))
++				st.status = http.StatusBadRequest
++				return
++			}
+ 			// 11148 is deterministic for this request body. Return immediately without
+ 			// rotating accounts or incrementing account failure counters.
+ 			if kind == upstream.ErrToolCallMismatch {
+@@ -1179,6 +1195,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		// 内容策略拦截：内容问题非账号问题，不罚账号（无冷却/熔断/NoteError）。
+ 		// passthrough 首遇由 chatCompletions 内降级重试处理；最终仍拦则回 400
+ 		// content_blocked（防火墙文案），不再轮转、不暴露账号/冷却/错误码。
++	case upstream.ErrEmptyMessage:
++		// 11151 空消息：请求的问题（同 body 换号结果不变），零动作 —— 不冷却/不熔断/
++		// 不 NoteError，由 chatCompletions 的 fail-fast 分支直接 400 透传（issue #203）。
+ 	case upstream.ErrPromptTooLong:
+ 		// 11115「prompt is too long」：请求的问题不是账号的问题（同一 body 换任何
+ 		// 号都超限）。零动作（不冷却/不熔断/不 NoteError，同 ErrContentBlocked
+diff --git a/internal/server/logging.go b/internal/server/logging.go
+index a6d6e7d..fb5d7a4 100644
+--- a/internal/server/logging.go
++++ b/internal/server/logging.go
+@@ -224,9 +224,12 @@ func uidPrefix(uid string) string {
+ // 是为了让 stdout 里成百上千行能竖着扫——否则模型名长短不一、中文昵称按字节补空格
+ // 错位，根本没法用肉眼对齐着一列列看（这正是上一版 11 字节硬截断要解决的问题）。
+ const (
+-	// chatModelWidth 覆盖 realm 前缀 + 最长模型名："global:" (7) + "deepseek-v4.1-flash" (19) = 26。
++	// chatModelWidth 覆盖 realm 前缀 + 最长模型名（含区域后缀，issue #207）：
++	// "global:" (7) + "deepseek-v4.1-flash-sg" (22) = 29，留 3 字节余量取 32。
++	// 按字节截断是刻意的（列对齐），但余量必须够 —— 26 会把 -sg 截掉，于是面板里
++	// 显示的模型名与实际请求的不是同一个。
+ 	// 旧的 11 字节截断会把 "cn:deepseek-v4-flash" 切成 "cn:deepseek"，让人误以为是另一个模型。
+-	chatModelWidth = 26
++	chatModelWidth = 32
+ 	// chatAcctWidth 容纳 "昵称(uid8)"：中文昵称按 2 列/字算，5 字中文 + "(xxxxxxxx)" = 20 列。
+ 	chatAcctWidth = 22
+ 	chatTTFBWidth = 8
+diff --git a/internal/server/logging_test.go b/internal/server/logging_test.go
+index e2e7349..a1a3a4c 100644
+--- a/internal/server/logging_test.go
++++ b/internal/server/logging_test.go
+@@ -10,6 +10,7 @@ import (
+ 	"time"
+ 
+ 	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/logfmt"
+ )
+ 
+ // captureStdout 重定向 os.Stdout 并捕获 fn 期间的全部输出。
+@@ -406,3 +407,25 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
+ 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+ 	}
+ }
++
++// 日志的模型列要装得下带区域后缀的模型名（issue #207）。
++//
++// 现场：26 字节的列宽把 global:deepseek-v4.1-flash-sg（29 字节）截成
++// global:deepseek-v4.1-flash —— 面板里显示的模型名与实际请求的不是同一个，
++// 排障时会以为「请求的是这个模型」。按字节截断本身是对的（列对齐），余量得够。
++func TestChatModelColumnFitsRegionSuffixedNames(t *testing.T) {
++	for _, name := range []string{
++		"global:deepseek-v4.1-flash-sg",
++		"cn:deepseek-v4.1-flash-sg",
++		"global:gpt-5.6-sol",
++	} {
++		if got := logfmt.Truncate(name, chatModelWidth); got != name {
++			t.Errorf("模型列宽 %d 装不下 %q（被截成 %q）", chatModelWidth, name, got)
++		}
++	}
++	// 列宽仍要对齐：超长的照旧截断到列宽
++	long := strings.Repeat("x", chatModelWidth+10)
++	if got := logfmt.Truncate(long, chatModelWidth); len(got) != chatModelWidth {
++		t.Errorf("超长模型名应按列宽截断，got len=%d", len(got))
++	}
++}
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index 288c723..e9b155e 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -39,6 +39,9 @@ const (
+ 	ErrImageInvalid                    // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
+ 	ErrClient                          // 其他 4xx / 业务错误
+ 	ErrToolCallMismatch                // 11148 工具调用/结果历史错配 → 请求级错误：不罚号、不轮转
++	// ErrEmptyMessage 11151「a message has empty content」→ 请求级错误：同 body 换
++	// 任何账号都是同一结果，换号只会白扔健康号配额、最后把 400 包装成 503（issue #203）。
++	ErrEmptyMessage
+ )
+ 
+ func (k ErrKind) String() string {
+@@ -67,6 +70,8 @@ func (k ErrKind) String() string {
+ 		return "prompt_too_long"
+ 	case ErrImageInvalid:
+ 		return "image_invalid"
++	case ErrEmptyMessage:
++		return "empty_message"
+ 	case ErrToolCallMismatch:
+ 		return "tool_call_mismatch"
+ 	case ErrClient:
+@@ -562,6 +567,15 @@ func ParseRateReset(body string) (time.Time, bool) {
+ //     带业务信封的 403 已被上方各层捕获（11140 request illegal →
+ //     ErrAccountFault 禁用语义不变），走不到本层。
+ //  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
++//
++// isEmptyMessage 11151「a message has empty content」的判定：code 标记 + 文案双通道。
++// 文案在中文体里也可能出现，所以同时认 code（宽松形态，见 codeMarker）。
++func isEmptyMessage(lower string) bool {
++	return codeMarker(lower, "11151") ||
++		strings.Contains(lower, "a message has empty content") ||
++		strings.Contains(lower, "存在空白消息")
++}
++
+ func isToolCallMismatch(lower string) bool {
+ 	return strings.Contains(lower, "tool calls and tool results do not match") ||
+ 		strings.Contains(lower, "tool_call_sequence_broken") ||
+@@ -650,6 +664,12 @@ func Classify(status int, body string) ErrKind {
+ 	if status == http.StatusBadRequest && isToolCallMismatch(lower) {
+ 		return ErrToolCallMismatch
+ 	}
++	// 11151「a message has empty content」：同样是**请求内容**决定的结果（issue #203）。
++	// 判在通用 4xx 之前：否则它落 ErrClient「只换号不罚号」，轮完一圈拿 503 收场 ——
++	// 客户端看到的是「服务不可用」，而真实原因只是对话里有一条空消息。
++	if status == http.StatusBadRequest && isEmptyMessage(lower) {
++		return ErrEmptyMessage
++	}
+ 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
+ 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
+ 	// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
+@@ -784,6 +804,45 @@ func (c *Client) chatHTTP() *http.Client {
+ 	return c.HTTP
+ }
+ 
++// clientFor 返回该账号出站应使用的 client（issue #210）。
++//
++// 未绑线路（ProxyName 为空）→ 走原来的共享 client，行为一字不变。
++// 绑了线路 → 换成按线路缓存的 Transport（连接池分开，出口不串）。
++// 线路名未知 → 返回 error，**不静默直连**：静默直连等于「以为隔离了其实没有」。
++func (c *Client) clientFor(a *auth.Auth, chat bool) (*http.Client, error) {
++	name := ""
++	if a != nil {
++		name = strings.TrimSpace(a.ProxyName)
++	}
++	if name == "" {
++		if chat {
++			return c.chatHTTP(), nil
++		}
++		if c.HTTP != nil {
++			return c.HTTP, nil
++		}
++		return &http.Client{Timeout: 120 * time.Second, Transport: newTransport()}, nil
++	}
++	tr, err := TransportFor(name)
++	if err != nil {
++		label := ""
++		if a != nil {
++			label = logfmt.Label(a.UID, a.Nickname) + " "
++		}
++		return nil, fmt.Errorf("账号 %s出口线路不可用：%w", label, err)
++	}
++	if chat {
++		// 聊天无总时长（SSE 长流），首字节由 Transport 的 ResponseHeaderTimeout 管
++		return &http.Client{Timeout: 0, Transport: tr}, nil
++	}
++	return &http.Client{Timeout: 120 * time.Second, Transport: tr}, nil
++}
++
++// chatHTTPFor 聊天用 client（按账号线路）。
++func (c *Client) chatHTTPFor(a *auth.Auth) (*http.Client, error) {
++	return c.clientFor(a, true)
++}
++
+ // defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
+ const defaultGlobalBase = "https://www.workbuddy.ai"
+ 
+@@ -942,8 +1001,12 @@ func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
+ // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
+ // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
+ // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
+-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
+-	resp, err := c.HTTP.Do(req)
++func (c *Client) doJSON(a *auth.Auth, req *http.Request) (json.RawMessage, error) {
++	client, cerr := c.clientFor(a, false)
++	if cerr != nil {
++		return nil, cerr
++	}
++	resp, err := client.Do(req)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -1018,12 +1081,13 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
+ 		EnterpriseID: a.EnterpriseID,
+ 		Nickname:     a.Nickname,
+ 		DeviceToken:  a.DeviceToken,
++		ProxyName:    a.ProxyName,
+ 	}
+ 	a.Unlock()
+ 	c.RefreshHeaders(req, &hdrSnapshot)
+ 
+ 	// 网络 I/O（锁外，30s 上限）。
+-	data, err := c.doJSON(req)
++	data, err := c.doJSON(&hdrSnapshot, req)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -1134,6 +1198,12 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
+ 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
+ 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
++	chatClient, cerr := c.chatHTTPFor(a)
++	if cerr != nil {
++		// 线路配置错误：立刻失败、**不进轮转**（换多少个号都一样），也不喂熔断 ——
++		// 这是配置问题，不是账号问题（见 clientFor 的注释）。
++		return nil, 0, nil, cerr
++	}
+ 	paths := c.chatPaths(a)
+ 	for i, path := range paths {
+ 		url := c.chatBase(a) + path
+@@ -1146,14 +1216,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
+ 		reqCtx, cancel := context.WithCancel(ctx)
+ 		req = req.WithContext(reqCtx)
+-		resp, err := c.chatHTTP().Do(req)
++		resp, err := chatClient.Do(req)
+ 		if err != nil {
+ 			cancel()
+ 			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
+ 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固第 5 件）：
+ 			// 失败连接可能仍留在空闲池里，下一个请求会继续捡到它（kongjianguan
+ 			// 实测：仅靠 IdleConnTimeout 等过期不够，主动清池才断根）。
+-			roundTripCloseIdle(c.chatHTTP().Transport)
++			roundTripCloseIdle(chatClient.Transport)
+ 			return nil, 0, nil, err
+ 		}
+ 		if resp.StatusCode >= 400 {
+diff --git a/internal/upstream/proxy_route_test.go b/internal/upstream/proxy_route_test.go
+new file mode 100644
+index 0000000..f4848da
+--- /dev/null
++++ b/internal/upstream/proxy_route_test.go
+@@ -0,0 +1,119 @@
++package upstream
++
++import (
++	"net/http"
++	"net/url"
++	"strings"
++	"testing"
++
++	"workbuddy2api/internal/auth"
++)
++
++// 账号级出口线路（issue #210）。
++//
++// 面板早就能给账号绑线路（auths/*.json 顶层 proxy 写线路名），但上游此前完全不读：
++// 出站只有 ProxyFromEnvironment（进程级），于是「每个号一条出口」只是界面上看起来
++// 生效，真正的对话流量还是全池共用宿主出口 IP。多号同 IP 正是平台最容易关联的特征。
++func TestTransportForRoute(t *testing.T) {
++	ConfigureProxies(map[string]string{
++		"route-a": "socks5h://user:pass@a.example:1080",
++		"route-b": "http://b.example:8080",
++	})
++	t.Cleanup(func() { ConfigureProxies(nil) })
++
++	// 空名 = 默认（进程级环境代理），不是错误
++	def, err := TransportFor("")
++	if err != nil || def == nil {
++		t.Fatalf("空线路名应返回默认 Transport：%v", err)
++	}
++
++	a, err := TransportFor("route-a")
++	if err != nil {
++		t.Fatalf("route-a: %v", err)
++	}
++	u, perr := a.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "api.example"}})
++	if perr != nil || u == nil {
++		t.Fatalf("route-a 没配置代理：%v", perr)
++	}
++	if u.Scheme != "socks5" {
++		t.Errorf("socks5h 应归一成 socks5（Go 的 socks5 拨号本身远端解析），got %q", u.Scheme)
++	}
++	if u.Host != "a.example:1080" {
++		t.Errorf("代理地址不对：%q", u.Host)
++	}
++
++	// 同一条线路必须复用同一个 Transport（连接池分开缓存，出口才不会串）
++	again, _ := TransportFor("route-a")
++	if again != a {
++		t.Error("同一线路名两次取到不同 Transport —— 连接池会分裂，出口可能串")
++	}
++	b, _ := TransportFor("route-b")
++	if b == a {
++		t.Error("不同线路拿到了同一个 Transport —— 连接池共用会让 A 的空闲连接给 B 用，出口串")
++	}
++	if u2, _ := b.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "x"}}); u2 == nil || u2.Host != "b.example:8080" {
++		t.Errorf("route-b 的代理不对：%v", u2)
++	}
++}
++
++func TestTransportForUnknownRouteFails(t *testing.T) {
++	ConfigureProxies(map[string]string{"route-a": "http://a.example:8080"})
++	t.Cleanup(func() { ConfigureProxies(nil) })
++
++	_, err := TransportFor("route-z")
++	if err == nil {
++		t.Fatal("未知线路必须报错 —— 静默直连会让用户以为已经隔离")
++	}
++	if !strings.Contains(err.Error(), "route-z") {
++		t.Errorf("错误里要带线路名，便于对照 config.json：%v", err)
++	}
++
++	// 一条线路都没配时，错误要说清「上游没有线路表」而不是「未知线路」
++	ConfigureProxies(nil)
++	_, err = TransportFor("route-a")
++	if err == nil || !strings.Contains(err.Error(), "proxies") {
++		t.Errorf("空线路表时应提示去配 proxies 段：%v", err)
++	}
++}
++
++func TestTransportForRejectsBadAddress(t *testing.T) {
++	ConfigureProxies(map[string]string{
++		"bad-scheme": "ftp://x.example:21",
++		"no-host":    "socks5://",
++	})
++	t.Cleanup(func() { ConfigureProxies(nil) })
++	for name := range map[string]bool{"bad-scheme": true, "no-host": true} {
++		if _, err := TransportFor(name); err == nil {
++			t.Errorf("%s 应报错（地址非法）", name)
++		}
++	}
++}
++
++func TestClientForUsesAccountRoute(t *testing.T) {
++	ConfigureProxies(map[string]string{"route-a": "http://a.example:8080"})
++	t.Cleanup(func() { ConfigureProxies(nil) })
++
++	c := New()
++	// 没绑线路 → 复用原 client（行为一字不变）
++	plain, err := c.clientFor(&auth.Auth{UID: "u1"}, false)
++	if err != nil || plain != c.HTTP {
++		t.Fatalf("未绑线路应沿用共享 client：%v", err)
++	}
++	// 绑了线路 → 换 Transport，且代理指向该线路
++	bound, err := c.clientFor(&auth.Auth{UID: "u2", ProxyName: "route-a"}, false)
++	if err != nil {
++		t.Fatalf("绑线路取 client 失败：%v", err)
++	}
++	tr, ok := bound.Transport.(*http.Transport)
++	if !ok {
++		t.Fatalf("Transport 类型不对：%T", bound.Transport)
++	}
++	u, _ := tr.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "api"}})
++	if u == nil || u.Host != "a.example:8080" {
++		t.Errorf("绑定的线路没生效：%v", u)
++	}
++	// 未知线路 → 明确报错（且错误里带账号标签，排障时知道是哪个号）
++	if _, err := c.clientFor(&auth.Auth{UID: "u3", Nickname: "坏号", ProxyName: "nope"}, true); err == nil {
++		t.Error("未知线路必须报错")
++	}
++}
+diff --git a/internal/upstream/report.go b/internal/upstream/report.go
+index bf320ed..2509bf6 100644
+--- a/internal/upstream/report.go
++++ b/internal/upstream/report.go
+@@ -37,7 +37,7 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
+ 		return nil, err
+ 	}
+ 	c.BillingHeaders(req, a)
+-	return c.doJSON(req)
++	return c.doJSON(a, req)
+ }
+ 
+ // chatRequestEvent 客户端 chat_request_send 事件完整形状（与 probe_active.py chat_event 对齐）。
+diff --git a/internal/upstream/transport.go b/internal/upstream/transport.go
+index abf72ec..b7a517f 100644
+--- a/internal/upstream/transport.go
++++ b/internal/upstream/transport.go
+@@ -7,8 +7,13 @@ package upstream
+ 
+ import (
+ 	"crypto/tls"
++	"fmt"
+ 	"net"
+ 	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"sync"
+ 	"time"
+ )
+ 
+@@ -85,7 +90,7 @@ func newTransport() *http.Transport {
+ 		// 空 TLSNextProto（非 nil）真正禁 h2：见函数注释。必须 make 而非 nil——
+ 		// nil 表示「让标准库注入默认 h2 映射」（kongjianguan 实测：设
+ 		// ForceAttemptHTTP2=false 后日志仍报 h2 timeout，正是这个陷阱）。
+-		TLSNextProto: make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
++		TLSNextProto:          make(map[string]func(authority string, c *tls.Conn) http.RoundTripper),
+ 		TLSHandshakeTimeout:   tlsHandshakeTimeout,
+ 		MaxIdleConns:          maxIdleConns,
+ 		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+@@ -94,6 +99,112 @@ func newTransport() *http.Transport {
+ 	}
+ }
+ 
++// ── 账号级出口线路（issue #210）──────────────────────────────────────────
++//
++// 面板早就能给账号绑一条命名线路（`auths/*.json` 顶层的 `proxy` 字段），但上游
++// 此前**完全不读**它：出站只有 `ProxyFromEnvironment`（进程级），于是所有账号共用
++// 宿主出口 IP —— 界面上看起来已经隔离，实际没有。多号同 IP 正是平台最容易关联的
++// 特征，所以这里按线路名构造并**分开缓存** Transport（连接池必须分开：共用一份会把
++// A 线路的空闲连接复用给 B 线路，出口照样会串）。
++//
++// 线路表来自 `config.json` 的 `proxies` 段（线路名 → 代理地址）。线路名查不到时
++// **明确报错、不静默直连** —— 静默直连会给出「以为隔离了其实没隔离」这个最坏结果。
++var routes = struct {
++	mu    sync.RWMutex
++	table map[string]string
++	cache map[string]*http.Transport
++}{table: map[string]string{}, cache: map[string]*http.Transport{}}
++
++// ConfigureProxies 注入「线路名 → 代理地址」表（main 启动时调用一次；传 nil 清空）。
++func ConfigureProxies(table map[string]string) {
++	routes.mu.Lock()
++	defer routes.mu.Unlock()
++	routes.table = map[string]string{}
++	// 清缓存：地址改了必须重建连接池，否则旧代理连接会继续用
++	routes.cache = map[string]*http.Transport{}
++	for name, addr := range table {
++		n := strings.TrimSpace(name)
++		v := strings.TrimSpace(addr)
++		if n != "" && v != "" {
++			routes.table[n] = v
++		}
++	}
++}
++
++// RouteNames 已配置的线路名（升序；供启动日志与排障）。
++func RouteNames() []string {
++	routes.mu.RLock()
++	defer routes.mu.RUnlock()
++	out := make([]string, 0, len(routes.table))
++	for name := range routes.table {
++		out = append(out, name)
++	}
++	sort.Strings(out)
++	return out
++}
++
++// normalizeProxyURL 归一化代理地址：`socks5h://` 与 `socks5://` 等价（Go 的 socks5
++// 拨号本身把域名交给代理解析），统一成 `socks5://`；其余 scheme 原样。
++func normalizeProxyURL(raw string) (*url.URL, error) {
++	v := strings.TrimSpace(raw)
++	if v == "" {
++		return nil, fmt.Errorf("empty proxy address")
++	}
++	u, err := url.Parse(v)
++	if err != nil {
++		return nil, fmt.Errorf("invalid proxy address: %w", err)
++	}
++	switch strings.ToLower(u.Scheme) {
++	case "socks5h":
++		u.Scheme = "socks5"
++	case "socks5", "http", "https":
++	default:
++		return nil, fmt.Errorf("unsupported proxy scheme %q (want http/https/socks5/socks5h)", u.Scheme)
++	}
++	if u.Host == "" {
++		return nil, fmt.Errorf("proxy address has no host: %q", v)
++	}
++	return u, nil
++}
++
++// TransportFor 返回线路名对应的出站 Transport：
++//   - 空名 → 默认（进程级环境代理，见 newTransport）
++//   - 已配置 → 该线路专属 Transport（按名缓存，连接池与默认分开）
++//   - 未配置 → error（不静默直连；错误里带线路名，便于对照 config.json）
++func TransportFor(name string) (*http.Transport, error) {
++	if strings.TrimSpace(name) == "" {
++		return newTransport(), nil
++	}
++	routes.mu.RLock()
++	addr, ok := routes.table[name]
++	cached := routes.cache[name]
++	known := len(routes.table)
++	routes.mu.RUnlock()
++	if !ok {
++		if known == 0 {
++			return nil, fmt.Errorf("账号绑定了出口线路 %q，但上游没有配置任何线路"+
++				"（config.json 的 proxies 段）", name)
++		}
++		return nil, fmt.Errorf("未知的出口线路 %q（config.json 的 proxies 里没有它）", name)
++	}
++	if cached != nil {
++		return cached, nil
++	}
++	u, err := normalizeProxyURL(addr)
++	if err != nil {
++		return nil, fmt.Errorf("出口线路 %q 的地址无效：%w", name, err)
++	}
++	tr := newTransport()
++	tr.Proxy = http.ProxyURL(u)
++	routes.mu.Lock()
++	if routes.cache == nil {
++		routes.cache = map[string]*http.Transport{}
++	}
++	routes.cache[name] = tr
++	routes.mu.Unlock()
++	return tr, nil
++}
++
+ // closeIdler 实现该接口的 RoundTripper 支持清空空闲连接池（*http.Transport、
+ // http2.Transport 等均满足；测试注入的自定义 RoundTripper 可选择性实现）。
+ type closeIdler interface {
+diff --git a/internal/upstream/travel.go b/internal/upstream/travel.go
+index 389a9fb..ba7f895 100644
+--- a/internal/upstream/travel.go
++++ b/internal/upstream/travel.go
+@@ -57,7 +57,7 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
+ 		return nil, err
+ 	}
+ 	c.BillingHeaders(req, a)
+-	return c.doJSON(req)
++	return c.doJSON(a, req)
+ }
+ 
+ // TravelStatus 查询猫猫旅行状态。

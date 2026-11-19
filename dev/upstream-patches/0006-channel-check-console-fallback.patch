@@ -1,0 +1,342 @@
+diff --git a/internal/server/channel_check_test.go b/internal/server/channel_check_test.go
+new file mode 100644
+index 0000000..0cf4573
+--- /dev/null
++++ b/internal/server/channel_check_test.go
+@@ -0,0 +1,107 @@
++package server
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/upstream"
++)
++
++// 渠道校验的处置：**换路径兜底 + 绝不禁用**（2026-10-17 用户报告）。
++//
++// 现场：上游对 /v2/chat/completions 新增渠道强校验，被校验到的号在面板上显示
++// 「已禁用（需重新登录）」—— 用户以为凭证坏了去重扫，扫完还是被禁。实际是凭封套里
++// 那句历史遗留的 `request illegal` 落进了「账号被封 → 硬禁用」，而账号本身是好的。
++// 官方客户端走的 /console 端点并未加强校验（报告方实测：换过去就通了）。
++
++// channelCheckBody 一次渠道校验的封套。业务码拼接构造，避免手抄整串出错。
++func channelCheckBody() string {
++	code := "1" + "1" + "1" + "2" + "8"
++	return `{"code":` + code + `,"msg":"request illegal","requestId":"x",` +
++		`"displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。",` +
++		`"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`
++}
++
++func sseResponse(status int, body string) *http.Response {
++	ct := "application/json"
++	if status == 200 {
++		ct = "text/event-stream"
++	}
++	return &http.Response{
++		StatusCode: status,
++		Header:     http.Header{"Content-Type": []string{ct}},
++		Body:       io.NopCloser(strings.NewReader(body)),
++	}
++}
++
++func TestChatFallsBackToConsoleOnChannelCheck(t *testing.T) {
++	var paths []string
++	up := &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			paths = append(paths, r.URL.Path)
++			if strings.Contains(r.URL.Path, "/v2/chat/completions") {
++				return sseResponse(400, channelCheckBody()), nil
++			}
++			return sseResponse(200, sseOK), nil
++		})},
++		ChatBaseCN:    "https://fake.example",
++		BillingBaseCN: "https://fake.example",
++	}
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 600 * time.Second})
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
++	if rec.Code != 200 {
++		t.Fatalf("应经 /console 兜底成功，got code=%d body=%s", rec.Code, rec.Body.String())
++	}
++	var sawV2, sawConsole bool
++	for _, p := range paths {
++		sawV2 = sawV2 || strings.Contains(p, "/v2/chat/completions")
++		sawConsole = sawConsole || strings.Contains(p, "/console/chat/completions")
++	}
++	if !sawV2 || !sawConsole {
++		t.Fatalf("应先在 /v2 被拒再换 /console，实际路径=%v", paths)
++	}
++	st, _ := p.Status("u1")
++	if st.Disabled {
++		t.Error("换路径已经成功，账号不该被禁用")
++	}
++	if st.Cooling {
++		t.Error("换路径已经成功，账号不该被冷却")
++	}
++}
++
++func TestChatChannelCheckNeverDisables(t *testing.T) {
++	// 两条路径都被渠道校验拒：软冷却（退出轮换、别被反复选中），但**不禁用** ——
++	// 禁用会写「需重新登录」，把用户指向错误的排查方向（凭证是好的）。
++	up := &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			return sseResponse(400, channelCheckBody()), nil
++		})},
++		ChatBaseCN:    "https://fake.example",
++		BillingBaseCN: "https://fake.example",
++	}
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: 600 * time.Second})
++
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
++	st, _ := p.Status("u1")
++	if st.Disabled {
++		t.Fatalf("渠道校验**绝不能**禁用账号（用户报告的症状）：reason=%q", st.DisabledReason)
++	}
++	if !st.Cooling || st.CoolKind != "soft_rate" {
++		t.Fatalf("两条路径都被拒时应软冷却让它退出轮换：%+v", st)
++	}
++	if !strings.Contains(st.Reason, "channel check") {
++		t.Errorf("冷却原因应写明是渠道校验，便于排障：%q", st.Reason)
++	}
++}
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 3841802..c2ac50e 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -1145,6 +1145,18 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		// 三条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
+ 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
+ 		lowerBody := strings.ToLower(body)
++		// **渠道校验必须判在「request illegal」之前**（用户报告 2026-10-17）：同一次
++		// 渠道校验会随封套给出不同的 msg（`request illegal` / `conversation id missing`
++		// / 中文「没通过渠道校验」），而按 msg 分野时 `request illegal` 那条会**硬禁用**
++		// 账号 —— 于是被校验到的号在面板上显示「已禁用（需重新登录）」，用户以为凭证
++		// 坏了去重扫，扫完还是被禁（凭证从来没问题）。账号本身是好的，禁用是误判。
++		// 上游层已先做过换路径兜底（/v2 → /console，见 upstream.chatPaths）；两条都被
++		// 拒才走到这里：软冷却让它退出轮换（别被反复选中），但**不清凭证、不标禁用**。
++		if upstream.IsChannelCheck(body) {
++			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown,
++				"channel check ("+upstreamCodeLabel(body, uerr)+")")
++			return
++		}
+ 		if strings.Contains(lowerBody, "request illegal") {
+ 			// 理由里带**响应自己的码**（issue #201 缺陷 1：此前写死 11140，而真实响应
+ 			// 是 http 400 + code 11-128 —— 按 11140 去搜会把排障方向带偏）。
+diff --git a/internal/upstream/channel_check_test.go b/internal/upstream/channel_check_test.go
+new file mode 100644
+index 0000000..43fb550
+--- /dev/null
++++ b/internal/upstream/channel_check_test.go
+@@ -0,0 +1,76 @@
++package upstream
++
++import "testing"
++
++// 渠道校验的识别与路径兜底（2026-10-17 用户报告）。
++//
++// 现场：上游对 /v2/chat/completions 新增渠道强校验，被校验到的请求回
++// 「没通过渠道校验，可能不是官方客户端发出的」；而官方客户端走的 /console 端点放行。
++// 此前这类响应要么落通用 4xx（只换号不罚、坏号留在池里次次失败），要么被封套里的
++// `request illegal` 带进「账号被封 → 硬禁用」—— 于是面板上显示「已禁用（需重新登录）」，
++// 用户重扫也没用（凭证从来没问题）。
++//
++// 注意：下面这串业务码**一律拼接构造**，不手写整串 —— 它在手抄时极易写成 1138/1128，
++// 而它正是判据本身，抄错会让测试「通过」一个不存在的判据（第一次写这文件就抄错了）。
++var (
++	codeDashed = "1" + "1" + "-" + "1" + "2" + "8" // 实测体里的写法
++	codePlain  = "1" + "1" + "1" + "2" + "8"       // 报告方另见的写法
++)
++
++// channelBody 一次渠道校验的真实封套：中文「渠道校验」+ 英文 displayTips +
++// 历史遗留的 `request illegal` msg（后者正是误禁用账号的触发点）。
++var channelBody = `{"code":` + codePlain + `,"msg":"request illegal","requestId":"x",` +
++	`"displayMsg":{"zh":"请求被拦截，请重新发送"},` +
++	`"displayTips":{"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。",` +
++	`"en":"This call failed channel verification, possibly because it was not sent from an official client."}}`
++
++func TestIsChannelCheckMatches(t *testing.T) {
++	if !IsChannelCheck(channelBody) {
++		t.Fatal("中文「渠道校验」文案必须被识别")
++	}
++	for _, code := range []string{
++		`"code":` + codeDashed,
++		`"code":` + codePlain,
++		`"code":"` + codeDashed + `"`,
++	} {
++		body := `{` + code + `,"displayTips":{"en":"This call failed channel verification"}}`
++		if !IsChannelCheck(body) {
++			t.Errorf("码写法 %s 没被识别", code)
++		}
++	}
++	// 英文 displayTips 单独也要能命中（中文可能被上游换掉）。
++	if !IsChannelCheck(`{"code":` + codePlain + `,"displayTips":{"en":"possibly because it was not sent from an official client"}}`) {
++		t.Error("英文 official client 文案没被识别")
++	}
++}
++
++func TestIsChannelCheckDoesNotSwallowContentBlock(t *testing.T) {
++	// 同一个码也承载「内容审核拦截」：那种必须保持原行为（不换路径、不罚号、
++	// 走降级重试），不能被这条规则吞成账号级。
++	content := `{"code":` + codeDashed + `,"msg":"blocked by security policy"}`
++	if IsChannelCheck(content) {
++		t.Fatal("内容审核拦截被误判成渠道校验 —— 会让它不再走降级重试")
++	}
++	if got := Classify(400, content); got != ErrContentBlocked {
++		t.Errorf("内容审核拦截的分类被影响：%v", got)
++	}
++	if IsChannelCheck(`{"msg":"request illegal"}`) {
++		t.Error("没有渠道校验文案时不该命中")
++	}
++}
++
++func TestClassifyRoutesChannelCheckToAccountFault(t *testing.T) {
++	// 归账号级是为了让 handler 的 ErrAccountFault 分支接管（那里最先判它、只软冷却）。
++	// 落通用 4xx 的后果是「只换号不罚」：坏号留在池里、每次被选中都失败。
++	if got := Classify(400, channelBody); got != ErrAccountFault {
++		t.Errorf("渠道校验应归 ErrAccountFault（供 handler 软冷却），got %v", got)
++	}
++}
++
++func TestChatPathsHaveConsoleFallback(t *testing.T) {
++	c := &Client{}
++	paths := c.chatPaths(nil)
++	if len(paths) != 2 || paths[0] != "/v2/chat/completions" || paths[1] != "/console/chat/completions" {
++		t.Fatalf("路径候选应为 [/v2, /console]（/v2 优先，兜底 /console），got %v", paths)
++	}
++}
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index d89cbeb..288c723 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -260,7 +260,7 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
+ //
+ // 只在 400/404/413 请求级状态码上判（429+11115 概率极低且属限流语义优先，
+ // 5xx 属服务端故障优先）——与 IsModelBlocked 的 400/404 口径同理。误判代价
+-//（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
++// （好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
+ // 上游原文可自行排查，代价可控。
+ var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
+ 	`"code":11115`,
+@@ -295,7 +295,7 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
+ // 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
+ // 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
+ var (
+-	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
++	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+ 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
+ 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
+ )
+@@ -588,6 +588,13 @@ func Classify(status int, body string) ErrKind {
+ 	if sessionDeadRule.hit(body, lower) {
+ 		return ErrSessionDead
+ 	}
++	// 渠道校验（/v2 上的新强校验，2026-10-17）：归**账号级**分类，但 applyErrorPolicy
++	// 里最先判它、只做软冷却（绝不禁用，理由见那里的注释）。不在这里归类的话：没带
++	// `request illegal` 字样的渠道校验会落通用 4xx「只换号不罚号」，坏号留在池里
++	// "显示健康、每次被选中都失败" —— 与 issue #201 缺陷 2 同型。
++	if IsChannelCheck(body) {
++		return ErrAccountFault
++	}
+ 	if accountFaultRule.hit(body, lower) {
+ 		return ErrAccountFault
+ 	}
+@@ -1063,8 +1070,29 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
+ 	return nil
+ }
+ 
+-// 路径常量：CN 与 global 共用的 chat 出站路径（/v2 单路径）。
+-const chatCompletionsPath = "/v2/chat/completions"
++// chat 出站路径：/v2 为主，/console 作为**兜底**（见 chatPaths）。
++const (
++	chatCompletionsPath = "/v2/chat/completions"
++	chatConsolePath     = "/console/chat/completions"
++)
++
++// IsChannelCheck 判上游的「渠道校验」拒绝（11128 / 11-128 家族，2026-10-17）。
++//
++// 指纹要**两条同时成立**：业务码（11128 或 11-128）**且**文案里出现渠道校验的措辞。
++// 只认码不行 —— 同一个 11-128 还承载「内容审核拦截」（`blocked by security policy`，
++// 见 contentBlockedRule），那种必须保持原行为（不换路径、不罚号、走降级重试）。
++// 文案两种语言都可能出现：中文「渠道校验」与英文 displayTips 的 channel verification
++// / official client；`request illegal` 这类历史 msg 也可能随同一封套出现，所以不能
++// 拿 msg 当判据。
++func IsChannelCheck(body string) bool {
++	lower := strings.ToLower(body)
++	if !codeMarker(lower, "11128") && !codeMarker(lower, "11-128") {
++		return false
++	}
++	return strings.Contains(body, "渠道校验") ||
++		strings.Contains(lower, "channel verification") ||
++		strings.Contains(lower, "official client")
++}
+ 
+ // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
+ // DeptestOnly: 全库仅 upstream 包测试引用；生产全走 ChatStreamContext
+@@ -1106,7 +1134,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
+ 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
+ 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
+-	for _, path := range c.chatPaths(a) {
++	paths := c.chatPaths(a)
++	for i, path := range paths {
+ 		url := c.chatBase(a) + path
+ 		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
+ 		if err != nil {
+@@ -1140,8 +1169,21 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 			kind := Classify(resp.StatusCode, string(raw))
+ 			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
+ 				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
+-			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链；billing 层的
+-			// 404 fallback 独立存在，语义不受影响）。
++			// 路径级拒绝 → 换下一个候选路径再试，**不**把它当账号问题。
++			//   · 渠道校验（11128/11-128）：/v2 新增强校验，/console 放行（见 chatPaths）；
++			// 触发条件**只有渠道校验**：404/405 不回落是 #119 的刻意取舍（/console 挂
++			// WAF 内容规则，不能因为路径写错就整批改道），契约由
++			// TestGlobalChatNoFallbackOn404 钉着；渠道校验是另一回事 —— /v2 新加强
++			// 校验而 /console 放行，不换就是整池被拦。只在还有候选时继续；两条都
++			// 失败仍按下面原有逻辑返回，由 handler 决定怎么罚号 —— 那时也**不该禁用**
++			// （见 handler 的 ErrAccountFault 分支）。
++			if i < len(paths)-1 && IsChannelCheck(string(raw)) {
++				log.Printf("WARN: [upstream] chat_stream acct=%s: %s 被拒（%d），换路径 %s 重试",
++					logfmt.Label(a.UID, a.Nickname), path, resp.StatusCode, paths[i+1])
++				continue
++			}
++			// ≥400 直接返回（除上面的渠道校验换路径外，chat 层无 fallback 链；billing
++			// 层的 404 fallback 独立存在，语义不受影响）。
+ 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析，P1-2）：
+ 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
+ 			if kind == ErrNone {
+@@ -1161,10 +1203,18 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
+ }
+ 
+-// chatPaths 返回按 realm 的 chat 路径候选序列：
+-// global → [/v2]（#119 固定单路径，见 ChatStreamContext 头注释）；cn → [/v2]（单元素，现状）。
++// chatPaths 返回按 realm 的 chat 路径候选序列：**/v2 优先，/console 兜底**。
++//
++// 兜底是 2026-10-17 加的（用户报告 + 实测）：上游对 /v2/chat/completions 新增了渠道
++// 强校验 —— 被校验到的请求回 11128 / 11-128「没通过渠道校验，可能不是官方客户端发出的」，
++// 而官方客户端走的 /console 端点正常放行；换过去之后连通性测试与对话全部恢复。
++//
++// 与 #119 的关系：那时实测 /console 挂腾讯云 WAF 的 body 内容规则（反引号 printf/whoami
++// 等命令执行特征确定性 403），所以把 /v2 定为主路径 —— 这一点没变：**只有** /v2 被判定为
++// 渠道校验时才换 /console（见 ChatStreamContext 的 fallback 条件），主路径行为零改动。
++// 这也正是 #119 注释里写的「若上游未来关闭 /v2，届时应重新启用 /console」。
+ func (c *Client) chatPaths(a *auth.Auth) []string {
+-	return []string{chatCompletionsPath}
++	return []string{chatCompletionsPath, chatConsolePath}
+ }
+ 
+ // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。

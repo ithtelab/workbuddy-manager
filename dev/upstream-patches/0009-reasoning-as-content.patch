@@ -1,0 +1,466 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index 0d570df..f483e0e 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -28,6 +28,16 @@ type Config struct {
+ 	// 「以为隔离了其实没隔离」，见 upstream.TransportFor）。
+ 	Proxies map[string]string `json:"proxies"`
+ 
++	// ReasoningAsContent 思考通道兜底（issue #135）：国际版 deepseek 思考模式下
++	// 答案只出现在 reasoning_content、content 恒空，只看 content 的客户端会看到
++	// 空回复。开启后，**整轮既无正文也无工具调用**时把思考原文同时作为 content
++	// 下发；正常轮次零改动。
++	//
++	// 默认 true（空回复比重复更难接受）。代价：同时渲染两个字段的客户端会把同一
++	// 段话显示两遍 —— 遇到就设 `"reasoning_as_content": false`，或环境变量
++	// WB2A_REASONING_AS_CONTENT=0。指针类型用于区分「没写」与「显式 false」。
++	ReasoningAsContent *bool `json:"reasoning_as_content"`
++
+ 	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
+ 
+ 	Cooldown struct {
+@@ -198,6 +208,8 @@ func Default() *Config {
+ 	// 显式 client_name="SaaS" 还原旧行为。
+ 	c.Upstream.ClientName = "WorkBuddy"
+ 	c.Features.SanitizeBlacklistFingerprints = true
++	reasoningFallback := true
++	c.ReasoningAsContent = &reasoningFallback
+ 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：默认透传客户端原始 system；显式配置 custom 仍可覆盖回替换
+ 	c.Pool.MaxInFlight = 3
+ 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403
+@@ -263,6 +275,10 @@ func applyEnv(c *Config) {
+ 	if v := os.Getenv("WB2A_CREDIT_EXHAUSTED"); v != "" {
+ 		c.Cooldown.CreditExhausted = v
+ 	}
++	if v := strings.TrimSpace(os.Getenv("WB2A_REASONING_AS_CONTENT")); v != "" {
++		on := !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "off"))
++		c.ReasoningAsContent = &on
++	}
+ 	if v := strings.TrimSpace(os.Getenv("WB2A_PROXIES")); v != "" {
+ 		var table map[string]string
+ 		if err := json.Unmarshal([]byte(v), &table); err == nil {
+@@ -343,6 +359,10 @@ func (c *Config) normalize() error {
+ 	// 出口线路表：名字与地址都去空白；scheme 只认 http/https/socks5/socks5h。
+ 	// 这里**启动即校验**：地址写错时让上游起不来（带明确提示），比跑起来以后每个
+ 	// 请求都失败容易发现得多；线路名查不到（账号引用了不存在的名字）则在用时明确报错。
++	if c.ReasoningAsContent == nil {
++		on := true
++		c.ReasoningAsContent = &on
++	}
+ 	if len(c.Proxies) > 0 {
+ 		clean := make(map[string]string, len(c.Proxies))
+ 		for name, addr := range c.Proxies {
+diff --git a/cmd/server/config_test.go b/cmd/server/config_test.go
+index 33758bc..a3a75b3 100644
+--- a/cmd/server/config_test.go
++++ b/cmd/server/config_test.go
+@@ -749,3 +749,45 @@ func TestPromptInvalidModeStillErrors(t *testing.T) {
+ 		t.Errorf("error should mention (custom / append / passthrough): %v", err)
+ 	}
+ }
++
++// 思考通道兜底（issue #135）：默认开；JSON 显式 false 与 env 都能关。
++func TestReasoningAsContentDefaultAndOverride(t *testing.T) {
++	c, err := Load("")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c.ReasoningAsContent == nil || !*c.ReasoningAsContent {
++		t.Fatalf("默认应为 true，实际 %v", c.ReasoningAsContent)
++	}
++
++	dir := t.TempDir()
++	fp := filepath.Join(dir, "c.json")
++	if err := os.WriteFile(fp, []byte(`{"reasoning_as_content":false}`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	c, err = Load(fp)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c.ReasoningAsContent == nil || *c.ReasoningAsContent {
++		t.Fatalf("JSON 显式 false 应生效，实际 %v", c.ReasoningAsContent)
++	}
++
++	t.Setenv("WB2A_REASONING_AS_CONTENT", "1")
++	c, err = Load(fp)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c.ReasoningAsContent == nil || !*c.ReasoningAsContent {
++		t.Fatalf("环境变量应覆盖 JSON，实际 %v", c.ReasoningAsContent)
++	}
++
++	t.Setenv("WB2A_REASONING_AS_CONTENT", "0")
++	c, err = Load("")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c.ReasoningAsContent == nil || *c.ReasoningAsContent {
++		t.Fatalf("环境变量 0 应关闭，实际 %v", c.ReasoningAsContent)
++	}
++}
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index ca5a055..de1599c 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -86,6 +86,12 @@ func main() {
+ 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+ 	// 账号级出口线路（issue #210）：面板绑在线路名上，这里把名字解析成地址。
+ 	upstream.ConfigureProxies(cfg.Proxies)
++	// 思考通道兜底（issue #135）：默认开启；显式关掉时打一行日志，免得"为什么
++	// 只看 content 的客户端又空了"变成悬案。
++	upstream.ConfigureReasoningFallback(cfg.ReasoningAsContent == nil || *cfg.ReasoningAsContent)
++	if !upstream.ReasoningFallbackEnabled() {
++		log.Printf("思考通道兜底已关闭：只含 reasoning_content 的回复不会再补成 content")
++	}
+ 	if names := upstream.RouteNames(); len(names) > 0 {
+ 		log.Printf("出口线路已加载：%d 条（%s）—— 账号绑定的线路名按它解析",
+ 			len(names), strings.Join(names, ", "))
+diff --git a/internal/upstream/reasoning_fallback.go b/internal/upstream/reasoning_fallback.go
+new file mode 100644
+index 0000000..6e7a8dc
+--- /dev/null
++++ b/internal/upstream/reasoning_fallback.go
+@@ -0,0 +1,36 @@
++package upstream
++
++import (
++	"sync/atomic"
++)
++
++// reasoningAsContent 是「思考通道兜底」的进程级开关（issue #135）。
++//
++// 背景：国际版 deepseek 系模型在思考模式下，答案只出现在 reasoning_content，
++// content 恒为空。只看 content 的 OpenAI 兼容客户端（大多数）会把「只有思考」
++// 判成空回复，用户看到的就是「模型没有输出」。
++//
++// 兜底条件刻意很窄：**整轮既没有正文、也没有工具调用**，才把思考原文同时作为
++// content 下发。有正文或有工具调用的正常轮次零改动。
++//
++// 已知代价：同时渲染 reasoning_content 与 content 的客户端（如 DeepSeek 自家
++// 客户端）会把同一段话显示两遍。默认开启（空回复比重复更难接受），需要时可用
++// 配置 `reasoning_as_content: false` 或环境变量 `WB2A_REASONING_AS_CONTENT=0` 关掉。
++//
++// 用 atomic 而不是普通变量：读发生在每个请求的流处理 goroutine 里，测试会并发
++// 跑；启动后只写一次，读多写一，atomic 足够且免锁。
++var reasoningAsContent atomic.Bool
++
++func init() {
++	reasoningAsContent.Store(true)
++}
++
++// ConfigureReasoningFallback 设置兜底开关（启动时调用一次；测试可来回切）。
++func ConfigureReasoningFallback(on bool) {
++	reasoningAsContent.Store(on)
++}
++
++// ReasoningFallbackEnabled 报告当前是否启用兜底（供测试与启动日志使用）。
++func ReasoningFallbackEnabled() bool {
++	return reasoningAsContent.Load()
++}
+diff --git a/internal/upstream/reasoning_fallback_test.go b/internal/upstream/reasoning_fallback_test.go
+new file mode 100644
+index 0000000..d6895a1
+--- /dev/null
++++ b/internal/upstream/reasoning_fallback_test.go
+@@ -0,0 +1,198 @@
++package upstream
++
++import (
++	"encoding/json"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++// 思考通道兜底（issue #135）：国际版 deepseek 思考模式下正文只在
++// reasoning_content 里，只看 content 的客户端会显示空回复。
++//
++// 契约（刻意很窄）：
++//
++//	· 整轮**既无正文、也无工具调用** → 把思考原文同时作为 content 下发；
++//	· 有正文 / 有工具调用的正常轮次 → 零改动；
++//	· 开关关闭 → 与旧行为逐字节一致。
++func withReasoningFallback(t *testing.T, on bool) {
++	t.Helper()
++	old := ReasoningFallbackEnabled()
++	ConfigureReasoningFallback(on)
++	t.Cleanup(func() { ConfigureReasoningFallback(old) })
++}
++
++func sseFrame(t *testing.T, delta map[string]any) string {
++	t.Helper()
++	raw, err := json.Marshal(map[string]any{
++		"id": "chatcmpl-x", "object": "chat.completion.chunk", "created": 1,
++		"choices": []any{map[string]any{"index": 0, "delta": delta}},
++	})
++	if err != nil {
++		t.Fatalf("marshal frame: %v", err)
++	}
++	return "data: " + string(raw)
++}
++
++func messageOf(t *testing.T, resp map[string]any) map[string]any {
++	t.Helper()
++	choices, _ := resp["choices"].([]any)
++	if len(choices) == 0 {
++		t.Fatalf("no choices in %v", resp)
++	}
++	c, _ := choices[0].(map[string]any)
++	msg, _ := c["message"].(map[string]any)
++	if msg == nil {
++		t.Fatalf("no message in %v", c)
++	}
++	return msg
++}
++
++func TestAggregateBackfillsReasoningAsContent(t *testing.T) {
++	withReasoningFallback(t, true)
++	raw := strings.Join([]string{
++		sseFrame(t, map[string]any{"role": "assistant", "reasoning_content": "思考A"}),
++		"",
++		sseFrame(t, map[string]any{"reasoning_content": "思考B"}),
++		"",
++		"data: [DONE]",
++		"",
++	}, "\n")
++
++	resp, err := Aggregate(strings.NewReader(raw))
++	if err != nil {
++		t.Fatalf("aggregate: %v", err)
++	}
++	msg := messageOf(t, resp)
++	if got := msg["content"]; got != "思考A思考B" {
++		t.Errorf("content=%v want 思考A思考B（整轮无正文时应回填思考原文）", got)
++	}
++	// 思考原文仍保留：客户端要自己渲染时不能丢数据
++	if got := msg["reasoning_content"]; got != "思考A思考B" {
++		t.Errorf("reasoning_content=%v want 思考A思考B（回填不应删掉原字段）", got)
++	}
++}
++
++func TestAggregateKeepsContentWhenPresent(t *testing.T) {
++	withReasoningFallback(t, true)
++	raw := strings.Join([]string{
++		sseFrame(t, map[string]any{"reasoning_content": "思考"}),
++		"",
++		sseFrame(t, map[string]any{"content": "正文"}),
++		"",
++		"data: [DONE]",
++		"",
++	}, "\n")
++	resp, err := Aggregate(strings.NewReader(raw))
++	if err != nil {
++		t.Fatalf("aggregate: %v", err)
++	}
++	if got := messageOf(t, resp)["content"]; got != "正文" {
++		t.Errorf("content=%v want 正文（有正文时不得改写）", got)
++	}
++}
++
++func TestAggregateSkipsBackfillWhenToolCalls(t *testing.T) {
++	withReasoningFallback(t, true)
++	raw := strings.Join([]string{
++		sseFrame(t, map[string]any{"reasoning_content": "思考"}),
++		"",
++		sseFrame(t, map[string]any{"tool_calls": []any{map[string]any{
++			"index": 0, "id": "call_1", "type": "function",
++			"function": map[string]any{"name": "f", "arguments": "{}"},
++		}}}),
++		"",
++		"data: [DONE]",
++		"",
++	}, "\n")
++	resp, err := Aggregate(strings.NewReader(raw))
++	if err != nil {
++		t.Fatalf("aggregate: %v", err)
++	}
++	msg := messageOf(t, resp)
++	if got := msg["content"]; got != "" {
++		t.Errorf("content=%v want 空（有工具调用时不得把思考当正文，否则客户端会多显示一段"+
++			"并可能误判为普通文本回答）", got)
++	}
++}
++
++func TestAggregateFallbackCanBeDisabled(t *testing.T) {
++	withReasoningFallback(t, false)
++	raw := strings.Join([]string{
++		sseFrame(t, map[string]any{"reasoning_content": "思考"}),
++		"",
++		"data: [DONE]",
++		"",
++	}, "\n")
++	resp, err := Aggregate(strings.NewReader(raw))
++	if err != nil {
++		t.Fatalf("aggregate: %v", err)
++	}
++	msg := messageOf(t, resp)
++	if got := msg["content"]; got != "" {
++		t.Errorf("content=%v want 空（开关关闭时保持旧行为）", got)
++	}
++}
++
++// 流式：收尾前一帧把思考补成 content；正常轮次不多发帧。
++func TestStreamBackfillsReasoningAsContent(t *testing.T) {
++	withReasoningFallback(t, true)
++	raw := strings.Join([]string{
++		sseFrame(t, map[string]any{"role": "assistant", "reasoning_content": "思考A"}),
++		"",
++		sseFrame(t, map[string]any{"reasoning_content": "思考B"}),
++		"",
++		"data: [DONE]",
++		"",
++	}, "\n")
++	rec := httptest.NewRecorder()
++	if err := StreamHint(rec, strings.NewReader(raw), nil); err != nil {
++		t.Fatalf("stream: %v", err)
++	}
++	out := rec.Body.String()
++	if !strings.Contains(out, `"content":"思考A思考B"`) {
++		t.Errorf("流里没有补发的正文帧：\n%s", out)
++	}
++	// 补发帧必须在 [DONE] 之前
++	if strings.Index(out, `"content":"思考A思考B"`) > strings.Index(out, "[DONE]") {
++		t.Errorf("补发帧出现在 [DONE] 之后：\n%s", out)
++	}
++}
++
++func TestStreamKeepsNormalTurnsUntouched(t *testing.T) {
++	withReasoningFallback(t, true)
++	raw := strings.Join([]string{
++		sseFrame(t, map[string]any{"reasoning_content": "思考"}),
++		"",
++		sseFrame(t, map[string]any{"content": "正文"}),
++		"",
++		"data: [DONE]",
++		"",
++	}, "\n")
++	rec := httptest.NewRecorder()
++	if err := StreamHint(rec, strings.NewReader(raw), nil); err != nil {
++		t.Fatalf("stream: %v", err)
++	}
++	out := rec.Body.String()
++	// 有正文时不得再补一帧把思考当正文（否则客户端显示两遍）
++	if strings.Contains(out, `"content":"思考"`) {
++		t.Errorf("有正文的轮次被补发了思考帧：\n%s", out)
++	}
++}
++
++func TestStreamBackfillCanBeDisabled(t *testing.T) {
++	withReasoningFallback(t, false)
++	raw := strings.Join([]string{
++		sseFrame(t, map[string]any{"reasoning_content": "思考"}),
++		"",
++		"data: [DONE]",
++		"",
++	}, "\n")
++	rec := httptest.NewRecorder()
++	if err := StreamHint(rec, strings.NewReader(raw), nil); err != nil {
++		t.Fatalf("stream: %v", err)
++	}
++	if strings.Contains(rec.Body.String(), `"content":"思考"`) {
++		t.Errorf("开关关闭时仍然补发了正文：\n%s", rec.Body.String())
++	}
++}
+diff --git a/internal/upstream/sse.go b/internal/upstream/sse.go
+index 49410a0..9095b3f 100644
+--- a/internal/upstream/sse.go
++++ b/internal/upstream/sse.go
+@@ -218,9 +218,15 @@ func Aggregate(r io.Reader) (map[string]any, error) {
+ 	if created == 0 {
+ 		created = float64(time.Now().Unix())
+ 	}
++	// reasoningBackfill（issue #135）：整轮没有正文、也没有工具调用时，把思考
++	// 原文当正文下发 —— 只看 content 的客户端否则会看到空回复。正常轮次零改动。
++	bodyText := content.String()
++	if ReasoningFallbackEnabled() && bodyText == "" && len(toolOrder) == 0 && reasoning.Len() > 0 {
++		bodyText = reasoning.String()
++	}
+ 	message := map[string]any{
+ 		"role":    role,
+-		"content": content.String(),
++		"content": bodyText,
+ 	}
+ 	if reasoning.Len() > 0 {
+ 		message["reasoning_content"] = reasoning.String()
+@@ -489,6 +495,13 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string)
+ 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
+ 	toolCallSeen := map[int]bool{}
+ 
++	// reasoningBackfill 的整轮状态（issue #135）：是否出现过正文 / 工具调用，
++	// 以及思考通道累积的原文。收尾时若两者都没有而思考有内容，补发一帧正文。
++	// 只在开关打开时维护（关掉时零开销、与旧行为逐字节一致）。
++	sawContent := false
++	sawToolCalls := false
++	var reasoningBuf strings.Builder
++
+ 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
+ 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
+ 	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
+@@ -528,6 +541,31 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string)
+ 				}
+ 				return 1, nil
+ 			}
++			// reasoningBackfill：记录整轮是否出现正文/工具调用，并累积思考原文。
++			// 放在错误帧早退之后 —— 上游错误帧不属于正常内容，不该参与判定。
++			if ReasoningFallbackEnabled() {
++				if chs, ok := obj["choices"].([]any); ok {
++					for _, ci := range chs {
++						c, _ := ci.(map[string]any)
++						if c == nil {
++							continue
++						}
++						d, _ := c["delta"].(map[string]any)
++						if d == nil {
++							continue
++						}
++						if v, ok := d["content"].(string); ok && v != "" {
++							sawContent = true
++						}
++						if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
++							sawToolCalls = true
++						}
++						if v, ok := d["reasoning_content"].(string); ok && v != "" {
++							reasoningBuf.WriteString(v)
++						}
++					}
++				}
++			}
+ 			// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
+ 			stripToolCallNames(obj, toolCallSeen)
+ 			// id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id 一律用缓存值，
+@@ -597,6 +635,33 @@ readLoop:
+ 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
+ 	}
+ 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
++	// reasoningBackfill：整轮无正文、无工具调用，但思考通道有内容 —— 补发一帧
++	// 正文，让只看 content 的客户端拿到输出，而不是判成「模型没有输出」。
++	// 放在 [DONE] 之前，客户端仍按正常流收尾；开关关闭时这段不执行。
++	if ReasoningFallbackEnabled() && !sawContent && !sawToolCalls && reasoningBuf.Len() > 0 {
++		rid := firstID
++		if rid == "" {
++			rid = "chatcmpl-wb2api"
++		}
++		chunk := map[string]any{
++			"id":      rid,
++			"object":  "chat.completion.chunk",
++			"created": time.Now().Unix(),
++			"choices": []any{map[string]any{
++				"index":         0,
++				"delta":         map[string]any{"content": reasoningBuf.String()},
++				"finish_reason": nil,
++			}},
++		}
++		if raw, merr := json.Marshal(chunk); merr == nil {
++			if _, werr := io.WriteString(w, "data: "+string(raw)+"\n\n"); werr != nil {
++				return werr
++			}
++			if fl != nil {
++				fl.Flush()
++			}
++		}
++	}
+ 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+ 		return err
+ 	}

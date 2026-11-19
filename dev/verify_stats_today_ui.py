@@ -102,6 +102,14 @@ def seed() -> None:
             'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, '
             'completion_tokens, credit, realm) VALUES(?, 1, ?, ?, ?, ?, ?, ?)',
             (day, 'glm-5.2', n, 100 * n, 50 * n, 1.5 * n, 'cn'))
+    # 今日再按小时铺开（「今日」趋势图读的是 usage_hourly）：当前小时与前面两个小时
+    # 各一次，合计与上面那行按天的数据**完全一致** —— 图与卡片同源，验收里才敢互相对照。
+    h = int(time.strftime('%H', time.localtime(now)))
+    for hour in sorted({h, max(0, h - 1), max(0, h - 3)}):
+        db.execute(
+            'INSERT INTO usage_hourly(day, hour, key_id, model, requests, prompt_tokens, '
+            'completion_tokens, credit, realm) VALUES(?, ?, 1, ?, ?, ?, ?, ?, ?)',
+            (today, hour, 'glm-5.2', 1, 100, 50, 1.5, 'cn'))
     db._conn.close()
     db._conn = None
 

@@ -269,8 +269,21 @@ const BASE = process.env.BASE, OUT = process.env.OUT, CFG = process.env.CFG;
   step(after.admin?.enabled === true, '开启后配置真的写到了上游 config.json',
        `admin.enabled=${after.admin?.enabled}`);
 
+  // 把开关**关回**去，再验账号页的回退提示 —— 这条提示是随开关状态变的：
+  // 开着但上游没提供接口时，界面说的是「已开启（…），但运行中的上游没有提供它，
+  // 改完配置需要重启上游容器」（另一条正确但不同的文案，见 issue #45 的追问）。
+  // 本脚本第 3 步要验的是**没开这个开关**的那条路径，所以必须先把状态复位。
+  // 这里原先只写了注释、没写复位代码，于是自 2026-09-21 起了新文案之后这条一直
+  // 是红的（验到的不是它以为的那件事），而不是产品坏了。
+  await sw.click();
+  await page.waitForTimeout(700);
+  await saveBtn.click();
+  await page.waitForTimeout(4000);
+  const reset = JSON.parse(fs.readFileSync(CFG, 'utf8'));
+  step(reset.admin?.enabled === false, '开关已关回（第 3 步的前提）',
+       `admin.enabled=${reset.admin?.enabled}`);
+
   // ── 3. 账号页回退提示要带可操作的下一步 ──
-  // 先把开关关回去（假上游没有真接口，停用仍会走回退）
   await page.goto(`${BASE}/accounts`, {waitUntil: 'load'});
   await page.waitForTimeout(4000);
   // 桌面表格与移动卡片**都在 DOM 里**（靠 md:hidden / hidden md:block 切换），

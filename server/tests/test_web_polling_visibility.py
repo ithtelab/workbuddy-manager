@@ -70,13 +70,43 @@ class PollingVisibilityTest(unittest.TestCase):
 
         否则弹窗关闭后，每次切标签页都会调用一个已作废的 tick：轻则白发请求，
         重则对着已卸载的组件 setState。
+
+        加与摘必须**出自同一份列表**（`wakeEvents()`）：早先是各写一遍事件名，
+        新增唤醒事件时极易只加不摘 —— 那就成了泄漏。现在两侧都遍历同一个列表，
+        这条测试钉住这个结构。
         """
         p = _WEB / 'components' / 'common' / 'accounts' / 'AddAccountDialog.tsx'
         src = p.read_text(encoding='utf-8')
         self.assertRegex(
-            src, r'removeEventListener\(\s*[\'"]visibilitychange[\'"]',
-            '没有移除 visibilitychange 监听器（弹窗关掉后仍会触发轮询）',
+            src, r'wakeEvents\(\)\.forEach\([\s\S]{0,200}?addEventListener',
+            '添加监听没有走 wakeEvents() —— 摘除那一侧就不会覆盖它',
         )
+        self.assertRegex(
+            src, r'wakeEvents\(\)\.forEach\([\s\S]{0,200}?removeEventListener',
+            '没有移除轮询监听器（弹窗关掉后仍会触发已作废的 tick）',
+        )
+
+    def test_occluded_window_wakes_on_interaction(self) -> None:
+        """被遮挡的窗口不触发 visibilitychange，必须靠交互事件唤醒。
+
+        现场：Chrome 对**被遮挡**（不是「隐藏」）的窗口把定时器压到约 1 次/分钟，
+        而 `document.hidden` 仍是 false、`visibilitychange` 一次都不触发 ——
+        只挂可见性的兜底完全失效。用户切回来点一下、敲一下或让窗口获得焦点时
+        必须立即补一次轮询，否则界面要干等一分钟（「加账号仍要等 20-60 秒」）。
+        """
+        p = _WEB / 'components' / 'common' / 'accounts' / 'AddAccountDialog.tsx'
+        src = p.read_text(encoding='utf-8')
+        m = re.search(r'function wakeEvents\(\)[\s\S]{0,900}?\n}', src)
+        self.assertIsNotNone(m, '找不到 wakeEvents() —— 唤醒事件的唯一列表')
+        body = m.group(0)
+        events = set(re.findall(r"\[\s*(?:document|window)\s*,\s*'([a-z]+)'\s*\]", body))
+        self.assertIn('visibilitychange', events, '丢了可见性兜底')
+        for ev in ('focus', 'pointerdown', 'keydown'):
+            self.assertIn(
+                ev, events,
+                f'唤醒列表里没有 {ev}：被遮挡窗口的定时器被节流且不触发 visibilitychange 时，'
+                f'用户回来操作页面不会立即刷新界面',
+            )
 
     def test_every_interval_poller_handles_visibility(self) -> None:
         """任何前端**轮询**（setInterval + 网络请求）都要处理可见性。
@@ -102,6 +132,21 @@ class PollingVisibilityTest(unittest.TestCase):
             '这些文件在轮询数据但没有处理 visibilitychange —— '
             '用户切回标签页后要等一个完整间隔才更新（后台还会被节流到约 1 次/分钟）：'
             + '\n  ' + '\n  '.join(offenders),
+        )
+
+    def test_no_listener_escapes_the_wake_list(self) -> None:
+        """这个文件里**只有** wakeEvents() 那两处监听器（一加一摘）。
+
+        绕过列表的监听器不会被 stopPoll 摘掉，弹窗关掉后仍会触发；这条测试的
+        失败信息就是给后来者看的说明：把事件加进 wakeEvents()。
+        """
+        p = _WEB / 'components' / 'common' / 'accounts' / 'AddAccountDialog.tsx'
+        src = p.read_text(encoding='utf-8')
+        self.assertEqual(
+            (src.count('addEventListener('), src.count('removeEventListener(')),
+            (1, 1),
+            '弹窗里的监听器数量不是「一加一摘」—— 多出来的那些不会被 wakeEvents() '
+            '统一摘除（弹窗关掉后仍会触发已作废的 tick）；请把事件加进 wakeEvents() 列表',
         )
 
     def test_heartbeat_helper_still_documents_the_pattern(self) -> None:

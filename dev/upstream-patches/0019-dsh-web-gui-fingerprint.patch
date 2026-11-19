@@ -1,0 +1,129 @@
+--- a/internal/upstream/sanitize.go
++++ b/internal/upstream/sanitize.go
+@@ -112,6 +112,24 @@ var sanitizeDshRe = regexp.MustCompile(
+ // 会粘成 "assistant.Use"，把两条指令并成一条。
+ const sanitizeDshRepl = "You are a helpful AI assistant.${1}"
+ 
++// sanitizeDshGuiRe 通配层：DSH 运行时上下文里的 Web GUI 段落（issue #246 后续实测）。
++//
++// 上游的匹配**不是单句**：单独一句
++//
++//	You are interacting with the user through the DeepSeek Harness Web GUI whose
++//	URL the runtime context names.
++//
++// 会放行；但连同下一句 "When the user refers to … they mean this GUI." 组成
++// 221 字符的**连续文本**就返回 400 code=11-128。二分实测：前缀 220 字符成功、
++// 221 字符失败，说明匹配窗口横跨两句，单句改写无效（两句各自单独测都放行）。
++//
++// 因此对段落里的品牌短语做最小改写（插入连字符）：破坏逐字匹配、语义不变，
++// 且该短语只出现在被拦段落内，不会误伤正常对话。实测改写后上游放行。
++var sanitizeDshGuiRe = regexp.MustCompile(`(?i)DeepSeek Harness Web GUI`)
++
++// sanitizeDshGuiRepl 替换串：保留品牌可读性，仅插入一个连字符。
++const sanitizeDshGuiRepl = "DeepSeek-Harness Web GUI"
++
+ // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
+ func sanitizeText(text string) string {
+ 	if !hasFingerprint(text) {
+@@ -121,6 +139,8 @@ func sanitizeText(text string) string {
+ 		text = strings.ReplaceAll(text, rw[0], rw[1])
+ 	}
+ 	text = sanitizeDshRe.ReplaceAllString(text, sanitizeDshRepl)
++	// DSH Web GUI 段落：上游按「跨两句的连续文本」拦截，必须动品牌短语才拆得开。
++	text = sanitizeDshGuiRe.ReplaceAllString(text, sanitizeDshGuiRepl)
+ 	if sanitizeHdrRe.MatchString(text) {
+ 		text = sanitizeHdrRe.ReplaceAllString(text, "")
+ 	}
+@@ -154,6 +174,11 @@ func hasFingerprint(text string) bool {
+ 	if sanitizeDshRe.MatchString(text) {
+ 		return true
+ 	}
++	// DSH Web GUI 段落指纹（见 sanitizeDshGuiRe）：跨两句匹配，单句放行，
++	// 所以特征表里补的是段落内的品牌短语；(?i) 覆盖大小写变体。
++	if sanitizeDshGuiRe.MatchString(text) {
++		return true
++	}
+ 	return sanitizeBareHdrRe.MatchString(text)
+ }
+ 
+--- a/internal/upstream/sanitize_test.go
++++ b/internal/upstream/sanitize_test.go
+@@ -590,3 +590,78 @@ func TestPrepareBodySanitizesDshPrompt(t *testing.T) {
+ 		t.Errorf("替换文本缺失: %s", out)
+ 	}
+ }
++
++// ── issue #250：DSH 运行时上下文「Web GUI」跨句指纹 ─────────────────────
++//
++// 与 #246 的身份句指纹是**两套规则**：本条必须两句连续出现才命中——
++// 单独第一句、单独第二句都放行（各 200）；只差一个字符就失败
++// （前缀 220 成功 / 221 失败），说明上游匹配的是跨句的连续文本。
++// 因此不能只改一句，必须动到段落里的品牌短语才能拆开匹配。
++const dshWebGuiBlock = `You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names. When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.`
++
++func TestDshWebGuiBlockRewritten(t *testing.T) {
++	out := sanitizeText(dshWebGuiBlock)
++	if strings.Contains(out, "DeepSeek Harness Web GUI") {
++		t.Errorf("指纹残留: %q", out)
++	}
++	if !strings.Contains(out, "DeepSeek-Harness Web GUI") {
++		t.Errorf("改写文本缺失: %q", out)
++	}
++	// 除品牌短语外内容不得改动（这段是工具/行为契约）。
++	if restored := strings.ReplaceAll(out, "DeepSeek-Harness Web GUI", "DeepSeek Harness Web GUI"); restored != dshWebGuiBlock {
++		t.Errorf("段落其他内容被改动:\n 得到 %q\n 期望 %q", restored, dshWebGuiBlock)
++	}
++}
++
++// 预检必须认这段，否则 hasFingerprint 提前 return、改写层执行不到。
++func TestDshWebGuiFingerprintDetected(t *testing.T) {
++	if !hasFingerprint(dshWebGuiBlock) {
++		t.Error("hasFingerprint 应认得 Web GUI 段落")
++	}
++	if !hasFingerprint("through the deepseek harness web gui") {
++		t.Error("大小写变体应识别")
++	}
++}
++
++// 幂等：PrepareBody 与 ChatStream 各预处理一次。
++func TestDshWebGuiRewriteIdempotent(t *testing.T) {
++	once := sanitizeText(dshWebGuiBlock)
++	if twice := sanitizeText(once); twice != once {
++		t.Errorf("非幂等: %q -> %q", once, twice)
++	}
++}
++
++// 反例：不含该品牌短语的普通文本不得被改写。
++func TestDshWebGuiPlainTextNotTouched(t *testing.T) {
++	for _, in := range []string{
++		"You are interacting with the user through a web GUI.",
++		"DeepSeek Harness is a coding agent runtime.",
++		"I like the Web GUI.",
++		"See the docs for the DeepSeek Harness runtime context.",
++	} {
++		if out := sanitizeText(in); out != in {
++			t.Errorf("不应改写: %q -> %q", in, out)
++		}
++	}
++}
++
++// 出站边界：developer 消息（DSH 用它承载系统提示词）也要净化。
++func TestPrepareBodySanitizesDshWebGui(t *testing.T) {
++	payload, err := json.Marshal(map[string]any{
++		"model": "deepseek-v4.1-flash",
++		"messages": []any{
++			map[string]any{"role": "developer", "content": dshWebGuiBlock},
++			map[string]any{"role": "user", "content": "hi"},
++		},
++	})
++	if err != nil {
++		t.Fatalf("marshal: %v", err)
++	}
++	out := PrepareBodyOpt(payload, true)
++	if strings.Contains(string(out), "DeepSeek Harness Web GUI") {
++		t.Errorf("PrepareBody 未净化 Web GUI 指纹: %s", out)
++	}
++	if !strings.Contains(string(out), "DeepSeek-Harness Web GUI") {
++		t.Errorf("替换文本缺失: %s", out)
++	}
++}

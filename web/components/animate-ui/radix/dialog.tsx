@@ -155,7 +155,13 @@ function DialogContent({
                   // 背景使用不透明色：半透明会让背后遮罩透出，与不透明的 header/footer
                   // 形成明暗分界，看起来像「双层边框」。同时只保留一条 border，
                   // 不再叠加 ring，避免边框外侧多出一圈描边。
-                  'fixed left-[50%] top-[50%] z-50 grid w-[calc(100%-2rem)] max-w-lg translate-x-[-50%] translate-y-[-50%] gap-0 overflow-hidden rounded-[24px] border border-border/60 bg-background shadow-[0_24px_60px_rgba(15,23,42,0.10)] duration-200 sm:max-w-lg dark:border-border/70 dark:bg-background dark:shadow-[0_24px_60px_rgba(0,0,0,0.42)]',
+                  //
+                  // ⚠️ 这里**只能**用不带响应式前缀的 max-w-lg，不要写成 max-w-lg sm:max-w-lg。
+                  // Tailwind 把响应式变体的规则排在样式表靠后的位置，所以 `sm:max-w-lg`
+                  // 会**盖过**调用方传进来的 `max-w-[900px]`（两者不在同一个变体组，
+                  // tailwind-merge 认为它们不冲突、都会保留），结果是任何 ≥640px 的屏幕
+                  // 上所有弹窗都被压回 512px。历史上 7 个弹窗的宽度覆盖全部因此失效过。
+                  'fixed left-[50%] top-[50%] z-50 grid max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] max-w-lg translate-x-[-50%] translate-y-[-50%] gap-0 overflow-hidden rounded-[24px] border border-border/60 bg-background shadow-[0_24px_60px_rgba(15,23,42,0.10)] duration-200 dark:border-border/70 dark:bg-background dark:shadow-[0_24px_60px_rgba(0,0,0,0.42)]',
                   className,
               )}
               {...props}
@@ -207,6 +213,23 @@ function DialogFooter({className, ...props}: DialogFooterProps) {
 
 type DialogBodyProps = React.ComponentProps<typeof ScrollArea>;
 
+/**
+ * 弹窗主体（可滚动）。
+ *
+ * ⚠️ `className` 落在 Radix ScrollArea 的 **Root** 上，而 children 被塞进内层的
+ * Viewport —— 所以这里**只能写结构性类**（限高 `max-h-[…]` 之类）。布局类
+ * （`space-y-*` / `px-*` / `py-*`）必须再套一层 div：
+ *
+ *   <DialogBody className="max-h-[min(640px,calc(100dvh-12rem))]">
+ *     <div className="space-y-4 px-6 pb-2">…字段…</div>
+ *   </DialogBody>
+ *
+ * 写成 `<DialogBody className="space-y-3 px-6">` 不会报错，但 space-y-3 会作用到
+ * Root 的 Viewport / ScrollBar / Corner 三个兄弟节点上，字段之间**一个间距都没有**
+ * —— 表现为「所有字段挤成一坨」（上游表单与移动分组弹窗都踩过这个坑）。
+ * 横向的 px-* 则"碰巧"有效：Root 的内边距会把 Viewport 挤窄，看起来像是生效了，
+ * 更容易骗过肉眼。
+ */
 function DialogBody({className, children, ...props}: DialogBodyProps) {
   return (
     <ScrollArea

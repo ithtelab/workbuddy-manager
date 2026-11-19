@@ -164,12 +164,18 @@ class KeyWhitelistCompatTest(unittest.TestCase):
             with self.subTest(models=models, model=model):
                 self.assertIsNone(keysvc.validate(self._row(models), '1.2.3.4', model))
 
-    def test_global_still_strict(self) -> None:
-        """`global:` 不参与归一化：两个版本的同名模型不是一回事。"""
+    def test_global_prefix_still_scoped(self) -> None:
+        """显式 `global:` 只放行国际版；裸名视为「任意版本」（issue #357）。
+
+        裸名那一侧曾经也是严格的，但密钥编辑器按版本分组、国际版组给的是裸名，
+        勾选后存进白名单的也是裸名，而客户端调用要带 `global:` 前缀 —— 严格比对
+        会让「列表里能选、一调用就 400」。裸名没有版本信息，解释成通配才符合
+        用户意图；想只放行国际版，写 `global:` 前缀即可。
+        """
         self.assertIsNotNone(keysvc.validate(self._row(['global:gpt-5']), '1.2.3.4', 'gpt-5'),
                              '国际版白名单不该放行裸名（会被路由到国内池）')
-        self.assertIsNotNone(keysvc.validate(self._row(['gpt-5']), '1.2.3.4', 'global:gpt-5'),
-                             '裸名白名单不该放行国际版请求')
+        self.assertIsNone(keysvc.validate(self._row(['gpt-5']), '1.2.3.4', 'global:gpt-5'),
+                          '裸名白名单应放行国际版请求（issue #357）')
 
     def test_other_model_still_rejected(self) -> None:
         self.assertIsNotNone(keysvc.validate(self._row(['glm-5.2']), '1.2.3.4', 'kimi-k2.7'))

@@ -9,26 +9,23 @@
 #
 # 与宿主机安装（deploy/install.sh + systemd）的区别，见 Dockerfile 顶部说明。
 # 简述：容器版**能**在界面上更新上游 —— 镜像内置了 docker CLI 与 compose 插件，
-# 挂上 docker.sock 后即可在容器内重建上游容器（见下方 volumes 的说明）。
-# 不挂 docker.sock 时那几项会降级为「请到宿主机操作」，界面如实提示。
+# 显式开启 docker.sock 挂载（见下方 volumes 的说明）即可在容器内重建上游容器。
+# 默认**不挂**：把宿主 root 交给一个 Web 应用不该是默认状态。不挂时那几项
+# 会降级为「请到宿主机操作」，界面如实提示。
 
 services:
   workbuddy-manager:
     build:
       context: .
-      # 可选：Debian 软件源镜像。
+      # 可选：Alpine 软件源镜像（镜像基于 python:3.12-alpine）。
+      # 官方源（dl-cdn.alpinelinux.org）国内偶有卡顿，填 mirrors.aliyun.com 可绕开。
+      #   docker compose build --build-arg ALPINE_MIRROR=mirrors.aliyun.com
       #
-      # 官方源（deb.debian.org）走 Fastly CDN，中国大陆访问实测**频繁 502 且极慢**
-      # （约 367 kB/s，常在下载某个 .deb 时中断），构建会在第 2 步 "apt-get update"
-      # 直接失败——表现就是镜像建不出来、容器起不来、页面 ERR_CONNECTION_REFUSED。
-      #
-      # Dockerfile 里已内置一次自动降级（官方源失败自动改阿里云重试），所以多数情况
-      # 不配也能建成功，只是会先白等一轮。想完全避免等待就把下面两行取消注释，
-      # 或临时用命令行覆盖：
-      #   docker compose build --build-arg DEBIAN_MIRROR=mirrors.aliyun.com
-      #
+      # DEBIAN_MIRROR 是旧版本的参数名，保留仅为兼容已有 compose（同样填 mirrors.aliyun.com
+      # 即可）；新部署请用 ALPINE_MIRROR。两者都留空 = 官方源。
       # 可选镜像：mirrors.aliyun.com / mirrors.tuna.tsinghua.edu.cn / mirrors.ustc.edu.cn
       args:
+        ALPINE_MIRROR: ""
         DEBIAN_MIRROR: ""
         # 可选：PyPI 镜像（成因同上——官方源走国际 CDN，国内会抖动/失败）。
         # 留空 = 官方源，失败时 Dockerfile 会自动降级到清华镜像重试。
@@ -39,6 +36,20 @@ services:
         # 官方 registry 国内访问慢且会断。
         #   docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
         NPM_REGISTRY: ""
+        # 可选：镜像里要装 docker CLI（供容器内「重载上游 / 读上游日志 / 一键更新」用），
+        # 它的静态包固定从 download.docker.com 取——国外 CDN，国内实测很慢，
+        # 构建会长时间停在这一步。填国内镜像基址可绕开。
+        # 可选值：https://mirrors.aliyun.com/docker-ce / https://mirrors.tuna.tsinghua.edu.cn/docker-ce
+        DOCKER_CLI_BASE: ""
+        # 可选：compose 插件从 GitHub Releases 下载（官方地址国内会超时）。
+        # 用法是「加速前缀 + 原始 URL」，例如 https://ghfast.top/
+        COMPOSE_URL_PREFIX: ""
+        # 可选：子路径部署前缀（如 /workbuddy-manager）。留空 = 部署在根路径。
+        #
+        # 容器版的前端是**构建期**编译进镜像的，所以前缀必须在 build 时传进来；
+        # 与下面 environment 里的 WB_BASE_PATH 取值必须一致。
+        #   docker compose build --build-arg BASE_PATH=/workbuddy-manager
+        BASE_PATH: ""
     image: workbuddy-manager:latest
     container_name: workbuddy-manager
     # 这个 restart 策略是容器版「一键更新」能生效的前提：
@@ -52,10 +63,24 @@ services:
       #   - 同网络（推荐）：http://workbuddy2api:7863
       #   - 用宿主机 Docker 网关：http://host.docker.internal:7863
       WB2API_BASE: http://host.docker.internal:7863
+      # 可选：子路径部署前缀，必须与上面 build.args.BASE_PATH 完全一致（留空则都不填）。
+      # 服务端用它补回响应里漏掉的站内地址，并在反代保留前缀时把前缀剥掉。
+      # 详见 deploy/README.md 的「子路径部署」。
+      # WB_BASE_PATH: /workbuddy-manager
       # 反向代理在后面时，真实 IP 取自它覆盖写入的 X-Real-IP
       WB_TRUST_PROXY: "1"
       # 生产环境不暴露 /docs 与 /openapi.json
       WB_ENABLE_DOCS: "0"
+      # 出口代理（可选）：写在与本文件同目录的 .env 里即可，compose 用 ${} 取过来。
+      # 支持 http:// / https:// / socks5://；内网与本机目标（含上游那一跳）始终直连。
+      WB_HTTP_PROXY: ${WB_HTTP_PROXY:-}
+      # 一键更新的下载代理（可选，只认 http/https）
+      WB_UPDATE_PROXY: ${WB_UPDATE_PROXY:-}
+      # GitHub 镜像加速（可选，issue #216）：国内机器直连 GitHub 超时时填基址，
+      # 例如 https://gh-proxy.com/ 。版本检测与发布包下载先走镜像，失败回退直连。
+      WB_GITHUB_MIRROR: ${WB_GITHUB_MIRROR:-}
+      # 新账号默认绑定的命名线路（名字要在上游 config.json 的 proxies 里）
+      WB_DEFAULT_ACCOUNT_PROXY: ${WB_DEFAULT_ACCOUNT_PROXY:-}
     ports:
       # **只监听本机**：管理端必须藏在反向代理之后。
       # 若确需直接从别的机器访问，改成 "7864:7864"，但请先确保有 HTTPS 与访问控制——
@@ -77,7 +102,15 @@ services:
       #   # 文件末尾另加：
       #   volumes:
       #     wb-manager-data:
-      - ./data:/app/data
+      #
+      # **更省事的做法（NAS / 群晖 / 没开 SSH）**：不用改这份文件，也不用 chown。
+      # 命名卷首次创建时会继承镜像内 /app/data 的属主（10001），容器直接可写。
+      # 在 compose 同目录的 .env 里加一行，再执行 `docker compose up -d`：
+      #   WB_DATA_VOLUME=wb-manager-data
+      # 不设该变量时，下面这行等价于原来的 `- ./data:/app/data`，老部署行为不变。
+      # 切过去之后数据库不再落在宿主 ./data 里，取文件用：
+      #   docker compose cp workbuddy-manager:/app/data/manager.db ./manager.db
+      - ${WB_DATA_VOLUME:-./data}:/app/data
       # 上游**整个仓库目录**。一次挂载覆盖下面三件事（分开挂子路径会互相重叠，
       # 反而让权限语义变模糊）：
       #   · 读/写上游 config.json —— 管理端「设置」页保存的目标
@@ -95,18 +128,29 @@ services:
       # 若你**不想**让管理端碰上游仓库（例如上游由别人维护），改成只挂 config.json
       # 与 auths/ 两条子路径即可：此时「更新上游」会不可用，界面会如实提示。
       - ../workbuddy2api:/opt/workbuddy2api
-      # docker 控制套接字：挂上后容器内的管理端可以像宿主部署那样操作上游容器
-      # （保存设置后自动重载 / 读上游日志 / 一键更新上游）。
+      # docker 控制套接字：**默认不挂**（opt-in）。
       #
-      # **安全性说明（值得读）**：挂 docker.sock 等于把宿主 root 权限交给本容器。
-      # 但这**不是新增的风险等级**——宿主部署时本服务本来就是 root 运行
-      # （systemd 单元无 User=、安装脚本要求 root），而 root 进程本来就能
-      # `docker run -v /:/host` 拿到宿主文件系统。两者权限等价。
+      # **安全性说明（值得读）**：挂 docker.sock 等于把宿主 root 权限交给本容器
+      # （`docker run -v /:/host` 即可拿到宿主文件系统）。管理端是持有全部账号
+      # 凭据的高价值目标，Web 应用被攻破的可能性永远不为零，所以这不该是默认
+      # 状态。需要「保存设置后自动重载上游 / 读上游日志 / 一键更新上游」这些
+      # 界面功能时，把下面这行与文件末尾的 group_add 一并取消注释，并把宿主
+      # socket 的真实 GID 写进 .env（见 deploy/README.md「容器内操作 docker」）。
       #
-      # 若你的要求是最小权限，把下面这行注释掉即可：此时依赖 docker 的功能会
-      # 自动降级为「请到宿主机执行 docker compose ...」，界面如实提示，不会
-      # 静默失败。
-      - /var/run/docker.sock:/var/run/docker.sock
+      # 不挂时依赖 docker 的功能会自动降级为「请到宿主机执行 docker compose ...」，
+      # 界面如实提示，不会静默失败。
+      #
+      # - /var/run/docker.sock:/var/run/docker.sock
+
+    # 与上面的挂载配套（同样默认注释掉）：
+    # 挂上 socket 只是必要条件 —— 还得**进得了那个组**。宿主的 socket 通常归
+    # root:docker（GID 998/999），而本容器以 uid 10001 运行，不在那个组里就是
+    # permission denied。GID 因机器而异，所以用变量：
+    #   DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)   # 写进 .env
+    # 默认 999 是 Debian/Ubuntu 上最常见的值；取错了不会静默失败 —— 更新上游时
+    # 会给出取真实 GID 的提示。
+    # group_add:
+    #   - "${DOCKER_GID:-999}"
 
     extra_hosts:
       # 让容器能通过 host.docker.internal 访问宿主机上的上游
@@ -117,3 +161,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+# 顶层卷声明：只在 .env 里设置 WB_DATA_VOLUME=wb-manager-data 时才会被引用。
+# 默认（未设变量）仍走 ./data，这个卷不会被写入数据，也不影响已有部署。
+volumes:
+  wb-manager-data:

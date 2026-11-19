@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -106,80 +107,25 @@ class VersionCompare(unittest.TestCase):
         self.assertFalse(updater._version_newer('v1.0.5-rc1', 'v1.0.5'))
 
 
-class UpstreamChanges(unittest.TestCase):
-    """上游「领先多少个提交 + 逐条说明」的解析。
+class RemoteCheckOnlyManager(unittest.TestCase):
+    """上游随包分发后，版本检测不能再请求外部上游仓库。"""
 
-    动机：原先只显示最新一条提交，看不出这批更新累积了几处改动，
-    也分不出是功能还是修复（用户明确问过「上游更新了什么」）。
-    """
+    def test_only_manager_release_is_queried(self) -> None:
+        calls: list[str] = []
 
-    def setUp(self) -> None:
-        self._orig = updater._gh_get
+        def fake_gh(url: str):
+            calls.append(url)
+            return {'tag_name': 'v9.9.9', 'html_url': '',
+                    'assets': [{'name': 'x.tar.gz'}], 'body': ''}
 
-    def tearDown(self) -> None:
-        updater._gh_get = self._orig
+        with mock.patch.object(updater, '_gh_get', side_effect=fake_gh):
+            out = updater._fetch_remote_versions()
 
-    def _fake(self, payload, raises=None):
-        def _get(url, timeout=15):
-            if raises:
-                raise raises
-            return payload
-        updater._gh_get = _get  # type: ignore[assignment]
-
-    def _compare(self, commits, ahead=None, total=None):
-        return {
-            'ahead_by': ahead if ahead is not None else len(commits),
-            'total_commits': total if total is not None else len(commits),
-            'commits': commits,
-        }
-
-    @staticmethod
-    def _c(sha, msg, date='2026-09-13T08:00:00Z'):
-        return {'sha': sha, 'commit': {'message': msg, 'committer': {'date': date}}}
-
-    def test_parses_ahead_and_subjects(self) -> None:
-        self._fake(self._compare([
-            self._c('a' * 40, 'fix: 修复一' + chr(10) + chr(10) + '详细说明'),
-            self._c('b' * 40, 'feat: 新功能'),
-        ]))
-        r = updater._fetch_upstream_changes('o/r', 'x' * 40, 'y' * 40)
-        self.assertEqual(r['ahead'], 2)
-        self.assertEqual(len(r['changes']), 2)
-        # 最新的在前
-        self.assertTrue(r['changes'][0]['sha'].startswith('b'))
-        # 只取首行
-        self.assertEqual(r['changes'][1]['subject'], 'fix: 修复一')
-
-    def test_changes_capped(self) -> None:
-        commits = [self._c(f'{i:040x}', f'c{i}') for i in range(30)]
-        self._fake(self._compare(commits, ahead=30, total=30))
-        r = updater._fetch_upstream_changes('o/r', 'x' * 40, 'y' * 40)
-        self.assertEqual(len(r['changes']), updater._CHANGES_LIMIT)
-        self.assertTrue(r['truncated'], '超出上限应标记截断')
-
-    def test_same_sha_short_circuits(self) -> None:
-        """同一版本不必请求 compare。"""
-        self._fake({'commits': []})
-        r = updater._fetch_upstream_changes('o/r', 'a' * 40, 'a' * 40)
-        self.assertEqual(r['ahead'], 0)
-        self.assertEqual(r['changes'], [])
-
-    def test_network_error_degrades_silently(self) -> None:
-        """拿不到变更列表不能影响版本检测本身。"""
-        self._fake(None, raises=RuntimeError('boom'))
-        r = updater._fetch_upstream_changes('o/r', 'x' * 40, 'y' * 40)
-        self.assertEqual(r['ahead'], 0)
-        self.assertEqual(r['changes'], [])
-
-    def test_malformed_payload_is_safe(self) -> None:
-        for payload in ({}, {'commits': None}, {'commits': 'x'}, []):
-            self._fake(payload)
-            r = updater._fetch_upstream_changes('o/r', 'x' * 40, 'y' * 40)
-            self.assertIsInstance(r['changes'], list)
-
-    def test_missing_sha_returns_empty(self) -> None:
-        self._fake({'commits': []})
-        self.assertEqual(updater._fetch_upstream_changes('o/r', '', 'y' * 40)['ahead'], 0)
+        self.assertEqual(out['manager']['latest'], 'v9.9.9')
+        self.assertNotIn('upstream', out, '不应再有独立的上游版本结果')
+        self.assertTrue(calls)
+        self.assertTrue(all('workbuddy-manager' in url for url in calls),
+                        f'版本检测请求了非管理端仓库：{calls}')
 
 
 if __name__ == '__main__':

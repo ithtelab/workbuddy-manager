@@ -17,8 +17,20 @@
  *   disabled → expired → unknown → cooling → neverSucceeded → notLoaded → online
  * 例如「上游状态取不到」必须早于「不在池里」——否则会把「看不到上游」
  * 误报成「账号文件坏了」（这个误报曾经真实发生过，见下）。
+ *
+ * 文件下半部分是**跨分组聚合**用的纯逻辑（`accountGroups` / `tagGroup` /
+ * `accountKey` / `interleave` / `poolTotals`）：仪表盘要把每个分组各取一份的
+ * 账号合成一份「全部」的视图（上游 issue #94 问题 2），而合成的每一步都要走
+ * `mergePoolStatus`，所以放在同一个模块里。
+ *
+ * ⚠️ 本模块**不得引入任何运行时 import**（只有 `import type`，编译后被抹掉）。
+ * 这是仓库给「可在 Node 里直接测的前端逻辑」定的规矩：`web/lib/*.test.mjs`
+ * 用 `node --experimental-strip-types` 直接 import `.ts` 源码，Node 的 ESM
+ * 解析要求带扩展名，而仓库的 app 代码一律不写扩展名——一旦这里 import 了别的
+ * 模块的**值**，测试就会以「找不到模块」失败，或者逼着全仓库改成 `.ts` 后缀。
+ * 要复用别的模块的函数，就把那个模块也做成零运行时依赖的。
  */
-import type {Account, UpstreamStatus} from './types';
+import type {Account, UpstreamEndpoint, UpstreamStatus} from './types';
 
 /** 账号当前的可用性分档 */
 export type AvailabilityTier =
@@ -27,6 +39,7 @@ export type AvailabilityTier =
   | 'disabledByPanel'
   /** 上游手动停用位（issue #45）：还在池里、任务照常，只是不被选中转发 */
   | 'manualDisabled'
+  | 'riskPaused'
   | 'expired'
   /** 本次读不到上游状态，运行时字段全部未知（`upstream.connected !== true`） */
   | 'unknown'
@@ -77,6 +90,7 @@ export function mergePoolStatus(
       // 上游的手动停用状态位（issue #45）。取的是**这份快照**的值——用户点了
       // 停用后状态位由上游持有，本页靠心跳拿到新值；不取的话徽章要等下次整页
       // 刷新才更新，点了按钮看着没反应。
+      refresh_risk: (p.refresh_risk as Account['refresh_risk']) ?? null,
       manual_disabled: typeof p.manual_disabled === 'boolean' ? p.manual_disabled : null,
       manual_reason: typeof p.manual_reason === 'string' ? p.manual_reason : '',
       in_flight: typeof p.in_flight === 'number' ? p.in_flight : null,
@@ -127,12 +141,94 @@ export function rateLimitedModels(a: Account): {model: string; reason: string}[]
   const now = Date.now();
   return rows
     .filter((m) => {
-      const until = m.until;
-      if (typeof until !== 'string' || !until) return false;
-      const at = Date.parse(until);
-      return Number.isFinite(at) && at > now;
+      // 上游 /status 同时给两个时间（issue #409）：
+      //   · until    —— 网关本地冷却截止，会被 soft_rate_max 截断；
+      //   · reset_at —— 上游真实额度重置（未截断，通常远晚于 until）。
+      // 模型要真正可用，必须**两个都过去**，所以判活跃取较晚者；只看到期时间
+      // 会在本地冷却一到期就把「模型受限」藏起来，而实际上游还要几小时。
+      const at = modelLimitEnd(m);
+      return at !== null && at > now;
     })
     .map((m) => ({model: m.model, reason: String(m.reason ?? '')}));
+}
+
+/** 该模型恢复可用的时刻（毫秒）：取 `until` 与 `reset_at` 的较晚者；都不可解析返回 null。 */
+export function modelLimitEnd(m: {until?: string; reset_at?: string}): number | null {
+  const parse = (v?: string) => {
+    if (typeof v !== 'string' || !v) return -Infinity;
+    const at = Date.parse(v);
+    return Number.isFinite(at) ? at : -Infinity;
+  };
+  const at = Math.max(parse(m.until), parse(m.reset_at));
+  return at === -Infinity ? null : at;
+}
+
+/**
+ * 展示用的**4 组**语义（P1-3）：把上面 9 个细分档收敛成用户一眼能扫过的 4 类。
+ *
+ * 为什么需要收敛：9 档的差别（面板停用 vs 上游手动停用、限流退避 vs 连败降权……）
+ * 对**排查单个账号**有用，对「这一池子有没有问题」却是噪音——用户要的是「哪些号
+ * 得我去管」。而且分档文案原先只挂在徽章的 hover 提示里，移动端没有 hover，
+ * 等于状态信息不可见；收敛成 4 组之后就能摆成**可点的筛选项**，不再依赖 hover。
+ *
+ * 归组判据（刻意不按「严重程度」排，而按**该谁动手**分）：
+ *
+ *  · `usable`  —— 正常在线。用户不用管。
+ *  · `cooling` —— 冷却中（含连败降权）。**该等**，除非降权（那说明号在持续失败）。
+ *  · `stopped` —— 两种停用机制。这是**用户自己摘的号**，不是故障；归进「需处理」
+ *    会催着他去修一个他故意关掉的东西。
+ *  · `attention` —— 其余：上游硬禁用 / 令牌过期 / 一直失败 / 不在池里 / **状态未知**。
+ *    都**得有人去查**。`unknown`（这次没取到上游状态）放这里是有意的：没有任何
+ *    依据说这些号有问题，但「看不到上游」这件事本身就需要人去查，把它塞进
+ *    `usable` 才是真的说谎（那等于说「一切正常」，而我们根本没看到）。
+ */
+export type AvailabilityGroup = 'usable' | 'attention' | 'cooling' | 'stopped';
+
+/** 4 组的固定顺序（筛选项按这个顺序排：先正常、再要处理的、最后是用户自己关的） */
+export const AVAILABILITY_GROUPS: readonly AvailabilityGroup[] = [
+  'usable',
+  'attention',
+  'cooling',
+  'stopped',
+];
+
+/** 细分档 → 展示分组 */
+export function availabilityGroup(tier: AvailabilityTier): AvailabilityGroup {
+  switch (tier) {
+    case 'online':
+      return 'usable';
+    case 'cooling':
+      return 'cooling';
+    case 'disabledByPanel':
+    case 'manualDisabled':
+      return 'stopped';
+    case 'disabled':
+    case 'riskPaused':
+    case 'expired':
+    case 'neverSucceeded':
+    case 'notLoaded':
+    case 'unknown':
+      return 'attention';
+  }
+}
+
+/**
+ * 4 组的文案键。
+ *
+ * 写成 switch + 字面量（而不是 `` `accounts.group${…}` `` 拼出来）是为了**可检索**：
+ * 拼出来的键在代码里搜不到，改文案时只能靠猜。同文件下面那些函数也是这个写法。
+ */
+export function availabilityGroupLabelKey(group: AvailabilityGroup): string {
+  switch (group) {
+    case 'usable':
+      return 'accounts.groupUsable';
+    case 'attention':
+      return 'accounts.groupAttention';
+    case 'cooling':
+      return 'accounts.groupCooling';
+    case 'stopped':
+      return 'accounts.groupStopped';
+  }
 }
 
 /** 该账号的可用性分档（顺序即优先级，见模块注释）。 */
@@ -146,6 +242,8 @@ export function availabilityOf(a: Account): AvailabilityTier {
   // **还在池里**，签到与保活照常，所以文案必须与改名那条区分开。
   if (a.manual_disabled === true) return 'manualDisabled';
   if (a.disabled === true) return 'disabled';
+  if (a.poolUnknown) return 'unknown';
+  if (a.refresh_risk?.needs_review || (a.refresh_risk?.until ?? 0) * 1000 > Date.now()) return 'riskPaused';
   if (a.is_expired) return 'expired';
   // 「看不到上游」必须早于「不在池里」：否则会把正常账号说成文件损坏
   if (a.poolUnknown) return 'unknown';
@@ -165,18 +263,61 @@ export function availabilityOf(a: Account): AvailabilityTier {
  * 分档对应的文案键。**两页共用同一套文案**——这正是为了让两处说法逐字一致；
  * 各写各的字符串，迟早又会出现「一个叫在线、一个叫正常」这种漂移。
  */
+/** 11140 也用于模型限流；只按封禁语义判断，不能只看错误码。 */
+export function isAccountBanned(a?: Account): boolean {
+  const reason = String(a?.disabled_reason || '');
+  if (a?.disabled !== true || /11128|11-128|channel check|渠道校验/i.test(reason)) return false;
+  return /账号存在异常行为|已被限制使用/.test(reason)
+    || (/\b11140\b/.test(reason) && /request illegal|account banned/i.test(reason));
+}
+
+export function needsRelogin(a: Account): boolean {
+  return availabilityOf(a) === 'disabled' && !isAccountBanned(a);
+}
+
+export function disabledReasonText(a: Account): string {
+  const reason = String(a.disabled_reason || '');
+  return isAccountBanned(a) ? reason.replace(/,?\s*re-login required\.?/gi, '') : reason;
+}
+
+/** 同一 uid 跨组只算一次；任一组可用时，其余额归入可用部分。 */
+export function partitionCredits(accounts: readonly Account[], live: Record<string, number>) {
+  const unique = new Map<string, Account>();
+  const isUsable = (a: Account) => {
+    const tier = availabilityOf(a);
+    // 临时冷却不使余额失效；保护暂停、禁用等仍由分档优先排除。
+    return (tier === 'online' && a.healthy !== false)
+      || (tier === 'cooling' && a.in_pool !== false);
+  };
+  for (const a of accounts) {
+    if (!unique.has(a.uid) || isUsable(a)) unique.set(a.uid, a);
+  }
+  let available = 0, unavailable = 0, known = 0, unknown = 0;
+  const usableAccounts: Account[] = [];
+  for (const a of unique.values()) {
+    const usable = isUsable(a);
+    if (usable) usableAccounts.push(a);
+    const balance = live[a.uid] ?? a.credits;
+    if (typeof balance !== 'number' || !Number.isFinite(balance)) { unknown += 1; continue; }
+    known += 1;
+    if (usable) available += balance;
+    else unavailable += balance;
+  }
+  return {available, unavailable, total: available + unavailable, known, unknown, usableAccounts};
+}
+
 export function availabilityLabelKey(tier: AvailabilityTier, a?: Account): string {
   switch (tier) {
     case 'disabled':
-      // 上游对 11140（request illegal）是硬禁用、到期也不自愈，必须重新登录；
-      // 只说「已禁用」会让人干等。
-      return /11140|request illegal/i.test(String(a?.disabled_reason || ''))
-        ? 'accounts.badgeDisabledRelogin'
+      return isAccountBanned(a)
+        ? 'accounts.badgeBanned'
         : 'accounts.badgeDisabled';
     case 'disabledByPanel':
       return 'accounts.badgeDisabledByPanel';
     case 'manualDisabled':
       return 'accounts.badgeManualDisabled';
+    case 'riskPaused':
+      return a?.refresh_risk?.needs_review ? 'risk.review' : 'risk.paused';
     case 'expired':
       return 'accounts.badgeExpired';
     case 'unknown':
@@ -196,7 +337,7 @@ export function availabilityLabelKey(tier: AvailabilityTier, a?: Account): strin
 }
 
 /** 需要解释「为什么是这个状态」时对应的提示键；没有可解释的返回 null。 */
-export function availabilityTitleKey(tier: AvailabilityTier): string | null {
+export function availabilityTitleKey(tier: AvailabilityTier, a?: Account): string | null {
   switch (tier) {
     case 'unknown':
       return 'accounts.badgeUnknownTitle';
@@ -210,6 +351,13 @@ export function availabilityTitleKey(tier: AvailabilityTier): string | null {
       return 'accounts.badgeDisabledByPanelTitle';
     case 'manualDisabled':
       return 'accounts.badgeManualDisabledTitle';
+    case 'riskPaused':
+      return 'risk.recovery';
+    // 系统自动禁用（12153 连败 / 11140 被封）必须给出**下一步**：只说「已禁用」
+    // 用户不知道能做什么。点「启用」现在会连同系统禁用位一起解除（面板会调上游
+    // 的 revive 端点）——这一点以前不成立，所以老提示只能写「重新登录」。
+    case 'disabled':
+      return isAccountBanned(a) ? 'accounts.bannedHint' : 'accounts.badgeDisabledTitle';
     default:
       return null;
   }
@@ -229,6 +377,7 @@ export function availabilityClass(tier: AvailabilityTier): string {
     case 'unknown':
       return 'text-muted-foreground';
     case 'cooling':
+    case 'riskPaused':
       return 'text-amber-600 dark:text-amber-400';
     case 'neverSucceeded':
     case 'notLoaded':
@@ -237,3 +386,168 @@ export function availabilityClass(tier: AvailabilityTier): string {
       return 'text-emerald-600 dark:text-emerald-400';
   }
 }
+
+/* ──────────────────────────────────────────────────────────────
+ * 跨分组聚合（仪表盘「全部」视图）
+ *
+ * 仪表盘原先只取默认分组（`accountApi.list()` 不传 upstreamId，后端
+ * `routers/accounts.py::_group(None)` 就是默认分组），于是有多个分组时首页
+ * 只报 1/N 个池子。而那个数**看起来完全正常**——数字合理、图表正常，用户
+ * 不会怀疑，也永远不会自己变对（上游 issue #94 问题 2）。这比「加载中显示 0」
+ * 严重：前者是延迟，后者是错误。
+ *
+ * 修法是逐组各取一份再合并。合并本身有几处容易写错，所以和 `mergePoolStatus`
+ * 放在一起、由 `account-status.test.mjs` 直接测真实实现：
+ *
+ *  1. **`file` 只在分组内唯一**。两个分组可以有同名账号文件（`sub2api.json`
+ *     这类是扫码登录的默认文件名）。合并后若还拿 `a.file` 当 React key，两条
+ *     会撞成一个——列表少一条，或者状态串到别的号上，而两种都不会报错。
+ *  2. **池状态必须逐组合并**（`tagGroup` 就是干这个的）。`mergePoolStatus` 是把
+ *     「**这一份** /status 快照」并到「**这一份**账号列表」上的；若先跨组拼账号、
+ *     再拿某一组的 /status 去并，其余组的账号会因为「不在这份池里」被整批判成
+ *     `notLoaded`——那正是本模块开头记着的那个 P0 级误报。
+ *  3. **没有账号目录的分组不该被取数**。后端对这类分组的账号接口直接 409
+ *     （`routers/accounts.py::_require_dir`），列表接口给空数组。它们本来就没有
+ *     账号，纳进来只会多出几个必然失败的请求，还会让「共 N 个分组」这个数虚高。
+ * ────────────────────────────────────────────────────────────── */
+
+/** 账号 + 它属于哪个分组 */
+export interface GroupedAccount extends Account {
+  group: {id: number | null; name: string};
+}
+
+/** 一个分组的取数结果（成功与失败都在这里；失败时 accounts 为空、error 有值） */
+export interface GroupSlice {
+  /** 分组 id；null = 默认分组（与后端 `upstreamsvc.DEFAULT_ID` 一致） */
+  gid: number | null;
+  /** 分组名。多于一个分组时，界面靠它标注「这条账号属于哪个池」 */
+  name: string;
+  /** 该组的账号：已合并**该组**的池状态、已打上分组标记 */
+  accounts: GroupedAccount[];
+  /** 该组的池状态；没取到为 null */
+  upstream: UpstreamStatus | null;
+  /** 该组取数失败的原因；成功为 null */
+  error: unknown;
+}
+
+/**
+ * 该在哪些分组上取账号数：只取**配了本地账号目录**的。
+ *
+ * 默认分组永远有目录（部署时的 `WB_AUTH_DIR`，见 `upstreamsvc.default_upstream`）；
+ * 其余分组没配目录 = 只做密钥转发，一个账号都没有，而且它的账号接口会 409。
+ */
+export function accountGroups(groups: readonly UpstreamEndpoint[]): UpstreamEndpoint[] {
+  return groups.filter((g) => String(g.auth_dir ?? '').trim() !== '');
+}
+
+/**
+ * 把**一组**的账号与**它自己的**池状态合并，并打上分组标记。
+ *
+ * 参数刻意是「一组的账号 + 一组的 /status」：跨组混用会把别的组的账号判成
+ * 「不在池里」（见上方第 2 条）。
+ */
+export function tagGroup(
+  accounts: readonly Account[],
+  upstream: UpstreamStatus | null,
+  gid: number | null,
+  name: string,
+): GroupedAccount[] {
+  return mergePoolStatus(accounts as Account[], upstream)
+    .map((a) => ({...a, group: {id: gid, name}}));
+}
+
+/**
+ * React key。**必须带分组**。
+ *
+ * `file` 只在分组内唯一：两个分组里的 `sub2api.json` 是两个不同的账号。
+ * 只用文件名当 key，React 会把它们当成同一条——表现是列表少一条、或者某条的
+ * 状态串到另一条上，而两种都不会报错。
+ */
+export function accountKey(a: GroupedAccount): string {
+  return `${a.group.id ?? 'default'}:${a.file}`;
+}
+
+/**
+ * 交错取各组的下一个账号（第 1 组第 1 条 → 第 2 组第 1 条 → … → 第 1 组第 2 条）。
+ *
+ * 首页快照只画前 9 条（P1-7 记录了这个硬截断）。若按「一组接一组」平铺，默认
+ * 分组的 9 个账号会把格子占满，其余分组的问题一条都看不到——而「覆盖所有分组」
+ * 正是这次要修的东西。交错之后每个分组都有代表，截断也不会把某一组整个吞掉。
+ */
+export function interleave(slices: readonly GroupSlice[]): GroupedAccount[] {
+  const out: GroupedAccount[] = [];
+  const longest = slices.reduce((m, s) => Math.max(m, s.accounts.length), 0);
+  for (let i = 0; i < longest; i += 1) {
+    for (const s of slices) {
+      const a = s.accounts[i];
+      if (a) out.push(a);
+    }
+  }
+  return out;
+}
+
+/**
+ * 该组里「连败降权」的账号数（只数当前版本，与卡片、快照同口径）。
+ *
+ * 为什么要单独数（上游 issue #114）：**上游把降权并进 `cooling`**，所以
+ * `realm_totals` 里的「冷却中」是个混数——既有等一会儿就好的限流退避，也有
+ * 「这个号在持续失败」的降权。面板只显示混数时用户看不出降权的存在（反馈原话：
+ * 「降权统计这里根本不统计」）。从账号明细单独数一份，与上游口径不冲突：
+ * 它只是把 `cooling` 里降权的那一部分显式化。
+ *
+ * 参数是**一个分组的切片**而不是全量账号：面板改成「每个分组一块」之后，这一格
+ * 必须只数本组，否则每块都会显示全池的降权数（看起来像「四个分组各自都降权了
+ * 同样多个号」）。
+ */
+export function degradedCount(slice: GroupSlice, realm: string): number {
+  return slice.accounts.filter((a) => (a.realm ?? 'cn') === realm && isDegraded(a)).length;
+}
+
+/** 「反代上游」面板里一个分组那一块的池计数 */
+export interface PoolTotals {
+  total: number;
+  healthy: number;
+  cooling: number;
+  disabled: number;
+  /** 拿到了可用的计数（无论来自 realm_totals 还是顶层汇总） */
+  known: boolean;
+  /** 只能拿到顶层汇总（含两个版本），界面需标注 */
+  globalOnly: boolean;
+}
+
+/**
+ * 一个分组的池计数。
+ *
+ * 优先用上游按版本分好的 `realm_totals[realm]`——口径与上游状态机完全一致，
+ * 也不用我们去猜 `healthy` 该怎么算（曾经从账号明细里自己数，而明细里根本
+ * 没有这个字段，布尔转换恒为 false，面板因此全显示 0）。
+ *
+ * 老版本上游没给 realm_totals 时退回顶层汇总，并标 `globalOnly`：那时它是
+ * 两个版本的**合计**，界面必须说明，否则切到国际版会看到两个版本加起来的数。
+ *
+ * ⚠️ 这里是**一个分组**的口径，刻意不做跨组求和：两个分组可以指向同一套上游
+ * 实例（新建分组时地址默认沿用默认分组的），求和会把同一套实例数两遍。
+ */
+export function poolTotals(upstream: UpstreamStatus | null, realm: string): PoolTotals {
+  const perRealm = upstream?.realm_totals?.[realm];
+  if (perRealm) {
+    return {
+      total: perRealm.total,
+      healthy: perRealm.healthy,
+      cooling: perRealm.cooling,
+      disabled: perRealm.disabled,
+      known: true,
+      globalOnly: false,
+    };
+  }
+  const hasTop = typeof upstream?.total === 'number';
+  return {
+    total: upstream?.total ?? 0,
+    healthy: upstream?.healthy ?? 0,
+    cooling: upstream?.cooling ?? 0,
+    disabled: upstream?.disabled ?? 0,
+    known: hasTop,
+    globalOnly: hasTop,
+  };
+}
+

@@ -168,6 +168,22 @@ console.log('\n=== 面板日志行（taskrun.ts）===');
 const LINE_CASES = [
   {label: 'query 已领跳过', raw: '[task_runner] abcd1234 t001: query claimed(3/5) -> 已领，跳过',
    data: ['[task_runner]', 'abcd1234', 't001', '3/5']},
+  // 上游 2026-09-23（ee3c694 / 9a26ae7）成长任务续作引入的两行：对象 id 池为空、
+  // 或数量不够本轮目标。任务类型（miniexpert）是数据，必须原样留着。
+  {label: '对象池为空：跳过点亮',
+   raw: '[task_runner] abcd1234 t009: miniexpert 无可用对象 id，WARN 跳过点亮',
+   data: ['[task_runner]', 'abcd1234', 't009', 'miniexpert']},
+  {label: '对象池不够本轮目标',
+   raw: '[task_runner] abcd1234 t009: 可用对象 id 3 < 需 5，本轮按可用数上报',
+   data: ['[task_runner]', 'abcd1234', 't009', '3', '5']},
+  // 上游 2026-09-24（06878fd / 1580a86）成长任务续作新增：任务未到上线时间。
+  // 解锁时间是数据，形态可能是时间戳（带空格）也可能是 "?"。
+  {label: '任务未到上线时间（解锁时间戳带空格）',
+   raw: '[task_runner] abcd1234 t011: query locked（解锁 2026-09-25 09:00:00）-> 未到上线时间，跳过',
+   data: ['[task_runner]', 'abcd1234', 't011', '2026-09-25 09:00:00']},
+  {label: '任务未到上线时间（无解锁时间）',
+   raw: '[task_runner] abcd1234 t011: query locked（解锁 ?）-> 未到上线时间，跳过',
+   data: ['abcd1234', 't011', '?']},
   {label: '看护追加：空闲超时（我们自己的行）', raw: '!! 已 300s 无输出，判定卡死并终止', data: ['300']},
   {label: '未命中的上游新行', raw: '这条上游新加的行没模板，应当原样返回',
    passthrough: ['这条上游新加的行没模板，应当原样返回']},

@@ -1,0 +1,381 @@
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index de1599c..fdebb5a 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -236,6 +236,8 @@ func main() {
+ 		GlobalEnabled: cfg.Global.Enabled,
+ 		// 运维管理端点开关（config admin.enabled，默认 false）。
+ 		AdminEnabled: cfg.Admin.Enabled,
++		// 余额刷新端点（POST /v1/balance/refresh）复用调度器。
++		Scheduler: sch,
+ 	})
+ 
+ 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
+index 55d2dca..00e65f9 100644
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -433,6 +433,57 @@ func (s *Scheduler) runCheckinNow(ctx context.Context) {
+ //
+ // session dead 走 Pool.NoteSessionDead 的**连续计数**语义（与 keepalive 一致）：
+ // 一次刷新失败不再立即杀号，连续 sessionDeadThreshold 次才禁用，刷新成功清计数。
++
++// BalanceOutcome 单个账号的余额刷新结果（供 POST /v1/balance/refresh 回执）。
++type BalanceOutcome struct {
++	UID      string `json:"uid"`
++	Nickname string `json:"nickname,omitempty"`
++	Credits  *int64 `json:"credits,omitempty"`
++	Expiring *int64 `json:"expiring,omitempty"`
++	Error    string `json:"error,omitempty"`
++}
++
++// RefreshBalances 对全池账号执行一次余额刷新（**不签到、不改 token**）。
++//
++// 为什么需要这个入口：上游的 credits 只在签到定时任务（checkin_hours，默认
++// 9/21 点）里刷新，而 /status 与面板读的是那个快照 —— 两次签到之间余额变化
++// 反映不到界面（企业账号的周期额度尤其明显：周期内消耗变化不会自己出现）。
++// 手动触发一次刷新即可让状态与上游真实值对齐。
++//
++// 与 checkinAll 的差异：只查余额，不发起签到。企业账号签不了（400 code=10001），
++// 个人账号签到有副作用，两者都不该被"刷新余额"连带触发。
++// 企业账号的额度由 UserResourceDetailed 内的企业分支处理
++// （remain = limitNum - credit，见 upstream/enterprise_usage.go）。
++func (s *Scheduler) RefreshBalances() []BalanceOutcome {
++	statuses := s.cfg.Pool.List()
++	out := make([]BalanceOutcome, 0, len(statuses))
++	for _, st := range statuses {
++		if st.Disabled {
++			continue
++		}
++		a := s.cfg.Pool.AuthByUID(st.UID)
++		if a == nil || a.RefreshTokenValue() == "" {
++			continue
++		}
++		oc := BalanceOutcome{UID: st.UID, Nickname: st.Nickname}
++		remain, buckets, err := s.cfg.Upstream.UserResourceDetailed(a, s.cfg.ExpiringSoonWindow)
++		if err != nil {
++			oc.Error = err.Error()
++			log.Printf("balance-refresh %s: %v", logfmt.Label(st.UID, st.Nickname), err)
++			out = append(out, oc)
++			continue
++		}
++		// 写回池状态：与签到路径同口径，保证 /status 与选号用的都是新值。
++		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, buckets.Expiring)
++		r := remain
++		oc.Credits = &r
++		e := buckets.Expiring
++		oc.Expiring = &e
++		out = append(out, oc)
++	}
++	return out
++}
++
+ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
+ 	return s.checkinAll(context.Background())
+ }
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index e8c4997..958aadc 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -19,6 +19,7 @@ import (
+ 	"workbuddy2api/internal/logfmt"
+ 	"workbuddy2api/internal/pool"
+ 	"workbuddy2api/internal/prompt"
++	"workbuddy2api/internal/scheduler"
+ 	"workbuddy2api/internal/session"
+ 	"workbuddy2api/internal/upstream"
+ )
+@@ -52,6 +53,17 @@ type Config struct {
+ 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
+ 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
+ 	AdminEnabled bool
++
++	// Scheduler 定时任务调度器（可选；nil = 不提供余额刷新端点）。
++	// 仅供 POST /v1/balance/refresh：手动触发一次全池余额刷新，
++	// 让 /status 的 credits 立刻反映上游真实值（不必等到下一个签到时刻）。
++	Scheduler BalanceRefresher
++}
++
++// BalanceRefresher 余额刷新能力（由 scheduler.Scheduler 实现）。
++// 用接口而非具体类型，避免 server 包反向依赖 scheduler 的实现细节。
++type BalanceRefresher interface {
++	RefreshBalances() []scheduler.BalanceOutcome
+ }
+ 
+ // notFoundCooldown 上游 404 的固定短冷却时长。
+@@ -108,6 +120,10 @@ func NewHandler(cfg Config) *Handler {
+ 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+ 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
+ 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
++	// 手动触发全池余额刷新（不签到）：让 /status 的 credits 立刻对齐上游。
++	if h.cfg.Scheduler != nil {
++		h.mux.HandleFunc("POST /v1/balance/refresh", h.withAuth(h.balanceRefresh))
++	}
+ 	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
+ 	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
+ 	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权
+@@ -1336,3 +1352,29 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
+ 	}
+ 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+ }
++
++
++// balanceRefresh 手动触发一次全池余额刷新（POST /v1/balance/refresh）。
++//
++// 上游 credits 只在签到定时任务里刷新，两次签到之间 /status 的余额是旧值。
++// 本端点复用 scheduler.RefreshBalances()：只查余额、不签到、不改 token。
++func (h *Handler) balanceRefresh(w http.ResponseWriter, r *http.Request) {
++	if h.cfg.Scheduler == nil {
++		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
++			"error": map[string]any{"message": "余额刷新未启用", "type": "api_error"},
++		})
++		return
++	}
++	outcomes := h.cfg.Scheduler.RefreshBalances()
++	okN := 0
++	for _, oc := range outcomes {
++		if oc.Error == "" {
++			okN++
++		}
++	}
++	writeJSON(w, http.StatusOK, map[string]any{
++		"total":     len(outcomes),
++		"succeeded": okN,
++		"accounts":  outcomes,
++	})
++}
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index e9b155e..ea2706f 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -1678,6 +1678,30 @@ const packageEndLayout = "2006-01-02 15:04:05"
+ // 双份逻辑漂移——旧中间 switch 只钳负值，上游脏数据 CycleRemain>Size 时会高估）。
+ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain int64, buckets CreditBuckets, err error) {
+ 	now := time.Now()
++
++	// 企业版账号（enterpriseId 非空）额度不在个人「资源包」体系内：
++	// get-user-resource 对它们恒返回空 Accounts，会把额度错算成 0。
++	// 改走 get-enterprise-user-usage，并按 remain = limitNum - credit 换算。
++	// 详见 enterprise_usage.go。
++	if IsEnterprise(a) {
++		eRemain, eTotal, eCycleEnd, eErr := c.enterpriseUsage(a)
++		if eErr != nil {
++			return 0, CreditBuckets{}, eErr
++		}
++		// total == -1 表示不限量：remaining 概念不适用，记 0 但不算「触底」。
++		if eTotal < 0 {
++			return 0, CreditBuckets{}, nil
++		}
++		if soon > 0 && eRemain > 0 && !eCycleEnd.IsZero() {
++			if !eCycleEnd.After(now.Add(soon)) {
++				buckets.Expiring += eRemain
++				return eRemain, buckets, nil
++			}
++		}
++		buckets.Stable += eRemain
++		return eRemain, buckets, nil
++	}
++
+ 	resp, err := c.getUserResourceBody(a)
+ 	if err != nil {
+ 		return 0, CreditBuckets{}, err
+diff --git a/internal/upstream/enterprise_usage.go b/internal/upstream/enterprise_usage.go
+new file mode 100644
+index 0000000..96eb052
+--- /dev/null
++++ b/internal/upstream/enterprise_usage.go
+@@ -0,0 +1,95 @@
++package upstream
++
++// 企业版（enterpriseId 非空）账号的额度查询。
++//
++// 背景：企业账号的额度**不在个人「资源包」体系内**，个人接口
++// `get-user-resource` 对它们恒返回空 Accounts，导致额度被算成 0。
++// 企业额度要走专用端点 `POST /v2/billing/meter/get-enterprise-user-usage`。
++//
++// 口径差异（与个人接口语义相反，务必注意）：
++//   - 个人：CapacityRemain 直接就是「剩余」
++//   - 企业：`credit` 是**本周期已用**，`limitNum` 是**分配给该账号的额度**，
++//     故 remain = limitNum - credit、total = limitNum
++//   - `limitNum == -1` 表示不限量（此时 total 返回 -1，由上层按「不限」展示）
++//
++// 周期字段：cycleStartTime / cycleEndTime / cycleResetTime 均为 UTC+8 墙钟字符串，
++// 与个人接口 CycleEndTime 同口径（packageEndLayout）。
++
++import (
++	"encoding/json"
++	"fmt"
++	"math"
++	"net/http"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++// billingMeterPathEnterpriseUsage 企业额度查询端点（CN）。
++const billingMeterPathEnterpriseUsage = "/v2/billing/meter/get-enterprise-user-usage"
++
++// enterpriseUsageData get-enterprise-user-usage 的 **data 本体**结构
++// （信封由 doJSON 解开，这里不含 code/msg）。
++type enterpriseUsageData struct {
++	// Credit 本周期已用（与个人口径的 remain 相反）。
++	Credit float64 `json:"credit"`
++	// LimitNum 分配给该账号的额度；-1 = 不限量。
++	LimitNum       float64 `json:"limitNum"`
++	CycleStartTime string  `json:"cycleStartTime"`
++	CycleEndTime   string  `json:"cycleEndTime"`
++	CycleResetTime string  `json:"cycleResetTime"`
++}
++
++// IsEnterprise 账号是否为企业版（auth 文件 enterpriseId 非空）。
++func IsEnterprise(a *auth.Auth) bool {
++	return a != nil && a.EnterpriseID != ""
++}
++
++// enterpriseUsage 查询企业账号额度。
++//
++// 返回：
++//   - remain 剩余额度（limitNum - credit，负值钳 0）
++//   - total  周期配额（limitNum；不限量时返回 -1）
++//   - cycleEnd 周期结束时间（用于 expiring 分桶；解析失败时为零值）
++func (c *Client) enterpriseUsage(a *auth.Auth) (remain int64, total int64, cycleEnd time.Time, err error) {
++	// 企业端点固定走 billingJSON（不经 billingMeterPaths：那条是个人接口的
++	// realm 路由，企业端点没有 global 变体）。
++	data, err := c.billingJSON(a, http.MethodPost, billingMeterPathEnterpriseUsage, map[string]any{})
++	if err != nil {
++		return 0, 0, time.Time{}, err
++	}
++
++	// 注意：billingJSON → doJSON **已经解过信封**（其返回的就是 env.Data，
++	// 业务码非 0 时 doJSON 早已按错误返回）。因此这里解析的是 data 本体，
++	// 不能再套 {code,msg,data} 结构 —— 否则 LimitNum/Credit 全落零值。
++	var resp enterpriseUsageData
++	if err := json.Unmarshal(data, &resp); err != nil {
++		return 0, 0, time.Time{}, fmt.Errorf("enterprise usage parse: %w", err)
++	}
++
++	// limitNum == -1 表示不限量：total 记 -1，由上层按「不限」处理。
++	if resp.LimitNum < 0 {
++		return 0, -1, parseEnterpriseCycleEnd(resp.CycleEndTime), nil
++	}
++
++	// 上游 credit 可能是小数（如 325.35），四舍五入后再减，避免累计误差。
++	used := int64(math.Round(resp.Credit))
++	limit := int64(math.Round(resp.LimitNum))
++	remain = limit - used
++	if remain < 0 {
++		remain = 0
++	}
++	return remain, limit, parseEnterpriseCycleEnd(resp.CycleEndTime), nil
++}
++
++// parseEnterpriseCycleEnd 解析企业周期结束时间（UTC+8 墙钟）。
++// 解析失败返回零值 —— 调用方据此跳过 expiring 分桶，不把额度算错。
++func parseEnterpriseCycleEnd(s string) time.Time {
++	if s == "" {
++		return time.Time{}
++	}
++	if t, err := time.ParseInLocation(packageEndLayout, s, softRateResetLoc); err == nil {
++		return t
++	}
++	return time.Time{}
++}
+diff --git a/internal/upstream/enterprise_usage_test.go b/internal/upstream/enterprise_usage_test.go
+new file mode 100644
+index 0000000..a33902a
+--- /dev/null
++++ b/internal/upstream/enterprise_usage_test.go
+@@ -0,0 +1,93 @@
++package upstream
++
++// 企业额度查询的单元测试（纯解析层，不打网络）。
++
++import (
++	"encoding/json"
++	"testing"
++
++	"workbuddy2api/internal/auth"
++)
++
++// TestIsEnterprise 覆盖 IsEnterprise 的边界。
++func TestIsEnterprise(t *testing.T) {
++	cases := []struct {
++		name string
++		a    *auth.Auth
++		want bool
++	}{
++		{"nil", nil, false},
++		{"个人号(空 enterpriseId)", &auth.Auth{UID: "u1"}, false},
++		{"企业号", &auth.Auth{UID: "u2", EnterpriseID: "ent-1"}, true},
++	}
++	for _, c := range cases {
++		if got := IsEnterprise(c.a); got != c.want {
++			t.Errorf("%s: IsEnterprise=%v want %v", c.name, got, c.want)
++		}
++	}
++}
++
++// TestParseEnterpriseCycleEnd 覆盖周期结束时间解析。
++func TestParseEnterpriseCycleEnd(t *testing.T) {
++	if got := parseEnterpriseCycleEnd(""); !got.IsZero() {
++		t.Errorf("空字符串应返回零值，got=%v", got)
++	}
++	if got := parseEnterpriseCycleEnd("not-a-time"); !got.IsZero() {
++		t.Errorf("非法格式应返回零值，got=%v", got)
++	}
++	got := parseEnterpriseCycleEnd("2026-11-13 23:59:59")
++	if got.IsZero() {
++		t.Fatal("合法时间不应返回零值")
++	}
++	if got.Year() != 2026 || got.Month() != 11 || got.Day() != 13 {
++		t.Errorf("解析结果错误: %v", got)
++	}
++	// UTC+8 墙钟 23:59:59 → UTC 15:59:59
++	if _, off := got.Zone(); off != 8*3600 {
++		t.Errorf("时区偏移=%d want %d", off, 8*3600)
++	}
++}
++
++// TestEnterpriseUsageDataParsing 覆盖 **data 本体** 的解析与口径换算。
++//
++// 关键回归点：billingJSON→doJSON 已经解过信封（返回 env.Data），
++// 所以这里解析的是 data 本体。曾经误把它当完整信封再套一层，
++// 导致 LimitNum/Credit 全落零值、企业额度恒为 0。
++func TestEnterpriseUsageDataParsing(t *testing.T) {
++	// doJSON 返回的 data 本体（2026-10-18 实测）
++	raw := `{"credit":342.1,"cycleStartTime":"2026-10-13 00:00:00",
++		"cycleEndTime":"2026-11-13 23:59:59","limitNum":2000,
++		"cycleResetTime":"2026-11-14 00:00:00"}`
++
++	var resp enterpriseUsageData
++	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	if resp.LimitNum != 2000 {
++		t.Errorf("limitNum=%v want 2000（若为 0 说明又把 data 当信封解了一遍）", resp.LimitNum)
++	}
++	if resp.Credit != 342.1 {
++		t.Errorf("credit=%v want 342.1", resp.Credit)
++	}
++	// 口径换算：remain = round(limitNum) - round(credit) = 2000 - 342 = 1658
++	remain := int64(2000) - int64(342)
++	if remain != 1658 {
++		t.Errorf("remain=%d want 1658", remain)
++	}
++	// 周期结束时间应能解析
++	if ce := parseEnterpriseCycleEnd(resp.CycleEndTime); ce.IsZero() {
++		t.Error("cycleEndTime 解析失败")
++	}
++}
++
++// TestEnterpriseUsageDataUnlimited limitNum=-1 表示不限量。
++func TestEnterpriseUsageDataUnlimited(t *testing.T) {
++	raw := `{"credit":10,"limitNum":-1}`
++	var resp enterpriseUsageData
++	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
++		t.Fatalf("unmarshal: %v", err)
++	}
++	if resp.LimitNum >= 0 {
++		t.Errorf("limitNum=%v 应为负数（不限量）", resp.LimitNum)
++	}
++}

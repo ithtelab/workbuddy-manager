@@ -48,7 +48,8 @@ _PAGE = _ROOT / 'web' / 'app' / '(main)' / 'accounts' / 'page.tsx'
 
 def _call(role: str, *, force: bool) -> dict:
     """直接调端点函数，把 user 传进去（依赖注入由框架负责，这里只验角色逻辑）。"""
-    with mock.patch.object(accounts.wb2api, 'list_auth_accounts', lambda: []):
+    with mock.patch.object(accounts.wb2api, 'list_auth_accounts',
+                              lambda auth_dir=None: []):
         return asyncio.run(accounts.refresh_all_credits(force=force, user={'role': role}))
 
 
@@ -82,7 +83,8 @@ class RefreshCreditsPermissionTest(unittest.TestCase):
         for role in ('', 'guest', None):
             with self.subTest(role=role):
                 with self.assertRaises(HTTPException):
-                    with mock.patch.object(accounts.wb2api, 'list_auth_accounts', lambda: []):
+                    with mock.patch.object(accounts.wb2api, 'list_auth_accounts',
+                              lambda auth_dir=None: []):
                         asyncio.run(accounts.refresh_all_credits(
                             force=True, user={'role': role}))
 

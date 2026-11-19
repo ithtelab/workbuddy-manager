@@ -1,14 +1,18 @@
 """上游配置、模型映射与管理端用户。"""
 from __future__ import annotations
 
+import os
 import secrets
+import time
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from .. import db, security
+from .. import config, db, security
+from ..services import pricing
 from ..iputil import client_ip
-from ..services import reload, updater, wb2api
+from ..services import autoupdate, gatewaycors, modelmap, reload, updater, wb2api
 
 router = APIRouter(prefix='/api', tags=['settings'])
 
@@ -21,7 +25,7 @@ def get_upstream(user: dict = Depends(security.current_user)) -> dict:
 
 @router.post('/settings/upstream')
 async def save_upstream(body: dict, request: Request,
-                        user: dict = Depends(security.require_admin)) -> dict:
+                        user: dict = Depends(security.require_session_admin)) -> dict:
     # 必须是 async：同步路由会被 FastAPI 放进线程池执行，那里没有事件循环，
     # 无法调度后台重载任务（request_restart 将拿不到 running loop）。
     try:
@@ -30,10 +34,17 @@ async def save_upstream(body: dict, request: Request,
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # 改上游配置会影响全部账号行为，且可能写入 device_token/base 等敏感项，必须留痕
+    # 改上游配置会影响全部账号行为，且可能写入 device_token/base 等敏感项，必须留痕。
+    # 顶层标量（如 reasoning_as_content）不属于任何段，单独列出——否则日志会显示
+    # 「段=」，看起来像什么都没改。
+    sections = ','.join(sorted(k for k in body if isinstance(body.get(k), dict)))
+    top_keys = ','.join(sorted(
+        f'{k}={body[k]}' for k in body
+        if not isinstance(body.get(k), dict) and k != 'listen'
+    ))
     security.audit(user, 'update_upstream', '',
-                   f"段={','.join(sorted(k for k in body if isinstance(body.get(k), dict)))}"
-                   f'；来源 {client_ip(request)}')
+                   f'段={sections}' + (f'；顶层={top_keys}' if top_keys else '')
+                   + f'；来源 {client_ip(request)}')
     # 上游只在启动时读 config.json，保存后自动重载使其生效
     result['reload_scheduled'] = reload.request_restart()
     # 无法自动重载上游时（没装 docker / 容器没挂 docker.sock），要如实告诉
@@ -45,7 +56,7 @@ async def save_upstream(body: dict, request: Request,
         result['reload_scheduled'] = False
         result['reload_hint'] = (
             '配置已写入，但当前环境无法操作 docker，不会自动重启上游容器。'
-            '请在宿主机执行 docker compose restart wbapi（上游目录下）使其生效。'
+            '请在宿主机执行 docker compose restart wb2api（上游目录下）使其生效。'
         )
     return result
 
@@ -63,15 +74,21 @@ class UpstashTestIn(BaseModel):
 
 
 @router.post('/settings/upstash/test')
-async def test_upstash(body: UpstashTestIn, user: dict = Depends(security.require_admin)) -> dict:
+async def test_upstash(body: UpstashTestIn,
+                       user: dict = Depends(security.require_session_admin)) -> dict:
     """探测 Upstash 是否可用（走其 REST 接口 PING）。"""
     ok, message = await wb2api.test_upstash(body.url, body.token)
     return {'ok': ok, 'message': message}
 
 
 @router.post('/settings/upstash/reload')
-async def reload_upstream(user: dict = Depends(security.require_admin)) -> dict:
-    """立即重启上游容器（等待结果）。一般无需手动调用——保存配置会自动重载。"""
+async def reload_upstream(user: dict = Depends(security.require_session_admin)) -> dict:
+    """立即重启上游容器（等待结果）。一般无需手动调用——保存配置会自动重载。
+
+    与会话绑定：它和 `/api/restart` 是**同一个动作**（都走 `reload.restart_now()`），
+    后者在引入 API Token 时被划为「仅会话」。同一个动作不能因为走的是哪个路由就
+    权限不同——否则 token 泄露者能从这里把上游重启掉，那条边界就形同虚设。
+    """
     ok, message = await reload.restart_now()
     return {'ok': ok, 'message': message}
 
@@ -84,9 +101,266 @@ def get_model_map(user: dict = Depends(security.current_user)) -> dict:
 
 @router.post('/settings/model-map')
 def save_model_map(body: dict[str, str], user: dict = Depends(security.require_admin)) -> dict:
-    clean = {str(k): str(v) for k, v in body.items() if str(k).strip() and str(v).strip()}
+    """保存映射表。键既可以是真实别名，也可以是兜底的 `*`（issue #173）。
+
+    校验集中在 `services/modelmap.validate`：这里只拒「落库后一定会坏」的那一类
+    —— 目前只有「目标写成 `*`」（查表会把 `*` 当模型名发给上游，而界面上显示着
+    "已设置兜底"，用户从报错里反推不出原因）。
+
+    ValueError 要**转成 400**：服务端校验按 4xx 送达，浏览器里才能把 detail 那句
+    原因显示出来；漏了这一步它就是 500，用户只看到「服务器错误」而拿不到该改什么
+    （浏览器验收里真踩到过：直接调接口写 `{"*": "*"}` 得到的是 500 空 body）。
+    """
+    try:
+        clean = modelmap.validate(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.set_setting('model_map', clean)
     return clean
+
+# ── 计费价目（issue #380）────────────────────────────────
+#
+# 价目表默认随版本分发（server/services/pricing.json）。管理员可以在这里覆盖：
+# 官方调价后不必等上游发版，改完立刻生效。**只影响之后的调用** —— 已经落库的
+# 费用按当时的价目算好并存着，不会被改写（历史账不跟着变，见 pricing 模块说明）。
+@router.get('/settings/pricing')
+def get_pricing(user: dict = Depends(security.current_user)) -> dict:
+    """价目表 + 当前生效档 + 是否用了覆盖 + 节假日表缺哪些年份。"""
+    return pricing.describe()
+
+
+def _validate_pricing(body: Any) -> dict | None:
+    """校验覆盖价目：结构不对就 400，别把坏数据落库。
+
+    只拦「落库后一定算错」的形态：版本列表里每一条都得有可解析的
+    `effective_from` 和至少一个模型；单价必须是数字。宁可拒绝，也不要存进去
+    之后让整张费用表变成「—」——那种故障没有报错，只有沉默。
+    """
+    if body in (None, {}, []):
+        return None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail='价目表必须是 JSON 对象')
+    versions = body.get('versions')
+    if versions is None:
+        return None
+    if not isinstance(versions, list):
+        raise HTTPException(status_code=400, detail='versions 必须是数组')
+    clean_versions: list[dict] = []
+    for idx, item in enumerate(versions):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f'第 {idx + 1} 条价目不是对象')
+        start = str(item.get('effective_from') or '').strip()
+        try:
+            time.strptime(start, '%Y-%m-%d')
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f'第 {idx + 1} 条价目的 effective_from 不是 YYYY-MM-DD：{start!r}',
+            ) from None
+        models = item.get('models')
+        if not isinstance(models, dict) or not models:
+            raise HTTPException(status_code=400,
+                                detail=f'第 {idx + 1} 条价目没有 models')
+        for name, table in models.items():
+            if not isinstance(table, dict):
+                raise HTTPException(status_code=400,
+                                    detail=f'{name} 的价目不是对象')
+            for field in ('cache_hit', 'cache_miss', 'output'):
+                band = table.get(field)
+                if band is None:
+                    continue
+                if not isinstance(band, dict):
+                    raise HTTPException(status_code=400,
+                                        detail=f'{name}.{field} 必须是 {{peak, off_peak}}')
+                for key, val in band.items():
+                    if key not in ('peak', 'off_peak'):
+                        raise HTTPException(status_code=400,
+                                            detail=f'{name}.{field} 只能有 peak / off_peak')
+                    if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
+                        raise HTTPException(status_code=400,
+                                            detail=f'{name}.{field}.{key} 必须是非负数字')
+            if 'cache_miss' not in table or 'output' not in table:
+                raise HTTPException(status_code=400,
+                                    detail=f'{name} 至少要给 cache_miss 与 output 两档价')
+        clean_versions.append(item)
+    out = {'versions': clean_versions}
+    if isinstance(body.get('model_aliases'), dict):
+        out['model_aliases'] = body['model_aliases']
+    if body.get('currency'):
+        out['currency'] = str(body['currency'])
+    return out
+
+
+@router.put('/settings/pricing')
+def save_pricing(body: Any = Body(None),
+                 user: dict = Depends(security.require_admin)) -> dict:
+    """保存（或清除）覆盖价目。传 null / 空对象 = 恢复成随版本分发的那份。
+
+    `Body(None)` 而不是 `Body(...)`：清除覆盖最自然的请求就是 body 为 `null`，
+    而 `...` 会把 null 判成「字段缺失」回 422 —— 界面上就变成「恢复默认」按钮
+    报错，还看不出是为什么。
+    """
+    clean = _validate_pricing(body)
+    pricing.set_override(clean)
+    pricing.invalidate()
+    return pricing.describe()
+
+
+# ── GitHub Token（版本检测 / 一键更新）────────────────────
+@router.get('/settings/github-token')
+def get_github_token(user: dict = Depends(security.require_admin)) -> dict:
+    """读当前生效的 GitHub Token（**只回掩码**）。
+
+    为什么只给管理员：它是凭据，能操作对应的 GitHub 账号配额；普通用户不需要它。
+    环境变量里已有值时界面要说明「由部署注入、面板填写不生效」，否则用户会以为
+    自己填的那份没保存（issue #205 的现场就是「没地方填、也不知道有没有生效」）。
+    """
+    env_token = next((str(os.environ.get(k) or '').strip()
+                      for k in ('WB_GITHUB_TOKEN', 'GITHUB_TOKEN')
+                      if (os.environ.get(k) or '').strip()), '')
+    stored = str(db.get_setting('github_token', '') or '').strip()
+    effective = env_token or stored
+    return {
+        'configured': bool(effective),
+        'masked': updater.mask_token(effective),
+        'source': 'env' if env_token else ('panel' if stored else ''),
+    }
+
+
+@router.put('/settings/github-token')
+def save_github_token(body: dict, user: dict = Depends(security.require_admin)) -> dict:
+    """保存面板这份 GitHub Token（空串 = 清除）。
+
+    不做格式校验（GitHub 的 token 形态换过几次），但长度上限兜住误贴整段文本；
+    保存后不返回明文 —— 与其它凭据字段同一口径。
+    """
+    raw = str((body or {}).get('token') or '').strip()
+    if len(raw) > 512:
+        raise HTTPException(status_code=400, detail='GitHub Token 过长（最多 512 字符）')
+    db.set_setting('github_token', raw)
+    security.audit(user, 'update_github_token', '', '已配置' if raw else '已清除')
+    return {'configured': bool(raw), 'masked': updater.mask_token(raw)}
+
+
+# ── 网关 CORS（issue #445）────────────────────────────────────
+#
+# 与 `WB_CORS_ORIGINS`（管理面 / Cookie）是两套：这里管 `/v1`、`/v2` 数据面，
+# 鉴权走 Bearer，所以可以允许 `*`。详见 services/gatewaycors.py 的模块说明。
+@router.get('/settings/gateway-cors')
+def get_gateway_cors(user: dict = Depends(security.require_admin)) -> dict:
+    return {
+        **gatewaycors.settings(),
+        # 管理面的来源白名单不在面板上改（改错等于把控制台交出去），
+        # 但要让用户看得见「为什么 /api 还是跨域失败」。
+        'admin_origins': list(config.CORS_ORIGINS),
+        'max_origins': gatewaycors.MAX_ORIGINS,
+        'prefixes': list(gatewaycors.DATA_API_PREFIXES),
+    }
+
+
+@router.put('/settings/gateway-cors')
+def save_gateway_cors(body: dict, request: Request,
+                      user: dict = Depends(security.require_admin)) -> dict:
+    """保存网关 CORS。改完即时生效（中间件每请求现读设置，不需要重启）。"""
+    try:
+        result = gatewaycors.save_settings(body or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    security.audit(user, 'update_gateway_cors', '',
+                   f"开关={'开' if result['enabled'] else '关'}；"
+                   f"来源={','.join(result['origins']) or '（空）'}；"
+                   f"缓存={result['max_age']}s；来源 {client_ip(request)}",
+                   ip=client_ip(request))
+    return {**result, 'max_origins': gatewaycors.MAX_ORIGINS,
+            'prefixes': list(gatewaycors.DATA_API_PREFIXES),
+            'admin_origins': list(config.CORS_ORIGINS)}
+
+
+# ── GitHub 镜像（issue #216）─────────────────────────────────
+@router.get('/settings/github-mirror')
+def get_github_mirror(user: dict = Depends(security.require_admin)) -> dict:
+    """当前生效的 GitHub 镜像基址 + 来源（面板 / 环境变量 / 未配置）。"""
+    env_value = updater.normalize_mirror(os.environ.get('WB_GITHUB_MIRROR') or '')
+    stored = updater.stored_github_mirror()
+    effective = updater.normalize_mirror(stored or env_value)
+    return {
+        'mirror': effective,
+        'stored': stored,
+        'env_mirror': env_value,
+        'source': 'panel' if stored else ('env' if env_value else ''),
+        'presets': ['https://gh-proxy.com/', 'https://gh-proxy.org/'],
+    }
+
+
+@router.put('/settings/github-mirror')
+def save_github_mirror(body: dict, user: dict = Depends(security.require_admin)) -> dict:
+    """保存镜像基址（空串 = 清除，回落到环境变量）。
+
+    只接受「协议 + 主机 + 可选路径」：拼地址的规则是「基址 + 完整原始地址」，
+    带查询串或片段的写法拼出来必然是一个错误页，所以在入口就拒掉。
+    """
+    raw = str((body or {}).get('mirror') or '').strip()
+    if not raw:
+        db.set_setting('github_mirror', '')
+        security.audit(user, 'update_github_mirror', '', '已清除')
+        return get_github_mirror(user)
+    value = updater.normalize_mirror(raw)
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail='镜像地址要以 http:// 或 https:// 开头，且不能带查询串或 # 片段',
+        )
+    db.set_setting('github_mirror', value)
+    security.audit(user, 'update_github_mirror', '', value)
+    return get_github_mirror(user)
+
+
+# ── 自动更新 ─────────────────────────────────────────────────
+def _auto_update_payload() -> dict:
+    cfg = autoupdate.get_config()
+    state = autoupdate.get_state()
+    return {
+        **cfg,
+        'state': {
+            'last_check_at': int(float(state.get('last_check_at') or 0)),
+            'last_action': str(state.get('last_action') or ''),
+            'last_message': str(state.get('last_message') or ''),
+            'pending_version': str(state.get('pending_version') or ''),
+        },
+        # 当前环境能否连上游一起更新（不能时 target=auto 会退化成只更新管理端）
+        'docker_ok': updater.can_control_docker(),
+        # 部署形态不支持一键更新时（如 Windows 原生）给出原因，前端据此禁用开关
+        'unsupported_reason': autoupdate.unsupported_reason(),
+        # 面板显示「服务器本地时间」，时间窗按它算
+        'server_tz_offset_minutes': autoupdate.server_tz_offset_minutes(),
+    }
+
+
+@router.get('/settings/auto-update')
+def get_auto_update(user: dict = Depends(security.require_admin)) -> dict:
+    """自动更新配置 + 最近一次巡检的结果。"""
+    return _auto_update_payload()
+
+
+@router.put('/settings/auto-update')
+def save_auto_update(body: dict, user: dict = Depends(security.require_session_admin)) -> dict:
+    """保存自动更新配置。
+
+    与一键更新同一权限（需要会话管理员）：开了它就等于授权面板在无人值守时
+    自行下载并安装新版本、重启服务。
+    """
+    cfg, err = autoupdate.validate_config(body)
+    if cfg is None:
+        raise HTTPException(status_code=400, detail=err)
+    blocked = autoupdate.unsupported_reason()
+    if blocked and cfg['enabled']:
+        raise HTTPException(status_code=409, detail=blocked)
+    saved = autoupdate.save_config(cfg)
+    security.audit(user, 'update_auto_update', '',
+                   (f"开启，每 {saved['interval_hours']} 小时检测，"
+                    f"时间窗 {saved['window_start']:02d}–{saved['window_end']:02d}，"
+                    f"对象 {saved['target']}") if saved['enabled'] else '关闭')
+    return _auto_update_payload()
 
 
 # ── 管理端用户 ───────────────────────────────────────────
@@ -112,15 +386,16 @@ def list_users(user: dict = Depends(security.current_user)) -> list[dict]:
 
 @router.post('/users')
 def add_user(body: UserIn, request: Request,
-             user: dict = Depends(security.require_admin)) -> dict:
+             user: dict = Depends(security.require_session_admin)) -> dict:
     """新建管理用户。
 
     审计是必须的：上次入侵里攻击者正是「先建自己的账号、再正常登录」，
     而这一步当时没有任何记录。新建用户写随机 sv，避免同名重建后旧 cookie 复活。
     """
     pw = str(body.password)
-    if len(pw) < 8:
-        raise HTTPException(status_code=400, detail='密码至少 8 位')
+    problem = security.password_problem(pw, body.username)
+    if problem:
+        raise HTTPException(status_code=400, detail=problem)
     cfg = security.load_users()
     if any(u.get('username') == body.username for u in cfg.get('users', [])):
         raise HTTPException(status_code=409, detail='用户名已存在')
@@ -132,13 +407,15 @@ def add_user(body: UserIn, request: Request,
         'sv': secrets.randbelow(1 << 30),
     })
     security.save_users(cfg)
-    security.audit(user, 'add_user', body.username, f'角色={body.role}；来源 {client_ip(request)}')
+    ip = client_ip(request)
+    security.audit(user, 'add_user', body.username,
+                   f'角色={body.role}；来源 {ip}', ip=ip)
     return {'username': body.username, 'role': body.role}
 
 
 @router.patch('/users/{username}')
 def update_user(username: str, body: UserPatch, request: Request,
-                user: dict = Depends(security.require_admin)) -> dict:
+                user: dict = Depends(security.require_session_admin)) -> dict:
     """改密码 / 改角色。
 
     两种改动都必须**吊销该用户既有会话**：
@@ -156,9 +433,10 @@ def update_user(username: str, body: UserPatch, request: Request,
     changed_pwd = changed_role = False
     if body.password:
         pw = str(body.password)
-        # 现在不再接受空/极短口令：管理端是公网入口，弱口令等于没有防护
-        if len(pw) < 8:
-            raise HTTPException(status_code=400, detail='密码至少 8 位')
+        # 管理端是公网入口：弱口令等于没有防护，统一走与启动时相同的策略。
+        problem = security.password_problem(pw, username)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
         target['pwd_hash'] = security.make_hash(pw)
         changed_pwd = True
     if body.role and body.role != target.get('role'):
@@ -175,13 +453,19 @@ def update_user(username: str, body: UserPatch, request: Request,
             target['sv'] = 1
 
     security.save_users(cfg)
+    if changed_pwd and username == 'admin':
+        # 改掉初始密码后，把 issue #179 留的那份明文副本抹掉 ——
+        # 这里只存了初始 admin 密码，改其他用户的密码不应让它失效。
+        security.clear_initial_password_file()
     if changed_pwd or changed_role:
         parts = []
         if changed_pwd:
             parts.append('改密码')
         if changed_role:
             parts.append('改角色')
-        security.audit(user, 'update_user', username, '、'.join(parts) + f'；来源 {client_ip(request)}')
+        ip = client_ip(request)
+        security.audit(user, 'update_user', username,
+                       '、'.join(parts) + f'；来源 {ip}', ip=ip)
     # 把自己的密码改了，当前会话也会失效——前端据此提示重新登录
     self_revoked = bool(changed_pwd and username == user.get('username'))
     return {
@@ -194,7 +478,7 @@ def update_user(username: str, body: UserPatch, request: Request,
 
 @router.delete('/users/{username}')
 def delete_user(username: str, request: Request,
-                user: dict = Depends(security.require_admin)) -> dict:
+                user: dict = Depends(security.require_session_admin)) -> dict:
     cfg = security.load_users()
     users = cfg.get('users', [])
     target = next((u for u in users if u.get('username') == username), None)
@@ -207,6 +491,9 @@ def delete_user(username: str, request: Request,
         raise HTTPException(status_code=400, detail='不能删除当前登录用户')
     cfg['users'] = [u for u in users if u.get('username') != username]
     security.save_users(cfg)
+    if target.get('username') == 'admin':
+        # 被删掉的就是初始账号，那份明文初始密码也随之失效。
+        security.clear_initial_password_file()
     security.audit(user, 'delete_user', username, f'来源 {client_ip(request)}')
     return {'ok': True}
 

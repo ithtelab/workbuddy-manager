@@ -14,7 +14,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / 'web/app/(main)/settings/page.tsx'
+# 设置页的字段定义与拼接文案在外壳里（批次 4 起 Tab 变成子路由，取数与表单状态
+# 都在 `layout.tsx` 上，见那个文件顶部的说明）。
+SRC = ROOT / 'web/app/(main)/settings/layout.tsx'
 LOCALES = ('en', 'ja', 'ko', 'zh-TW')
 STR_RE = re.compile(r"'((?:[^'\\]|\\.)*)'")
 

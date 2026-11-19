@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -104,6 +105,110 @@ class LoadUsersDestructiveFallbackTest(unittest.TestCase):
                 pass
         self.assertEqual(self._path.read_text(encoding='utf-8'), good,
                          '替换失败时旧文件应保持原样')
+
+
+class InitialPasswordFileTest(unittest.TestCase):
+    """issue #179：随机初始密码必须留一份能取回的明文，且改密后抹掉。
+
+    背景：随机密码只在 stderr 打一次。journal 会被轮转、安装脚本可能因竞态
+    没抓到、用户在几屏日志里也可能翻过去 —— 一旦错过，users.json 里只有
+    pbkdf2 哈希，于是**没有任何办法登录**。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._path = Path(self._tmp.name) / 'users.json'
+        self._orig_users = config.USERS_FILE
+        self._orig_pwd = os.environ.pop('WB_ADMIN_PASSWORD', None)
+        config.USERS_FILE = self._path
+
+    def tearDown(self) -> None:
+        config.USERS_FILE = self._orig_users
+        if self._orig_pwd is not None:
+            os.environ['WB_ADMIN_PASSWORD'] = self._orig_pwd
+        else:
+            os.environ.pop('WB_ADMIN_PASSWORD', None)
+        try:
+            self._tmp.cleanup()
+        except PermissionError:
+            pass
+
+    def _pw_file(self) -> Path:
+        return self._path.with_name('initial-admin-password.txt')
+
+    def test_bootstrap_writes_recoverable_plaintext(self) -> None:
+        """随机生成时必须落一份明文，且内容与真正能登录的密码一致。"""
+        security.load_users()
+        self.assertTrue(self._pw_file().exists(), '初始密码未落盘，错过日志就登不进去')
+        pwd = self._pw_file().read_text(encoding='utf-8').strip()
+        self.assertTrue(pwd)
+        stored = json.loads(self._path.read_text(encoding='utf-8'))['users'][0]['pwd_hash']
+        self.assertTrue(security.verify_pwd(pwd, stored),
+                        '落盘的密码必须能对上哈希，否则只是看着像找回入口')
+
+    def test_env_password_not_persisted(self) -> None:
+        """用户自己设了 WB_ADMIN_PASSWORD 时不落盘 —— 那是他已知的值。"""
+        os.environ['WB_ADMIN_PASSWORD'] = 'operator-chosen-pw'
+        security.load_users()
+        self.assertFalse(self._pw_file().exists(),
+                         '显式配置的密码不该被复制到磁盘')
+
+    def test_weak_env_password_refused(self) -> None:
+        """生产事故根因：WB_ADMIN_PASSWORD=admin123 必须拒绝启动，不能落库。"""
+        os.environ['WB_ADMIN_PASSWORD'] = 'admin123'
+        with self.assertRaises(RuntimeError) as ctx:
+            security.load_users()
+        self.assertIn('密码策略', str(ctx.exception))
+        self.assertFalse(self._path.exists(), '拒绝启动时不应写出 users.json')
+
+    def test_existing_weak_admin_password_detected(self) -> None:
+        """升级上来的 users.json 若仍是 admin123，启动时必须能被点出来。"""
+        self._path.write_text(json.dumps({
+            'secret': 'x',
+            'users': [{'username': 'admin', 'role': 'admin',
+                       'pwd_hash': security.make_hash('admin123')}],
+            'api_keys': [],
+        }), encoding='utf-8')
+        self.assertEqual(security.weak_admin_passwords(), ['admin'])
+
+    def test_change_password_clears_plaintext(self) -> None:
+        """改过密码后必须抹掉，否则那是一份永远有效的凭据。"""
+        security.load_users()
+        self.assertTrue(self._pw_file().exists())
+        security.clear_initial_password_file()
+        self.assertFalse(self._pw_file().exists())
+
+    def test_clear_is_idempotent(self) -> None:
+        """文件本来就不存在时抹除不能报错（改密路径总会调它）。"""
+        security.clear_initial_password_file()
+        security.clear_initial_password_file()
+
+    def test_second_start_does_not_overwrite(self) -> None:
+        """非首次启动（文件已存在）不得重新生成/覆盖 —— 那会把用户的密码换掉。"""
+        security.load_users()
+        first = self._pw_file().read_text(encoding='utf-8').strip()
+        security.load_users()
+        self.assertEqual(self._pw_file().read_text(encoding='utf-8').strip(), first)
+        stored = json.loads(self._path.read_text(encoding='utf-8'))['users'][0]['pwd_hash']
+        self.assertTrue(security.verify_pwd(first, stored),
+                        '重启后落盘密码必须仍然有效')
+
+
+class PasswordPolicyTest(unittest.TestCase):
+    """管理端密码策略：长度、常见弱口令、用户名+数字、纯数字/重复字符。"""
+
+    def test_common_and_short_passwords_rejected(self) -> None:
+        for pwd in ('admin123', 'admin123456789', 'password1234', '123456789012',
+                    'aaaaaaaaaaaa'):
+            self.assertIsNotNone(security.password_problem(pwd), pwd)
+
+    def test_username_plus_digits_rejected(self) -> None:
+        self.assertIn('用户名加数字',
+                      security.password_problem('admin9876543210', 'admin') or '')
+
+    def test_strong_password_accepted(self) -> None:
+        self.assertIsNone(security.password_problem('correct-horse-battery', 'admin'))
+        self.assertIsNone(security.password_problem('Snow fox 2026!', 'admin'))
 
 
 class ModelAllowlistBypassTest(unittest.TestCase):
@@ -214,10 +319,12 @@ class AuditCoverageTest(unittest.TestCase):
         self.assertNotIn(chr(10), rows[0]['detail'])
 
     def test_audit_records_ip_field(self) -> None:
-        security.audit({'username': 'admin'}, 'create_key', 'mykey', '来源 10.0.0.1')
+        security.audit({'username': 'admin'}, 'create_key', 'mykey',
+                       '来源 10.0.0.1', ip='10.0.0.1')
         rows = db.list_audit_logs(10)
         self.assertEqual(rows[0]['action'], 'create_key')
         self.assertIn('10.0.0.1', rows[0]['detail'])
+        self.assertEqual(rows[0]['ip'], '10.0.0.1')
 
 
 if __name__ == '__main__':

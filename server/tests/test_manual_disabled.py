@@ -32,6 +32,25 @@
      出现在账号列表里，否则面板看不出被摘过（会显示成「在线」）。
   5. **前端分档**：`manual_disabled` 要单独成一档（与改名的 `disabledByPanel`
      并列），且**不禁用**签到 / 测试 / 刷新按钮——任务照常正是这条路的意义所在。
+
+## 补充（用户反馈：国际版重新登录后账号池调不动）
+
+上游把「账号不可用」拆成**两位独立开关**，由**不同端点**解除：
+
+  · `manual_disabled` —— 运维主动摘的，`enable` 清它；
+  · `disabled`        —— 系统自动禁的（12153 连败 3 次 / 11140 被封），**只有
+    `revive` 能清**。上游 admin.go 原话：「若账号仍被系统自动禁用（disabled），
+    它**不会**因此回到选号池——那需要 revive。」
+
+面板此前只调 disable/enable、**从不调 revive**，于是被自动禁用的账号在面板里
+没有任何操作能救回来（重新登录只换凭证、签到被 `!e.disabled` 挡掉、一次成功又
+要求先被选中 —— 自锁）。所以本文件后半段钉住三件事：
+
+  6. **`revive` 要真的被调用**（路由是 `/revive`，不是 `/enable`）；
+  7. **不能把失败报成成功**：上游回显里 `disabled` 仍为真时，必须如实报错——
+     以前无条件回一句「已启用」正是用户被误导的来源；
+  8. **重新登录要自动恢复**：登录在语义上就是刷新账号状态，凭证已是全新的，
+     上游那句「需重新登录」的禁用理由消失了，没有道理还把它留在池外。
 """
 from __future__ import annotations
 
@@ -53,11 +72,17 @@ UID = '9b212d8c-f5f7-4ad6-aa20-1d576508c8c1'
 
 
 class _Resp:
-    """假的 httpx 响应（只用到 status_code / text）。"""
+    """假的 httpx 响应（只用到 status_code / text / json）。"""
 
-    def __init__(self, status: int, text: str = '') -> None:
+    def __init__(self, status: int, text: str = '', payload: dict | None = None) -> None:
         self.status_code = status
         self.text = text
+        self._payload = payload
+
+    def json(self) -> dict:
+        if self._payload is None:
+            raise ValueError('no json body')
+        return self._payload
 
 
 class _Client:
@@ -351,7 +376,8 @@ class RouteIntegrationTest(unittest.TestCase):
             return _Client(resp, calls)
 
         with mock.patch.object(config, 'http_client', fake_client), \
-             mock.patch.object(acct_router.reload, 'request_restart', lambda: True):
+             mock.patch.object(acct_router.reload, 'request_restart',
+                               lambda upstream=None: True):
             out = asyncio.run(acct_router.account_set_disabled(
                 self.fname, {'disabled': disabled}, {'username': 'admin'}))
         return out, calls
@@ -485,13 +511,417 @@ class AdminSectionEditableTest(unittest.TestCase):
         文案必须讲清「开与不开分别会怎样」——用户在账号页点停用时看到的提示
         会随这个开关变化，不说清楚会以为是 bug。
         """
-        src = (ROOT / 'web/app/(main)/settings/page.tsx').read_text(encoding='utf-8')
+        # 设置页的字段定义在外壳里（批次 4 起 Tab 变成子路由，见 layout.tsx 顶部）
+        src = (ROOT / 'web/app/(main)/settings/layout.tsx').read_text(encoding='utf-8')
         self.assertIn('ADMIN_FIELDS', src)
         self.assertIn("id: 'admin'", src)
         seg = src[src.index('const ADMIN_FIELDS'):]
         seg = seg[:seg.index('];')]
         self.assertIn('签到', seg, '没说明开启后签到照常')
         self.assertIn('重启', seg, '没说明需要重启上游才生效')
+
+
+# ── 系统自动禁用（disabled）的解除 ────────────────────────────────
+
+
+def _revive(resp: _Resp, uid: str = UID) -> tuple[tuple, list]:
+    """跑一次 revive_account，返回 ((ok, msg, code), 请求记录)。"""
+    calls: list = []
+
+    def fake_client(*a: object, **kw: object) -> _Client:
+        return _Client(resp, calls)
+
+    with mock.patch.object(config, 'http_client', fake_client), \
+         mock.patch.object(wb2api, 'get_status', new=mock.AsyncMock(return_value={
+             'connected': True, 'accounts': [{'uid': uid, 'disabled': True,
+                                             'disabled_reason': '12153 session dead'}]})):
+        out = asyncio.run(wb2api.revive_account(uid))
+    return out, calls
+
+
+class ReviveAccountTest(unittest.TestCase):
+    """`revive_account` 打的是 /revive，且**不能把失败报成成功**。"""
+
+    def test_hits_revive_route_not_enable(self) -> None:
+        """**核心**：必须打 `/revive`。
+
+        打成 `/enable` 就是原来的 bug —— 上游的 enable 只清 manual_disabled，
+        被系统禁用的账号照样留在池外，而面板还会报「已启用」。
+        """
+        (ok, _msg, code), calls = _revive(_Resp(200, payload={'changed': True,
+                                                              'disabled': False}))
+        self.assertTrue(ok)
+        self.assertEqual(code, 'ok')
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][0].endswith(f'/admin/accounts/{UID}/revive'),
+                        f'打到了错误的端点：{calls[0][0]}')
+        self.assertNotIn('/enable', calls[0][0])
+
+    def test_still_disabled_is_reported_as_failure(self) -> None:
+        """**核心**：回显说还禁用着，就必须报失败。
+
+        以前这里是无条件 `return True, '已启用'` —— 用户看到成功提示、账号却
+        调不动，正是 issue 里最让人困惑的那一点。
+        """
+        (ok, msg, code), _ = _revive(_Resp(200, payload={'changed': True,
+                                                         'disabled': True}))
+        self.assertFalse(ok, '上游回显仍为禁用，不能报成功')
+        self.assertEqual(code, 'error')
+        self.assertIn('仍', msg)
+
+    def test_already_enabled_is_ok(self) -> None:
+        """本来就没被禁用 → 幂等成功，调用方不必先查状态。"""
+        (ok, msg, code), _ = _revive(_Resp(200, payload={'changed': False,
+                                                         'disabled': False}))
+        self.assertTrue(ok)
+        self.assertEqual(code, 'ok')
+        self.assertIn('未被系统禁用', msg)
+
+    def test_plain_text_404_is_no_route(self) -> None:
+        (ok, _msg, code), _ = _revive(_Resp(404, '404 page not found\n'))
+        self.assertFalse(ok)
+        self.assertEqual(code, 'no_route')
+
+    def test_json_404_is_not_found(self) -> None:
+        """账号不在池里 ≠ 接口没注册：前者不能触发「去开管理接口」的引导。"""
+        body = json.dumps({'error': {'code': 'not_found', 'message': 'account not found'}})
+        (ok, _msg, code), _ = _revive(_Resp(404, body))
+        self.assertFalse(ok)
+        self.assertEqual(code, 'not_found')
+
+    def test_empty_uid_short_circuits(self) -> None:
+        (ok, _msg, code), calls = _revive(_Resp(200, payload={}), uid='')
+        self.assertFalse(ok)
+        self.assertEqual(code, 'error')
+        self.assertEqual(calls, [], 'uid 为空时不该发请求')
+
+
+class AccountDisabledStatusTest(unittest.TestCase):
+    """`account_disabled` 从 /status 读禁用位 —— 「启用之后到底好没好」的最终判据。"""
+
+    def _status(self, accounts: list, uid: str = UID):
+        payload = {'connected': True, 'accounts': accounts}
+
+        class _GetClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, url, **kw):
+                return _Resp(200, payload=payload)
+
+        with mock.patch.object(config, 'http_client', lambda *a, **k: _GetClient()):
+            return asyncio.run(wb2api.account_disabled(uid))
+
+    def test_reads_disabled_flag(self) -> None:
+        self.assertTrue(self._status([{'uid': UID, 'disabled': True}]))
+        self.assertFalse(self._status([{'uid': UID, 'disabled': False}]))
+        self.assertFalse(self._status([{'uid': UID}]))          # 缺字段 = 未禁用
+
+    def test_unknown_when_not_in_pool(self) -> None:
+        """读不到必须是 None 而不是 False —— 否则会把「还没入池」当成「已经好了」。"""
+        self.assertIsNone(self._status([{'uid': 'other', 'disabled': True}]))
+        self.assertIsNone(self._status([]))
+
+    def test_empty_uid(self) -> None:
+        self.assertIsNone(asyncio.run(wb2api.account_disabled('')))
+
+
+class ReviveIfDisabledTest(unittest.TestCase):
+    """`_revive_if_disabled`：先看状态、再决定要不要 revive。"""
+
+    def _run(self, states: list, revive_result=(True, '已解除系统禁用', 'ok')):
+        from server.routers import accounts
+        seq = list(states)
+
+        async def fake_disabled(uid, **kw):
+            return seq.pop(0) if seq else states[-1]
+
+        revive_calls: list = []
+
+        async def fake_revive(uid, **kw):
+            revive_calls.append(uid)
+            return revive_result
+
+        with mock.patch.object(wb2api, 'account_disabled', fake_disabled), \
+             mock.patch.object(wb2api, 'revive_account', fake_revive):
+            out = asyncio.run(accounts._revive_if_disabled(UID))
+        return out, revive_calls
+
+    def test_noop_when_not_disabled(self) -> None:
+        (revived, _msg, still), calls = self._run([False])
+        self.assertFalse(revived)
+        self.assertFalse(still)
+        self.assertEqual(calls, [], '没被禁用就不该调 revive')
+
+    def test_revives_when_disabled(self) -> None:
+        (revived, msg, still), calls = self._run([True, False])
+        self.assertTrue(revived)
+        self.assertFalse(still)
+        self.assertEqual(calls, [UID])
+        self.assertEqual(msg, '已解除系统禁用')
+
+    def test_reports_still_disabled_after_revive(self) -> None:
+        """接口回了成功，但再查一次仍禁用 —— 必须如实说仍禁用。"""
+        (revived, _msg, still), _ = self._run([True, True])
+        self.assertTrue(revived)
+        self.assertTrue(still)
+
+    def test_no_route_gives_actionable_hint(self) -> None:
+        """上游没开管理接口时要给出「去哪儿开」，而不是一句失败。"""
+        (revived, msg, still), _ = self._run(
+            [True], revive_result=(False, '上游未启用管理接口', 'no_route'))
+        self.assertFalse(revived)
+        self.assertTrue(still)
+        self.assertIn('账号管理接口', msg)
+
+    def test_unknown_status_does_not_revive(self) -> None:
+        """读不到状态时不能瞎 revive（那会打在错误的 uid 上）。"""
+        (revived, _msg, still), calls = self._run([None])
+        self.assertFalse(revived)
+        self.assertFalse(still)
+        self.assertEqual(calls, [])
+
+    def test_unknown_status_is_none_not_false(self) -> None:
+        """读不到状态时第三位必须是 `None`（不知道），不是 `False`（确认没被禁用）。
+
+        复核补的：原来这一位是 bool，调用方拿到 `False` 就会**无条件报成功**
+        （「已启用」），而那时我们其实什么都没确认 —— 正是这个功能要消灭的那类误导。
+        """
+        (revived, msg, still), _ = self._run([None])
+        self.assertIsNone(still, '把「读不到状态」当成了「确认没被禁用」')
+        self.assertIn('读不到', msg)
+
+
+class ReviveAfterLoginTest(unittest.TestCase):
+    """重新登录后的自动恢复：等账号入池 → 仍被禁用就解除。"""
+
+    def _run(self, states: list):
+        from server.routers import accounts
+        seq = list(states)
+        revive_calls: list = []
+
+        async def fake_disabled(uid, **kw):
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        async def fake_revive(uid, **kw):
+            revive_calls.append(uid)
+            return True, '已解除系统禁用', 'ok'
+
+        async def no_sleep(_s):
+            return None
+
+        with mock.patch.object(wb2api, 'account_disabled', fake_disabled), \
+             mock.patch.object(wb2api, 'revive_account', fake_revive), \
+             mock.patch.object(asyncio, 'sleep', no_sleep):
+            asyncio.run(accounts._revive_after_login(UID, {'base_url': 'http://x'}))
+        return revive_calls
+
+    def test_waits_for_pool_then_revives(self) -> None:
+        """账号刚落盘时 /status 里还读不到（None）→ 等一轮，入池且禁用 → 解除。"""
+        calls = self._run([None, True])
+        self.assertEqual(calls, [UID])
+
+    def test_no_revive_when_healthy(self) -> None:
+        calls = self._run([None, False])
+        self.assertEqual(calls, [], '账号健康时不该动它')
+
+    def test_empty_uid_is_ignored(self) -> None:
+        from server.routers import accounts
+        accounts._schedule_revive_after_login('', {'base_url': 'http://x'})   # 不该抛
+
+
+class EnableRouteRevivesTest(unittest.TestCase):
+    """路由层：点「启用」必须把**两位**都清掉，清不掉要如实报。
+
+    前面几条测的是 `_revive_if_disabled` 本身；这里测的是它**真的被接在
+    「启用」这条路上** —— 只把函数写对、却忘了在路由里调用，是这类修复最典型
+    的失败形态（而它不会让任何单测变红）。
+    """
+
+    UID = 'e11c0a4e-1b1a-4a2f-9c6f-2f0f5b0b1a11'
+
+    def setUp(self) -> None:
+        from server import db, security
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = (config.AUTH_DIR, config.DB_PATH, config.USERS_FILE)
+        root = Path(self._tmp.name)
+        config.AUTH_DIR = root / 'auths'
+        config.AUTH_DIR.mkdir()
+        config.DB_PATH = root / 'm.db'
+        config.USERS_FILE = root / 'users.json'
+        db._conn = None
+        db.connect()
+        security.save_users({'secret': 'S', 'users': [
+            {'username': 'admin', 'role': 'admin',
+             'pwd_hash': security.make_hash('pw')}], 'api_keys': []})
+        self.fname = f'workbuddy-{self.UID}.json'
+        (config.AUTH_DIR / self.fname).write_text(json.dumps({
+            'account': {'uid': self.UID, 'nickname': '禁用号', 'enterpriseId': ''},
+            'auth': {'accessToken': 'AT', 'refreshToken': 'RT',
+                     'expiresAt': 9999999999,
+                     'domain': 'copilot.tencent.com', 'realm': 'cn'},
+        }), encoding='utf-8')
+        from server.main import app
+        from fastapi.testclient import TestClient
+        self.client = TestClient(app)
+        r = self.client.post('/api/login', json={'username': 'admin', 'password': 'pw'})
+        assert r.status_code == 200, r.text
+        self.client.cookies.update(dict(r.cookies))
+
+    def tearDown(self) -> None:
+        from server import db
+        if db._conn is not None:
+            db._conn.close()
+        db._conn = None
+        config.AUTH_DIR, config.DB_PATH, config.USERS_FILE = self._orig
+        try:
+            self._tmp.cleanup()
+        except PermissionError:
+            pass
+
+    def _enable(self, still_states: list):
+        """POST 一次「启用」，返回 (响应, revive 调用记录)。"""
+        revive_calls: list = []
+        seq = list(still_states)
+
+        async def fake_disabled(uid, **kw):
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        async def fake_revive(uid, **kw):
+            revive_calls.append(uid)
+            return True, '已解除系统禁用', 'ok'
+
+        with mock.patch.object(wb2api, 'set_manual_disabled',
+                               new=mock.AsyncMock(return_value=(True, '已通过上游状态位启用', 'ok'))), \
+                mock.patch.object(wb2api, 'account_disabled', fake_disabled), \
+                mock.patch.object(wb2api, 'revive_account', fake_revive), \
+                mock.patch('server.routers.accounts.reload') as rl:
+            rl.request_restart = mock.MagicMock(return_value=False)
+            resp = self.client.post(f'/api/accounts/{self.fname}/disabled',
+                                    json={'disabled': False})
+        return resp, revive_calls
+
+    def test_enable_revives_auto_disabled_account(self) -> None:
+        """**核心**：被系统禁用的账号点「启用」→ 会调 revive → 报成功。"""
+        resp, calls = self._enable([True, False])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()
+        self.assertTrue(out['ok'], out)
+        self.assertEqual(calls, [self.UID], '「启用」没有调 revive —— 系统禁用位没被清掉')
+        self.assertIn('解除系统禁用', out['message'])
+
+    def test_enable_reports_failure_when_still_disabled(self) -> None:
+        """清不掉时不能报成功（以前无条件回「已启用」，正是用户被误导的来源）。"""
+        resp, calls = self._enable([True, True])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()
+        self.assertFalse(out['ok'], '仍被系统禁用却报了成功')
+        self.assertTrue(out['disabled'])
+        self.assertIn('系统禁用', out['message'])
+        self.assertEqual(calls, [self.UID])
+
+    def test_enable_without_disable_does_not_revive(self) -> None:
+        """账号本来就正常 → 不该白调一次 revive（那是写操作）。"""
+        resp, calls = self._enable([False])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertTrue(resp.json()['ok'])
+        self.assertEqual(calls, [])
+
+    def test_enable_with_unknown_status_says_so(self) -> None:
+        """启用成功了、但读不到上游状态时：报成功可以，**别把话说满**。
+
+        复核补的：这一档原来会回一句干净的「已启用」——用户以为账号已经回到池子，
+        而面板连它是否仍被系统禁用都没读到。现在如实带上这一句。
+        """
+        resp, calls = self._enable([None])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        out = resp.json()
+        self.assertTrue(out['ok'], '状态位确实清掉了，这一档仍应算成功')
+        self.assertIn('未能确认', out['message'],
+                      f'读不到状态却报了一句干净的「已启用」：{out["message"]}')
+        self.assertNotIn('并已解除系统禁用', out['message'], '并没有真的解除（读不到状态）')
+        self.assertEqual(calls, [], '读不到状态时不该去 revive')
+
+
+class LoginRevivesTest(unittest.TestCase):
+    """登录收尾必须挂上自动恢复 —— 忘了挂是这类修复最典型的失败形态。"""
+
+    def test_save_and_finish_schedules_revive(self) -> None:
+        from server.routers import accounts
+        src = (ROOT / 'server/routers/accounts.py').read_text(encoding='utf-8')
+        seg = src[src.index('def _save_and_finish'):]
+        seg = seg[:seg.index('\n\ndef ')]
+        self.assertIn('_schedule_revive_after_login(', seg,
+                      '登录成功后没有调度自动解除禁用 —— 用户报的「重新登录救不回来」就回来了')
+
+    def test_schedule_creates_task_when_loop_running(self) -> None:
+        """有事件循环时要真的排一个任务出去（拿不到循环才静默跳过）。"""
+        from server.routers import accounts
+        created: list = []
+
+        class _Loop:
+            def create_task(self, coro):
+                created.append(coro)
+                coro.close()          # 不跑它，只确认被调度了
+
+        async def run():
+            with mock.patch.object(asyncio, 'get_running_loop', lambda: _Loop()):
+                accounts._schedule_revive_after_login(UID, {'base_url': 'http://x'})
+
+        asyncio.run(run())
+        self.assertEqual(len(created), 1)
+
+    def test_schedule_skips_without_loop(self) -> None:
+        """没有运行中的循环（测试/脚本直呼）时不能抛 —— 登录已经成功了。"""
+        from server.routers import accounts
+        accounts._schedule_revive_after_login(UID, {'base_url': 'http://x'})   # 不该抛
+
+    def test_scheduled_task_is_held_then_released(self) -> None:
+        """排出去的任务要被**强引用**，跑完再摘掉。
+
+        复核补的：`create_task()` 的结果原来没人接住 —— asyncio 只保留弱引用，
+        任务可能在执行途中被 GC 掉，症状是「这个修复有时不生效」且不报错。
+        这里连带把引用表的一生也钉住：排上 → 表里有 → 跑完 → 表里没了。
+        """
+        from server.routers import accounts
+        ran: list = []
+
+        async def fake(uid, group):
+            ran.append(uid)
+
+        async def run():
+            with mock.patch.object(accounts, '_revive_after_login', fake):
+                accounts._schedule_revive_after_login(UID, {'base_url': 'http://x'})
+                self.assertEqual(len(accounts._revive_tasks), 1,
+                                 '调度后没有持有任务引用（可能被 GC 掉）')
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                self.assertEqual(accounts._revive_tasks, set(), '跑完没有摘掉引用')
+
+        asyncio.run(run())
+        self.assertEqual(ran, [UID])
+
+    def test_scheduling_failure_never_escapes(self) -> None:
+        """排不上任务也不能抛出去 —— 登录已经成功，这里抛会把 200 变成 500。
+
+        整段（不只是 `get_running_loop`）都要兜住：`create_task` 那一步同样会抛，
+        而它冒出去会顺着 `_save_and_finish` 一路到 `auth_poll`。
+        """
+        from server.routers import accounts
+
+        class _BadLoop:
+            def create_task(self, coro):
+                coro.close()
+                raise RuntimeError('boom')
+
+        async def run():
+            with mock.patch.object(asyncio, 'get_running_loop', lambda: _BadLoop()):
+                accounts._schedule_revive_after_login(UID, {'base_url': 'http://x'})  # 不该抛
+
+        asyncio.run(run())
 
 
 if __name__ == '__main__':

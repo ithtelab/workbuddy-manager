@@ -5,7 +5,21 @@ export interface Me {
   role: Role;
 }
 
+export interface RefreshRisk {
+  until: number; last_failure_at: number; failures: number;
+  needs_review: boolean; retry_after_sec: number; paused: boolean;
+}
+
 export interface Account {
+  /** 本面板记录的添加时间（Unix 秒）；旧账号/直接拷贝的文件可能未知。 */
+  added_at?: number | null;
+  refresh_risk?: RefreshRisk | null;
+  proxy?: string;
+  /**
+   * 手写权重（issue #187）：上游选号的**乘数**，默认 1；0 = 未设置（等价 1）。
+   * 写在上游 auth 文件顶层 `weight` 里 —— 上游刷新 token 时会保留它。
+   */
+  weight?: number;
   /** 该令牌签发的总时长（秒）；后端从 JWT 解出，解不出为 null */
   ttl_seconds?: number | null;
   /** 令牌签发时间（秒）≈ 最近一次刷新时间；后端从 JWT iat 解出，解不出为 null */
@@ -33,6 +47,19 @@ export interface Account {
    * 账号级冷却时间不足以表达，故逐条列出。
    * 字段名照上游 /status 的 JSON：model / until / reset_at / reason。
    */
+  /**
+   * 本端给这个账号写的备注（issue #67）。按 uid 存在本端库里，不在上游账号文件里，
+   * 所以临时停用（改文件名）不会丢。没有备注时是空串（不是缺字段）。
+   */
+  note?: string;
+  /**
+   * 今天成功签到的时刻（epoch 秒）；null / 缺省 = 今天还没签。
+   *
+   * 判定依据是本端签到记录（腾讯对「今天已签过」回 10001，我们照记成功），
+   * 所以它同时代表「本面板签过」与「今天已签到」。界面据此把签到按钮变成
+   * 已签到态，避免重复点击（详见 server/routers/accounts.py 的 `_today_start`）。
+   */
+  checkin_today?: number | null;
   rate_limited_models?: {
     model: string;
     /** 该模型的冷却截止（已被 soft_rate_max 截断） */
@@ -116,6 +143,77 @@ export interface AccountsResponse {
   pool_synced?: number;
   /** 上游是否可达 */
   pool_available?: boolean;
+  /**
+   * 分组上下文（多账号池）：这次列表来自哪个分组。默认分组也带这个字段
+   * （is_default = true）——界面靠它标注「本列表属于哪一组」。
+   */
+  upstream?: {id: number | null; name: string; is_default: boolean};
+  /** 该分组的本地账号目录；空串 = 未配置（该分组在面板里只能看、不能管理账号） */
+  auth_dir?: string;
+  /** 该分组能否在面板管理账号（= 配置了本地账号目录） */
+  manageable?: boolean;
+}
+
+/**
+ * 令牌刷新计划（计划任务）：每 `interval_days` 天的 `hour` 整点，全量刷新一次
+ * 所有账号的 accessToken。与「快过期才续期」的自动续期是并列的两条路径。
+ *
+ * `last_run` / `next_run` 都是 epoch 秒；`last_run=0` = 从未跑过，
+ * `next_run=null` = 计划未启用。
+ */
+export interface RefreshPlan {
+  enabled: boolean;
+  interval_days: number;
+  hour: number;
+  last_run: number;
+  next_run: number | null;
+}
+
+/** 每日任务计划里的单个任务（签到 / 领取补偿 / 领奖 / 做任务） */
+export interface DailyTaskConfig {
+  enabled: boolean;
+  /** 0-23 整点 */
+  hour: number;
+  /** 本小时是否已跑（`YYYY-MM-DD-HH`；空串 = 从未） */
+  last_run: string;
+}
+
+export type DailyTask = 'checkin' | 'compensation' | 'claim' | 'full';
+
+/**
+ * 每日任务计划（`/api/accounts/daily-plan`）。
+ *
+ * 与「令牌刷新计划」并列，跑的是管理端的「一键」动作。三者安全等级不同：`claim`
+ * 只认领已完成任务的奖励（幂等）、`checkin` 与 `compensation` 幂等，而 `full` 会
+ * **伪造活跃上报**（上游脚本自己都标「慎用」）——所以有写风险的那个默认关，界面对
+ * full 必须带警告。`compensation` 是唯一默认开的：见 dailyplan._DEFAULTS 的说明。
+ */
+export interface DailyPlan {
+  checkin: DailyTaskConfig;
+  compensation: DailyTaskConfig;
+  claim: DailyTaskConfig;
+  full: DailyTaskConfig;
+}
+
+/** 上游与面板两套调度的重叠状态（issue #375）。 */
+export interface TaskSchedulerStatus {
+  upstream: {
+    available: boolean;
+    /** 上游 config.json 的 schedule.checkin_enabled */
+    checkin: boolean;
+    /** 上游 schedule.activity_enabled（内部含领取补偿） */
+    activity: boolean;
+  };
+  panel: Record<DailyTask, boolean>;
+  /** 两套都开的重叠任务：checkin / compensation */
+  conflicts: string[];
+}
+
+export interface TaskSchedulerApply {
+  plan: DailyPlan;
+  scheduler: TaskSchedulerStatus;
+  reload_scheduled: boolean | null;
+  reload_hint?: string;
 }
 
 /** 上游为一组账号给出的计数（`/status` 的顶层汇总与 realm_totals 同构） */
@@ -145,6 +243,83 @@ export interface UpstreamStatus {
   redis_mode?: string;
   sticky_sessions?: number;
   error?: string;
+}
+
+export interface ProxyRoute {
+  name: string;
+  scheme: string;
+  host: string;
+  port: number | null;
+  has_auth: boolean;
+  masked: string;
+  local?: boolean;
+  /** 绑定账号数（列表接口一定会给） */
+  bound: number;
+  /** 池里的启用开关：停用的线路不会被自动挑选（显式绑定仍会报错提醒） */
+  enabled: boolean;
+  /** 按权重分摊/挑选（越大越常被选中） */
+  weight: number;
+  /** 前几个绑定账号的昵称（列表里显示 chips） */
+  bound_names?: string[];
+  /** 绑了 ≥3 台时的风控提示（同一个出口 IP 上的号容易被上游按 IP 聚类） */
+  shared_warning?: boolean;
+  /** 上次测试的结果（面板里记着） */
+  probe?: {ok: boolean; ms: number; at: number; exit_ip?: string; error?: string} | null;
+}
+
+export interface RouteAccount {
+  file: string;
+  uid: string;
+  nickname: string;
+  /** 绑定的线路名；空 = 跟随池策略 */
+  proxy: string;
+}
+
+export interface ProxyPool {
+  enabled: boolean;
+  strategy: 'priority' | 'round_robin' | 'random' | 'least_connections';
+  interval_seconds: number;
+  strategies: string[];
+  routes_total: number;
+  routes_enabled: number;
+}
+
+export interface RouteBindingsResponse {
+  accounts: RouteAccount[];
+  routes: string[];
+  pool: ProxyPool;
+}
+
+export interface ProxyRouteList {
+  routes: ProxyRoute[];
+  default: string;
+  schemes: string[];
+  bound_total: number;
+  /** 池配置（开关 / 策略 / 间隔） */
+  pool: ProxyPool;
+}
+
+export interface ProxyProbe {
+  ok: boolean;
+  ms: number;
+  exit_ip?: string;
+  exit_info?: string;
+  error?: string;
+  /** 失败时的可行动提示（协议/端口/认证/规则），原始 error 仍保留 */
+  hint?: string;
+}
+
+export interface ProxySettings {
+  http_proxy: string;
+  update_proxy: string;
+  http_configured: boolean;
+  update_configured: boolean;
+  env_http_proxy: string;
+  env_update_proxy: string;
+  effective: string;
+  source: 'panel' | 'env' | 'none' | 'off';
+  probe_url: string;
+  global_proxy_enabled: boolean;
 }
 
 export interface ModelInfo {
@@ -203,8 +378,13 @@ export interface CatalogModel {
   reasoning_summary?: string;
   /** 默认推理档位；空串 = 上游未声明（由上游自行回退到硬编码默认） */
   default_effort: string;
-  /** 是否支持图片输入（多模态） */
-  supports_images: boolean;
+  /** 平台声明的图片输入能力；null 表示未知或冲突，不代表模型原生多模态 */
+  supports_images: boolean | null;
+  native_modality?: 'text' | 'multimodal' | 'router' | 'unknown';
+  native_modality_source?: string;
+  native_modality_verified_at?: string;
+  image_input_conflict?: boolean;
+  image_input_sources?: Record<string, boolean | null>;
   /** 系列归属（按 id 前缀推导，仅用于分组浏览） */
   series: string;
 }
@@ -246,6 +426,41 @@ export interface ModelCatalog {
   summary: CatalogSummary;
 }
 
+/**
+ * 上游接入点（多上游 / 账号池分组）。
+ *
+ * `id === null && is_default` 那条是**默认上游**：来自环境变量 / 上游 config.json，
+ * 不是数据库记录，所以它没有 id、也不可改不可删。
+ */
+export interface UpstreamEndpoint {
+  id: number | null;
+  name: string;
+  base_url: string;
+  /**
+   * 上游凭据**不明文回传**（与 api_key / upstash.token 同规矩）：接口只给
+   * 「有没有配」与脱敏值。编辑时留空即不修改。
+   */
+  has_key: boolean;
+  api_key_masked: string;
+  note: string;
+  enabled: boolean;
+  is_default: boolean;
+  /**
+   * 该分组的**本地账号目录**（绝对路径）：面板按它列账号 / 添号 / 移动账号。
+   * 空串 = 该分组只用于密钥转发，不管账号。默认分组 = 部署时的 WB_AUTH_DIR。
+   */
+  auth_dir: string;
+  /**
+   * 该分组上游实例的容器名（可选）：面板「重启该分组」按它 docker restart。
+   * 空串 = 不能从面板重启（账号文件的增删改由上游热加载自动收录）。
+   */
+  container: string;
+  /** 有多少把密钥绑定在它上面（默认上游那行 = 未绑定上游的密钥数） */
+  bound_keys: number;
+  created_at?: number | null;
+  updated_at?: number | null;
+}
+
 export interface ApiKey {
   id: number;
   name: string;
@@ -273,10 +488,165 @@ export interface ApiKey {
    */
   quota_credit: number;
   used_credit: number;
+  /** 每日 token 限额：0 = 不限；与 quota 各自独立，任一超限即拒绝 */
+  daily_quota: number;
+  /** 今天（服务器本地日期）已用的 token，次日 0 点归零 */
+  daily_used_tokens: number;
+  /**
+   * 绑定的上游接入点（多上游 / 分组隔离）；null = 默认上游。
+   *
+   * 为什么是可空 id 而不是「上游名字」：默认上游不是数据库里的一行
+   * （见 server/upstreamsvc.py），空值本身就代表「走默认」这个合法状态。
+   */
+  upstream_id?: number | null;
+  /**
+   * 来源红包的 id；null = 手工建的。
+   *
+   * 密钥列表按它分成两个 tab：红包一次生成一批、额度零碎，与手工建的混在
+   * 一起很难看（也从没人会去逐把编辑红包发出去的密钥）。
+   */
+  packet_id: number | null;
   created_at: number;
   last_used_at: number | null;
   /** 仅在创建时返回一次 */
   key?: string;
+}
+
+/**
+ * 密钥导出结果（`POST /api/keys/export`）。
+ *
+ * 两个客户端的载荷载体不同，故用可选字段而不是联合类型：调用方按 `client`
+ * 取值即可，避免为两个分支各写一份收窄逻辑。
+ *   · ccswitch → `app_type` + `settings_config`
+ *   · zcode    → `provider`（片段，含 providerRule 与 providerModelRules）
+ */
+export interface KeyExportResult {
+  client: 'ccswitch' | 'zcode';
+  /** 面板对外地址 + /v1，客户端实际要填的 base URL */
+  base_url: string;
+  realm: 'cn' | 'global';
+  /** **网关口径**的模型 id（带 cn: / global: 前缀） */
+  models: string[];
+  name: string;
+  app_type?: 'claude' | 'codex';
+  settings_config?: Record<string, unknown>;
+  provider?: Record<string, unknown>;
+}
+
+/**
+ * 本机一键导入：单个客户端的可写状态（见 server/services/keyimport.py）。
+ *
+ * `running` 是**三态**：true / false / null，null = 探测不到。后端把 null 也
+ * 当作"不能写"（fail-closed）：漏判的代价是写坏用户本机配置，误判的代价只是
+ * 让用户改用导出，两者不对称。
+ */
+export interface KeyImportClientStatus {
+  client: 'ccswitch' | 'zcode';
+  /** 该客户端的配置文件是否存在 */
+  installed: boolean;
+  /** 是否正在运行；null = 探测不到 */
+  running: boolean | null;
+  /** 综合结论：现在能不能*直接写*（客户端没在跑时才为 true） */
+  importable: boolean;
+  /** 不能直写的原因；可写时为空串 */
+  reason: '' | 'not_installed' | 'client_running' | 'cannot_detect';
+  /** 会被写入的文件路径 */
+  target: string;
+  /**
+   * 面板认得的可执行文件；null = 还没定位到（界面提示可点「自动检测」）。
+   * 直写模式下要在写完后把客户端拉起来，靠的就是它。
+   */
+  exe: string | null;
+  /** 上面那个路径是从哪认出来的：env / process / protocol / cache / registry / known-dir / scan */
+  exe_source: string;
+  /** 正在运行、但可以自动关闭（定位到了 exe）——界面要提前说清"会先替你关掉它" */
+  needs_close: boolean;
+  /** 本机支持客户端官方的 ccswitch:// 深链导入（首选路径：不用关客户端、不用改它的库） */
+  deeplink: boolean;
+}
+
+export interface KeyImportStatus {
+  /** 面板侧开关（WB_LOCAL_IMPORT），默认关 */
+  enabled: boolean;
+  /** 这次请求是否来自面板所在机器；false 时只能导出后手动导入 */
+  local_caller: boolean;
+  clients: KeyImportClientStatus[];
+}
+
+/**
+ * 导入结果。**不含密钥**——服务端刻意不回显：配置已经落盘，没必要再把明文
+ * 放进响应体（明文只该在「创建密钥」那一次出现）。
+ */
+export interface KeyImportResult {
+  client: 'ccswitch' | 'zcode';
+  app: '' | 'claude' | 'codex';
+  realm: 'cn' | 'global';
+  base_url: string;
+  model_count: number;
+  /**
+   * 走的是哪条路：
+   *  · `deeplink` = 把配置拼成客户端官方的 ccswitch:// 链接交给系统，
+   *    由客户端自己弹确认框、自己入库（此时 `action` 是 `handed-off`）；
+   *  · `direct`   = 面板直接改它的配置/数据库。
+   */
+  method: 'deeplink' | 'direct';
+  /** created = 新增；updated = 更新了已有项；handed-off = 已交给客户端去导入 */
+  action: 'created' | 'updated' | 'handed-off';
+  provider_id: string;
+  /** 实际写入的文件（深链模式下为空：面板没碰文件） */
+  target: string;
+  /** 写入前的备份（可据此回滚）；深链模式下为空 */
+  backup: string;
+  /** 直写模式才有的进程生命周期：是否被面板关掉/重新拉起 */
+  lifecycle: {
+    stopped: boolean;
+    forced: boolean;
+    /** null = 没关过（谈不上重开）；false = 关了但没拉起来 */
+    restarted: boolean | null;
+    exe: string;
+  } | null;
+  name?: string;
+  app_type?: 'claude' | 'codex';
+  /** 深链模式：真正接收这条链接的客户端可执行文件 */
+  handler?: string;
+}
+
+/** 自动检测客户端位置的结果（面板的「自动检测」按钮）。 */
+export interface KeyImportDetectResult {
+  client: 'ccswitch' | 'zcode';
+  found: boolean;
+  exe: string | null;
+  /** 从哪找到的；没找到时为空串。界面据此说明"是从注册表/扫描里认出来的" */
+  source: '' | 'env' | 'process' | 'protocol' | 'cache' | 'registry'
+    | 'known-dir' | 'scan';
+}
+
+/**
+ * 管理面**作用域化 API Token**（见 docs/api-tokens.md）。
+ *
+ * 与上面那把网关密钥（`ApiKey`）是**两套东西**：`ApiKey` 只授权模型调用；
+ * 本类型授权的是管理接口 `/api/*`，供脚本 / CI 免登录调用。
+ */
+export interface ApiToken {
+  id: number;
+  name: string;
+  /** 明文前 12 字符，用于展示与识别（明文本身不会再回传） */
+  prefix: string;
+  /** 权限：只读 / 管理员（角色由它决定） */
+  scope: 'readonly' | 'admin';
+  enabled: boolean;
+  /** 到期时刻（epoch 秒）；null = 永不过期 */
+  expires_at: number | null;
+  created_at: number;
+  /** 创建者用户名（审计用） */
+  created_by: string;
+  last_used_at: number | null;
+  last_used_ip: string | null;
+}
+
+/** 创建令牌的返回：比 ApiToken 多一个**仅此一次**的明文字段。 */
+export interface CreatedApiToken extends ApiToken {
+  token: string;
 }
 
 export interface RequestLog {
@@ -287,9 +657,32 @@ export interface RequestLog {
   ip: string;
   model: string | null;
   mapped_model: string | null;
+  /**
+   * 思考强度（reasoning_effort）：客户端在请求体里**显式传的**档位
+   * （low / medium / high / max…，不同模型档位不同）。
+   *
+   * null = 客户端没传（走模型默认档）或该字段上线前的历史记录——界面显示「—」。
+   * 刻意不做推断：把「默认」写成某个具体档位，排查时会误判客户端行为
+   * （例如以为客户端一直在要 max）。
+   */
+  effort: string | null;
+  /**
+   * 客户端渠道（issue #233）：按 User-Agent 归类（codex / vscode / cli / wb /
+   * web / api / other / unknown）。
+   *
+   * 只用于排查「哪类客户端在把账号打进 429」，**不改变网关行为**。
+   * null = 该列上线前的历史记录（界面显示「—」）。
+   */
+  channel: string | null;
   status: number;
   prompt_tokens: number;
   completion_tokens: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或该行在功能上线前写入，
+   * 界面显示「—」——不能显示 ¥0，那会被读成「这次调用免费」。
+   */
+  cost: number | null;
   latency_ms: number;
   /**
    * 首字延迟（毫秒）：从发起上游请求到收到第一个含正文的 delta。
@@ -298,11 +691,30 @@ export interface RequestLog {
    * 反映不出上游响应快慢；首字延迟才是「上游多久开始回话」。
    */
   first_token_ms: number | null;
+  /**
+   * 提示词缓存的三段 token（issue #69）：上游（腾讯）在流式末帧 usage 里给。
+   * **null = 上游没给这三个字段**（老上游），与「给了 0」不是一回事——
+   * 后者代表这次请求确实没命中缓存。界面据此显示「—」而不是 0%。
+   *
+   * 前缀缓存是**按账号**存的，所以「换了号」与「没命中」常常一起出现，
+   * 与下面那个 account 列对着看才有意义。
+   */
+  cache_hit_tokens: number | null;
+  cache_miss_tokens: number | null;
+  cache_write_tokens: number | null;
   ua: string | null;
   error: string | null;
   stream: boolean;
   /** 本次调用的真实扣费（上游 usage.credit）；null = 上游未返回，不是 0 */
   credit: number | null;
+  /**
+   * 本次实际用了哪个上游账号，形如 `昵称(uid8)`。
+   *
+   * 账号由上游决定、不在响应里回传，本端是**采集上游容器日志后按时间对回来的**，
+   * 所以比请求本身晚几秒——刚打完的请求这一列可能还是 null（界面显示「—」，
+   * 稍后刷新即有）。null 也可能是「日志已滚掉」或「上游没在跑容器」。
+   */
+  account: string | null;
 }
 
 export interface UsagePoint {
@@ -312,6 +724,10 @@ export interface UsagePoint {
   completion_tokens: number;
   /** 当日实际扣费合计 */
   credit: number;
+  /** 按 DeepSeek 官方价估算的费用（元）；null = 这天没有可计价的调用 */
+  cost: number | null;
+  /** 这天里没计入费用的请求数 */
+  unpriced_requests: number;
   /**
    * 当日失败请求数（4xx + 5xx 合计）。
    *
@@ -322,6 +738,114 @@ export interface UsagePoint {
    * 可选：老版本后端不返回该字段，界面按 0 处理（不显示失败）。
    */
   failed?: number;
+  /** 当日成功请求数（2xx，issue #369 第 3 点）；同样来自 request_logs。 */
+  success?: number;
+}
+
+/**
+ * 某一天**按小时**的用量（`/api/stats/hourly`）。
+ *
+ * 「今日」趋势图用：范围只有一天时按天聚合只会得到一根柱子（那正是用户反馈的
+ * 「今日还是柱状图，不太对劲」）。与 `UsagePoint` **同源同口径** —— 小时表与
+ * 按天表由同一处写入累计，所以图与页头卡片永远一致，清日志也不会打架。
+ */
+export interface UsageHourPoint {
+  /** `YYYY-MM-DD` */
+  day: string;
+  /** 0-23（本地时区） */
+  hour: number;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  credit: number;
+  /** 该小时的失败请求数（来自请求日志，与 `UsagePoint.failed` 同一口径） */
+  failed: number;
+  /** 该小时的成功请求数（2xx） */
+  success?: number;
+}
+
+/** 一天的积分收入 / 支出（`/api/stats/credits` 的 daily 项） */
+export interface CreditsFlowPoint {
+  day: string;
+  /** 收入：余额增加流水（kind='credit'）当日合计 */
+  income: number;
+  /** 支出：调用实际扣费（usage.credit）当日合计 */
+  expense: number;
+  /** income - expense */
+  net: number;
+}
+
+/**
+ * 单日按小时桶（`days=1` 时后端额外返回，粒度规则与用量趋势图一致）。
+ *
+ * 固定 24 个桶补零：X 轴长度不随「今天走到几点」变化，图上不会因为还没到的
+ * 时段而抖动。
+ */
+export interface CreditsFlowHourPoint {
+  day: string;
+  hour: number;
+  income: number;
+  expense: number;
+  net: number;
+}
+
+/**
+ * 积分收支统计。
+ *
+ * 收入与支出是**两套口径**（见后端 `credits_flow` 的说明）：收入是「余额比
+ * 上次查询增加的部分」，按查询时刻归日，属于近似值；支出是每次调用的真实扣费，
+ * 精确到请求。所以界面上必须分开标注，不能只拿「净额」下结论。
+ */
+export interface CreditsFlow {
+  days: number;
+  from: string;
+  to: string;
+  today: {income: number; expense: number; net: number};
+  week: {income: number; expense: number; net: number};
+  total: {income: number; expense: number; net: number};
+  daily: CreditsFlowPoint[];
+  /** 范围只有一天时为 hour（此时带 hourly），否则 day。旧后端不返回。 */
+  granularity?: 'day' | 'hour';
+  /** 24 个小时桶；仅 granularity === 'hour' 时存在。 */
+  hourly?: CreditsFlowHourPoint[];
+}
+
+export interface AccountUsageRow {
+  day: string;
+  account: string;
+  nickname: string;
+  uid8: string;
+  requests: number;
+  tokens: number;
+  credit: number;
+  cost: number | null;
+}
+
+export interface AccountModelUsageRow {
+  account: string;
+  nickname: string;
+  uid8: string;
+  model: string;
+  requests: number;
+  tokens: number;
+  credit: number;
+  cost: number | null;
+}
+
+export interface AccountModelUsageResponse {
+  items: AccountModelUsageRow[];
+  total: number;
+  truncated: boolean;
+  from: string;
+  to: string;
+}
+
+export interface AccountUsageResponse {
+  items: AccountUsageRow[];
+  total: number;
+  truncated: boolean;
+  from: string;
+  to: string;
 }
 
 export interface UsageBreakdown {
@@ -331,8 +855,83 @@ export interface UsageBreakdown {
   completion_tokens: number;
   /** 该维度实际扣费合计 */
   credit: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 这个模型没收录价目（glm / kimi / minimax…）或全在该列上线前，
+   * 界面显示「—」。**不是 0**：0 会被读成「免费」。
+   */
+  cost: number | null;
+  /** 同一维度里没有计入费用的请求数（模型不在价目表 / 历史行） */
+  unpriced_requests: number;
+  /**
+   * 输出速率（tokens/秒，issue #214）：按「生成耗时 = 总耗时 − 首字耗时」估算。
+   * null / 缺省 = 没有可用样本（日志已清或该模型没成功请求），界面显示「—」。
+   */
+  tokens_per_sec?: number | null;
+  /** 参与速率计算的请求条数（只覆盖日志保留期内的成功请求） */
+  throughput_samples?: number;
 }
 
+/**
+ * 实时指标（`GET /api/stats/realtime`）。
+ *
+ * 与 `StatsSummary` 那类累计值口径不同，界面上必须分组显示：
+ * `inflight` / `capacity` 是**此刻**的瞬时值（来自上游 `/status`），上游不可达时
+ * 整组缺失；`rpm_*` / `peaks` / `series` 来自本库 `request_logs`，只含已完成请求。
+ */
+export interface StatsRealtimeSeries {
+  /** 窗口长度（秒） */
+  window: number;
+  /** 每个桶多少秒 */
+  step: number;
+  /** 窗口起点（epoch 秒，已对齐到 step 的整数倍） */
+  start: number;
+  end: number;
+  /** 每个桶的请求数 */
+  rpm: number[];
+  /** 每个桶内的并发峰值 */
+  concurrency: number[];
+}
+
+export interface StatsRealtimePeaks {
+  concurrency: number;
+  rpm: number;
+  /** 参与计算的行数：0 表示这段时间没有任何已完成请求 */
+  samples: number;
+}
+
+export interface StatsRealtime {
+  /** 上游 `/status` 是否取到；false 时只有 rpm_* / peaks / series 有效 */
+  available: boolean;
+  /**
+   * 客户端在途：面板正在处理、还没把响应写完的条数（含流式全过程、含排队）。
+   * 与 `inflight`（上游槽位占用）是两个视角，界面上一个当主数字、一个当小字。
+   */
+  client_inflight?: number;
+  /** 取不到上游时的原因（直接展示，服务端文案） */
+  error?: string;
+  days: number;
+  updated_at: number;
+  /** 最近 60 秒的请求数（即「此刻的 RPM」） */
+  rpm_60: number;
+  rpm_5m: number;
+  rpm_3m: number;
+  peaks: StatsRealtimePeaks;
+  series: StatsRealtimeSeries;
+  /** 以下仅在 available 时存在 */
+  inflight?: number;
+  busy_accounts?: number;
+  accounts_total?: number;
+  /** 国内版（`cn`）账号的单账号在途上限（`pool.max_in_flight`） */
+  per_account_limit?: number;
+  /** 国际版账号的单账号在途上限（`pool.max_in_flight_global`，不是全池上限） */
+  per_account_limit_global?: number;
+  /** 全池同时在途上限 = 各账号按 realm 取上限后求和 */
+  capacity?: number;
+  full_accounts?: number;
+  healthy?: number;
+  sticky?: number;
+}
 export interface StatsSummary {
   today_requests: number;
   today_tokens: number;
@@ -340,6 +939,19 @@ export interface StatsSummary {
   today_credit: number;
   week_credit: number;
   total_credit: number;
+  /**
+   * 按 DeepSeek 官方价估算的费用（元，issue #380）。
+   * null = 该区间内没有任何可计价的调用（与「0 元」不同，界面显示「—」）。
+   */
+  today_cost: number | null;
+  week_cost: number | null;
+  total_cost: number | null;
+  /** 同一区间内**没有**计入费用的请求数——有它才能说清金额只覆盖了一部分调用 */
+  today_unpriced: number;
+  week_unpriced: number;
+  total_unpriced: number;
+  /** 费用币种（目前只有 CNY） */
+  cost_currency: string;
   week_requests: number;
   week_tokens: number;
   total_requests: number;
@@ -394,9 +1006,13 @@ export interface IpAccessLog {
   ua: string | null;
   /**
    * 拦截原因短码（issue #33）：missing_key / invalid_key / ip_blocked /
-   * key_disabled / key_expired / quota_exhausted / credit_quota_exhausted /
+   * key_disabled / key_expired / quota_exhausted / daily_quota_exhausted / credit_quota_exhausted /
    * ip_not_allowed / too_many_ips / realm_mismatch / model_not_allowed /
-   * rate_limited 等。
+   * rate_limited / key_auth_flood 等。
+   *
+   * `key_auth_flood` 不是「这一条被什么拦了」，而是一条**汇总标记**：同一个 IP
+   * 在一分钟窗口内用无效/缺失密钥刷了太多次，后面的同类记录被折叠，这一行代表
+   * 那批被折叠的请求（后端 `_auth_log_verdict`）。
    *
    * 稳定短码而非散文：展示侧按语言翻译，改文案不必迁移历史数据。
    * 存量记录为 null（那时没记原因），界面显示「未记录」。
@@ -438,6 +1054,11 @@ export interface UpstreamConfig {
   listen?: string;
   api_key_masked?: string;
   auth_dir?: string;
+  /**
+   * 思考内容兜底（上游 config.json 的**顶层**键，不在 features 段里）：
+   * 正文为空时把推理原文当正文下发。缺省按上游默认 true 回显。
+   */
+  reasoning_as_content?: boolean;
   /** 上游 config.json 中声明的 auth_dir，与管理端不一致时出现 */
   upstream_auth_dir?: string;
   schedule?: Record<string, unknown>;
@@ -533,10 +1154,23 @@ export interface TaskLogResponse {
  *   claim   只领已完成任务的奖励（幂等，不伪造行为）
  *   full    点亮 + 领奖（会伪造活跃上报，有风控风险，需二次确认）
  */
+/** 活动任务的一行摘要（后端 task_summary.summarize 产出，issue #189） */
+export interface TaskRunSummaryItem {
+  /** 上游任务码，如 `Sequential_Tasks_2`；认不出的就原样显示 */
+  code: string;
+  state: 'pending' | 'claimed' | 'skipped' | 'failed';
+  /** 该任务最有代表性的一条原始日志行（未翻译） */
+  line: string;
+  /** 命中该任务的行数（多行时取最需要行动的那条做代表） */
+  count: number;
+}
+
 export interface TaskRunStatus {
   running: boolean;
   mode: string;
   target: string;
+  /** 执行的分组名（issue #274）；空串 = 默认分组 */
+  group?: string;
   started_at: number;
   finished_at: number;
   exit_code: number | null;
@@ -544,6 +1178,12 @@ export interface TaskRunStatus {
   error: string;
   /** 输出尾部（脚本按行打印，后端只保留最近若干行） */
   lines: string[];
+  /**
+   * 按任务聚合的摘要（issue #189）：每条 `{code, state, line, count}`。
+   * `line` 是原始日志行（前端按当前语言渲染），`state` 是机器可读枚举。
+   * 后端按「失败 → 待处理 → 已领取 → 跳过」排好序，前端不再重排。
+   */
+  tasks?: TaskRunSummaryItem[];
   /** 上游脚本与账号目录是否就位；false 时 unavailable_reason 说明原因与做法 */
   available: boolean;
   unavailable_reason: string;
@@ -551,6 +1191,32 @@ export interface TaskRunStatus {
   schedule: {enabled?: boolean; hours?: number[]};
 }
 
+
+/** 账号 × 模型探测的单条结果（issue #270） */
+export type ProbeStatus = 'ok' | 'rate' | 'credit' | 'auth' | 'no_model' | 'error';
+
+export interface ProbeModelResult {
+  /** 探测成功且已同步网关（解除该模型 11102 误标）；上游没开管理接口时缺省 */
+  gateway_synced?: boolean;
+  /** 上游未注册管理接口（admin.enabled=false）：不是失败，只是无从同步 */
+  gateway_sync_skipped?: boolean;
+  gateway_sync_message?: string;
+  file: string;
+  uid: string;
+  nickname: string;
+  realm: string;
+  model: string;
+  status: ProbeStatus;
+  code: string | null;
+  message: string;
+  latency_ms: number;
+}
+
+export interface ProbeModelsResponse {
+  results: ProbeModelResult[];
+  summary: Record<ProbeStatus, number>;
+  requests: number;
+}
 
 /** 签到记录分页返回 */
 export interface CheckinLogPage {
@@ -588,8 +1254,8 @@ export interface UpdateStatus {
   version: string;
   updater_found: boolean;
   upstream_dir: string;
-  /** 当前固定的上游版本（空 = 跟随分支） */
-  upstream_ref?: string;
+  /** 随包上游的稳定标识（空 = 旧部署没有 .upstream-id） */
+  upstream_id?: string;
   started_at?: number;
   finished_at?: number | null;
   duration?: number;
@@ -597,11 +1263,11 @@ export interface UpdateStatus {
   /** 日志原文（便于复制反馈） */
   log_tail?: string;
   /**
-   * 发布包签名校验结果（供应链防护）。
-   * verified = 已验签通过；skipped = 走了 WB_SKIP_SIGNATURE 绕过开关（有风险）；
-   * none 或缺失 = 未执行验签（如旧版本更新器）。
+   * 发布包完整性校验结果。
+   * digest = sha256 与发布页一致；none = 走的回退路径拿不到发布页摘要，
+   * 只打印了本地摘要（如实标注，不假装校验过）；缺失 = 更新器太旧，没这一项。
    */
-  signature?: {status: 'verified' | 'skipped' | 'none'; detail?: string};
+  integrity?: {status: 'digest' | 'none'; digest?: string};
 }
 
 export interface VersionSide {
@@ -613,11 +1279,33 @@ export interface VersionSide {
   has_update: boolean;
   /** 检测失败原因 */
   error: string;
+  /**
+   * 这一侧的值是否来自**上一次**成功检测（本次失败了）。
+   *
+   * 为 true 时界面不能下「已是最新」的结论 —— 那等于把一次 403/网络失败说成
+   * 「确实没有新版本」（issue #204）。
+   */
+  stale?: boolean;
+  /** 旧值的检测时间（秒，配合 stale 显示「下面是 X 时的结果」） */
+  stale_at?: number;
 }
 
 export interface ManagerVersion extends VersionSide {
   /** Release 页面地址 */
   url: string;
+  /**
+   * 该 Release 的产物（.tar.gz）是否就位。
+   *
+   * `false` = 版本可见但产物还没上传（手工建的 Release 会这样）：这时点了更新
+   * 只会拿到 404，界面要**先说清楚**。`null` = 未知（旧缓存）。
+   */
+  assets_ready: boolean | null;
+  /** Release 正文（纯文本，截断）；更新前展示，避免装完才知道配套要求 */
+  release_notes?: string;
+  /** Release 发布时间（ISO 字符串） */
+  published_at?: string;
+  /** 本次发布包内的上游与本机不一致（由 Release 正文里的 upstream-id 判断） */
+  upstream_changed?: boolean;
   repo: string;
 }
 
@@ -655,11 +1343,120 @@ export interface UpdateCheck {
   has_any: boolean;
 }
 
+/** 已上传的离线升级包（issue #153）：内网机器用它代替「从 GitHub 拉最新」 */
+export interface UpdatePackageMeta {
+  /** 文件是否还在（记录存在但文件被清掉时为 false） */
+  present: boolean;
+  /** 上传时的原始文件名（只用于显示） */
+  name?: string;
+  /** 文件大小（字节） */
+  size?: number;
+  /** 服务端算出的 sha256 */
+  sha256?: string;
+  /** 用户在界面上填的「发布页 sha256」，空 = 没填、更新时只做结构校验 */
+  expected_sha256?: string;
+  /** 包内 .version（发布包打进包里的版本号） */
+  version?: string;
+  uploaded_at?: number;
+  uploaded_by?: string;
+}
+
 export interface Versions {
   manager: string;
   upstream_connected: boolean;
   upstream_accounts: number | null;
   upstream_dir: string;
+}
+
+/**
+ * GitHub 镜像（issue #216）：国内机器直连 GitHub 超时时，用加速服务取
+ * Release 元信息与发布包。走镜像时**不会**发送 GitHub Token。
+ */
+/**
+ * 账号列的自诊断（issue #232）。
+ *
+ * 请求日志的「账号」来自上游运行日志回填，面板转发时并不知道用了哪个号。
+ * 这一列空的时候有四种完全不同的原因，后端把事实与判断依据一起返回。
+ */
+export interface AccountBackfillInfo {
+  /** native = 日志文件；docker = docker logs；systemd = journal */
+  mode: 'native' | 'docker' | 'systemd';
+  /** native 是文件路径，docker 是容器名，systemd 是 unit 名 */
+  source: string;
+  /** 最近一次采集的时刻（epoch 秒，0 = 还没跑过） */
+  checked_at: number;
+  /** 那次读到的日志行数 */
+  lines: number;
+  /** 解析出的请求行数 */
+  parsed: number;
+  /** 成功回填到本地请求记录的行数 */
+  filled: number;
+  /** 采集抛出的异常原文（空 = 没有异常） */
+  error: string;
+  /** native: 日志文件是否存在；docker: 能否操作 docker */
+  exists: boolean;
+  /** native 的日志文件大小（字节） */
+  size?: number;
+  /** 人读的判断结论；空串表示当前没有异常 */
+  hint: string;
+}
+
+/** 自动更新设置（设置 → 更新） */
+export interface AutoUpdateConfig {
+  enabled: boolean;
+  /** 检测间隔（小时，1–168） */
+  interval_hours: number;
+  /** 允许动手的时间窗（服务器本地时间整点，[start, end)，相等 = 全天） */
+  window_start: number;
+  window_end: number;
+  /** auto：上游变了且能操作 docker 时一起更新；manager：只更新管理端 */
+  target: 'auto' | 'manager';
+}
+
+export interface AutoUpdateInfo extends AutoUpdateConfig {
+  state: {
+    last_check_at: number;
+    /** none / wait / started / error / 空 = 还没跑过 */
+    last_action: string;
+    last_message: string;
+    pending_version: string;
+  };
+  docker_ok: boolean;
+  /** 非空 = 当前部署形态不支持自动更新（如 Windows 原生），开关禁用 */
+  unsupported_reason: string;
+  server_tz_offset_minutes: number;
+}
+
+export interface GithubMirror {
+  /** 生效的镜像基址（规范化后带尾斜杠）；空串 = 直连 */
+  mirror: string;
+  /** 面板里存的值（空 = 没设过） */
+  stored: string;
+  /** 部署时注入的环境变量 WB_GITHUB_MIRROR */
+  env_mirror: string;
+  source: 'panel' | 'env' | '';
+  /** 界面上的快捷选项 */
+  presets: string[];
+}
+
+/**
+ * 网关数据面 CORS（issue #445）。
+ *
+ * 与 `WB_CORS_ORIGINS`（管理面 `/api/*`，Cookie 会话）是**两套**东西：
+ * 这里管 `/v1`、`/v2`，鉴权走 Bearer，所以允许 `*`。
+ */
+export interface GatewayCors {
+  enabled: boolean;
+  /** 来源白名单；`*` = 任意，`null` = file:// 页面的字面量来源 */
+  origins: string[];
+  /** 预检结果缓存秒数（0 = 不缓存） */
+  max_age: number;
+  /** 条数上限（超过时保存会被拒） */
+  max_origins: number;
+  /** 本配置作用的路径前缀 */
+  prefixes: string[];
+  /** 管理面来源（`WB_CORS_ORIGINS`，只读展示） */
+  admin_origins: string[];
 }
 
 /** 更新日志中的一条（level 1 = 二级缩进，作为子项展示） */
@@ -750,4 +1547,645 @@ export interface AuditLog {
 export interface AuditLogPage {
   items: AuditLog[];
   total: number;
+}
+
+/**
+ * 上游自己那份统计（`/v1/stats`，issue #59）。
+ *
+ * 字段名照上游 JSON。**口径与面板的用量统计不同**：这份含直连上游的调用，
+ * 且自上游进程启动累计——界面必须标注清楚，别与按时段统计的数字混着看。
+ */
+export interface UpstreamStatRow {
+  model?: string;
+  requests?: number;
+  success?: number;
+  failed?: number;
+  total_tokens?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  credit?: number;
+  cache_hit_rate?: number;
+}
+
+export interface UpstreamStats {
+  /** 取不到时为 false，此时只有 error */
+  available: boolean;
+  error?: string;
+  /** 上游可关闭统计采集；关闭时 enabled=false 且 message 说明原因 */
+  enabled?: boolean;
+  message?: string;
+  since?: string;
+  uptime_sec?: number;
+  total?: UpstreamStatRow;
+  models?: UpstreamStatRow[];
+}
+
+/* ── 红包：一次建一批带额度的密钥，管理员自己分发 ──────────
+ * 见 server/redpacket.py 的模块说明（为什么不做领取页/分享码）。 */
+
+/**
+ * 额度类别。两者**限制的对象不同**，不只是单位不同：
+ * credit 限制上游返回的真实扣费（口径准）；token 限制 token 总数（直观）。
+ */
+export type RedPacketKind = 'credit' | 'token';
+
+/** 分配方式：lucky = 拼手气（有人多有人少），even = 均分 */
+export type RedPacketMode = 'lucky' | 'even';
+
+export interface RedPacket {
+  id: number;
+  title: string;
+  quota_kind: RedPacketKind;
+  total_amount: number;
+  shares: number;
+  mode: RedPacketMode;
+  /**
+   * 限定的模型范围。**token 红包非空、积分红包恒为空**（两类规则相反，见
+   * server/redpacket.py 的 validate）：token 是「量」与模型强相关，
+   * 积分是「钱」任何模型都能用。
+   */
+  models: string[];
+  /**
+   * 抽奖码 —— 拼出分享链接用。**它是凭据**：拿到就能抽走一份，
+   * 所以只在管理端接口下发，不要贴到公开场合。
+   */
+  code: string;
+  created_by: string;
+  created_at: number;
+  expires_at: number;
+  /** 已被抽走的份数（抽奖式红包看的就是这个进度） */
+  claimed: number;
+  /** 整批都已停用 = 已收回（部分停用不算，那种情况去密钥页看单把） */
+  revoked: boolean;
+}
+
+/** 红包里的一份（= 一个密钥）。**不含明文** —— 库里只有哈希。 */
+export interface RedPacketItem {
+  key_id: number;
+  prefix: string;
+  amount: number;
+  enabled: boolean;
+  used_tokens: number;
+  used_credit: number;
+}
+
+export interface RedPacketDetail extends RedPacket {
+  items: RedPacketItem[];
+}
+
+/**
+ * 创建红包的结果：含**明文 key**，且**仅此一次**（与 keyApi.create 同理）。
+ *
+ * 界面上必须提示「离开后无法再看到」并提供复制/导出 —— 这是「直接发 key」
+ * 方案的固有代价，不是缺陷。
+ */
+/** 抽奖页的元信息。**不含密钥** —— 没点「开启」之前不该能拿到。 */
+export interface ClaimInfo {
+  title: string;
+  quota_kind: RedPacketKind;
+  shares: number;
+  /** 还剩几份 */
+  left: number;
+  models: string[];
+  expires_at: number;
+  expired: boolean;
+  /** 本机（IP）是不是已经抽过了 */
+  claimed: boolean;
+  /**
+   * 本机领到的那一份（没领过时为 null）。
+   *
+   * 第二次打开时会**直接展示**：关掉弹窗才想起没存密钥是很常见的，而明文
+   * 只显示那一次 —— 刷新就能找回来，比「请联系发红包的人」有用。
+   * 代价是同一 NAT 出口下的人能看到彼此的那份（红包的熟人场景下可接受）。
+   */
+  my_amount: number | null;
+  my_key: string | null;
+}
+
+/** 抽到的那一份。`key` 是**明文**，只在抽的这一刻返回。 */
+export interface DrawResult {
+  amount: number;
+  quota_kind: RedPacketKind;
+  models: string[];
+  key: string;
+  expires_at: number;
+}
+
+export interface CreatedRedPacket {
+  id: number;
+  title: string;
+  quota_kind: RedPacketKind;
+  total_amount: number;
+  shares: number;
+  mode: RedPacketMode;
+  /** 同上：token 红包非空、积分红包恒为空 */
+  models: string[];
+  /** 抽奖码 —— 拼分享链接用（仅此一次能拿到，之后详情接口还会给） */
+  code: string;
+  created_at: number;
+  expires_at: number;
+  keys: ApiKey[];
+}
+
+/* ── PostgreSQL 异地备份（设置 → 数据备份）────────────── */
+
+/**
+ * 连接配置。密码在读取时恒为掩码（`********`），保存时原样回传表示「不改动」——
+ * 见 `server/services/pgsync.py` 的 merge_form。
+ */
+export interface PgSyncConfig {
+  /** 是否开启定时自动备份 */
+  enabled: boolean;
+  host: string;
+  port: number;
+  dbname: string;
+  user: string;
+  password: string;
+  /** libpq 的 sslmode；prefer 是默认值，不写进连接串 */
+  sslmode: string;
+  /** 自动备份间隔（分钟）；0 = 只手动 */
+  interval_minutes: number;
+  /** 恢复前是否自动备份本地库 */
+  keep_local_backup: boolean;
+  /** 上次导出完成的时刻（0 = 从未） */
+  last_export_at: number;
+  /** 上次恢复完成的时刻（0 = 从未） */
+  last_import_at: number;
+}
+
+export interface PgSyncLogLine {
+  ts: number;
+  level: string;
+  text: string;
+}
+
+export interface PgSyncStatus {
+  running: boolean;
+  /** 空串 = 从未跑过 */
+  kind: '' | 'export' | 'import';
+  /** null = 未运行过 */
+  ok: boolean | null;
+  step: string;
+  /** 0-100 */
+  percent: number;
+  tables_total: number;
+  tables_done: number;
+  rows: number;
+  logs: PgSyncLogLine[];
+  started_at: number;
+  finished_at: number;
+}
+
+export interface PgSyncConfigResponse {
+  config: PgSyncConfig;
+  status: PgSyncStatus;
+}
+
+export interface PgSyncTestResult {
+  ok: boolean;
+  message: string;
+  server_version?: string;
+}
+
+/* ── 页面监控（watchdog）──────────────────────────────── */
+/**
+ * 监控目标。`kind` 决定「比什么」：
+ *   · `html`   —— 页面结构行（标签 + 可见文本）；
+ *   · `assets` —— 页面骨架 + 它引用的前端 bundle（JS 里的字符串与端点）。
+ *     前端发版时页面骨架往往一个字都不变，变的是 bundle 的哈希与内容——
+ *     活动入口和领取文案都在那里，所以默认目标用的是这个。
+ *   · `js` / `text` —— 目标本身就是一个 JS 文件 / 纯文本，直接比其中的字符串。
+ */
+export interface WatchdogTarget {
+  name: string;
+  url: string;
+  kind: 'html' | 'js' | 'text' | 'assets';
+  enabled: boolean;
+}
+
+/** 通知时机：任意变化 / 只有出现可领取 / 只有异常（含可领取）。 */
+export type WatchdogNotifyOn = 'change' | 'claimable' | 'anomaly';
+
+export interface WatchdogLlmConfig {
+  enabled: boolean;
+  /** OpenAI 兼容的 base url；不带 /v1 时自动补 */
+  base_url: string;
+  /** 打码值 `********` 表示保持不变 */
+  api_key: string;
+  model: string;
+  timeout_seconds: number;
+}
+
+export interface WatchdogMailConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  security: 'ssl' | 'starttls' | 'none';
+  username: string;
+  /** 打码值 `********` 表示保持不变 */
+  password: string;
+  from: string;
+  to: string[];
+  subject_prefix: string;
+}
+
+/**
+ * QQ 通知（经 AstrBot HTTP OpenAPI 中转）。
+ *
+ * 管理端不持有 QQ 官方机器人的 AppID/Secret：那是 AstrBot 的职责。这里只有
+ * 「AstrBot 在哪、用什么密钥、发给哪个会话」三样。
+ */
+export interface WatchdogQqConfig {
+  enabled: boolean;
+  /** AstrBot 地址；不带路径时自动补 `/api/v1` */
+  base_url: string;
+  /** 开发者访问密钥 `abk_...`（需 `im` scope）；打码值 `********` 表示保持不变 */
+  api_key: string;
+  /** UMO：`平台:消息类型:会话ID`，如 `qq_official:GroupMessage:<group_openid>` */
+  umo: string;
+  timeout_seconds: number;
+}
+
+export interface WatchdogConfig {
+  enabled: boolean;
+  interval_minutes: number;
+  targets: WatchdogTarget[];
+  timeout_seconds: number;
+  /** kind=assets 时最多抓几个静态资源（0 = 不抓 bundle） */
+  asset_limit: number;
+  notify_on: WatchdogNotifyOn;
+  /** 检测到变化后，逐账号只读查询「活动补偿」状态 */
+  scan_compensation: boolean;
+  /** 扫描明确可领时才真的领取（复用每日计划里的补偿任务） */
+  auto_claim: boolean;
+  /** 允许监控内网地址（默认关闭：SSRF 防护） */
+  allow_private_targets: boolean;
+  llm: WatchdogLlmConfig;
+  mail: WatchdogMailConfig;
+  qq: WatchdogQqConfig;
+}
+
+/** 单个 SMTP 端口的出口探测结果。 */
+export interface WatchdogPortProbe {
+  port: number;
+  ok: boolean;
+  banner: string;
+  error: string;
+}
+
+export interface WatchdogEgress {
+  ok: boolean;
+  host: string;
+  port?: number;
+  banner?: string;
+  error?: string;
+  ports: WatchdogPortProbe[];
+  checked_at: number;
+}
+
+/** 判读结论（LLM 或规则退化；`source=rule` 表示 LLM 未启用/失败）。 */
+export interface WatchdogVerdict {
+  layout_changed: boolean;
+  claimable: boolean;
+  anomaly: boolean;
+  confidence: number;
+  summary: string;
+  evidence: string[];
+  actions: string[];
+  source: string;
+  llm_error?: string;
+}
+
+export interface WatchdogTargetResult {
+  name: string;
+  url: string;
+  /** baseline_created = 首次建立基线（不告警） */
+  status: 'baseline_created' | 'unchanged' | 'changed' | 'error';
+  digest: string;
+  previous_digest?: string;
+  lines: number;
+  diff?: {added: number; removed: number; truncated: boolean};
+  verdict?: WatchdogVerdict;
+}
+
+export interface WatchdogScanSummary {
+  ok: boolean;
+  total?: number;
+  claimable?: number;
+  already?: number;
+  unknown?: number;
+  failed?: number;
+  error?: string;
+}
+
+export interface WatchdogRunResult {
+  ok: boolean;
+  trigger: string;
+  started_at?: number;
+  finished_at?: number;
+  targets?: WatchdogTargetResult[];
+  changed?: string[];
+  errors?: {name: string; error: string}[];
+  scan?: WatchdogScanSummary | null;
+  claim?: {ok: boolean; message: string} | null;
+  mail?: {ok: boolean; message?: string; skipped?: string} | null;
+  qq?: WatchdogQqResult | null;
+  /** 已有一次检测在运行时返回 */
+  skipped?: string;
+}
+
+export interface WatchdogQqResult {
+  ok: boolean;
+  message?: string;
+  skipped?: string;
+  error?: string;
+  /** 已发送的目标 UMO */
+  umo?: string;
+}
+
+export interface WatchdogState {
+  last_run_at?: number;
+  last_result?: WatchdogRunResult;
+  last_error?: string;
+  egress?: WatchdogEgress;
+}
+
+export interface WatchdogStatus {
+  config: WatchdogConfig;
+  state: WatchdogState;
+  /** 现在是否已到下一次检测时间 */
+  due: boolean;
+  next_run_at: number | null;
+}
+
+export interface WatchdogConfigResponse {
+  config: WatchdogConfig;
+}
+
+export interface WatchdogSaveResult {
+  config: WatchdogConfig;
+  mail_egress?: WatchdogEgress | null;
+  warning?: string;
+}
+
+export interface WatchdogMailTest {
+  ok: boolean;
+  message?: string;
+  skipped?: string;
+  egress: WatchdogEgress;
+}
+
+/** AstrBot 平台适配器（`GET /api/v1/im/bots` 的返回项）。 */
+export interface WatchdogQqBot {
+  id?: string;
+  name?: string;
+  type?: string;
+  [key: string]: unknown;
+}
+
+export interface WatchdogQqBotsResult {
+  ok: boolean;
+  error?: string;
+  status?: number;
+  bots?: WatchdogQqBot[];
+}
+
+export interface WatchdogQqTest extends WatchdogQqBotsResult {
+  /** auth = 地址/密钥/scope 没过；send = 已通过鉴权，问题在 UMO 或发送 */
+  stage?: 'auth' | 'send';
+  message?: string;
+  sent_at?: number;
+  umo?: string;
+}
+
+/* ── 计费价目（issue #380）──────────────────────────────── */
+export interface PricingModelRate {
+  cache_hit?: {peak?: number; off_peak?: number};
+  cache_miss?: {peak?: number; off_peak?: number};
+  output?: {peak?: number; off_peak?: number};
+}
+
+export interface PricingVersion {
+  effective_from: string;
+  verified_at: string;
+  source: string;
+  source_note?: string;
+  holiday_source?: string;
+  models: Record<string, PricingModelRate & {label?: string}>;
+  peak_windows: number[][];
+  peak_days: number[];
+  holiday_years: string[];
+  /** 是否是管理员自己覆盖的版本（不是随版本分发的那份） */
+  overridden: boolean;
+  /** 距上次核对官方价目的天数；null = 没写核验日期 */
+  age_days: number | null;
+}
+
+/**
+ * 价目表状态。
+ *
+ * `missing_holiday_years` 非空表示**节假日安排缺这一年**：那段时间的高峰判定
+ * 会退化成「只看周几」，节假日里本来该按空闲价算的调用会被按高峰价计（高估一倍）。
+ */
+export interface PricingInfo {
+  currency: string;
+  money_unit: string;
+  versions: PricingVersion[];
+  active: Record<string, unknown> | null;
+  is_peak_now: boolean;
+  override: Record<string, unknown> | null;
+  has_override: boolean;
+  missing_holiday_years: number[];
+  stale_after_days: number;
+  aliases: Record<string, string>;
+  priced_models: string[];
+}
+
+/* ── 调用抓包（Trace Tap，见 docs/api-traffic-tap.md）──────────────────
+ *
+ * 与请求日志（`RequestLog`）是两套数据：那边的每一行只是**计量**，
+ * 这里的每一行是**证据** —— 完整请求体、完整响应、重建后的模型输出。
+ */
+
+/** 抓包开关与容量。 */
+export interface TapConfig {
+  enabled: boolean;
+  /** 单条请求/响应的存储上限（字节），超出即截断并标记。 */
+  max_body: number;
+  /** 保留天数。 */
+  retention_days: number;
+  /** 会话数上限。 */
+  max_sessions: number;
+}
+
+export interface TapStats {
+  sessions: number;
+  turns: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  first_at: number | null;
+  last_at: number | null;
+}
+
+export interface TapConfigResponse {
+  config: TapConfig;
+  stats: TapStats;
+}
+
+/** 一次 agent 任务（按 system + 首条 user 消息的指纹归并）。 */
+export interface TapSession {
+  id: number;
+  fingerprint: string;
+  key_id: number | null;
+  key_name: string | null;
+  client: string | null;
+  /** 原始 UA。`client` 是从它派生的分类，版本号也从这里取。 */
+  client_ua?: string | null;
+  /** `main` = 一轮对话；`title` 等 = 辅助调用（会话标题生成），属于某条主会话。 */
+  kind: string;
+  /** 辅助调用所属的主会话 id。 */
+  parent_id: number | null;
+  /** 这条主会话底下挂了几次辅助调用（标题 / 压缩）。 */
+  aux_count?: number;
+  /** 客户端说的协议：chat / anthropic / responses。 */
+  protocol: string;
+  model: string | null;
+  started_at: number;
+  updated_at: number;
+  turns: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+}
+
+/** 会话里的一轮（详情列表项，不含正文）。 */
+export interface TapTurnBrief {
+  id: number;
+  seq: number;
+  ts: number;
+  status: number | null;
+  stream: boolean;
+  latency_ms: number | null;
+  first_token_ms: number | null;
+  model: string | null;
+  mapped_model: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cache_hit_tokens: number | null;
+  cache_miss_tokens: number | null;
+  cost: number | null;
+  error: string | null;
+  truncated: boolean;
+  protocol: string | null;
+  request_bytes: number;
+  response_bytes: number;
+}
+
+export interface TapSessionDetail extends TapSession {
+  items: TapTurnBrief[];
+  /** 挂在它名下的辅助调用（点一下可跳转）。 */
+  aux?: {id: number; kind: string; ts: number; model: string | null}[];
+}
+
+/** 请求体的结构摘要（后端现算，不落库）。 */
+export interface TapTurnSummary {
+  messages: number;
+  roles: Record<string, number>;
+  tools: number;
+  system_chars: number;
+  tool_names: string[];
+}
+
+export interface TapToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+/** 流式响应重建的结果。 */
+export interface TapRecon {
+  text: string;
+  reasoning: string;
+  tool_calls: TapToolCall[];
+  finish?: string | null;
+  events?: number;
+  done?: boolean;
+}
+
+/** 一轮完整内容。 */
+export interface TapTurn extends Omit<TapTurnBrief, 'request_bytes' | 'response_bytes'> {
+  session_id: number;
+  path: string | null;
+  request: Record<string, unknown> | null;
+  /** false = 被截断或格式异常，只能看原文（`request_raw`）。 */
+  request_ok: boolean;
+  request_raw: string | null;
+  response: unknown;
+  response_ok: boolean;
+  response_raw: string | null;
+  recon: TapRecon;
+  usage: Record<string, unknown>;
+  summary: TapTurnSummary;
+
+  /* ── 两端视角 ────────────────────────────────────────────────
+   *
+   * 一次调用有两份请求、两份响应，缺哪一份都排不了「网关/转换层改了什么」：
+   *   · 请求：`request.body` 是客户端**原样**发的，`request.upstream_body`
+   *     是网关改写后发往上游的；
+   *   · 响应：`upstream_*` 是网关卡在上游与客户端中间看到的原文，
+   *     `client_*` 是客户端手里真正收到的那份。
+   *
+   * 对 Chat 协议两者相同（透传），`passthrough` 为 true。
+   */
+  upstream_response: unknown;
+  upstream_response_ok: boolean;
+  upstream_recon: TapRecon;
+  client_response: unknown;
+  client_response_ok: boolean;
+  /** 客户端视角无法解析成 JSON 时的原文（流式或已截断）。 */
+  client_response_raw: string | null;
+  client_recon: TapRecon | null;
+  passthrough: boolean;
+  client_protocol: string;
+  /** 关联键：网关发往上游时带的 X-Trace-ID（对账用）。NULL = 老记录。 */
+  trace_id?: string | null;
+}
+
+/** 两轮请求的结构化差异（claude-tap 的 diff 视图）。 */
+export interface TapDiff {
+  before: {id: number; seq: number; ts: number; model: string | null};
+  after: {id: number; seq: number; ts: number; model: string | null};
+  params: {key: string; before: string | null; after: string | null}[];
+  system: {
+    changed: boolean;
+    before_chars: number;
+    after_chars: number;
+    before: string;
+    after: string;
+  };
+  messages: {
+    before_total: number;
+    after_total: number;
+    common: number;
+    added: {index: number; role: string; preview: string; chars: number}[];
+    removed: {index: number; role: string; preview: string}[];
+    changed: {index: number; role: string; before: string; after: string}[];
+  };
+  tools: {
+    added: string[];
+    removed: string[];
+    changed: {name: string; before: string; after: string}[];
+  };
+  summary: {
+    params: number;
+    system: number;
+    added: number;
+    removed: number;
+    changed: number;
+    tools: number;
+  };
+  /**
+   * true = 两轮请求体都被截断，这次比的是**摘要**（逐条消息的角色 + 内容哈希），
+   * 而不是请求体全文 —— 截断会把两轮切在同一位置，比前缀必然「完全一致」。
+   */
+  from_digest?: boolean;
 }

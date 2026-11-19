@@ -289,12 +289,12 @@ export function AiChatInput({
                                     {m.name || m.id}
                                   </span>
                                   {m.series && (
-                                    <span className="shrink-0 text-[10px] text-muted-foreground">
+                                    <span className="shrink-0 text-[11px] text-muted-foreground">
                                       {m.series}
                                     </span>
                                   )}
                                 </span>
-                                <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
+                                <span className="mt-0.5 block truncate font-mono text-[11px] text-muted-foreground">
                                   {m.id}
                                   {m.efforts.length > 0 && t('chat.reasoningSuffix', {efforts: m.efforts.join('/')})}
                                 </span>
@@ -380,7 +380,7 @@ export function AiChatInput({
                   </AnimatePresence>
                 </div>
 
-                <span className="ml-auto hidden text-[10px] text-muted-foreground/70 sm:inline">
+                <span className="ml-auto hidden text-[11px] text-muted-foreground sm:inline">
                   {t('chat.keyboardHint')}
                 </span>
               </div>

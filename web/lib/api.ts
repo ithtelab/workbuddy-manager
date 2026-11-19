@@ -1,40 +1,103 @@
 import axios, {AxiosError} from 'axios';
-import {tp} from './i18n';
+import {BASE_PATH} from './base-path';
+import {t, tp} from './i18n';
 import type {Realm} from './realm-context';
 import type {
   Account,
+  AccountsResponse,
+  RefreshPlan,
+  DailyPlan,
+  TaskSchedulerStatus,
+  TaskSchedulerApply,
+  DailyTask,
+  CreditsFlow,
+  AccountUsageResponse,
+  AccountModelUsageResponse,
+  ApiKey,
+  ApiToken,
+  AuditLogPage,
+  Changelog,
   CheckinLogPage,
+  ClaimInfo,
+  ProxyProbe,
+  ProxyPool,
+  RouteBindingsResponse,
+  ProxyRoute,
+  ProxyRouteList,
+  ProxySettings,
+  CreatedApiToken,
+  CreatedRedPacket,
   CreditExpiry,
   CreditsMeta,
-  AccountsResponse,
-  ApiKey,
+  DrawResult,
+  AccountBackfillInfo,
+  AutoUpdateConfig,
+  AutoUpdateInfo,
+  GithubMirror,
+  GatewayCors,
   IpAccessLog,
   IpRule,
+  KeyExportResult,
+  KeyImportDetectResult,
+  KeyImportResult,
+  KeyImportStatus,
   Me,
-  AuditLogPage,
   ModelCatalog,
+  PricingInfo,
   ModelListResponse,
   Page,
+  PgSyncConfig,
+  PgSyncConfigResponse,
+  PgSyncStatus,
+  PgSyncTestResult,
   PlaygroundModels,
+  ProbeModelsResponse,
+  RedPacket,
+  RedPacketDetail,
+  RedPacketKind,
+  RedPacketMode,
   ReloadState,
   RequestLog,
-  Changelog,
   SecurityConfig,
   StatsSummary,
+  StatsRealtime,
+  TapConfigResponse,
+  TapDiff,
+  TapSession,
+  TapSessionDetail,
+  TapTurn,
   TaskLogResponse,
   TaskRunStatus,
+  UpdateCheck,
+  UpdatePackageMeta,
+  UpdateStatus,
   UpstreamConfig,
+  UpstreamEndpoint,
+  UpstreamStats,
   UpstreamStatus,
   UsageBreakdown,
-  UpdateCheck,
-  UpdateStatus,
+  UsageHourPoint,
   UsagePoint,
   UserItem,
   Versions,
+  WatchdogConfigResponse,
+  WatchdogEgress,
+  WatchdogLlmConfig,
+  WatchdogMailConfig,
+  WatchdogMailTest,
+  WatchdogQqBotsResult,
+  WatchdogQqConfig,
+  WatchdogQqTest,
+  WatchdogRunResult,
+  WatchdogSaveResult,
+  WatchdogStatus,
+  WatchdogVerdict,
 } from './types';
 
 export const http = axios.create({
-  baseURL: '',
+  // 子路径部署时接口也挂在前缀下（反向代理剥掉前缀再转发给本服务）。
+  // 这里必须用 basePath，否则所有请求都会打到域名根路径的 /api 上。
+  baseURL: BASE_PATH,
   withCredentials: true,
   timeout: 60000,
 });
@@ -45,22 +108,55 @@ export const http = axios.create({
  * 后端的报错是中文（服务端不做多语言，见 README 的多语言说明），这里过一遍
  * 短语表：命中已收录的后端文案就换成当前语言，没收录的原样展示——既不需要
  * 后端改造，也不会因为漏收录而显示成键名或空白。
+ *
+ * 403 **不做统一改写**。这个状态码在本项目里有四种互不相干的含义：角色不够
+ * （`require_admin`）、接口只收会话不收 API Token（`require_session_admin`）、
+ * 本机导入的开关没开、以及调用方不是面板所在的机器。后两种的原文是**可照做的
+ * 操作说明**（去哪儿开开关、改用「导出配置」），一律改写成「权限不足」会把
+ * 用户唯一能照着做的那句话抹掉。所以只要后端给了文案，就永远优先用它。
+ *
+ * 兜底只在后端**没给**文案时生效。那种情况下原本会露出 axios 自己的英文
+ * message（"Request failed with status code 403"）——界面明明是多语言的，
+ * 偏偏在这条路径上漏出英文，而且对用户没有任何指导意义。
  */
 export function errText(e: unknown): string {
   const ax = e as AxiosError<{detail?: string; error?: string}>;
   const d = ax?.response?.data;
-  const raw = (typeof d === 'string' ? d : d?.detail || d?.error) || ax?.message || '';
-  return raw ? tp(raw) : tp('请求失败');
+  const raw = (typeof d === 'string' ? d : d?.detail || d?.error) || '';
+  if (raw) return tp(raw);
+  if (ax?.response?.status === 403) return t('error.forbidden');
+  const fallback = ax?.message || '';
+  return fallback ? tp(fallback) : tp('请求失败');
 }
 
 http.interceptors.response.use(
   (r) => r,
   (error: AxiosError) => {
     if (error.response?.status === 401 && typeof window !== 'undefined') {
-      // 会话失效：清掉缓存的登录态，避免仍显示管理员入口
+      // 会话失效：清掉缓存的登录态，避免仍显示管理员入口。
+      // `hadSession` 决定要不要说「会话已过期」：首次访问本来就没有会话，
+      // 那是「请登录」而不是「过期了」（用户会以为面板坏了）。
+      const hadSession = !!window.sessionStorage.getItem('wb-me');
       window.sessionStorage.removeItem('wb-me');
-      if (!window.location.pathname.startsWith('/login')) {
-        window.location.href = '/login';
+      const path = window.location.pathname;
+      // **公开页不跳登录页**：红包抽奖页就是给没账号的人看的（同事朋友收到链接
+      // 直接打开），而它自己也会加载 /api/me（根 layout 的 AuthProvider 一挂载
+      // 就校验一次会话）—— 未登录必然 401，于是被这个拦截器立刻踢去登录页，
+      // 用户根本没机会点「开启」。那正是「不注册也能领」的反面。
+      // 这不改变服务端的鉴权（那些端点本来就是公开的），只是别在前端自己拦自己。
+      // 将来再加公开页，往这个清单里加一条即可。
+      // 路径必须带 basePath：basePath 只自动作用于 next/router 的跳转，裸的
+      // window.location.href 会跳到域名根（通常 404）—— 登录页与公开页都一样。
+      const loginPath = `${BASE_PATH}/login`;
+      const publicPaths = [loginPath, `${BASE_PATH}/claim`];
+      // 根路径只是「跳到 /dashboard」的中转页，不在这里拦（否则首次访问者
+      // 会先被重定向到登录页并显示「会话已过期」）。
+      const isRoot = path === BASE_PATH || path === `${BASE_PATH}/`;
+      if (!isRoot && !publicPaths.some((p) => path.startsWith(p))) {
+        // 带上 `?expired=1`：登录页据此显示「会话已过期，请重新登录」，而不是毫无
+        // 解释地把人丢回登录页 —— 实测用户会以为自己点了退出、或面板坏了（明明刚才
+        // 还在用）。服务端鉴权不受影响，这只是给跳转补一个原因。
+        window.location.href = `${loginPath}${hadSession ? '?expired=1' : ''}`;
       }
     }
     return Promise.reject(error);
@@ -88,15 +184,129 @@ export const authApi = {
 };
 
 /* ── 账号 ───────────────────────────────────────────── */
+/**
+ * 账号接口的分组参数（`?upstream_id=`）。默认分组（null / undefined）= 不带
+ * 参数，与升级前的请求逐字一致——「默认分组的定义」只有后端一份（upstreamsvc）。
+ */
+const groupQs = (upstreamId?: number | null): string =>
+  upstreamId == null ? '' : `?upstream_id=${encodeURIComponent(String(upstreamId))}`;
+
+export interface AccountRiskEvent {
+  id: string; uid: string; nickname: string; group: string; realm: string;
+  operation: string; http_status: number; ts: number; historical: boolean;
+  acknowledged: boolean; paused: boolean | null; action_error: string;
+  pause_until: number; needs_review: boolean; failures: number;
+}
+
+export const accountRiskApi = {
+  list: (realm: string, upstreamId: number | null = null, allGroups = false, includeAcknowledged = false) =>
+    get<{items: AccountRiskEvent[]; failed_groups: string[]; total: number}>('/api/account-risk',
+      {realm, upstream_id: upstreamId ?? undefined, all_groups: allGroups, include_acknowledged: includeAcknowledged}),
+  resume: (id: string) => post<{ok: boolean}>(`/api/account-risk/${encodeURIComponent(id)}/resume`),
+  acknowledge: (id: string) => post<{ok: boolean}>(`/api/account-risk/${encodeURIComponent(id)}/acknowledge`),
+};
+
+/**
+ * `POST /api/auth/start` 的响应。
+ *
+ * `target` 只有**重登**（请求里带了 `uid`）时才有：后端据此回显「这次到底在给
+ * 哪个账号换凭证」，界面拿它显示标题与版本，并在扫错号时继续显示目标是谁。
+ */
+export interface AuthStartResult {
+  state: string;
+  authUrl: string;
+  realm: Realm;
+  target?: {
+    uid: string;
+    nickname: string;
+    realm: Realm;
+    file: string;
+    /** 面板里被「临时停用」：重登只刷凭证，不会自动启用它 */
+    panel_disabled: boolean;
+  };
+}
+
 export const accountApi = {
-  list: () => get<AccountsResponse>('/api/accounts'),
-  /** 发起扫码登录；realm 决定国内版 / 国际版端点 */
-  start: (realm: Realm = 'cn') =>
-    post<{state: string; authUrl: string; realm: Realm}>('/api/auth/start', {realm}),
+  proxies: () => get<{routes: string[]; default: string}>('/api/proxies'),
+  /** 上游「账号管理接口」（admin.enabled）开关状态；供解禁队列判断能否真的解封。
+   *  非默认分组返回 null（面板读不到那套实例的 config.json）。 */
+  adminApiStatus: (upstreamId?: number | null) =>
+    get<{enabled: boolean | null}>('/api/accounts/admin-api-status' + groupQs(upstreamId)),
+  setProxy: (filename: string, proxy: string, upstreamId?: number | null) =>
+    put<{ok: boolean; proxy: string; reload_triggered: boolean}>(
+      `/api/accounts/${encodeURIComponent(filename)}/proxy` + groupQs(upstreamId), {proxy}),
+  /**
+   * 设置 / 清除账号手写权重（issue #187）。`weight = 0` 表示恢复默认（1.0）。
+   *
+   * 写的是上游 auth 文件顶层 `weight`（不是本端库）：选号发生在上游，它必须能读到。
+   * 后端会顺带请求重载上游 —— 权重和线路一样是**加载时**解析进内存的。
+   */
+  setWeight: (filename: string, weight: number, upstreamId?: number | null) =>
+    put<{ok: boolean; weight: number; reload_triggered: boolean}>(
+      `/api/accounts/${encodeURIComponent(filename)}/weight` + groupQs(upstreamId), {weight}),
+  /**
+   * 某分组的账号列表。upstreamId 省略 / null = 默认分组。
+   *
+   * 「分组」= 一套上游实例（账号池）：账号文件读该分组的目录、运行状态问该
+   * 分组的上游。两者必须成对——只换其中一个会把别的组的账号标错状态。
+   */
+  list: (upstreamId?: number | null) =>
+    get<AccountsResponse>('/api/accounts',
+                          upstreamId == null ? undefined : {upstream_id: upstreamId}),
+  /**
+   * 本分组的自定义顺序（拖拽排序）。
+   *
+   * 顺序存在服务端而不是浏览器里：它是这份部署的**共享视图**，换设备 / 换浏览器
+   * 打开要看到同一份顺序。它只是展示顺序，不影响上游选号或任何一次调用的结果。
+   */
+  order: (upstreamId?: number | null) =>
+    get<{order: string[]}>('/api/accounts/order' + groupQs(upstreamId)),
+  saveOrder: (order: string[], upstreamId?: number | null) =>
+    put<{order: string[]}>('/api/accounts/order' + groupQs(upstreamId), {order}),
+  exportZip: async (upstreamId?: number | null) => {
+    const response = await http.get<Blob>('/api/accounts/export' + groupQs(upstreamId), {
+      responseType: 'blob',
+    });
+    return response.data;
+  },
+  upload: (files: File[], upstreamId?: number | null, overwrite = false) => {
+    const body = new FormData();
+    files.forEach((file) => body.append('files', file, file.name));
+    const group = groupQs(upstreamId);
+    const separator = group ? '&' : '?';
+    return http.post<{
+      ok: boolean;
+      uploaded: Array<{file: string; uid: string; updated: boolean}>;
+      added: Array<{file: string; uid: string; updated: boolean}>;
+      overwritten: Array<{file: string; uid: string; updated: boolean}>;
+      rejected: Array<{file: string; uid?: string; message: string}>;
+      failed: Array<{file: string; message: string}>;
+    }>('/api/accounts/upload' + group + separator + `overwrite=${overwrite ? 'true' : 'false'}`, body)
+      .then((r) => r.data);
+  },
+  /**
+   * 发起扫码登录；realm 决定国内版 / 国际版端点。
+   *
+   * region 也一并带上：服务端会替我们盯着这张码（前端被节流也不影响），
+   * 而地区登记必须在落盘**前**完成 —— 后台那条路径拿不到 region 就会漏掉它
+   * （国际版新号聊天报 14017）。用户在弹窗里改地区会重新发码，所以这里带的
+   * 总是当前这张码对应的地区。
+   */
+  /**
+   * 发起扫码登录。
+   *
+   * `uid` 非空 = **重登这个账号**（见后端 `auth_start` 的说明）：版本会跟随该
+   * 账号、扫到的账号必须就是它、落盘就地写它已有的那份文件。不传 = 添加新账号。
+   */
+  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string,
+          proxy?: string, uid?: string) =>
+    post<AuthStartResult>(
+      '/api/auth/start' + groupQs(upstreamId), {realm, region, proxy, uid}),
   /** 轮询扫码结果。region 仅国际版需要（新号必须先做地区注册） */
-  poll: (state: string, realm?: Realm, region?: string) =>
+  poll: (state: string, realm?: Realm, region?: string, upstreamId?: number | null) =>
     get<{
-      status: 'waiting' | 'success' | 'expired' | 'invalid' | 'realm_mismatch';
+      status: 'waiting' | 'success' | 'expired' | 'invalid' | 'realm_mismatch'
+        | 'account_mismatch';
       uid?: string;
       nickname?: string;
       updated?: boolean;
@@ -104,19 +314,51 @@ export const accountApi = {
       region_note?: string;
       expected?: Realm;
       got?: Realm;
-    }>('/api/auth/poll', {state, realm, region}),
-  remove: (file: string) => del<{success: boolean}>(`/api/accounts/${encodeURIComponent(file)}`),
+      /** account_mismatch：要重登的是谁、扫到的又是谁 */
+      expected_uid?: string;
+      expected_name?: string;
+      /**
+       * 重登成功后**当场**解除上游系统禁用的结果。没有这个字段 = 不是重登。
+       * `ok=false` 时 `message` 就是要给用户看的原因（管理接口没开 / api_key
+       * 不对 / 账号被封禁）；`pending=true` = 还在后台尝试。
+       */
+      revive?: {
+        attempted: boolean;
+        ok: boolean;
+        still_disabled?: boolean | null;
+        pending?: boolean;
+        message?: string;
+      };
+    }>('/api/auth/poll', {state, realm, region, upstream_id: upstreamId ?? undefined}),
+  remove: (file: string, upstreamId?: number | null) =>
+    del<{success: boolean}>(`/api/accounts/${encodeURIComponent(file)}${groupQs(upstreamId)}`),
+  /**
+   * 把账号**移动**到另一个分组（账号页「移动到分组…」）。
+   *
+   * 后端移动的是账号文件本身（凭证不改一个字节）；`toUpstreamId = 0` 表示
+   * 移回默认分组（见 routers/accounts.py 的 move 端点）。upstreamId = 源分组。
+   */
+  move: (file: string, toUpstreamId: number, upstreamId?: number | null) =>
+    post<{ok: boolean; file: string; uid: string;
+          from: {id: number | null; name: string};
+          to: {id: number | null; name: string}}>(
+      `/api/accounts/${encodeURIComponent(file)}/move${groupQs(upstreamId)}`,
+      {to_upstream_id: toUpstreamId}),
   /** 临时禁用 / 启用账号（issue #21）：改文件名 + 触发上游重载。 */
-  setDisabled: (file: string, disabled: boolean) =>
+  setDisabled: (file: string, disabled: boolean, upstreamId?: number | null) =>
     post<{ok: boolean; file: string; disabled: boolean; changed: boolean;
           reload_triggered: boolean; message: string}>(
-      `/api/accounts/${encodeURIComponent(file)}/disabled`, {disabled}),
-  checkin: (file: string) =>
-    post<{code: number; message: string; credits?: number | null}>(
-      `/api/accounts/${encodeURIComponent(file)}/checkin`,
-    ),
+      `/api/accounts/${encodeURIComponent(file)}/disabled${groupQs(upstreamId)}`, {disabled}),
+  checkin: (file: string, upstreamId?: number | null) =>
+    post<{
+      code: number;
+      message: string;
+      /** 今天已经签过：后端没打上游请求，直接就地返回。提示语要与「刚签上」分开 */
+      already?: boolean;
+      credits?: number | null;
+    }>(`/api/accounts/${encodeURIComponent(file)}/checkin${groupQs(upstreamId)}`),
   /** 单个账号的实时积分（直接向腾讯查询） */
-  credits: (file: string) =>
+  credits: (file: string, upstreamId?: number | null) =>
     get<{
       ok: boolean;
       credits: number | null;
@@ -124,21 +366,39 @@ export const accountApi = {
       cached: boolean;
       cache_age: number | null;
       expiries?: CreditExpiry[];
-    }>(`/api/accounts/${encodeURIComponent(file)}/credits`),
+    }>(`/api/accounts/${encodeURIComponent(file)}/credits`,
+       upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 并发刷新所有账号的实时积分 */
   /** 查询全部账号积分；force=false 时 60 秒内命中服务端缓存 */
-  refreshCredits: (force = true) =>
+  refreshCredits: (force = true, upstreamId?: number | null, file?: string) =>
     post<{
       total: number;
       succeeded: number;
       credits: Record<string, number | null>;
       meta: Record<string, CreditsMeta>;
       failed: string[];
-    }>('/api/accounts/refresh-credits' + (force ? '?force=true' : '?force=false')),
-  checkinAll: () =>
-    post<{total: number; succeeded: number; results: {nickname: string; ok: boolean; message: string}[]}>(
-      '/api/accounts/checkin-all',
-    ),
+    }>('/api/accounts/refresh-credits?force=' + (force ? 'true' : 'false')
+       + (upstreamId == null ? '' : `&upstream_id=${encodeURIComponent(String(upstreamId))}`)
+       // 单账号刷新（issue #432）：给了文件名就只刷这一个号
+       + (file ? `&file=${encodeURIComponent(file)}` : '')),
+  checkinAll: (upstreamId?: number | null) =>
+    post<{
+      /**
+       * 只统计**本次真正发起签到**的账号：国际版（不适用）与今天已签到的都不进
+       * 分母，分别见 skipped / already。原先 total 里混着「今天已签过」的账号，
+       * 界面会把「无需重复」说成「刚签成功」。
+       */
+      total: number;
+      succeeded: number;
+      /** 今天已签到、本次被跳过的账号数（没打上游请求） */
+      already: number;
+      /** 不适用的账号数（国际版没有签到体系）。它既不算成功也不算失败 */
+      skipped: number;
+      results: {
+        nickname: string; ok: boolean; message: string;
+        code?: number; skipped?: boolean; already?: boolean;
+      }[];
+    }>('/api/accounts/checkin-all' + groupQs(upstreamId)),
   /** 签到记录（分页）。days 用于时间范围筛选 */
   checkinLogs: (limit = 20, offset = 0, uid?: string, days?: number, realm?: Realm) =>
     get<CheckinLogPage>('/api/checkin-logs', {limit, offset, uid, days, realm}),
@@ -150,19 +410,99 @@ export const accountApi = {
   clearTaskLogs: () => post<{ok: boolean}>('/api/task-logs/clear'),
   upstreamLogs: (limit = 200) =>
     get<{available: boolean; lines: string[]; total: number}>('/api/upstream/logs', {limit}),
-  test: (file: string) =>
-    post<{ok: boolean; message: string}>(`/api/accounts/${encodeURIComponent(file)}/test`),
-  refresh: (file: string) =>
-    post<{ok: boolean; message: string}>(`/api/accounts/${encodeURIComponent(file)}/refresh`),
-  restart: () => post<{ok: boolean; message: string}>('/api/restart'),
+  test: (file: string, upstreamId?: number | null) =>
+    post<{ok: boolean; message: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/test${groupQs(upstreamId)}`),
+  refresh: (file: string, upstreamId?: number | null) =>
+    post<{ok: boolean; message: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/refresh${groupQs(upstreamId)}`),
+  /** 账号 × 模型主动探测（issue #270）：files 为账号文件名，models 为模型 id。 */
+  probeModels: (files: string[], models: string[], upstreamId?: number | null) =>
+    post<ProbeModelsResponse>(`/api/accounts/probe-models${groupQs(upstreamId)}`,
+                              {accounts: files, models}),
+  /** 一键刷新所有账号的 accessToken（真实续期，末尾只重载一次上游） */
+  refreshAllTokens: (upstreamId?: number | null) =>
+    post<{
+      total: number;
+      succeeded: number;
+      failed: string[];
+      results: {file: string; nickname: string; uid: string; ok: boolean; message: string}[];
+      reload_triggered: boolean;
+    }>(`/api/accounts/refresh-tokens${groupQs(upstreamId)}`),
+  /** 令牌刷新计划（计划任务：每 N 天自动全量刷新一次） */
+  refreshPlan: () => get<RefreshPlan>('/api/accounts/refresh-plan'),
+  saveRefreshPlan: (enabled: boolean, intervalDays: number, hour: number) =>
+    put<RefreshPlan>('/api/accounts/refresh-plan',
+                     {enabled, interval_days: intervalDays, hour}),
+  /** 立即执行一次计划（全量刷新；串行，不重载上游） */
+  runRefreshPlan: () => post<{
+    checked: number; renewed: number; failed: number; skipped: number;
+    last_run: number; next_run: number | null;
+  }>('/api/accounts/refresh-plan/run'),
+  /** 每日任务计划（签到 / 领奖 / 做任务，到点自动跑） */
+  dailyPlan: () => get<DailyPlan>('/api/accounts/daily-plan'),
+  saveDailyPlan: (plan: DailyPlan) =>
+    put<DailyPlan>('/api/accounts/daily-plan', plan),
+  /** 上游与面板两套调度的重叠状态（issue #375） */
+  taskScheduler: () => get<TaskSchedulerStatus>('/api/accounts/task-scheduler'),
+  /** 只保留一套调度；panel 会写上游 config 并触发重载 */
+  keepTaskScheduler: (keep: 'upstream' | 'panel') =>
+    put<TaskSchedulerApply>('/api/accounts/task-scheduler', {keep}),
+  /** 立即执行一次某个每日任务（不等定时） */
+  runDailyTask: (task: DailyTask) =>
+    post<{ok: boolean; message: string; task: string; plan: DailyPlan}>(
+      '/api/accounts/daily-plan/run', {task}),
+  /** 强制清除账号级冷却、熔断/降权与模型级限流（会重启一次上游）。 */
+  clearCooling: (file: string, upstreamId?: number | null) =>
+    post<{ok: boolean; message: string; uid?: string; backup?: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/clear-cooling${groupQs(upstreamId)}`,
+    ),
+  /** 强制设定账号级冷却（会重启一次上游）。 */
+  forceCooling: (
+    file: string,
+    body: {duration_seconds?: number; until?: string; permanent?: boolean; reason?: string},
+    upstreamId?: number | null,
+  ) =>
+    post<{ok: boolean; message: string; uid?: string; until?: string; backup?: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/force-cooling${groupQs(upstreamId)}`,
+      body,
+    ),
+  /**
+   * 给账号写备注（issue #67）。传空串 = 清除备注。
+   * 存的是本端库、按 uid 关联——临时停用（改文件名）不会丢。
+   */
+  setNote: (file: string, note: string, upstreamId?: number | null) =>
+    put<{ok: boolean; uid: string; note: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/note${groupQs(upstreamId)}`,
+      {note},
+    ),
+  restart: (upstreamId?: number | null) =>
+    post<{ok: boolean; message: string}>('/api/restart' + groupQs(upstreamId)),
 
   /* ── 成长任务一键执行（issue #19）─────────────────────
    * 调用上游自带的 scripts/task_runner.py。full（点亮）会伪造活跃上报，
    * 因此单独要求 confirm，与幂等的 claim 区分开。 */
   taskRunStatus: () => get<TaskRunStatus>('/api/task-run'),
-  taskRunStart: (mode: 'preview' | 'claim' | 'full', target = 'ALL', confirm = false) =>
-    post<{ok: boolean; message: string}>('/api/task-run', {mode, target, confirm}),
+  /** upstreamId 选分组（issue #274）：null/省略 = 默认分组的账号目录。 */
+  taskRunStart: (mode: 'preview' | 'claim' | 'full', target = 'ALL', confirm = false,
+                 upstreamId: number | null = null) =>
+    post<{ok: boolean; message: string}>('/api/task-run',
+      {mode, target, confirm, upstream_id: upstreamId}),
   taskRunStop: () => post<{ok: boolean; message: string}>('/api/task-run/stop'),
+
+  /* ── 定时领奖配置：**后端有、前端有意不做 UI** ───────────────
+   * 这两个封装是**故意留着但没人调**的，不要当成「漏接线的死代码」删掉，
+   * 也不要顺手补一个入口——这是一次明确的决策，不是疏忽：
+   *
+   *   1. 定时领奖本身只跑幂等认领（不伪造行为），但它是**无人值守**的写操作：
+   *      用户设完就忘了，出了问题（上游限流、账号失效）没有任何人在场看到。
+   *   2. 设置页的「定时任务」区块走的是**上游配置**（`SCHEDULE_FIELDS`），
+   *      而这里走的是**管理端自己的调度器**——两套独立机制。界面只暴露前者时，
+   *      这层困惑不会被放大；**一旦补了入口，用户会看到两个都叫「定时」的东西**。
+   *      所以补入口之前必须先决定这两套是合并还是分层展示。
+   *
+   * 也就是说：入口的问题不是「没做」，是「还差一个前置决策」。详见
+   * `server/services/taskrun.py` 的 `get_schedule()` 与 UI-UX-ROADMAP 的 P1-8 / P1-9。 */
   taskClaimSchedule: () => get<{enabled: boolean; hours: number[]}>('/api/task-claim-schedule'),
   saveTaskClaimSchedule: (enabled: boolean, hours: number[]) =>
     put<{enabled: boolean; hours: number[]}>('/api/task-claim-schedule', {enabled, hours}),
@@ -170,7 +510,10 @@ export const accountApi = {
 
 /* ── 上游状态 ───────────────────────────────────────── */
 export const upstreamApi = {
-  status: () => get<UpstreamStatus>('/api/status'),
+  /** 上游运行状态。upstreamId 非空时查**该分组**的实例（多账号池）。 */
+  status: (upstreamId?: number | null) =>
+    get<UpstreamStatus>('/api/upstream/status',
+                        upstreamId == null ? undefined : {upstream_id: upstreamId}),
   /** 上游模型简表；realm 非空时只返回该版本的条目 */
   models: (realm?: Realm) => get<ModelListResponse>('/api/models', {realm}),
 };
@@ -190,12 +533,52 @@ export const playgroundApi = {
 };
 
 /* ── API 密钥 ───────────────────────────────────────── */
+/* ── 多上游（账号池分组，见 server/upstreamsvc.py）────
+ * 密钥绑定上游后，它的请求只走那个上游的账号池；未绑定 = 默认上游。
+ * 写接口是**会话管理员**专属（带着上游 api_key，属配置级凭据）。
+ *
+ * 注意 `UpstreamWrite` 与 `UpstreamEndpoint` 是**两套形状**：`api_key` 只在请求里
+ * 出现（响应只回脱敏值与 has_key，见 routers/upstreams.py 的 _serialize）。 */
+export type UpstreamWrite = {
+  name: string;
+  base_url: string;
+  api_key?: string;
+  note?: string;
+  enabled?: boolean;
+  /**
+   * 该分组的本地账号目录（绝对路径）。账号页的「分组」视图按它列账号 /
+   * 添号 / 移动账号；空串 = 该分组只用于密钥转发。
+   */
+  auth_dir?: string;
+  /** 该分组上游实例的容器名（可选）：「重启该分组」按它 docker restart。 */
+  container?: string;
+};
+
+export const upstreamsApi = {
+  list: () => get<{items: UpstreamEndpoint[]}>('/api/upstreams'),
+  create: (body: UpstreamWrite) => post<UpstreamEndpoint>('/api/upstreams', body),
+  update: (id: number, body: Partial<UpstreamWrite>) =>
+    patch<UpstreamEndpoint>(`/api/upstreams/${id}`, body),
+  remove: (id: number) => del<{ok: boolean}>(`/api/upstreams/${id}`),
+  /** 探测该上游是否可达（走它的 /healthz）；失败原因原样返回给界面。 */
+  probe: (id: number) => post<{ok: boolean; message: string}>(`/api/upstreams/${id}/probe`),
+};
+
 export const keyApi = {
   list: () => get<ApiKey[]>('/api/keys'),
   create: (body: Partial<ApiKey>) => post<ApiKey>('/api/keys', body),
   update: (id: number, body: Partial<ApiKey>) => patch<ApiKey>(`/api/keys/${id}`, body),
   remove: (id: number) => del<{ok: boolean}>(`/api/keys/${id}`),
   resetUsage: (id: number) => post<{ok: boolean}>(`/api/keys/${id}/reset-usage`),
+  /**
+   * 取回一把已创建密钥的明文（「再复制一次」）。
+   *
+   * 面板现在把明文也存了一份（只为这一下；网关校验仍走哈希）。这条接口要求
+   * **会话管理员**，且每次调用都写一条审计日志——列表只回前缀，只能在这里拿。
+   * 存量密钥（保存明文之前的版本）回 409，界面据此提示「需要重新建一把」。
+   */
+  reveal: (id: number) => post<{id: number; name: string; prefix: string; key: string}>(
+    `/api/keys/${id}/reveal`),
   /**
    * 检查模型白名单里哪些名字匹配不到已知模型（issue #46）。
    *
@@ -206,23 +589,193 @@ export const keyApi = {
   checkModels: (models: string[], realm: string) =>
     post<{checked: boolean; unknown: string[]; reason?: string}>(
       '/api/keys/check-models', {models, realm}),
+  /**
+   * 把一把**刚创建**的密钥导出为客户端配置片段（cc-switch / ZCode）。
+   *
+   * 必须传明文 `token`：面板只存哈希，库里拿不回明文——这个端点的存在前提
+   * 就是「调用方此刻手里有明文」。因此它只在一次性展示弹窗里被调用，
+   * 密钥列表那行（只有 prefix）导不出来。
+   */
+  exportConfig: (body: {
+    client: 'ccswitch' | 'zcode';
+    token: string;
+    app?: 'claude' | 'codex';
+    baseUrl?: string;
+    providerName?: string;
+    models?: string[];
+    defaultModel?: string;
+  }) => post<KeyExportResult>('/api/keys/export', body),
+  /**
+   * 本机导入的可用状态（**只读探测**，不写任何东西）。
+   *
+   * 要看三件事：面板侧开关是否打开、这次请求是否来自面板所在机器、目标
+   * 客户端是否已安装且未在运行。三者齐了才谈得上「一键导入」——界面据此
+   * 提前把不能用的原因说清楚，用户就不会点完才知道不行。
+   *
+   * 开关关着时返回 200 + `enabled: false`（报错会被当成故障，而这里只是
+   * 一个默认关闭的可选特性）。
+   */
+  importLocalStatus: () => get<KeyImportStatus>('/api/keys/import-local/status'),
+  /**
+   * 把刚创建的密钥**直接写进本机**的 cc-switch / ZCode 配置（真一键）。
+   *
+   * 与 `exportConfig` 同一份参数、同一份配置生成逻辑，区别只在去向：导出把
+   * 片段交给用户，导入替用户落盘。返回体里**没有密钥**。
+   *
+   * 可预期的失败都有明确状态码，`errText` 能直接取到可照做的说明：
+   * 403 = 开关没开或不是本机访问；404 = 本机没装该客户端；
+   * 409 = 客户端正在运行（或探测不到），退出客户端后可重试。
+   */
+  importLocal: (body: {
+    client: 'ccswitch' | 'zcode';
+    token: string;
+    app?: 'claude' | 'codex';
+    baseUrl?: string;
+    providerName?: string;
+    models?: string[];
+    defaultModel?: string;
+    /** 是否把导入的供应商设为当前（cc-switch 置 is_current；ZCode 移到最前） */
+    setCurrent?: boolean;
+    /**
+     * 导入方式。`auto`（默认）= 能走客户端官方深链就走深链；
+     * `deeplink` / `direct` 是给它兜底和排障用的强制值。
+     */
+    mode?: 'auto' | 'deeplink' | 'direct';
+    /**
+     * 直写方式下，客户端正在运行就替用户关掉、写完再拉起来。
+     * 关掉前会先确认定位得到它的可执行文件——关掉却拉不起来比不改更糟。
+     */
+    closeRunning?: boolean;
+  }) => post<KeyImportResult>('/api/keys/import-local', body),
+  /**
+   * 自动检测客户端装在哪（「自动检测」按钮）。
+   *
+   * 为什么需要：安装路径因机器而异——绿色版可能解压在 `E:\cc swich\`，安装版在
+   * `%LOCALAPPDATA%\Programs\…`。检测顺序是"可信度从高到低"：环境变量 →
+   * 运行中的进程 → 注册表里的协议处理器 → 上次结果 → 常见安装位 → 受限扫描。
+   * 命中后会缓存在面板数据目录，之后不用再扫。**只读**，不写用户配置。
+   */
+  importLocalDetect: (client: 'ccswitch' | 'zcode' = 'ccswitch') =>
+    get<KeyImportDetectResult>('/api/keys/import-local/detect', {client}),
+};
+
+/* ── 红包：批量发放带额度的密钥（见 server/redpacket.py）────
+ * create 返回**明文 key**，且仅此一次（库里只存哈希）。 */
+export const redPacketApi = {
+  list: () => get<RedPacket[]>('/api/red-packets'),
+  detail: (id: number) => get<RedPacketDetail>(`/api/red-packets/${id}`),
+  create: (body: {
+    title: string;
+    quota_kind: RedPacketKind;
+    total_amount: number;
+    shares: number;
+    mode: RedPacketMode;
+    /** 有效期（天）。null = 用后端默认值（7 天） */
+    ttl_days: number | null;
+    /** 模型白名单：**token 红包必填、积分红包必须为空**（见 server/redpacket.py） */
+    models: string[];
+  }) => post<CreatedRedPacket>('/api/red-packets', body),
+  /** 收回整批（停用这批密钥，可逆）。返回停用的数量。 */
+  revoke: (id: number) => post<{revoked: number}>(`/api/red-packets/${id}/revoke`),
+};
+
+/* ── 抽奖（**公开**，不需要登录）─────────────────────────
+ * 收到链接的是同事朋友，不该要求他们注册账号。防滥用靠「每 IP 一次」
+ * + 128 位抽奖码 + 有效期。 */
+export const claimApi = {
+  info: (code: string) => get<ClaimInfo>(`/api/claim/${encodeURIComponent(code)}`),
+  /** 抽一份。同一 IP 第二次会 409（提示「你已经抽过了」）。 */
+  draw: (code: string) => post<DrawResult>(`/api/claim/${encodeURIComponent(code)}`, {}),
+};
+
+/* ── 访问令牌（管理面作用域化 API Token）──────────────────
+ * 与 keyApi 是两套：那个是给下游调模型的网关密钥，这个授权管理接口。
+ * 明文只在创建时返回一次。 */
+export const tokenApi = {
+  list: () => get<ApiToken[]>('/api/tokens'),
+  create: (body: {name: string; scope: 'readonly' | 'admin'; expires_at: number | null}) =>
+    post<CreatedApiToken>('/api/tokens', body),
+  update: (id: number, body: {
+    name?: string;
+    scope?: 'readonly' | 'admin';
+    enabled?: boolean;
+    expires_at?: number | null;
+  }) => patch<ApiToken>(`/api/tokens/${id}`, body),
+  remove: (id: number) => del<{ok: boolean}>(`/api/tokens/${id}`),
 };
 
 /* ── 日志 ───────────────────────────────────────────── */
 export const logApi = {
   list: (params: Record<string, unknown>) => get<Page<RequestLog>>('/api/logs', params),
   clear: () => post<{ok: boolean}>('/api/logs/clear'),
+  /** 账号列的自诊断：日志从哪读、读到几行、为什么可能是空的（issue #232） */
+  accountBackfill: () => get<AccountBackfillInfo>('/api/logs/account-backfill'),
+};
+
+/* ── 调用抓包（Trace Tap）───────────────────────────── */
+export const tapApi = {
+  config: () => get<TapConfigResponse>('/api/tap/config'),
+  saveConfig: (
+    body: Partial<{enabled: boolean; max_body: number; retention_days: number; max_sessions: number}>,
+  ) => put<TapConfigResponse>('/api/tap/config', body),
+  prune: () => post<{turns: number; stats: TapConfigResponse['stats']}>('/api/tap/prune'),
+  sessions: (params: Record<string, unknown>) =>
+    get<{total: number; items: TapSession[]}>('/api/tap/sessions', params),
+  /** 触发一次历史重算：按库里已有的 UA 重新归类、并把辅助调用挂回主会话。 */
+  backfill: () => post<{changed: number; aux: number}>('/api/tap/backfill'),
+  session: (id: number) => get<TapSessionDetail>(`/api/tap/sessions/${id}`),
+  remove: (id: number) => del<{ok: boolean}>(`/api/tap/sessions/${id}`),
+  turn: (id: number) => get<TapTurn>(`/api/tap/turns/${id}`),
+  diff: (before: number, after: number) =>
+    get<TapDiff>('/api/tap/diff', {before, after}),
+  clear: () => post<{ok: boolean; turns: number}>('/api/tap/clear'),
+  /**
+   * 导出自包含 HTML 的地址。
+   *
+   * 走浏览器原生下载（而不是 axios 取文本再拼 Blob）：附件带
+   * `Content-Disposition`，由浏览器决定落在哪里，也不会把几十 KB 的 HTML
+   * 塞进前端内存再拼一遍。带 BASE_PATH —— 子路径部署时裸路径会 404。
+   */
+  exportUrl: (id: number) => `${BASE_PATH}/api/tap/sessions/${id}/export`,
 };
 
 /* ── 用量统计 ───────────────────────────────────────── */
+/** 自定义日期范围（issue #257）：两端都含；与 days 同时传时后端优先用日期。 */
+export interface StatsRange {
+  start?: string;
+  end?: string;
+}
+
 export const statsApi = {
   /** realm 非空时只统计该版本（界面按版本切换时传） */
   summary: (realm?: Realm) => get<StatsSummary>('/api/stats/summary', {realm}),
-  daily: (days = 30, realm?: Realm) => get<UsagePoint[]>('/api/stats/daily', {days, realm}),
-  byModel: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
-  byKey: (days = 30, realm?: Realm) =>
-    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm}),
+  daily: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsagePoint[]>('/api/stats/daily', {days, realm, ...range}),
+  /**
+   * 某天**按小时**的用量（默认今天）。「今日」趋势图用它 —— 范围只有一天时
+   * 按天聚合只有一根柱子。后端固定返回 24 个桶（补零），前端不必再补。
+   */
+  hourly: (day?: string, realm?: Realm) =>
+    get<UsageHourPoint[]>('/api/stats/hourly', {day, realm}),
+
+  /** 积分收支（收入 / 支出）按天聚合 + 今日 / 近 7 天合计 */
+  creditsFlow: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<CreditsFlow>('/api/stats/credits', {days, realm, ...range}),
+  byModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-model', {days, realm, ...range}),
+  byKey: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<UsageBreakdown[]>('/api/stats/by-key', {days, realm, ...range}),
+  /** 按「日期 × 账号」聚合（issue #402）；同一范围解析规则 */
+  byAccount: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountUsageResponse>('/api/stats/by-account', {days, realm, ...range}),
+  /** 按「账号 × 模型」聚合（issue #369） */
+  byAccountModel: (days = 30, realm?: Realm, range?: StatsRange) =>
+    get<AccountModelUsageResponse>('/api/stats/by-account-model', {days, realm, ...range}),
+  /**
+   * 上游自己那份统计（issue #59）。口径与本页其它数字不同：含**直连上游**的调用，
+   * 且是自上游进程启动以来的累计（没有时段概念）。
+   */
+  upstream: () => get<UpstreamStats>('/api/stats/upstream'),
   /** 按请求日志回填用量缺口（幂等） */
   rebuildUsage: () =>
     post<{rows_before: number; rows_after: number; requests_delta: number; tokens_delta: number}>(
@@ -230,6 +783,14 @@ export const statsApi = {
     ),
   repairUsage: () =>
     post<{repaired: number; requests: number; tokens: number}>('/api/stats/repair-usage'),
+  /**
+   * 实时并发 / RPM / 近 3 分钟走势。
+   *
+   * 与上面那些「按天聚合」的不是一回事：`inflight`/`capacity` 是**此刻**的瞬时值
+   * （来自上游 /status），`rpm_*`/`peaks`/`series` 来自本库、只含已完成请求。所以
+   * 它们的刷新节奏也不同（界面每 5 秒拉一次），也不跟 `range` 自定义区间走。
+   */
+  realtime: (days = 1) => get<StatsRealtime>('/api/stats/realtime', {days}),
 };
 
 /* ── 安全 / IP ──────────────────────────────────────── */
@@ -245,6 +806,45 @@ export const securityApi = {
 };
 
 /* ── 上游配置 / 用户 ───────────────────────────────── */
+/** 代理线路与全局出口代理（设置 → 代理）。凭据一律走服务端的脱敏口径。 */
+export const proxyApi = {
+  routes: (upstreamId?: number | null) =>
+    get<ProxyRouteList>('/api/proxy-routes' + groupQs(upstreamId)),
+  create: (name: string, url: string, weight?: number, enabled?: boolean) =>
+    post<ProxyRoute>('/api/proxy-routes', {name, url, weight, enabled}),
+  update: (name: string, body: {url?: string; new_name?: string; weight?: number},
+           upstreamId?: number | null) =>
+    put<ProxyRoute>(`/api/proxy-routes/${encodeURIComponent(name)}` + groupQs(upstreamId), body),
+  remove: (name: string, force: boolean, upstreamId?: number | null) => {
+    // 查询串自己拼：groupQs 只负责分组参数，force 是这条接口特有的
+    const qs = new URLSearchParams();
+    if (upstreamId) qs.set('upstream_id', String(upstreamId));
+    if (force) qs.set('force', '1');
+    const query = qs.toString();
+    return del<{name: string; bound_cleared: number}>(
+      `/api/proxy-routes/${encodeURIComponent(name)}${query ? `?${query}` : ''}`);
+  },
+  import: (text: string) =>
+    post<{imported: number; problems: string[]}>('/api/proxy-routes/import', {text}),
+  probe: (name: string) => post<ProxyProbe>('/api/proxy-routes/probe', {name}),
+  /** 绑定管理：全部账号 + 各自绑定的线路（空 = 跟随池策略） */
+  bindings: (upstreamId?: number | null) =>
+    get<RouteBindingsResponse>('/api/proxy-routes/bindings' + groupQs(upstreamId)),
+  /** 自动分配 N 台账号到这条线路（未绑定的优先，挑完仍可手动增删） */
+  autoAssign: (name: string, count: number, upstreamId?: number | null) =>
+    post<{updated: number; requested: number; candidates: number; unbound_left: number}>(
+      `/api/proxy-routes/${encodeURIComponent(name)}/auto-assign` + groupQs(upstreamId),
+      {count}),
+  /** 池配置：开关 / 策略 / 间隔 */
+  savePool: (body: {enabled?: boolean; strategy?: string; interval_seconds?: number}) =>
+    put<ProxyPool>('/api/settings/proxy-pool', body),
+  settings: () => get<ProxySettings>('/api/settings/proxy'),
+  saveSettings: (body: {http_proxy?: string; update_proxy?: string;
+                           global_proxy_enabled?: boolean}) =>
+    put<ProxySettings>('/api/settings/proxy', body),
+  probeGlobal: () => post<ProxyProbe>('/api/settings/proxy/probe', {}),
+};
+
 export const settingsApi = {
   upstream: () => get<UpstreamConfig>('/api/settings/upstream'),
   saveUpstream: (body: Record<string, unknown>) =>
@@ -257,6 +857,11 @@ export const settingsApi = {
   /** 立即重启上游（一般无需手动调用，保存配置会自动重载） */
   reloadUpstream: () =>
     post<{ok: boolean; message: string}>('/api/settings/upstash/reload'),
+  /** 计费价目表（issue #380）：版本、生效档、覆盖情况、节假日缺口 */
+  pricing: () => get<PricingInfo>('/api/settings/pricing'),
+  /** 保存覆盖价目；传 null 恢复成随版本分发的那份 */
+  savePricing: (body: Record<string, unknown> | null) =>
+    put<PricingInfo>('/api/settings/pricing', body),
   modelMap: () => get<Record<string, string>>('/api/settings/model-map'),
   saveModelMap: (body: Record<string, string>) =>
     post<Record<string, string>>('/api/settings/model-map', body),
@@ -272,6 +877,50 @@ export const settingsApi = {
   removeUser: (username: string) => del<{ok: boolean}>(`/api/users/${encodeURIComponent(username)}`),
 };
 
+/* ── 页面监控（watchdog）──────────────────────────────── */
+/**
+ * 上游网页改版监控：配置 / 状态 / 立即检测 / 基线 / 邮件出口 / 测试发信。
+ *
+ * 全部要求管理员 —— 状态里有账号昵称与收件地址，配置里有 LLM 地址与打码凭据。
+ * 「立即检测」是同步返回的：一轮是几次页面抓取 + 一两个只读查询，正常几秒内
+ * 结束，界面可以直接把结果写出来，不用再引入一套任务轮询。
+ */
+export const watchdogApi = {
+  config: () => get<WatchdogConfigResponse>('/api/watchdog/config'),
+  /** 只传要改的段即可；打码值 `********` 表示保持原密码/密钥不变 */
+  saveConfig: (body: Record<string, unknown>) =>
+    put<WatchdogSaveResult>('/api/watchdog/config', body),
+  status: () => get<WatchdogStatus>('/api/watchdog/status'),
+  /**
+   * 一轮可能是「页面 25s + 资源预算 40s + LLM 60s」，超过全局 60s 上限——
+   * 超时只影响这一次等待，后端仍会跑完并落库；但界面会显示一条失败，
+   * 用户会以为没检测。这里单独放宽到 4 分钟。
+   */
+  run: async () => (await http.post<WatchdogRunResult>(
+    '/api/watchdog/run', {}, {timeout: 240000})).data,
+  /** 清掉全部基线：下次检测只重建指纹，不告警（改版后误报时用） */
+  resetBaseline: () =>
+    post<{ok: boolean; cleared: number; message: string}>('/api/watchdog/baseline', {}),
+  /**
+   * 三个「测试」都接受表单当前值（不必先保存）：用户填完 SMTP 主机就会点
+   * 检测，要求先保存再测试等于把一步藏在别处。未传 body 时后端用已保存配置。
+   */
+  checkEgress: (mail?: Partial<WatchdogMailConfig>) =>
+    post<WatchdogEgress>('/api/watchdog/mail/egress', mail ?? {}),
+  testMail: (mail?: Partial<WatchdogMailConfig>) =>
+    post<WatchdogMailTest>('/api/watchdog/mail/test', mail ?? {}),
+  /** 检测 AstrBot 地址 / 密钥 / scope，并列出可用平台适配器（拼 UMO 用） */
+  qqBots: (qq?: Partial<WatchdogQqConfig>) =>
+    post<WatchdogQqBotsResult>('/api/watchdog/qq/bots', qq ?? {}),
+  /** 发一条 QQ 测试消息（同样用表单当前值，不要求先保存） */
+  testQq: async (qq?: Partial<WatchdogQqConfig>) =>
+    (await http.post<WatchdogQqTest>(
+      '/api/watchdog/qq/test', qq ?? {}, {timeout: 60000})).data,
+  testLlm: async (llm?: Partial<WatchdogLlmConfig>) =>
+    (await http.post<{ok: boolean; verdict: WatchdogVerdict}>(
+      '/api/watchdog/llm/test', llm ?? {}, {timeout: 120000})).data,
+};
+
 export type {Account};
 
 /* ── 系统维护（一键更新）──────────────────────────────── */
@@ -280,12 +929,69 @@ export const systemApi = {
   /** 检测新版本；force=true 绕过 6 小时缓存 */
   checkUpdate: (force = false) => get<UpdateCheck>('/api/system/check-update', {force}),
   versions: () => get<Versions>('/api/system/versions'),
-  /** 启动一键更新；target: manager | upstream | both */
-  startUpdate: (target: 'manager' | 'upstream' | 'both') =>
-    post<{ok: boolean; message: string}>('/api/system/update', {target}),
-  /** 固定上游版本（空串 = 取消固定，恢复跟随分支） */
-  setUpstreamRef: (ref: string) =>
-    post<{ok: boolean; upstream_ref: string}>('/api/system/upstream-ref', {ref}),
+  /** GitHub Token（版本检测 / 一键更新的认证）：读回掩码，写只传明文 */
+  githubToken: () => get<{configured: boolean; masked: string; source: 'env' | 'panel' | ''}>(
+    '/api/settings/github-token'),
+  saveGithubToken: (token: string) =>
+    put<{configured: boolean; masked: string}>('/api/settings/github-token', {token}),
+  /** GitHub 镜像（issue #216）：国内机器用它加速版本检测与发布包下载 */
+  githubMirror: () => get<GithubMirror>('/api/settings/github-mirror'),
+  saveGithubMirror: (mirror: string) =>
+    put<GithubMirror>('/api/settings/github-mirror', {mirror}),
+  /** 网关数据面 CORS（issue #445）：给浏览器里的前端页面直连 `/v1` 用 */
+  gatewayCors: () => get<GatewayCors>('/api/settings/gateway-cors'),
+  saveGatewayCors: (body: Partial<Pick<GatewayCors, 'enabled' | 'origins' | 'max_age'>>) =>
+    put<GatewayCors>('/api/settings/gateway-cors', body),
+  /** 自动更新：定时检测，在时间窗内自动执行一键更新 */
+  autoUpdate: () => get<AutoUpdateInfo>('/api/settings/auto-update'),
+  saveAutoUpdate: (cfg: AutoUpdateConfig) =>
+    put<AutoUpdateInfo>('/api/settings/auto-update', cfg),
+  /**
+   * 启动一键更新；target: manager | upstream | both。
+   * source='uploaded' 用面板里已上传的离线升级包（issue #153）。
+   */
+  startUpdate: (target: 'manager' | 'upstream' | 'both', source: 'release' | 'uploaded' = 'release') =>
+    post<{ok: boolean; message: string}>('/api/system/update', {target, source}),
+  /** 已上传的离线升级包元信息 */
+  packageMeta: () => get<UpdatePackageMeta>('/api/system/update-package'),
+  /**
+   * 上传离线升级包（发布页下载的 .tar.gz）。
+   * `expectedSha256` 是发布页那串摘要；服务端默认必填，缺失会直接拒收。
+   */
+  uploadPackage: (file: File, expectedSha256: string) => {
+    const body = new FormData();
+    body.append('file', file, file.name);
+    body.append('expected_sha256', expectedSha256);
+    return post<UpdatePackageMeta>('/api/system/update-package', body);
+  },
+  deletePackage: () => del<{ok: boolean}>('/api/system/update-package'),
+  /**
+   * 清除上次更新的结果与日志（issue #105）。
+   *
+   * 此前失败记录只能靠「下次发起更新」覆盖：状态文件与 update.log 都留着，
+   * 界面上那条「更新未完成」与日志永远擦不掉，用户得进容器手删文件。
+   * 更新进行中后端会拒绝（409）——那会把「正在更新」看丢。
+   */
+  clearUpdateStatus: () =>
+    del<{ok: boolean; message: string}>('/api/system/update-status'),
   /** 更新日志（解析仓库根目录 CHANGELOG.md，离线可用） */
   changelog: () => get<Changelog>('/api/system/changelog'),
+};
+
+/* ── PostgreSQL 异地备份（设置 → 数据备份）────────────── */
+export const pgSyncApi = {
+  config: () => get<PgSyncConfigResponse>('/api/settings/pg-sync'),
+  /** 保存连接配置；password 传掩码或空串表示沿用已保存的值 */
+  save: (body: Partial<PgSyncConfig>) =>
+    post<{config: PgSyncConfig}>('/api/settings/pg-sync', body),
+  /** 探测连通性。表单里刚填的值优先，没填的字段回落到已保存的配置 */
+  test: (body: Partial<PgSyncConfig>) =>
+    post<PgSyncTestResult>('/api/settings/pg-sync/test', body),
+  /** 把本地数据全量推到 PostgreSQL（只读本地，不会改动它） */
+  exportData: () =>
+    post<{ok: boolean; message: string; status: PgSyncStatus}>('/api/settings/pg-sync/export'),
+  /** 从 PostgreSQL 拉回数据。**会覆盖本地数据**，前端必须先二次确认 */
+  importData: () =>
+    post<{ok: boolean; message: string; status: PgSyncStatus}>('/api/settings/pg-sync/import'),
+  status: () => get<PgSyncStatus>('/api/settings/pg-sync/status'),
 };

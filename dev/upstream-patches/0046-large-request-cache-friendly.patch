@@ -1,0 +1,218 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index 4ea687e..ac703d8 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -150,10 +150,12 @@ type Config struct {
+ 	} `json:"upstash"`
+ 
+ 	Pool struct {
+-		// 大上下文请求的逐请求轮换（本地增强）：请求体 ≥ large_request_bytes 时
+-		// 放弃会话粘性、按请求换号，并在 large_request_cooldown 窗口内不再复用同号。
++		// 大上下文请求的逐请求轮换（本地增强，默认关闭）：只有
++		// large_request_cooldown > 0 时才生效。请求体 ≥ large_request_bytes 时放弃
++		// 会话粘性、按请求换号，并在窗口内不再复用同号。前缀缓存按账号存放，轮换会让
++		// 长上下文的缓存整段失效，所以默认 "0s"（关闭），风控现场再显式打开。
+ 		LargeRequestBytes    int    `json:"large_request_bytes"`    // 默认 262144；<=0 关闭
+-		LargeRequestCooldown string `json:"large_request_cooldown"` // 默认 "90s"
++		LargeRequestCooldown string `json:"large_request_cooldown"` // 默认 "0s"（关闭）；>0 才启用轮换
+ 		MaxInFlight          int    `json:"max_in_flight"`          // 单账号最大在途请求数，0 = 不限
+ 		MaxInFlightGlobal    int    `json:"max_in_flight_global"`   // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+ 		BreakerThreshold     int    `json:"breaker_threshold"`      // 连续失败次数触发熔断，默认 3
+@@ -439,7 +441,7 @@ func (c *Config) normalize() error {
+ 		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
+ 	}
+ 	if c.Pool.LargeRequestCooldown == "" {
+-		c.Pool.LargeRequestCooldown = "90s"
++		c.Pool.LargeRequestCooldown = "0s" // 空 = 关闭逐请求轮换（默认）
+ 	}
+ 	if c.LargeRequestCooldownDur, err = time.ParseDuration(c.Pool.LargeRequestCooldown); err != nil {
+ 		return fmt.Errorf("pool.large_request_cooldown: %w", err)
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index b25924f..05a0ab1 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -107,7 +107,7 @@ type Handler struct {
+ // largeExclusions 返回「LargeRequestCooldown 窗口内已承接过大请求」的号集合，
+ // 顺手清掉过期项。窗口内这些号不再参与大请求选号 —— 这就是逐请求轮换。
+ func (h *Handler) largeExclusions(now time.Time) map[string]bool {
+-	if h.cfg.LargeRequestBytes <= 0 {
++	if h.cfg.LargeRequestBytes <= 0 || h.cfg.LargeRequestCooldown <= 0 {
+ 		return nil // 策略关闭：不排除任何号
+ 	}
+ 	h.largeMu.Lock()
+@@ -150,9 +150,8 @@ func NewHandler(cfg Config) *Handler {
+ 	if cfg.LargeRequestBytes == 0 {
+ 		cfg.LargeRequestBytes = 256 << 10 // 256 KiB ≈ 6–8 万 token
+ 	}
+-	if cfg.LargeRequestCooldown <= 0 {
+-		cfg.LargeRequestCooldown = 90 * time.Second
+-	}
++	// LargeRequestCooldown <= 0 = 关闭逐请求轮换（默认）。这里不做缺省兜底：
++	// 轮换与上游按账号存放的前缀缓存互斥，代价见 chatCompletions 的触发处注释。
+ 	if cfg.RefreshSkew <= 0 {
+ 		cfg.RefreshSkew = 10 * time.Minute
+ 	}
+@@ -741,10 +740,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+ 
+-	// 大上下文请求：放弃会话粘性、逐请求轮换（本地增强）。
+-	// 触发面：上游把「单号短时间承接大量超大上下文」判为异常使用行为（11140）。
+-	largeCtx := h.cfg.LargeRequestBytes > 0 && len(body) >= h.cfg.LargeRequestBytes
+-	if largeCtx {
++	// 大上下文请求的逐请求轮换（本地增强，默认关闭）。触发面：上游把「单号短时间
++	// 承接大量超大上下文」判为异常使用行为（11140）。代价：前缀缓存按账号存放，
++	// 换号后整段 prompt 必然 miss。实测同一个 300 KB 请求体连发两次，开轮换时
++	// 命中 0，不轮换时第二次命中全部前缀。因此默认不轮换，只有现场确实出现风控
++	// 时才把 large_request_cooldown 设成 > 0 显式打开。
++	largeRotate := h.cfg.LargeRequestBytes > 0 && len(body) >= h.cfg.LargeRequestBytes &&
++		h.cfg.LargeRequestCooldown > 0
++	if largeRotate {
+ 		unbindSticky()
+ 	}
+ 
+@@ -763,7 +766,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
+ 			// （healthyForModel），realm 谓词过滤跨域账号。
+ 			pickTried := tried
+-			if largeCtx {
++			if largeRotate {
+ 				if extra := h.largeExclusions(time.Now()); len(extra) > 0 {
+ 					pickTried = make(map[string]bool, len(tried)+len(extra))
+ 					for k, v := range tried {
+@@ -775,11 +778,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				}
+ 			}
+ 			acct = h.cfg.Pool.PickExcludingForRealm(pickTried, bareModel, realm)
+-			if acct == nil && largeCtx {
++			if acct == nil && largeRotate {
+ 				// 所有号都在大请求窗口内：退化普通轮换，避免直接 503。
+ 				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+ 			}
+-			if acct != nil && largeCtx {
++			if acct != nil && largeRotate {
+ 				h.noteLargeUse(acct.UID, time.Now())
+ 			}
+ 		}
+@@ -1040,7 +1043,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+ 		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
+ 		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
+-		if stickyKey != "" && h.cfg.Session != nil && !largeCtx {
++		// 大请求同样绑定：轮换关闭时必须让它吃到前缀缓存，否则长上下文每轮都整段重算。
++		if stickyKey != "" && h.cfg.Session != nil && !largeRotate {
+ 			h.cfg.Session.Bind(stickyKey, acct.UID)
+ 		}
+ 		if peek.Stream {
+diff --git a/internal/server/large_request_cache_test.go b/internal/server/large_request_cache_test.go
+new file mode 100644
+index 0000000..174f992
+--- /dev/null
++++ b/internal/server/large_request_cache_test.go
+@@ -0,0 +1,70 @@
++package server
++
++import (
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/session"
++)
++
++// largeBodyWith 组装一个超过 large_request_bytes 默认阈值（256 KiB）的请求体。
++func largeBodyWith(convID string) string {
++	return `{"model":"glm-5.2","messages":[{"role":"user","content":"` +
++		strings.Repeat("x", 256<<10) + `"}],"metadata":{"conversation_id":"` + convID + `"}}`
++}
++
++// TestChatLargeRequestKeepsStickyByDefault 大请求默认不轮换：成功号要写进会话绑定，
++// 下一轮仍在同一个号上，上游的前缀缓存才能整段命中。
++func TestChatLargeRequestKeepsStickyByDefault(t *testing.T) {
++	st := newBindStore()
++	sess := session.New(session.Config{
++		TTL:       time.Minute,
++		Store:     st,
++		Available: func() []string { return []string{"good"} },
++	})
++	p := testPoolWith(&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999})
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		return 200, sseOK, true
++	})
++	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(largeBodyWith("conv-large"))))
++	if rec.Code != 200 {
++		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
++	}
++	if uid, ok := st.lastUID("conv-large"); !ok || uid != "good" {
++		t.Fatalf("大请求成功也应写会话绑定, got %s ok=%v", uid, ok)
++	}
++}
++
++// TestChatLargeRequestRotationDoesNotBind 显式打开轮换后，大请求不写绑定（逐请求换号）。
++func TestChatLargeRequestRotationDoesNotBind(t *testing.T) {
++	st := newBindStore()
++	sess := session.New(session.Config{
++		TTL:       time.Minute,
++		Store:     st,
++		Available: func() []string { return []string{"good"} },
++	})
++	p := testPoolWith(&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999})
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		return 200, sseOK, true
++	})
++	h := NewHandler(Config{
++		Pool:                 p,
++		Upstream:             up,
++		Session:              sess,
++		SoftCooldown:         time.Minute,
++		LargeRequestCooldown: 90 * time.Second,
++	})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(largeBodyWith("conv-large-rot"))))
++	if rec.Code != 200 {
++		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
++	}
++	if uid, ok := st.lastUID("conv-large-rot"); ok {
++		t.Fatalf("轮换开启时大请求不应写绑定, got %s", uid)
++	}
++}
+diff --git a/internal/server/large_rotation_test.go b/internal/server/large_rotation_test.go
+index 6f8dd60..337789c 100644
+--- a/internal/server/large_rotation_test.go
++++ b/internal/server/large_rotation_test.go
+@@ -5,14 +5,28 @@ import (
+ 	"time"
+ )
+ 
+-// 大上下文请求的逐请求轮换：窗口内同号不再被选中，窗口过后恢复。
+-func TestLargeExclusionsWindow(t *testing.T) {
++// 默认关闭：未配置 large_request_cooldown 时既不轮换也不排除任何号。
++// 轮换会让上游的前缀缓存整段 miss，长上下文每轮都按全量计费，代价远大于收益。
++func TestLargeRotationOffByDefault(t *testing.T) {
+ 	h := NewHandler(Config{})
+ 	if h.cfg.LargeRequestBytes != 256<<10 {
+ 		t.Fatalf("默认阈值 = %d, want 262144", h.cfg.LargeRequestBytes)
+ 	}
++	if h.cfg.LargeRequestCooldown != 0 {
++		t.Fatalf("默认窗口 = %v, want 0（关闭）", h.cfg.LargeRequestCooldown)
++	}
++	now := time.Now()
++	h.noteLargeUse("u1", now)
++	if got := h.largeExclusions(now); len(got) != 0 {
++		t.Fatalf("默认关闭时不应排除任何号, got %v", got)
++	}
++}
++
++// 显式打开后：窗口内同号不再被选中，窗口过后恢复。
++func TestLargeExclusionsWindow(t *testing.T) {
++	h := NewHandler(Config{LargeRequestCooldown: 90 * time.Second})
+ 	if h.cfg.LargeRequestCooldown != 90*time.Second {
+-		t.Fatalf("默认窗口 = %v, want 90s", h.cfg.LargeRequestCooldown)
++		t.Fatalf("显式窗口 = %v, want 90s", h.cfg.LargeRequestCooldown)
+ 	}
+ 
+ 	now := time.Now()

@@ -253,8 +253,14 @@ class LoginLockoutTest(unittest.TestCase):
             security.record_fail(f'172.{i // 250}.{i % 250}.9', f'flood{i}')
         self.assertTrue(security.login_blocked('4.4.4.4', 'admin'),
                         '窗口内的 admin 锁定条目被灌入操作挤掉了')
+        # 按用户名维度的锁定只拦「自己也失败过」的来源 IP（2026-10-21 安全
+        # 检查 L2）：干净的管理员 IP 不该被匿名者的失败计数锁在门外。
+        self.assertFalse(security.login_blocked('5.5.5.5', 'admin'),
+                         '从未输错的来源不该被按用户名的锁定拦截（远程锁定 DoS）')
+        # 但「失败过的」来源仍要被拦——这就是防换 IP 爆破的那一半。
+        security.record_fail('5.5.5.5', 'someone-else')
         self.assertTrue(security.login_blocked('5.5.5.5', 'admin'),
-                        '按用户维度的 admin 锁定同样不该被挤掉')
+                        '自己失败过的来源在用户名锁定期内必须被拦')
 
     def test_successful_login_clears_counter(self) -> None:
         for _ in range(3):
@@ -317,6 +323,7 @@ class UserAdminHttpTest(unittest.TestCase):
             {'username': 'guest', 'role': 'viewer',
              'pwd_hash': security.make_hash('guest-pw-123')},
         ], api_keys=['wbk_leaked_from_production'])
+        security.initial_password_path().unlink(missing_ok=True)
         try:
             db.execute('DELETE FROM audit_logs')
         except Exception:  # noqa: BLE001
@@ -342,20 +349,51 @@ class UserAdminHttpTest(unittest.TestCase):
 
     def test_admin_can_change_password_and_old_session_dies(self) -> None:
         """改密码必须成功（不是 500），且旧会话立即失效。"""
+        password_path = security.initial_password_path()
+        password_path.write_text('initial-admin-pw\n', encoding='utf-8')
         self.assertEqual(self._login('admin', 'http-admin-pw'), 200)
         self.assertEqual(self.c.get('/api/me').status_code, 200)
         r = self.c.patch('/api/users/admin', json={'password': 'brand-new-pw-1'})
         self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(password_path.exists(), '修改 admin 密码后应清理初始密码文件')
         self.assertTrue(r.json().get('relogin_required'))
         # 同一个 client（持有旧 cookie）应被踢下线
         self.assertEqual(self.c.get('/api/me').status_code, 401)
         # 新密码可用
         self.assertEqual(self._login('admin', 'brand-new-pw-1'), 200)
 
+    def test_changing_non_admin_password_preserves_initial_admin_password_file(self) -> None:
+        """改其他用户密码时，初始 admin 密码仍有效，恢复文件应保留。"""
+        password_path = security.initial_password_path()
+        password_path.write_text('initial-admin-pw\n', encoding='utf-8')
+
+        self.assertEqual(self._login('admin', 'http-admin-pw'), 200)
+        r = self.c.patch('/api/users/guest', json={'password': 'guest-new-pw-1'})
+
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(password_path.exists())
+        self.assertEqual(password_path.read_text(encoding='utf-8'), 'initial-admin-pw\n')
+
     def test_short_password_rejected(self) -> None:
         self._login('admin', 'http-admin-pw')
         r = self.c.patch('/api/users/admin', json={'password': 'abc'})
         self.assertEqual(r.status_code, 400)
+
+    def test_weak_password_rejected_on_create_and_change(self) -> None:
+        """生产事故根因：admin123 这类弱口令不能再被设置。"""
+        self.assertEqual(self._login('admin', 'http-admin-pw'), 200)
+
+        r = self.c.post('/api/users', json={
+            'username': 'weakling', 'password': 'admin123', 'role': 'viewer'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('12', r.json().get('detail', ''))
+
+        r = self.c.patch('/api/users/admin', json={'password': 'admin9876543210'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('用户名加数字', r.json().get('detail', ''))
+
+        # 被拒绝的两次都不能改掉原来的密码
+        self.assertEqual(self._login('admin', 'http-admin-pw'), 200)
 
     def test_viewer_cannot_manage_users(self) -> None:
         self.assertEqual(self._login('guest', 'guest-pw-123'), 200)
@@ -395,10 +433,14 @@ class UserAdminHttpTest(unittest.TestCase):
         self.assertEqual(self._login('admin', 'final-pw-123'), 200)
         r2 = self.c.get('/api/audit-logs')
         self.assertEqual(r2.status_code, 200, r2.text)
-        actions = {it['action'] for it in r2.json()['items']}
+        rows = r2.json()['items']
+        actions = {it['action'] for it in rows}
         self.assertIn('login', actions, '登录成功要留痕')
         self.assertIn('login_failed', actions, '登录失败要留痕（攻击者试密码就在这里）')
         self.assertIn('update_user', actions, '改密码要留痕')
+        for action in ('login', 'login_failed', 'update_user'):
+            row = next(it for it in rows if it['action'] == action)
+            self.assertTrue(row.get('ip'), f'{action} 应记录结构化来源 IP')
 
 
 if __name__ == '__main__':
@@ -485,7 +527,7 @@ if __name__ == '__main__':
 class MalformedLoginBodyTest(unittest.TestCase):
     """登录接口对「合法 JSON 但非对象」的 body 必须返回 400，而不是 500。
 
-    实测（真实部署 https://wk.sbai.shop/）：`null` 与 `[]` 会让 `body.get()`
+    实测（真实部署环境）：`null` 与 `[]` 会让 `body.get()`
     抛 AttributeError → 500。虽然 500 的响应体只有 "Internal Server Error"、
     不泄露堆栈，但这属于未处理异常：
 

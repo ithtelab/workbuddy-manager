@@ -1,0 +1,2 @@
+# Preserve unified patch context bytes and source line endings.
+*.patch -text -whitespace

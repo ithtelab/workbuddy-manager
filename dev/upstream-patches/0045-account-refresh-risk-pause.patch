@@ -1,0 +1,900 @@
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -136,6 +136,9 @@
+ 	}
+ 
+ 	up := upstream.New()
++	up.RefreshPaused = p.RiskPaused
++	up.OnRefreshRateLimit = func(uid string, retryAfter time.Duration) { p.PauseRefreshRateLimited(uid, retryAfter) }
++	up.OnRefreshSuccess = p.NoteRefreshSuccess
+ 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
+ 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
+ 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -32,16 +32,17 @@
+ 
+ // Status 单个账号对外暴露的状态（脱敏）。
+ type Status struct {
+-	UID           string    `json:"uid"`
+-	Realm         string    `json:"realm,omitempty"`
+-	Nickname      string    `json:"nickname,omitempty"`
+-	Credits       int64     `json:"credits"`
+-	Cooling       bool      `json:"cooling"`
+-	CoolKind      string    `json:"cool_kind,omitempty"`
+-	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
+-	Until         time.Time `json:"until,omitempty"`
+-	Reason        string    `json:"reason,omitempty"`
+-	SoftStreak    int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
++	RefreshRisk   *RefreshRiskStatus `json:"refresh_risk,omitempty"`
++	UID           string             `json:"uid"`
++	Realm         string             `json:"realm,omitempty"`
++	Nickname      string             `json:"nickname,omitempty"`
++	Credits       int64              `json:"credits"`
++	Cooling       bool               `json:"cooling"`
++	CoolKind      string             `json:"cool_kind,omitempty"`
++	CoolRemaining int64              `json:"cool_remaining_sec,omitempty"`
++	Until         time.Time          `json:"until,omitempty"`
++	Reason        string             `json:"reason,omitempty"`
++	SoftStreak    int                `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+ 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
+ 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
+ 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
+@@ -51,19 +52,19 @@
+ 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
+ 	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
+ 	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
+-	ModelCosts []ModelCostStatus `json:"model_costs,omitempty"`
+-	Disabled          bool               `json:"disabled"`
+-	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
++	ModelCosts     []ModelCostStatus `json:"model_costs,omitempty"`
++	Disabled       bool              `json:"disabled"`
++	DisabledReason string            `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+ 	// ManualDisabled 运维手动停用（issue #138/#118）——与 disabled **并列独立**，
+ 	// 叠加态分别透出不合并（面板据此区分「系统判定坏了」与「我主动摘的」，
+ 	// 两种可用操作不同：前者可 revive，后者该 enable）。
+ 	// 零值也显式写出（运维口径，同 consecutive_fails：缺失会让人误以为"没记录"）。
+-	ManualDisabled bool   `json:"manual_disabled"`
+-	ManualReason   string `json:"manual_reason,omitempty"` // 仅手动停用：停用原因（运维可见）
+-	SuccessCount      int64              `json:"success_count,omitempty"`
+-	ErrTotal          int64              `json:"err_total,omitempty"`
+-	LastSuccessTime   time.Time          `json:"last_success,omitempty"`
+-	LastErrTime       time.Time          `json:"last_err,omitempty"`
++	ManualDisabled  bool      `json:"manual_disabled"`
++	ManualReason    string    `json:"manual_reason,omitempty"` // 仅手动停用：停用原因（运维可见）
++	SuccessCount    int64     `json:"success_count,omitempty"`
++	ErrTotal        int64     `json:"err_total,omitempty"`
++	LastSuccessTime time.Time `json:"last_success,omitempty"`
++	LastErrTime     time.Time `json:"last_err,omitempty"`
+ 	// ConsecutiveFails 连续失败计数（连败降权用，见 entry.consecutiveFails）。
+ 	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
+ 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
+@@ -102,8 +103,9 @@
+ }
+ 
+ type entry struct {
+-	a       *auth.Auth
+-	credits int64
++	refreshRisk *RefreshRiskState
++	a           *auth.Auth
++	credits     int64
+ 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
+ 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
+ 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
+@@ -111,23 +113,23 @@
+ 	// 签到之间第四因子（weightOf ×8）不应失忆——签到 09:00/21:00 定期刷新，
+ 	// 窗口外重启会丢快过期积分偏好，可能让奖励积分到期作废。
+ 	creditsExpiring int64
+-	successCount    int64     // 累计成功
++	successCount    int64 // 累计成功
+ 	// errTotal 累计错误（终身累计，仅状态展示用；选号权重不消费——原「成功率」
+ 	// 因子已删，见 pick.weightOf 注释与 success-ema-review）。
+-	errTotal    int64         // 累计错误（终身累计，供状态展示；选号权重不消费，原成功率因子已删）
+-	lastErr     time.Time     // 最近一次错误时间
+-	lastSuccess     time.Time // 最近一次成功时间
+-	coolKind        CoolKind
+-	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
+-	disabled        bool
+-	reason          string
++	errTotal    int64     // 累计错误（终身累计，供状态展示；选号权重不消费，原成功率因子已删）
++	lastErr     time.Time // 最近一次错误时间
++	lastSuccess time.Time // 最近一次成功时间
++	coolKind    CoolKind
++	until       time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
++	disabled    bool
++	reason      string
+ 	// manualDisabled 运维手动停用（issue #138/#118）：与 disabled 并列的独立状态位。
+ 	// 语义是「对话流量摘除」而非「账号冻结」——停用期间签到/token 保活/排程照常执行，
+ 	// 凭证与积分都是活的，只是不参与选号。与 disabled 各自独立清除，两位都清才回池。
+ 	// 持久化（stateAccount.ManualDisabled）：重启保留运维意图。
+ 	manualDisabled bool
+ 	manualReason   string
+-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
++	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
+ 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
+ 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
+ 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效（高并发/低精度时钟下：
+@@ -205,7 +207,7 @@
+ // 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
+ // 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
+ func (e *entry) healthy(now time.Time) bool {
+-	if e.disabled || e.manualDisabled {
++	if e.disabled || e.manualDisabled || e.refreshRiskActive(now) {
+ 		return false
+ 	}
+ 	if !e.until.IsZero() && now.Before(e.until) {
+@@ -230,7 +232,7 @@
+ // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
+ func (e *entry) modelExempt() bool {
+ 	return len(e.modelCooldowns) > 0 &&
+-		!e.disabled && !e.manualDisabled && e.breakerUntil.IsZero()
++		!e.disabled && !e.manualDisabled && !e.refreshRiskActive(time.Now()) && e.breakerUntil.IsZero()
+ }
+ 
+ // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
+@@ -277,7 +279,7 @@
+ // 从不回收——即「map 只增不减」。而 entry.modelCost 的注释明确声称
+ // 「落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活（同 modelCooldowns 口径）」，
+ // 模型级冷却表正是靠 pruneExpiredModelCooldowns 在 pick 写锁路径做真正删除的
+-//（见 pick.go「map 不无限膨胀」）。两者口径不一致：一旦某模型的观测过期，它就会
++// （见 pick.go「map 不无限膨胀」）。两者口径不一致：一旦某模型的观测过期，它就会
+ // 永久占据一条内存（进程重启才清），并在后续每一轮 pick 的遍历、每次 status 遍历里
+ // 被反复判定为过期（只是没人删）。
+ //
+@@ -345,17 +347,18 @@
+ 
+ // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
+ type stateAccount struct {
+-	Credits      int64     `json:"credits"`
+-	Disabled     bool      `json:"disabled"`
+-	Reason       string    `json:"reason,omitempty"`
++	RefreshRisk *RefreshRiskState `json:"refresh_risk,omitempty"`
++	Credits     int64             `json:"credits"`
++	Disabled    bool              `json:"disabled"`
++	Reason      string            `json:"reason,omitempty"`
+ 	// ManualDisabled 运维手动停用（issue #138/#118）。持久化——重启保留运维意图，
+ 	// 这也正是该功能要解决的痛点之一（旧权宜做法改 state.json 会被 5s flush 覆盖，
+ 	// 入口化后无需再碰文件）。零值也显式写出（运维口径，同 err_total 注释）。
+-	ManualDisabled bool   `json:"manual_disabled"`
+-	ManualReason   string `json:"manual_reason,omitempty"`
+-	Until        time.Time `json:"until,omitempty"`
+-	CoolKind     CoolKind  `json:"cool_kind"`
+-	SuccessCount int64     `json:"success_count,omitempty"`
++	ManualDisabled bool      `json:"manual_disabled"`
++	ManualReason   string    `json:"manual_reason,omitempty"`
++	Until          time.Time `json:"until,omitempty"`
++	CoolKind       CoolKind  `json:"cool_kind"`
++	SuccessCount   int64     `json:"success_count,omitempty"`
+ 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
+ 	// 仅作一次性迁移，不再回写 err_count。
+ 	// 运维可见的运行态计数（err_total/soft_streak/session_dead_fails/credits_expiring）
+--- a/internal/pool/persist.go
++++ b/internal/pool/persist.go
+@@ -173,6 +173,7 @@
+ 			reason:           s.Reason,
+ 			manualDisabled:   s.ManualDisabled,
+ 			manualReason:     s.ManualReason,
++			refreshRisk:      cloneRefreshRisk(s.RefreshRisk),
+ 			until:            s.Until,
+ 			coolKind:         s.CoolKind,
+ 			successCount:     s.SuccessCount,
+@@ -417,6 +418,7 @@
+ 			Reason:           reason,
+ 			ManualDisabled:   e.manualDisabled,
+ 			ManualReason:     e.manualReason,
++			RefreshRisk:      cloneRefreshRisk(e.refreshRisk),
+ 			Until:            e.until,
+ 			CoolKind:         coolKind,
+ 			SuccessCount:     e.successCount,
+--- a/internal/pool/pick.go
++++ b/internal/pool/pick.go
+@@ -238,7 +238,7 @@
+ 		if realm != "" && e.a.Realm() != realm {
+ 			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
+ 		}
+-		if e.disabled || e.manualDisabled {
++		if e.disabled || e.manualDisabled || e.refreshRiskActive(now) {
+ 			continue // 禁用/手动停用的账号永不参与兜底
+ 		}
+ 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
+--- /dev/null
++++ b/internal/pool/refresh_risk.go
+@@ -0,0 +1,126 @@
++package pool
++
++import "time"
++
++const (
++	RefreshRiskMinWait         = 5 * time.Minute
++	RefreshRiskMaxWait         = 6 * time.Hour
++	refreshRiskRepeatWindow    = 5 * time.Minute
++	refreshRiskReviewThreshold = 3
++)
++
++// RefreshRiskState is independent of operator stops and system disablement.
++// Epoch seconds survive restarts; Paused is derived, never persisted stale.
++type RefreshRiskState struct {
++	Until         int64 `json:"until"`
++	LastFailureAt int64 `json:"last_failure_at"`
++	Failures      int   `json:"failures"`
++	NeedsReview   bool  `json:"needs_review"`
++	RetryAfterSec int64 `json:"retry_after_sec"`
++}
++
++type RefreshRiskStatus struct {
++	RefreshRiskState
++	Paused bool `json:"paused"`
++}
++
++func cloneRefreshRisk(state *RefreshRiskState) *RefreshRiskState {
++	if state == nil {
++		return nil
++	}
++	copy := *state
++	return &copy
++}
++
++func (e *entry) refreshRiskActive(now time.Time) bool {
++	return e.refreshRisk != nil && (e.refreshRisk.NeedsReview || now.Unix() < e.refreshRisk.Until)
++}
++
++func (e *entry) refreshRiskStatus(now time.Time) *RefreshRiskStatus {
++	if e.refreshRisk == nil {
++		return nil
++	}
++	return &RefreshRiskStatus{RefreshRiskState: *e.refreshRisk, Paused: e.refreshRiskActive(now)}
++}
++
++func (p *Pool) RiskPaused(uid string) bool {
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++	e := p.byUID[uid]
++	return e != nil && e.refreshRiskActive(time.Now())
++}
++
++func (p *Pool) PauseRefreshRateLimited(uid string, retryAfter time.Duration) bool {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	e := p.byUID[uid]
++	if e == nil {
++		return false
++	}
++	p.noteRefreshRateLimitedLocked(e, retryAfter, time.Now())
++	return true
++}
++
++func (p *Pool) noteRefreshRateLimitedLocked(e *entry, retryAfter time.Duration, now time.Time) {
++	wait := retryAfter
++	if wait < RefreshRiskMinWait {
++		wait = RefreshRiskMinWait
++	}
++	if wait > RefreshRiskMaxWait {
++		wait = RefreshRiskMaxWait
++	}
++	if e.refreshRisk == nil {
++		e.refreshRisk = &RefreshRiskState{}
++	}
++	risk := e.refreshRisk
++	if !e.refreshRiskActive(now) {
++		if risk.Failures > 0 && risk.Until > 0 && now.Unix() <= risk.Until+int64(refreshRiskRepeatWindow.Seconds()) {
++			risk.Failures++
++		} else {
++			risk.Failures = 1
++		}
++		if risk.Failures >= refreshRiskReviewThreshold {
++			risk.NeedsReview = true
++		}
++	}
++	until := now.Add(wait).Unix()
++	if until > risk.Until {
++		risk.Until = until
++	}
++	risk.LastFailureAt = now.Unix()
++	risk.RetryAfterSec = int64(wait.Seconds())
++	p.dirty.Store(true)
++}
++
++// A successful retry resets the streak. An in-flight response cannot clear an
++// active pause or a manual-review escalation raised by another request.
++func (p *Pool) NoteRefreshSuccess(uid string) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	e := p.byUID[uid]
++	if e == nil || e.refreshRisk == nil || e.refreshRiskActive(time.Now()) {
++		return
++	}
++	e.refreshRisk.Until = 0
++	e.refreshRisk.Failures = 0
++	p.dirty.Store(true)
++}
++
++// ClearRefreshRisk is an explicit admin action, orthogonal to enable/revive.
++func (p *Pool) ClearRefreshRisk(uid string) (bool, bool) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	e := p.byUID[uid]
++	if e == nil {
++		return false, false
++	}
++	if e.refreshRisk == nil {
++		return true, false
++	}
++	changed := e.refreshRisk.Until != 0 || e.refreshRisk.NeedsReview || e.refreshRisk.Failures != 0
++	e.refreshRisk.Until = 0
++	e.refreshRisk.NeedsReview = false
++	e.refreshRisk.Failures = 0
++	p.dirty.Store(true)
++	return true, changed
++}
+--- /dev/null
++++ b/internal/pool/refresh_risk_test.go
+@@ -0,0 +1,111 @@
++package pool
++
++import (
++	"encoding/json"
++	"testing"
++	"time"
++	"workbuddy2api/internal/auth"
++)
++
++func TestRefreshRiskBoundsExpiryAndIndependence(t *testing.T) {
++	for _, tc := range []struct{ input, want time.Duration }{{-time.Hour, 5 * time.Minute}, {0, 5 * time.Minute}, {time.Second, 5 * time.Minute}, {15 * time.Minute, 15 * time.Minute}, {24 * time.Hour, 6 * time.Hour}} {
++		p := New("")
++		p.Add(&auth.Auth{UID: "risk"})
++		p.Add(&auth.Auth{UID: "healthy"})
++		now := time.Now()
++		e := p.byUID["risk"]
++		p.noteRefreshRateLimitedLocked(e, tc.input, now)
++		if e.refreshRisk.Until != now.Add(tc.want).Unix() {
++			t.Fatalf("wait=%v state=%+v", tc.input, e.refreshRisk)
++		}
++		if !e.refreshRiskActive(now) || e.healthy(now) || e.manualDisabled || e.disabled {
++			t.Fatal("automatic hold changed independent flags")
++		}
++		if got := p.Pick(""); got == nil || got.UID != "healthy" {
++			t.Fatalf("picked paused account: %+v", got)
++		}
++		if e.refreshRiskActive(now.Add(tc.want)) || !e.healthy(now.Add(tc.want)) {
++			t.Fatal("hold did not expire")
++		}
++		e.manualDisabled = true
++		e.disabled = true
++		p.ClearRefreshRisk("risk")
++		if !e.manualDisabled || !e.disabled {
++			t.Fatal("clear erased operator/system state")
++		}
++	}
++}
++
++func TestRefreshRiskEscalationRequiresDistinctRecoveryCycles(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u"})
++	e := p.byUID["u"]
++	now := time.Now()
++	p.noteRefreshRateLimitedLocked(e, 0, now)
++	p.noteRefreshRateLimitedLocked(e, 0, now.Add(time.Second))
++	if e.refreshRisk.Failures != 1 {
++		t.Fatal("concurrent failure counted as recovery")
++	}
++	for i := 2; i <= 3; i++ {
++		now = time.Unix(e.refreshRisk.Until, 0).Add(time.Second)
++		p.noteRefreshRateLimitedLocked(e, 0, now)
++		if e.refreshRisk.Failures != i {
++			t.Fatal(e.refreshRisk)
++		}
++	}
++	if !e.refreshRiskActive(now.Add(24*time.Hour)) || !e.refreshRisk.NeedsReview {
++		t.Fatal("repeat failures not escalated")
++	}
++	p.NoteRefreshSuccess("u")
++	if !e.refreshRisk.NeedsReview {
++		t.Fatal("inflight success cleared review")
++	}
++	p.ClearRefreshRisk("u")
++	if e.refreshRiskActive(time.Now()) {
++		t.Fatal("explicit clear failed")
++	}
++}
++
++func TestRefreshRiskLateFailureResetsStreakAndSuccessResets(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u"})
++	e := p.byUID["u"]
++	now := time.Now().Add(-time.Hour)
++	p.noteRefreshRateLimitedLocked(e, 0, now)
++	p.noteRefreshRateLimitedLocked(e, 0, time.Unix(e.refreshRisk.Until, 0).Add(6*time.Minute))
++	if e.refreshRisk.Failures != 1 {
++		t.Fatal("late failure escalated")
++	}
++	p.NoteRefreshSuccess("u")
++	if e.refreshRisk.Failures != 0 || e.refreshRisk.LastFailureAt == 0 {
++		t.Fatal("success must reset streak but retain warning")
++	}
++}
++
++func TestRefreshRiskStructuredStateRoundTripAndReasonNotAuthority(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u"})
++	e := p.byUID["u"]
++	e.manualReason = "account-risk: user-supplied reason"
++	if e.refreshRiskActive(time.Now()) {
++		t.Fatal("parsed manual reason")
++	}
++	p.PauseRefreshRateLimited("u", time.Hour)
++	// Persisted state and /status have distinct state/derived status types.
++	raw, err := json.Marshal(stateAccount{RefreshRisk: cloneRefreshRisk(e.refreshRisk)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	var saved stateAccount
++	if err = json.Unmarshal(raw, &saved); err != nil {
++		t.Fatal(err)
++	}
++	restored := &entry{refreshRisk: cloneRefreshRisk(saved.RefreshRisk)}
++	if !restored.refreshRiskActive(time.Now()) || restored.refreshRiskActive(time.Now().Add(2*time.Hour)) {
++		t.Fatal("persistent deadline invalid")
++	}
++	st, _ := p.Status("u")
++	if st.RefreshRisk == nil || !st.RefreshRisk.Paused || st.ManualDisabled || st.Disabled || st.CoolKind != "refresh_risk" {
++		t.Fatalf("wrong status: %+v", st)
++	}
++}
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -475,7 +475,8 @@
+ 	// 清理 cooledReasonLocked 同口径）。disabled 账号的 reason 是禁用原因，保留。
+ 	_, reason := cooledReasonLocked(e, now)
+ 	st := Status{
+-		UID: uid,
++		RefreshRisk: e.refreshRiskStatus(now),
++		UID:         uid,
+ 		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
+ 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
+ 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
+@@ -489,7 +490,7 @@
+ 		Credits:    e.credits,
+ 		// Cooling 口径含连败降权（degradeUntil）：降权期账号不可选，运维在 /status
+ 		// 应看到它处于非健康态（CoolRemaining 取三截止最远者，与 healthy 或门同口径）。
+-		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
++		Cooling:          now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil) || e.refreshRiskActive(now),
+ 		Reason:           reason,
+ 		Disabled:         e.disabled,
+ 		ManualDisabled:   e.manualDisabled,
+@@ -537,6 +538,16 @@
+ 		if st.Reason == "" && now.Before(e.degradeUntil) {
+ 			st.Reason = degradeReason
+ 			st.CoolKind = "degrade"
++		}
++	}
++	if e.refreshRiskActive(now) {
++		st.CoolKind = "refresh_risk"
++		st.Reason = "token refresh HTTP 429; bounded account backoff"
++		if e.refreshRisk.NeedsReview {
++			st.Reason = "token refresh repeated HTTP 429; manual review required"
++		}
++		if remaining := e.refreshRisk.Until - now.Unix(); remaining > st.CoolRemaining {
++			st.CoolRemaining = remaining
+ 		}
+ 	}
+ 	return st
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -506,7 +506,7 @@
+ 	}
+ 	for _, st := range statuses {
+ 		oc := CheckinOutcome{UID: st.UID, Nickname: st.Nickname}
+-		if st.Disabled {
++		if st.Disabled || s.cfg.Pool.RiskPaused(st.UID) {
+ 			oc.Status, oc.Detail = CheckinSkipped, "disabled"
+ 			skipN++
+ 			out = append(out, oc)
+@@ -657,7 +657,7 @@
+ 	count := s.cfg.ActivityReportCount
+ 	first := true
+ 	for _, st := range s.cfg.Pool.List() {
+-		if st.Disabled {
++		if st.Disabled || s.cfg.Pool.RiskPaused(st.UID) {
+ 			continue
+ 		}
+ 		a := s.cfg.Pool.AuthByUID(st.UID)
+@@ -895,13 +895,19 @@
+ func (s *Scheduler) RunKeepaliveNow() { s.runKeepalive(context.Background()) }
+ 
+ func (s *Scheduler) runKeepalive(ctx context.Context) {
++	checked, okN, failed, skipped := 0, 0, 0, 0
++	defer func() {
++		log.Printf("keepalive done: checked=%d ok=%d failed=%d skipped=%d", checked, okN, failed, skipped)
++	}()
+ 	first := true
+ 	for _, st := range s.cfg.Pool.List() {
+-		if st.Disabled {
++		if st.Disabled || s.cfg.Pool.RiskPaused(st.UID) {
++			skipped++
+ 			continue
+ 		}
+ 		a := s.cfg.Pool.AuthByUID(st.UID)
+ 		if a == nil || a.RefreshTokenValue() == "" {
++			skipped++
+ 			continue
+ 		}
+ 		if !first && !sleepCtx(ctx, s.accountGap(ctx, 0)) {
+@@ -911,7 +917,9 @@
+ 			return
+ 		}
+ 		first = false
++		checked++
+ 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
++			failed++
+ 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+ 			var ue *upstream.Error
+ 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+@@ -921,6 +929,8 @@
+ 			}
+ 			continue
+ 		}
++		okN++
++		log.Printf("keepalive %s: ok", logfmt.Label(st.UID, st.Nickname))
+ 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
+ 		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
+ 		if err := a.SaveAtomic(); err != nil {
+--- a/internal/scheduler/school.go
++++ b/internal/scheduler/school.go
+@@ -108,6 +108,14 @@
+ func (s *Scheduler) RunSchoolNow() { s.runSchool(context.Background()) }
+ 
+ func (s *Scheduler) runSchool(ctx context.Context) {
++	if s.cfg.Pool != nil {
++		for _, account := range s.cfg.Pool.List() {
++			if s.cfg.Pool.RiskPaused(account.UID) {
++				log.Printf("scheduled school skipped: token refresh safety pause")
++				return
++			}
++		}
++	}
+ 	root := repoRoot()
+ 	runScriptContext(ctx, "school", root, [][]string{
+ 		s.accountScriptArgs(ctx, []string{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"}),
+@@ -120,6 +128,14 @@
+ func (s *Scheduler) RunCatNow() { s.runCat(context.Background()) }
+ 
+ func (s *Scheduler) runCat(ctx context.Context) {
++	if s.cfg.Pool != nil {
++		for _, account := range s.cfg.Pool.List() {
++			if s.cfg.Pool.RiskPaused(account.UID) {
++				log.Printf("scheduled cat skipped: token refresh safety pause")
++				return
++			}
++		}
++	}
+ 	root := repoRoot()
+ 	runScriptContext(ctx, "cat", root, [][]string{
+ 		s.accountScriptArgs(ctx, []string{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"}),
+--- a/internal/scheduler/travel.go
++++ b/internal/scheduler/travel.go
+@@ -72,7 +72,7 @@
+ func (s *Scheduler) runTravel(ctx context.Context) {
+ 	first := true
+ 	for _, st := range s.cfg.Pool.List() {
+-		if st.Disabled {
++		if st.Disabled || s.cfg.Pool.RiskPaused(st.UID) {
+ 			continue
+ 		}
+ 		a := s.cfg.Pool.AuthByUID(st.UID)
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -175,6 +175,9 @@
+ 		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
+ 		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
+ 		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
++		h.mux.HandleFunc("POST /admin/accounts/{uid}/refresh-risk", h.withAuth(h.adminRefreshRisk))
++		h.mux.HandleFunc("POST /admin/accounts/{uid}/refresh-risk/clear", h.withAuth(h.adminClearRefreshRisk))
++		h.mux.HandleFunc("POST /admin/accounts/{uid}/refresh-risk/success", h.withAuth(h.adminRefreshRiskSuccess))
+ 		h.mux.HandleFunc("POST /admin/accounts/{uid}/models/{model}/available", h.withAuth(h.adminModelAvailable))
+ 	}
+ 	h.mux.HandleFunc("GET /healthz", h.healthz)
+--- /dev/null
++++ b/internal/server/refresh_risk.go
+@@ -0,0 +1,65 @@
++package server
++
++import (
++	"encoding/json"
++	"io"
++	"net/http"
++	"time"
++)
++
++func (h *Handler) adminRefreshRisk(w http.ResponseWriter, r *http.Request) {
++	uid, ok := adminUID(w, r)
++	if !ok {
++		return
++	}
++	if _, found := h.cfg.Pool.Status(uid); !found {
++		writeOpenAIError(w, 404, "not_found", "account not found")
++		return
++	}
++	var body struct {
++		RetryAfterSec int64 `json:"retry_after_sec"`
++	}
++	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
++		writeOpenAIError(w, 400, "invalid_request", "expected retry_after_sec")
++		return
++	}
++	// Clamp before conversion to avoid duration overflow from untrusted JSON.
++	if body.RetryAfterSec < 300 {
++		body.RetryAfterSec = 300
++	}
++	if body.RetryAfterSec > 21600 {
++		body.RetryAfterSec = 21600
++	}
++	h.cfg.Pool.PauseRefreshRateLimited(uid, time.Duration(body.RetryAfterSec)*time.Second)
++	status, _ := h.cfg.Pool.Status(uid)
++	writeJSON(w, 200, map[string]any{"uid": uid, "refresh_risk": status.RefreshRisk})
++}
++
++func (h *Handler) adminClearRefreshRisk(w http.ResponseWriter, r *http.Request) {
++	uid, ok := adminUID(w, r)
++	if !ok {
++		return
++	}
++	found, changed := h.cfg.Pool.ClearRefreshRisk(uid)
++	if !found {
++		writeOpenAIError(w, 404, "not_found", "account not found")
++		return
++	}
++	status, _ := h.cfg.Pool.Status(uid)
++	writeJSON(w, 200, map[string]any{"uid": uid, "changed": changed, "refresh_risk": status.RefreshRisk,
++		"manual_disabled": status.ManualDisabled, "disabled": status.Disabled})
++}
++
++func (h *Handler) adminRefreshRiskSuccess(w http.ResponseWriter, r *http.Request) {
++	uid, ok := adminUID(w, r)
++	if !ok {
++		return
++	}
++	if _, found := h.cfg.Pool.Status(uid); !found {
++		writeOpenAIError(w, 404, "not_found", "account not found")
++		return
++	}
++	h.cfg.Pool.NoteRefreshSuccess(uid)
++	status, _ := h.cfg.Pool.Status(uid)
++	writeJSON(w, 200, map[string]any{"uid": uid, "refresh_risk": status.RefreshRisk})
++}
+--- /dev/null
++++ b/internal/server/refresh_risk_test.go
+@@ -0,0 +1,56 @@
++package server
++
++import (
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++	"workbuddy2api/internal/auth"
++)
++
++func TestRefreshRiskAdminAuthAndIndependentRecovery(t *testing.T) {
++	p := testPoolWith(&auth.Auth{UID: "u1"})
++	for _, enabled := range []bool{false, true} {
++		h := NewHandler(Config{Pool: p, APIKey: "key", AdminEnabled: enabled})
++		for _, action := range []string{"refresh-risk", "refresh-risk/clear"} {
++			path := "/admin/accounts/u1/" + action
++			req := httptest.NewRequest("POST", path, strings.NewReader(`{"retry_after_sec":900}`))
++			rec := httptest.NewRecorder()
++			h.ServeHTTP(rec, req)
++			want := 401
++			if !enabled {
++				want = 404
++			}
++			if rec.Code != want {
++				t.Fatalf("%s unauth=%d want=%d", action, rec.Code, want)
++			}
++		}
++	}
++	h := NewHandler(Config{Pool: p, APIKey: "key", AdminEnabled: true})
++	for _, action := range []string{"refresh-risk", "disable", "enable", "refresh-risk/clear"} {
++		req := httptest.NewRequest("POST", "/admin/accounts/u1/"+action, strings.NewReader(`{"retry_after_sec":900}`))
++		req.Header.Set("Authorization", "Bearer key")
++		rec := httptest.NewRecorder()
++		h.ServeHTTP(rec, req)
++		if rec.Code != 200 {
++			t.Fatalf("%s: %s", action, rec.Body.String())
++		}
++		if action == "enable" && !p.RiskPaused("u1") {
++			t.Fatal("enable must not clear independent hold")
++		}
++	}
++	if p.RiskPaused("u1") {
++		t.Fatal("dedicated clear failed")
++	}
++	p.PauseRefreshRateLimited("u1", time.Hour)
++	req := httptest.NewRequest("POST", "/admin/accounts/u1/disable", strings.NewReader(`{}`))
++	req.Header.Set("Authorization", "Bearer key")
++	h.ServeHTTP(httptest.NewRecorder(), req)
++	req = httptest.NewRequest("POST", "/admin/accounts/u1/refresh-risk/clear", strings.NewReader(`{}`))
++	req.Header.Set("Authorization", "Bearer key")
++	h.ServeHTTP(httptest.NewRecorder(), req)
++	st, _ := p.Status("u1")
++	if !st.ManualDisabled || p.RiskPaused("u1") {
++		t.Fatal("clearing risk changed operator stop")
++	}
++}
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -726,7 +726,10 @@
+ 
+ // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
+ type Client struct {
+-	HTTP *http.Client
++	RefreshPaused      func(uid string) bool
++	OnRefreshRateLimit func(uid string, retryAfter time.Duration)
++	OnRefreshSuccess   func(uid string)
++	HTTP               *http.Client
+ 
+ 	// ChatHTTP 聊天 SSE 专用 client：无总时长上限（Timeout=0），首字节由
+ 	// Transport.ResponseHeaderTimeout 约束，流中空闲由 IdleTimeout 约束。
+@@ -1058,7 +1061,11 @@
+ 	}
+ 	if resp.StatusCode >= 400 {
+ 		kind := Classify(resp.StatusCode, string(raw))
+-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
++		retryAfter := time.Duration(0)
++		if resp.StatusCode == http.StatusTooManyRequests {
++			retryAfter = refreshRetryAfter(resp.Header, raw)
++		}
++		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200), RetryAfter: retryAfter}
+ 	}
+ 	var env apiEnvelope
+ 	if err := json.Unmarshal(raw, &env); err != nil {
+@@ -1093,7 +1100,15 @@
+ //     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
+ //   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
+ //     已变），本次结果直接采用（新 token 已生效），不再重复写回。
+-func (c *Client) RefreshToken(a *auth.Auth) error {
++func (c *Client) RefreshToken(a *auth.Auth) (err error) {
++	if c.RefreshPaused != nil && c.RefreshPaused(a.UID) {
++		return &Error{Kind: ErrSoftRate, Status: http.StatusTooManyRequests, Msg: "token refresh safety pause active"}
++	}
++	defer func() {
++		if err == nil && c.OnRefreshSuccess != nil {
++			c.OnRefreshSuccess(a.UID)
++		}
++	}()
+ 	// 第 1 段（锁内）：读快照。
+ 	a.Lock()
+ 	rtSnapshot := a.RefreshToken
+@@ -1130,6 +1145,10 @@
+ 	// 网络 I/O（锁外，30s 上限）。
+ 	data, err := c.doJSON(&hdrSnapshot, req)
+ 	if err != nil {
++		var upstreamErr *Error
++		if errors.As(err, &upstreamErr) && upstreamErr.Status == 429 && c.OnRefreshRateLimit != nil {
++			c.OnRefreshRateLimit(a.UID, upstreamErr.RetryAfter)
++		}
+ 		return err
+ 	}
+ 	var tok struct {
+--- /dev/null
++++ b/internal/upstream/refresh_retry.go
+@@ -0,0 +1,42 @@
++package upstream
++
++import (
++	"encoding/json"
++	"net/http"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// Refresh backoff has its own small, bounded retry policy. It must not share
++// model quota parsing or infer a permanent restriction from HTTP 429 alone.
++func refreshRetryAfter(header http.Header, raw []byte) time.Duration {
++	seconds := float64(300)
++	value := strings.TrimSpace(header.Get("Retry-After"))
++	if n, err := strconv.ParseFloat(value, 64); err == nil {
++		seconds = n
++	} else if at, err := http.ParseTime(value); err == nil {
++		seconds = time.Until(at).Seconds()
++	} else {
++		var body struct {
++			RetryAfter float64 `json:"retry_after"`
++			Policy     struct {
++				RetryAfter float64 `json:"retry_after"`
++			} `json:"retry_policy"`
++		}
++		if json.Unmarshal(raw, &body) == nil {
++			if body.RetryAfter != 0 {
++				seconds = body.RetryAfter
++			} else if body.Policy.RetryAfter != 0 {
++				seconds = body.Policy.RetryAfter
++			}
++		}
++	}
++	if seconds < 300 {
++		seconds = 300
++	}
++	if seconds > 21600 {
++		seconds = 21600
++	}
++	return time.Duration(seconds) * time.Second
++}
+--- /dev/null
++++ b/internal/upstream/refresh_risk_test.go
+@@ -0,0 +1,75 @@
++package upstream
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++	"workbuddy2api/internal/auth"
++)
++
++func TestRefreshRetryAfterBounded(t *testing.T) {
++	for _, tc := range []struct {
++		header, body string
++		want         time.Duration
++	}{{"", "", 5 * time.Minute}, {"1", "", 5 * time.Minute}, {"900", "", 15 * time.Minute}, {"999999999", "", 6 * time.Hour}, {"", `{"retry_after":900}`, 15 * time.Minute}, {"", `{"retry_policy":{"retry_after":1200}}`, 20 * time.Minute}} {
++		h := http.Header{}
++		h.Set("Retry-After", tc.header)
++		if got := refreshRetryAfter(h, []byte(tc.body)); got != tc.want {
++			t.Fatalf("%+v: %v", tc, got)
++		}
++	}
++	h := http.Header{}
++	h.Set("Retry-After", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
++	got := refreshRetryAfter(h, nil)
++	if got < 59*time.Minute || got > time.Hour {
++		t.Fatal(got)
++	}
++}
++
++func TestRefreshPausedSkipsNetworkAndCallbacks(t *testing.T) {
++	c := New()
++	c.RefreshPaused = func(uid string) bool { return uid == "u" }
++	c.OnRefreshRateLimit = func(string, time.Duration) { t.Fatal("local guard is not a new upstream failure") }
++	c.OnRefreshSuccess = func(string) { t.Fatal("blocked refresh cannot count as success") }
++	if err := c.RefreshToken(&auth.Auth{UID: "u"}); err == nil {
++		t.Fatal("expected local hold")
++	}
++}
++
++func TestRefreshRateLimitCallbackUsesActualRefreshResponse(t *testing.T) {
++	for _, status := range []int{429, 500, 200} {
++		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++			w.Header().Set("Retry-After", "900")
++			w.WriteHeader(status)
++			if status == 200 {
++				fmt.Fprint(w, `{"code":0,"data":{"accessToken":"new","refreshToken":"new-refresh","expiresIn":3600}}`)
++			} else {
++				fmt.Fprint(w, `{"code":500,"msg":"temporarily unavailable"}`)
++			}
++		}))
++		c := New()
++		c.ChatBaseCN = srv.URL
++		limits, successes := 0, 0
++		c.OnRefreshRateLimit = func(uid string, d time.Duration) {
++			limits++
++			if uid != "u" || d != 15*time.Minute {
++				t.Errorf("callback uid=%s wait=%v", uid, d)
++			}
++		}
++		c.OnRefreshSuccess = func(string) { successes++ }
++		_ = c.RefreshToken(&auth.Auth{UID: "u", AccessToken: "old", RefreshToken: "old-refresh"})
++		srv.Close()
++		wantLimits, wantSuccesses := 0, 0
++		if status == 429 {
++			wantLimits = 1
++		}
++		if status == 200 {
++			wantSuccesses = 1
++		}
++		if limits != wantLimits || successes != wantSuccesses {
++			t.Fatalf("status=%d limits=%d successes=%d", status, limits, successes)
++		}
++	}
++}

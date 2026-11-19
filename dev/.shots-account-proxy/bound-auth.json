@@ -1,0 +1,15 @@
+{
+ "account": {
+  "uid": "ap000000-0000-0000-0000-0000000000p1",
+  "enterpriseId": "ent",
+  "nickname": "代理号"
+ },
+ "auth": {
+  "accessToken": "eyJhbGciOiAibm9uZSIsICJ0eXAiOiAiSldUIn0.eyJpYXQiOiAxNzkwODQzODgxLCAiZXhwIjogMTc5NjAyNzg4MSwgInVpZCI6ICJhcDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwcDEifQ.sig",
+  "refreshToken": "r",
+  "expiresAt": 1796027881,
+  "domain": "copilot.tencent.com",
+  "realm": "cn"
+ },
+ "proxy": "hk"
+}

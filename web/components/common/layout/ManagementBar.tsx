@@ -5,11 +5,10 @@ import {
   MessageCircleIcon,
   BarChart3,
   Users,
-  ClipboardList,
   KeyRound,
   Boxes,
-  MessageSquare,
   ScrollText,
+  Radar,
   TrendingUp,
   ShieldCheck,
   Settings,
@@ -20,6 +19,8 @@ import {
   Link2,
   FolderGit2,
   ChevronRight,
+  Pin as PinIcon,
+  Move as MoveIcon,
 } from 'lucide-react';
 import {useThemeUtils} from '@/hooks/use-theme-utils';
 import {useAuth} from '@/lib/auth-context';
@@ -56,12 +57,22 @@ const BUILD_TIME = process.env.NEXT_PUBLIC_BUILD_TIME || '';
 // v2：坐标语义由「左边缘」改为「水平中心」，旧版本存储的位置不再兼容
 const DOCK_STORAGE_KEY = 'workbuddy-manager:dock-position-v2';
 const DOCK_TIP_STORAGE_KEY = 'workbuddy-manager:dock-tip-dismissed';
+// 底栏位置模式。floating = 自由拖动（默认，沿用原有形态）；pinned = 固定底部居中、不可拖。
+// 之所以要有 pinned：底栏是**浮动**的，拖到页面中部就会压住正文（`docs/images/settings.png`
+// 里它正压着「自定义系统提示词」输入区）。形态本身按既定决策保留，但得给用户一个
+// 「别再挡我」的确定性选项 —— 拖回去靠的是「记得它本来在哪」。
+const DOCK_MODE_STORAGE_KEY = 'workbuddy-manager:dock-mode';
 const DOCK_MARGIN = 16;
-const DOCK_LONG_PRESS_MS = 180;
+// 180ms 太短：正常慢点击也会越过阈值，进入拖动后 pointerup 还会吞掉 click。
+// 500ms 与系统长按手势一致；拖动前还要再确认「指针没先移动」。
+const DOCK_LONG_PRESS_MS = 500;
+const DOCK_DRAG_CANCEL_DISTANCE = 8;
+const DOCK_DRAG_MOVE_EPSILON = 2;
 const DOCK_CLICK_SUPPRESS_MS = 220;
 const DOCK_INTERACTIVE_SELECTOR = 'a,button,input,textarea,select,[role="button"],[data-dock-no-drag="true"]';
 
 type DockViewport = 'desktop' | 'mobile';
+type DockMode = 'floating' | 'pinned';
 
 type DockPosition = {
   x: number;
@@ -89,6 +100,7 @@ export function ManagementBar() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [dockPosition, setDockPosition] = useState<DockPosition | null>(null);
+  const [dockMode, setDockMode] = useState<DockMode>('floating');
   const [showDockTip, setShowDockTip] = useState(false);
   const [dockTipStep, setDockTipStep] = useState(0);
   /** 受管账号数量（真实数据，供个人信息面板展示） */
@@ -104,10 +116,17 @@ export function ManagementBar() {
   const [runtimeVersion, setRuntimeVersion] = useState<string | null>(null);
   const dockRef = useRef<HTMLDivElement>(null);
   const dockViewportRef = useRef<DockViewport>('desktop');
+  /**
+   * 位置解析要读模式，但模式在 `syncDockPosition` 的依赖里会带来无谓的重建
+   * （每次切换模式都会换掉 resize 监听）。用 ref 镜像一份，回调保持稳定。
+   */
+  const dockModeRef = useRef<DockMode>('floating');
   const dragOffsetRef = useRef({x: 0, y: 0});
   const dockPressTimerRef = useRef<number | null>(null);
   const pressStartRef = useRef({x: 0, y: 0});
+  const pressCleanupRef = useRef<(() => void) | null>(null);
   const isDraggingRef = useRef(false);
+  const dragMovedRef = useRef(false);
   const suppressClickUntilRef = useRef(0);
 
   const getViewport = useCallback((): DockViewport => (window.innerWidth >= 768 ? 'desktop' : 'mobile'), []);
@@ -206,20 +225,47 @@ export function ManagementBar() {
     });
   }, [clampDockPosition, getDockRect]);
 
+  /**
+   * 当前模式下、某个视口应该把底栏放在哪。
+   *
+   * 固定底部时**一律用默认位置**（桌面：底部居中；手机：右下角），不再读 localStorage
+   * 里那份拖动过的坐标 —— 否则窗口一 resize 就会跳回用户之前拖到的位置，
+   * 而用户选「固定底部」正是为了让它别再乱跑。
+   */
+  const resolveDockPosition = useCallback((viewport: DockViewport): DockPosition => {
+    if (dockModeRef.current === 'pinned') return getDefaultDockPosition(viewport);
+    const savedPosition = readDockPositions()[viewport];
+    return savedPosition ? getScaledDockPosition(savedPosition) : getDefaultDockPosition(viewport);
+  }, [getDefaultDockPosition, getScaledDockPosition, readDockPositions]);
+
   const syncDockPosition = useCallback((nextViewport?: DockViewport) => {
     if (typeof window === 'undefined') return;
 
     const viewport = nextViewport ?? getViewport();
     dockViewportRef.current = viewport;
     setDockViewport(viewport);
+    setDockPosition(resolveDockPosition(viewport));
+  }, [getViewport, resolveDockPosition]);
 
-    const savedPosition = readDockPositions()[viewport];
-    const nextPosition = savedPosition ? getScaledDockPosition(savedPosition) : getDefaultDockPosition(viewport);
-    setDockPosition(nextPosition);
-  }, [getDefaultDockPosition, getScaledDockPosition, getViewport, readDockPositions]);
+  /**
+   * 切换底栏位置模式。只写 localStorage 与状态，位置交给 `syncDockPosition` 重算
+   * —— 两处各算一次的话，resize 与切换会得到不同结果。
+   */
+  const changeDockMode = useCallback((mode: DockMode) => {
+    dockModeRef.current = mode;
+    setDockMode(mode);
+    if (typeof window !== 'undefined') {
+      window.localStorage.setItem(DOCK_MODE_STORAGE_KEY, mode);
+    }
+    syncDockPosition();
+  }, [syncDockPosition]);
 
   useEffect(() => {
     setMounted(true);
+    if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem(DOCK_MODE_STORAGE_KEY) === 'pinned' ? 'pinned' : 'floating';
+    dockModeRef.current = stored;
+    setDockMode(stored);
   }, []);
 
   // 取真实运行版本（后端为准）。失败就退回 package.json，不让面板空白。
@@ -297,11 +343,10 @@ export function ManagementBar() {
     const handleResize = () => {
       window.requestAnimationFrame(() => {
         const viewport = getViewport();
-        const savedPosition = readDockPositions()[viewport];
 
         dockViewportRef.current = viewport;
         setDockViewport(viewport);
-        setDockPosition(savedPosition ? getScaledDockPosition(savedPosition) : getDefaultDockPosition(viewport));
+        setDockPosition(resolveDockPosition(viewport));
       });
     };
 
@@ -311,7 +356,7 @@ export function ManagementBar() {
       window.cancelAnimationFrame(frameId);
       window.removeEventListener('resize', handleResize);
     };
-  }, [getDefaultDockPosition, getScaledDockPosition, getViewport, mounted, readDockPositions, syncDockPosition]);
+  }, [getViewport, mounted, resolveDockPosition, syncDockPosition]);
 
   useEffect(() => {
     const openAdd = () => {
@@ -339,12 +384,14 @@ export function ManagementBar() {
   const dockTipSteps = dockViewport === 'mobile' ?
     [
       t('dock.mobile1'),
-      t('dock.mobile2'),
+      // 「长按空白区域可拖动」这一条在固定底部模式下是**假的**（那时拖动被禁用）。
+      // 引导里留一句做不到的话，比不写更糟 —— 用户会反复长按然后怀疑是自己手法不对。
+      ...(dockMode === 'floating' ? [t('dock.mobile2')] : []),
       t('dock.mobile3'),
       t('dock.mobile4'),
     ] :
     [
-      t('dock.desktop1'),
+      ...(dockMode === 'floating' ? [t('dock.desktop1')] : []),
       t('dock.desktop2'),
       t('dock.desktop3'),
     ];
@@ -358,6 +405,23 @@ export function ManagementBar() {
       return current + 1;
     });
   }, [dockTipSteps.length, handleDismissDockTip]);
+
+  // 点底栏以外的任何地方就把引导收起来。原实现只能靠**把几条都点完**才关得掉，
+  // 于是它会在页面上一直挂着（用户反馈「反复出现在页面中部」）—— 它挂在底栏正上方，
+  // 而底栏可以被拖到页面中部，于是它正好压住正文。
+  // 捕获阶段监听：底栏自己的 pointerdown 也要能让它先关掉。
+  useEffect(() => {
+    if (!showDockTip || typeof document === 'undefined') return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-slot=dock-tip]')) return;
+      handleDismissDockTip();
+    };
+
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    return () => document.removeEventListener('pointerdown', handlePointerDown, true);
+  }, [handleDismissDockTip, showDockTip]);
 
   const clearDockPressTimer = useCallback(() => {
     if (dockPressTimerRef.current !== null) {
@@ -377,8 +441,17 @@ export function ManagementBar() {
       y: clientY - dockPosition.y,
     };
     isDraggingRef.current = true;
+    dragMovedRef.current = false;
+    const pressStart = pressStartRef.current;
 
     const handlePointerMove = (moveEvent: PointerEvent) => {
+      const dx = moveEvent.clientX - pressStart.x;
+      const dy = moveEvent.clientY - pressStart.y;
+      // 长按后没移动就不算拖动：否则 pointerup 会吞掉一次正常点击。
+      if (!dragMovedRef.current &&
+          Math.hypot(dx, dy) < DOCK_DRAG_MOVE_EPSILON) return;
+      dragMovedRef.current = true;
+
       const nextPosition = clampDockPosition({
         x: moveEvent.clientX - dragOffsetRef.current.x,
         y: moveEvent.clientY - dragOffsetRef.current.y,
@@ -396,7 +469,10 @@ export function ManagementBar() {
       setDockPosition(nextPosition);
       writeDockPosition(dockViewportRef.current, nextPosition);
       isDraggingRef.current = false;
-      suppressClickUntilRef.current = Date.now() + DOCK_CLICK_SUPPRESS_MS;
+      if (dragMovedRef.current) {
+        suppressClickUntilRef.current = Date.now() + DOCK_CLICK_SUPPRESS_MS;
+      }
+      dragMovedRef.current = false;
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
       window.removeEventListener('pointercancel', handlePointerUp);
@@ -409,15 +485,53 @@ export function ManagementBar() {
 
   const handleDockPointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (!dockPosition || event.button !== 0) return;
+    // 固定底部时**彻底关掉拖动**，而不只是「拖完再弹回来」：后者会先跟手走一段、
+    // 松手才归位，看起来像拖动坏了。
+    if (dockMode !== 'floating') return;
     if ((event.target as HTMLElement).closest(DOCK_INTERACTIVE_SELECTOR)) return;
 
     pressStartRef.current = {x: event.clientX, y: event.clientY};
     clearDockPressTimer();
+    // 上一轮按下如果还在等长按，先撤掉它的 window 监听。
+    pressCleanupRef.current?.();
+    pressCleanupRef.current = null;
+
+    function cleanupPressListeners() {
+      window.removeEventListener('pointermove', handlePreDragMove);
+      window.removeEventListener('pointerup', handlePreDragEnd);
+      window.removeEventListener('pointercancel', handlePreDragEnd);
+      pressCleanupRef.current = null;
+    }
+    function handlePreDragMove(moveEvent: PointerEvent) {
+      const dx = moveEvent.clientX - pressStartRef.current.x;
+      const dy = moveEvent.clientY - pressStartRef.current.y;
+      // 还没到长按时间就先移动了 → 这是点击/滑动，不是拖动底栏。
+      if (Math.hypot(dx, dy) < DOCK_DRAG_CANCEL_DISTANCE) return;
+      clearDockPressTimer();
+      cleanupPressListeners();
+    }
+    function handlePreDragEnd() {
+      clearDockPressTimer();
+      cleanupPressListeners();
+    }
+
+    window.addEventListener('pointermove', handlePreDragMove);
+    window.addEventListener('pointerup', handlePreDragEnd);
+    window.addEventListener('pointercancel', handlePreDragEnd);
+    pressCleanupRef.current = cleanupPressListeners;
+
     dockPressTimerRef.current = window.setTimeout(() => {
+      cleanupPressListeners();
       beginDockDrag(pressStartRef.current.x, pressStartRef.current.y);
       dockPressTimerRef.current = null;
     }, DOCK_LONG_PRESS_MS);
-  }, [beginDockDrag, clearDockPressTimer, dockPosition]);
+  }, [beginDockDrag, clearDockPressTimer, dockMode, dockPosition]);
+
+  useEffect(() => () => {
+    // 卸载时别把等待中的长按 timer 留到下一次挂载后再触发。
+    clearDockPressTimer();
+    pressCleanupRef.current?.();
+  }, [clearDockPressTimer]);
 
   const handleDockPointerEnd = useCallback(() => {
     if (!isDraggingRef.current) {
@@ -432,66 +546,96 @@ export function ManagementBar() {
     event.stopPropagation();
   }, []);
 
+  /**
+   * 底栏分组（P1-1：11 项平铺、分隔线无标签）。
+   *
+   * 三组语义 —— 总览 / 运营 / 治理；快速添加与个人信息不是「目的地」而是动作，
+   * 单独一组（不带组名，只画一条分隔线）。
+   *
+   * 组名只写在该组**第一项**上：`splitByGroup` 取的是组内首项的 label，
+   * 所以不必每项重复一遍。
+   *
+   * ⚠️ 原来这里有一个 `{title: 'divider', icon: <div />}` 的**哨兵条目**。
+   * 它有两个问题：渲染层每个分支都得记得跳过它（移动端就是靠一句
+   * `if (item.title === 'divider') return null` 硬跳过的），而且**手机端因此
+   * 完全没有分组语义**。现在改成把分组键挂在条目上，由渲染层自己切。
+   *
+   * ⚠️ 批次 4 ② 把**目的地从 11 项收敛到 8 项**：`任务记录` / `红包` /
+   * `聊天测试台` 不再各占一个入口，改成在「账号」/「密钥」/「模型」页里用
+   * 页内二级导航切换（清单在 `@/lib/section-nav`，渲染在 `PageSectionTabs`）。
+   * 判据是「用户会不会在同一段时间里来回切」——会，那就不是两个一级入口。
+   * 三个被吸收的页面**路径没变**，所以既有的书签与深链仍然直接可用。
+   */
   const dockItems = [
     {
       title: t('nav.dashboard'),
       icon: <BarChart3 {...IconOptions} />,
       href: '/dashboard',
+      groupKey: 'overview',
+      groupLabel: t('nav.groupOverview'),
     },
     {
       title: t('nav.accounts'),
       icon: <Users {...IconOptions} />,
       href: '/accounts',
-    },
-    {
-      title: t('nav.tasks'),
-      icon: <ClipboardList {...IconOptions} />,
-      href: '/tasks',
+      groupKey: 'ops',
+      groupLabel: t('nav.groupOps'),
     },
     {
       title: t('nav.keys'),
       icon: <KeyRound {...IconOptions} />,
       href: '/keys',
+      groupKey: 'ops',
     },
     {
       title: t('nav.models'),
       icon: <Boxes {...IconOptions} />,
       href: '/models',
-    },
-    {
-      title: t('nav.playground'),
-      icon: <MessageSquare {...IconOptions} />,
-      href: '/playground',
-    },
-    {
-      title: 'divider',
-      icon: <div />,
+      groupKey: 'ops',
     },
     {
       title: t('nav.stats'),
       icon: <TrendingUp {...IconOptions} />,
       href: '/stats',
+      groupKey: 'governance',
+      groupLabel: t('nav.groupGovernance'),
     },
     {
       title: t('nav.logs'),
       icon: <ScrollText {...IconOptions} />,
       href: '/logs',
+      groupKey: 'governance',
+    },
+    {
+      // 轨迹（调用抓包）与请求日志同属「治理」组，但**同级的入口**：
+      // 日志回答「谁用了多少」，轨迹回答「这一轮到底发了什么、改了什么」，
+      // 是两种不同的动作（扫一眼 vs 逐轮对比），不该藏进二级导航里。
+      title: t('nav.traces'),
+      icon: <Radar {...IconOptions} />,
+      href: '/traces',
+      groupKey: 'governance',
     },
     {
       title: t('nav.security'),
       icon: <ShieldCheck {...IconOptions} />,
       href: '/security',
+      groupKey: 'governance',
     },
     {
       title: t('nav.settings'),
       icon: <Settings {...IconOptions} />,
       href: '/settings',
+      groupKey: 'governance',
     },
     {
       title: t('nav.quickAdd'),
       icon: <PlusCircle {...IconOptions} />,
+      // 动作组：不带组名，只跟前面的目的地分开
+      groupKey: 'actions',
       customComponent: (
         <div
+          data-slot="dock-quick-add"
+          data-dock-no-drag="true"
           onClick={() => {
             if (isAdmin) setAddOpen(true);
           }}
@@ -504,11 +648,16 @@ export function ManagementBar() {
     {
       title: t('nav.profile'),
       icon: <User {...IconOptions} />,
+      groupKey: 'actions',
       customComponent: (
         <>
           <Dialog open={profileOpen} onOpenChange={setProfileOpen}>
             <DialogTrigger asChild>
-              <div className="w-full h-full flex items-center justify-center cursor-pointer rounded transition-colors">
+              <div
+                data-slot="dock-profile-trigger"
+                data-dock-no-drag="true"
+                className="w-full h-full flex items-center justify-center cursor-pointer rounded transition-colors"
+              >
                 <User className="h-4 w-4" />
               </div>
             </DialogTrigger>
@@ -647,6 +796,30 @@ export function ManagementBar() {
                                   </span>
                                 </div>
                               </button>
+
+                              {/* 底栏位置：底栏是浮动的，拖到页面中部就会压住正文。
+                                  形态按既定决策保留，但给一个「别再挡我」的确定性选项。
+                                  做成 toggle 而不是两个按钮：它是二选一的状态，
+                                  两个按钮会让人以为可以同时开。 */}
+                              <button
+                                type="button"
+                                data-slot="dock-mode-toggle"
+                                aria-label={t('profile.dockLabel')}
+                                title={t('profile.dockLabel')}
+                                onClick={() => changeDockMode(dockMode === 'floating' ? 'pinned' : 'floating')}
+                                className="inline-flex items-center gap-2 rounded-full bg-muted px-3 py-2 transition-colors hover:bg-muted/80"
+                              >
+                                <div className="flex items-center gap-2">
+                                  {dockMode === 'pinned' ? (
+                                    <PinIcon className="size-3.5 text-foreground/60" />
+                                  ) : (
+                                    <MoveIcon className="size-3.5 text-foreground/60" />
+                                  )}
+                                  <span className="text-xs font-medium text-foreground">
+                                    {dockMode === 'pinned' ? t('profile.dockPinned') : t('profile.dockFloating')}
+                                  </span>
+                                </div>
+                              </button>
                             </div>
                           </div>
                         )}
@@ -734,20 +907,29 @@ export function ManagementBar() {
     <>
       <div
         ref={dockRef}
+        data-slot="dock-root"
         className="fixed z-40 select-none touch-none"
         onPointerDown={handleDockPointerDown}
         onPointerUp={handleDockPointerEnd}
         onPointerCancel={handleDockPointerEnd}
         onClickCapture={handleDockClickCapture}
         style={
-          dockPosition ?
-            {left: dockPosition.x, top: dockPosition.y, transform: 'translateX(-50%)'} :
-            {visibility: 'hidden'}
+          // 个人信息 / 快速添加弹窗打开时把底栏整个藏起来（issue #406）：遮罩是
+          // 半透明的，底栏会留在下面，而鼠标跟随的放大动画不会自己复位，看起来
+          // 像「弹窗开着底栏还在动」。快速添加原本就因焦点转移而停住，这里把两个
+          // 弹窗统一处理，避免两处行为不一致。
+          profileOpen || addOpen ?
+            {visibility: 'hidden'} :
+            dockPosition ?
+              {left: dockPosition.x, top: dockPosition.y, transform: 'translateX(-50%)'} :
+              {visibility: 'hidden'}
         }
       >
         {showDockTip && (
           <div
             data-dock-no-drag="true"
+            data-slot="dock-tip"
+            role="status"
             className="pointer-events-auto absolute bottom-full right-0 mb-2 w-[min(15rem,calc(100vw-2.5rem))] rounded-2xl border border-border/60 bg-background/95 px-2.5 py-2 text-left shadow-[0_18px_40px_rgba(15,23,42,0.12)] ring-1 ring-black/[0.03] backdrop-blur-sm md:left-1/2 md:right-auto md:mb-2.5 md:w-[17rem] md:-translate-x-1/2 md:px-3 dark:bg-background dark:shadow-[0_18px_40px_rgba(0,0,0,0.35)] dark:ring-white/[0.04]"
             onPointerDown={(event) => event.stopPropagation()}
             onPointerUp={(event) => event.stopPropagation()}
@@ -758,7 +940,10 @@ export function ManagementBar() {
                 {t('dock.tipTitle')}
               </div>
               <p className="text-[10px] leading-4 text-muted-foreground md:text-[11px]">
-                {dockTipSteps[dockTipStep]}
+                {/* 索引夹回范围内：切换「固定底部 / 悬浮」会让步骤数变化
+                    （固定模式下「长按可拖动」那一条被去掉），停在最后一步时
+                    索引可能越界，直接取会渲染出 undefined。 */}
+                {dockTipSteps[Math.min(dockTipStep, dockTipSteps.length - 1)]}
               </p>
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-1.5">
@@ -769,15 +954,31 @@ export function ManagementBar() {
                     />
                   ))}
                 </div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="h-5 rounded-full px-1 text-[10px] text-muted-foreground md:h-6 md:px-1.5 md:text-[11px]"
-                  onClick={handleNextDockTip}
-                >
-                  <ChevronRight className="size-3 md:size-3.5" />
-                </Button>
+                <div className="flex items-center gap-0.5">
+                  {/* 明确的关闭入口。原实现只能靠「把几条都点完」关掉，
+                      于是这条气泡会在页面上一直挂着 —— 它挂在底栏正上方，
+                      而底栏能被拖到页面中部，正好压住正文。 */}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-5 rounded-full px-1 text-[10px] text-muted-foreground md:h-6 md:px-1.5 md:text-[11px]"
+                    onClick={handleDismissDockTip}
+                  >
+                    {t('dock.tipDismiss')}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    aria-label={t('dock.tipNext')}
+                    title={t('dock.tipNext')}
+                    className="h-5 rounded-full px-1 text-[10px] text-muted-foreground md:h-6 md:px-1.5 md:text-[11px]"
+                    onClick={handleNextDockTip}
+                  >
+                    <ChevronRight className="size-3 md:size-3.5" />
+                  </Button>
+                </div>
               </div>
             </div>
           </div>

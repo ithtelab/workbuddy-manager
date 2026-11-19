@@ -1,18 +1,19 @@
-# 打 tag 时自动构建前端、打包产物并创建 GitHub Release。
+# 打 tag 时自动构建前端、打包产物并创建一个**草稿** Release。
 #
 # 用法：推送形如 v1.0.0 的 tag 即可
 #   git tag v1.0.0 && git push origin v1.0.0
 #
 # 产物为可直接部署的压缩包（含 server/ 与已构建的 web/out/）。
 #
-# ── 关于签名（重要）──────────────────────────────────────────
-# 本工作流**不持有签名私钥**，也不代替维护者签名：
-#   * 私钥绝不进 CI —— 恶意 PR 合并后能改 workflow 里的任意步骤，
-#     把密钥放在这里等于直接交给攻击者。
-#   * 签名在维护者本机完成（见步骤末尾的 step summary 与
-#     docs/release-signing.md），.sig 作为 Release 资产上传。
-#   * 用户侧 deploy/update.py 强制验签，未签名的 Release 会被拒绝安装；
-#     本 workflow 在检测到已签名后也**不再覆盖 tar.gz**，避免使签名失效。
+# ── 关于产物与发布（重要）────────────────────────────────────
+#   * 产物是 GitHub Release 资产（HTTPS），发布说明里附了 tar.gz 的 sha256；
+#     用户侧 deploy/update.py 会用它自动核对（大小 + 摘要），不符即拒绝安装。
+#   * Release 先建为**草稿**：`releases/latest` 跳过草稿，所以「构建中 / 还没
+#     核对」这段时间用户看不到这个版本，避免了「点了更新却拿到半成品」
+#     （issue #127/#129 就是那个窗口期）。维护者核对后执行
+#     `gh release edit <tag> --draft=false` 发布。
+#   * 2026-10-14 起不再有「维护者离线私钥签名」这一步 —— 取舍与边界见
+#     docs/release-signing.md。
 name: Release
 
 on:
@@ -36,6 +37,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # 供后面的 installer 作业复用同一个 tag（workflow_dispatch 时 tag 来自输入）
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
     steps:
       - name: 解析版本号
         id: vars
@@ -48,15 +52,18 @@ jobs:
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "version=${TAG#v}" >> $GITHUB_OUTPUT
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ steps.vars.outputs.tag }}
           fetch-depth: 0
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '20'
+          # 22 起才有 ESM 的 TypeScript type stripping：几处「借 Node 直接跑真实 .ts
+          # 实现」的用例（async-state / display-prefs 等）在 20 上会自我 skip —— 也就是
+          # 那些断言在 CI 里从来没跑过。升到 22 让它们真正执行。
+          node-version: '22'
           cache: npm
           cache-dependency-path: web/package-lock.json
 
@@ -90,8 +97,35 @@ jobs:
           cp -r server "$STAGE/"
           mkdir -p "$STAGE/web" && cp -r web/out "$STAGE/web/"
           cp -r deploy "$STAGE/"
-          # 文档一并打包（安全审查报告、设计说明等），便于离线查阅
-          cp -r docs "$STAGE/" 2>/dev/null || true
+          # 更新器再放一份到 server/：一键更新必然整体替换 server/，而旧版
+          # 更新器可能不替换根目录 deploy/。放在 server/ 后，面板重启就能用
+          # 新版更新器，不必先「更新一次才会更新更新器」（issue #240）。
+          mkdir -p "$STAGE/server/deploy"
+          cp deploy/update.py "$STAGE/server/deploy/update.py"
+          # ── 用户文档（白名单）────────────────────────────────────────
+          # 只把**用户看得懂的文档**放进发布包：维护者手册（发布流程 / i18n /
+          # 命名兼容 / 上游修复记录 / 提案 / 设计方案）留在仓库里做开发参考，
+          # 用户机器上不需要它们 —— 少一份内部文档落地，也少一份「内部细节
+          # 顺手被分发出去」的风险。
+          # 名单不许手改完就算：docs-pack:begin / end 之间的内容由
+          # server/tests/test_docs_packaging.py 双向守着（README 链到的必须
+          # 在名单里；名单里不许有 README 链不到的）。
+          # docs-pack:begin
+          DOCS_LIST="usage.md features.md screenshots.md development.md security-notes.md api-tokens.md api-traffic-tap.md web-search-passthrough.md account-proxy-routes.md SECURITY-AUDIT.md release-signing.md watchdog.md qq-bot.md"
+          mkdir -p "$STAGE/docs"
+          for f in $DOCS_LIST; do
+            cp "docs/$f" "$STAGE/docs/" || { echo "::error::发布包缺少用户文档 docs/$f"; exit 1; }
+          done
+          cp -r docs/images "$STAGE/docs/images" || { echo "::error::发布包缺少截图 docs/images"; exit 1; }
+          # 反向核对：包内 docs/ 只许出现名单里的东西 —— 防止别处又加了一次整目录拷贝
+          # （那种改动会让 6 篇内部文档静默进入每一个用户的安装目录）。
+          for got in $(ls "$STAGE/docs"); do
+            case " $DOCS_LIST images " in
+              *" $got "*) ;;
+              *) echo "::error::包内 docs/ 出现计划外文件：$got（内部文档不应进发布包）"; exit 1 ;;
+            esac
+          done
+          # docs-pack:end
           cp .env.example README.md README.en.md CHANGELOG.md LICENSE "$STAGE/"
           # 容器部署资产一并打包：用户下载发布包后可直接 docker compose up，
           # 不必再回仓库取这两个文件（实测漏打包过，Docker 用户拿不到）
@@ -100,19 +134,140 @@ jobs:
           # 不替换根目录文件。放进 server/ 后，任何部署（含从旧版升上来的）
           # 都拿得到更新日志，避免界面报「未找到更新日志文件」。
           cp CHANGELOG.md "$STAGE/server/CHANGELOG.md"
+          # ── 上游源码随包分发 ─────────────────────────────────────────
+          # 上游源码不放进本仓库（不是我们的代码），其公开地址也已不可用。
+          # 用户要能装，所以源码从固定的载体 Release（tag upstream-src，
+          # 标为 pre-release 以免影响 releases/latest）取回来塞进包里：
+          #   · 新装：install.sh 见到 upstream/ 直接用（离线可装）
+          #   · 升级：update.py 把它同步进上游目录（保留 config/auths/data）
+          # 上游已由本项目维护，管理端 Release 是唯一更新源：取不到源码或缺少
+          # `.upstream-id` 时必须让发布失败，不能发出一个用户无法更新上游的包。
+          UPSTREAM_SRC_URL="${UPSTREAM_SRC_URL:-https://github.com/${{ github.repository }}/releases/download/upstream-src/workbuddy2api-src.tar.gz}"
+          mkdir -p "$STAGE/upstream"
+          if curl -fsSL --retry 3 --retry-delay 2 --max-time 120 \
+                 "$UPSTREAM_SRC_URL" -o /tmp/upstream-src.tar.gz \
+             && tar -xzf /tmp/upstream-src.tar.gz -C "$STAGE/upstream" --strip-components=1 \
+             && [ -f "$STAGE/upstream/docker-compose.yml" ]; then
+            echo "已内嵌上游源码：$(find "$STAGE/upstream" -type f | wc -l) 个文件"
+            echo "has_upstream=1" >> $GITHUB_OUTPUT
+          else
+            echo "::error::取不到上游源码包（$UPSTREAM_SRC_URL）。上游已由本项目维护，不能再发布不含 upstream/ 的包。"
+            exit 1
+          fi
+          if [ ! -s "$STAGE/upstream/.upstream-id" ]; then
+            echo "::error::包内 upstream/.upstream-id 缺失或为空；更新器无法判断是否需要同步上游。"
+            exit 1
+          fi
+          # 上游镜像的稳定标识随镜像 label 下发（dev.workbuddy.upstream-id）：
+          # 面板读本机容器的镜像 label 即可判断「镜像部署且与本次发布同源」，
+          # 不再要求镜像部署用户的磁盘上有源码目录（issue #254）。
+          UPSTREAM_ID="$(cat "$STAGE/upstream/.upstream-id")"
+          echo "upstream_id=$UPSTREAM_ID" >> $GITHUB_OUTPUT
           # 写入版本标记：管理端「系统更新」页与安装流程据此显示当前版本
           echo "${TAG}" > "$STAGE/.version"
           # 不含运行时数据与凭据
           find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
           echo "stage=$STAGE" >> $GITHUB_OUTPUT
-          tar czf "${STAGE}.tar.gz" "$STAGE"
-          zip -qr "${STAGE}.zip" "$STAGE"
+          # ── 可复现打包 ─────────────────────────────────────────────
+          # 发布说明把 sha256 当作对用户的承诺。普通 `tar czf` 会把文件的
+          # mtime、属主与 gzip 自己的时间戳写进字节流 —— 同一份内容在不同
+          # 时刻/机器上重打会得到不同哈希，「基线摘要 → 产出摘要」的核对
+          # 就失去意义。这里固定排序、mtime、属主，并让 gzip 不写时间戳；
+          # 只要暂存内容一致，tar.gz 的 sha256 就一致。
+          find "$STAGE" -exec touch -h -d @0 {} + 2>/dev/null || true
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+              --format=gnu -cf - "$STAGE" | gzip -n -9 > "${STAGE}.tar.gz"
+          # zip 不是一键更新的载体（updater 只取 tar.gz），但同样去掉
+          # 平台扩展属性，避免无意义的字节差异。
+          rm -f "${STAGE}.zip"
+          zip -qrX "${STAGE}.zip" "$STAGE"
           ls -lh "${STAGE}.tar.gz" "${STAGE}.zip"
           echo "打包完成"
+
+      - name: 安装 Go（校验随包上游）
+        if: steps.pack.outputs.has_upstream == '1'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: ${{ steps.pack.outputs.stage }}/upstream/go.mod
+          cache: false
+
+      # 发布前把「随包上游」当成一次真正的构建来验：补丁是否齐全、能否编译、
+      # 单测是否通过、我们自己的改动是否 gofmt 干净。补丁是上游改动的唯一事实
+      # 来源，而 CI 以前只跑 Python 测试 —— 补丁出错会一路带进 Release。
+      - name: 校验随包上游与版本一致性
+        run: |
+          set -eu
+          TAG="${{ steps.vars.outputs.tag }}"
+          VERSION="${{ steps.vars.outputs.version }}"
+          STAGE="${{ steps.pack.outputs.stage }}"
+
+          CODE_VER=$(python3 - "$STAGE/server/main.py" <<'PY'
+          import re, sys
+          text = open(sys.argv[1], encoding='utf-8').read()
+          m = re.search(r"version='([^']+)'", text)
+          print(m.group(1) if m else '')
+          PY
+          )
+          if [ "$CODE_VER" != "$VERSION" ]; then
+            echo "::error::server/main.py 的 version=$CODE_VER 与 tag ${TAG} 不一致"
+            exit 1
+          fi
+          echo "版本一致：$CODE_VER"
+
+          if [ "${{ steps.pack.outputs.has_upstream }}" != "1" ]; then
+            echo "::warning::本包不含上游源码，跳过上游校验"
+            exit 0
+          fi
+
+          # 在副本上验，避免把 __pycache__ / 测试缓存写进要发布的目录
+          TMP=$(mktemp -d)
+          cp -a "$STAGE/upstream/." "$TMP/"
+          OUT=$(python3 dev/apply_upstream_patches.py "$TMP")
+          echo "$OUT"
+          if echo "$OUT" | grep -q '^applied:'; then
+            echo "::error::随包上游不是最新资产：仍有补丁需要现场应用"
+            exit 1
+          fi
+          N=$(ls dev/upstream-patches/*.patch | wc -l)
+          GOT=$(echo "$OUT" | grep -c '^already applied:' || true)
+          if [ "$GOT" -ne "$N" ]; then
+            echo "::error::随包上游的补丁数不符：已应用 $GOT / 共 $N"
+            exit 1
+          fi
+
+          ( cd "$TMP" && go build ./... )
+          ( cd "$TMP" && go test ./... )
+          # 只检查**补丁新增的 Go 文件**（整份都是我们写的，格式该由我们负责）。
+          # 改动过的既有文件里夹着上游自己的历史格式问题，整文件 gofmt 会误报；
+          # 而补丁里的 Python 脚本也不能喂给 gofmt。
+          NEWFILES=$(python3 - <<'PY'
+          import glob
+          out = set()
+          for path in glob.glob('dev/upstream-patches/*.patch'):
+              lines = open(path, encoding='utf-8').read().splitlines()
+              for i, line in enumerate(lines):
+                  if (line.startswith('--- /dev/null') and i + 1 < len(lines)
+                          and lines[i + 1].startswith('+++ b/')):
+                      name = lines[i + 1][6:].strip()
+                      if name.endswith('.go'):
+                          out.add(name)
+          print('\n'.join(sorted(out)))
+          PY
+          )
+          if [ -n "$NEWFILES" ]; then
+            FMT=$(cd "$TMP" && gofmt -l $NEWFILES || true)
+            if [ -n "$FMT" ]; then
+              echo "::error::补丁新增的 Go 文件未通过 gofmt：$FMT"
+              exit 1
+            fi
+          fi
+          rm -rf "$TMP"
+          echo "随包上游校验通过（$N 条补丁、build/test/gofmt）"
 
       - name: 生成发布说明
         run: |
           TAG="${{ steps.vars.outputs.tag }}"
+          STAGE="${{ steps.pack.outputs.stage }}"
           # 优先取 CHANGELOG 中该版本的段落；取不到则退回提交摘要
           python3 - "$TAG" > RELEASE_NOTES.md <<'PY'
           import re, sys, subprocess
@@ -140,24 +295,31 @@ jobs:
               ).stdout.strip()
               print(log or '详见提交历史。')
           PY
-          echo "--- 发布说明预览 ---"
-          head -20 RELEASE_NOTES.md
-
-      - name: 检查是否已有签名资产
-        id: sigcheck
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ steps.vars.outputs.tag }}"
-          STAGE="${{ steps.pack.outputs.stage }}"
-          if gh release view "$TAG" >/dev/null 2>&1 && \
-             gh release view "$TAG" --json assets -q '.assets[].name' | grep -qx "${STAGE}.tar.gz.sig"; then
-            echo "has_sig=1" >> $GITHUB_OUTPUT
-            echo "Release 已带签名资产 .tar.gz.sig"
-          else
-            echo "has_sig=0" >> $GITHUB_OUTPUT
-            echo "尚未签名（正常：签名由维护者在本机完成，见下方说明）"
+          # 附上产物摘要：用户在 Releases 页面就能看到，下载后可以自己核对
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "### 产物校验（sha256）"
+            echo ""
+            echo '```'
+            echo "$(sha256sum "${STAGE}.tar.gz" | cut -d' ' -f1)  $(basename "${STAGE}").tar.gz"
+            echo '```'
+          } >> RELEASE_NOTES.md
+          # 摘要为空说明上面那条 sha256sum 没算出来（例如忘了给 STAGE 赋值）——
+          # 发布说明里挂着一行空的哈希，用户拿去核对只会对不上，不如当场报红。
+          if ! grep -qE '^[0-9a-f]{64}  workbuddy-manager' RELEASE_NOTES.md; then
+            echo "::error::发布说明里的产物 sha256 为空，检查 STAGE 变量与打包步骤"
+            exit 1
           fi
+          # 包内上游的稳定标识：面板据此判断「这次更新是否需要同步上游」。
+          # 用 HTML 注释写在正文末尾，用户看不到，但 check-update 能读到。
+          if [ -f "$STAGE/upstream/.upstream-id" ]; then
+            echo "" >> RELEASE_NOTES.md
+            echo "<!-- upstream-id: $(cat "$STAGE/upstream/.upstream-id") -->" >> RELEASE_NOTES.md
+          fi
+          echo "--- 发布说明预览 ---"
+          head -26 RELEASE_NOTES.md
 
       - name: 创建 Release 并上传产物
         env:
@@ -165,45 +327,33 @@ jobs:
         run: |
           TAG="${{ steps.vars.outputs.tag }}"
           STAGE="${{ steps.pack.outputs.stage }}"
-          if [ "${{ steps.sigcheck.outputs.has_sig }}" = "1" ]; then
-            # 一旦有签名就绝不再覆盖 tar.gz：重新打包会产生不同的字节流，
-            # 使已上传的 .sig 失效，而用户侧的更新器会因此拒绝安装。
-            echo "Release $TAG 已带 .tar.gz.sig 签名，**不覆盖既有产物**（覆盖会使签名失效）"
-            echo "确需重新发布：先删除 Release（含 .sig），再重跑本流程并重新签名"
-          elif gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG 已存在（未签名），改为上传/覆盖产物"
-            gh release upload "$TAG" "${STAGE}.tar.gz" "${STAGE}.zip" --clobber
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "true" ]; then
+              echo "Release $TAG 还是草稿，覆盖产物"
+              gh release upload "$TAG" "${STAGE}.tar.gz" "${STAGE}.zip" --clobber
+            else
+              # **已发布的 Release 绝不覆盖产物**：发布说明里印着 sha256，用户侧的
+              # 更新器就是拿它核对的 —— 换掉字节流等于让所有人的更新校验失败
+              # （旧版本那套「有 .sig 就不覆盖」的规则，现在针对的是摘要）。
+              echo "Release $TAG 已发布：不覆盖既有产物（发布说明里的 sha256 已公布）"
+              echo "  确需重新发布：先删掉整个 Release 再重跑本流程"
+            fi
           else
+            # **草稿**（issue #127/#129）：产物还在构建、还没核对时不能让用户看到。
+            # `releases/latest`（面板与更新器的版本检查都是它）会跳过草稿，所以
+            # 「CI 先建、维护者核对后发布」这段窗口里，用户侧只会看到上一个已发布
+            # 的版本，不会出现「点了更新却拿到半成品」。
             gh release create "$TAG" \
+              --draft \
               --title "$TAG" \
               --notes-file RELEASE_NOTES.md \
               "${STAGE}.tar.gz" "${STAGE}.zip"
           fi
           echo ""
-          echo "== 发版必做：本机签名并上传 =="
-          echo "  正常流程：先让 CI 建好 Release，再由你在本机对下载下来的产物签名上传。"
-          echo "  命令见下方 step summary 与 docs/release-signing.md。"
-
-      - name: 校验签名（已上传 .sig 时）
-        if: steps.sigcheck.outputs.has_sig == '1'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ steps.vars.outputs.tag }}"
-          STAGE="${{ steps.pack.outputs.stage }}"
-          gh release download "$TAG" --pattern "${STAGE}.tar.gz" --pattern "${STAGE}.tar.gz.sig" --dir . --clobber
-          if [ ! -f deploy/release-signing-key.pub ]; then
-            echo "::warning::仓库缺少 deploy/release-signing-key.pub，无法比对公钥"
-            exit 0
-          fi
-          if grep -q 'AAAA_REPLACE_ME' deploy/release-signing-key.pub; then
-            echo "::warning::deploy/release-signing-key.pub 仍是占位值，无法比对公钥"
-            exit 0
-          fi
-          printf 'release %s\n' "$(cat deploy/release-signing-key.pub)" > /tmp/allowed_signers
-          ssh-keygen -Y verify -f /tmp/allowed_signers -I release -n file \
-            -s "${STAGE}.tar.gz.sig" < "${STAGE}.tar.gz"
-          echo "✓ 签名与仓库内公钥匹配"
+          echo "== 发版收尾 =="
+          echo "  草稿已就绪。核对（下载 → 比对发布说明里的 sha256 → 抽查包内版本号）之后发布："
+          echo "      gh release edit $TAG --draft=false"
+          echo "  在此之前 ${TAG} 对用户不可见（版本检查走 releases/latest，跳过草稿）。"
 
       # ── 构建并发布容器镜像（Docker 部署方案，issue #7）──────────────
       #
@@ -216,9 +366,9 @@ jobs:
       # 只能靠 QEMU 模拟跑，或者干脆报 `no matching manifest for linux/arm64`。
       # 两个架构合并成一个 manifest list，用户 `docker pull` 时按自身架构自动选。
       #
-      # 注意：镜像**不由本项目签名**（签名机制只覆盖 tar.gz 发布包）。
-      # 镜像的完整性依赖 GHCR 的 digest 与 GitHub 的账号安全——这一层
-      # 与发布包签名是两套信任链，README 里已如实说明。
+      # 注意：镜像不由本项目做额外签名，发布包（tar.gz）也一样 —— 两者都依赖
+      # GitHub / GHCR 账号安全与传输层的 HTTPS，README 与 docs/release-signing.md
+      # 里如实说明了这层信任边界（2026-10-14 起取消了原来的离线私钥签名）。
       - name: 解析镜像名
         # GHCR 要求仓库名全小写，而 repository_owner 可能含大写。
         # build-push-action 的 tags 里没法做大小写转换，先在这里算好。
@@ -235,17 +385,17 @@ jobs:
         # 跨架构构建 arm64 层需要它：runner 是 amd64，模拟出 arm64 执行环境
         continue-on-error: true
         if: github.event_name == 'push' || inputs.tag != ''
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
 
       - name: 设置 Buildx
         continue-on-error: true
         if: github.event_name == 'push' || inputs.tag != ''
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: 登录 GHCR
         continue-on-error: true
         if: github.event_name == 'push' || inputs.tag != ''
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -259,7 +409,7 @@ jobs:
         continue-on-error: true
         if: github.event_name == 'push' || inputs.tag != ''
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           # 多平台必须走 buildx 并直接 push：本地镜像库放不下多架构的 manifest list
@@ -282,35 +432,79 @@ jobs:
           echo "镜像：${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
           echo "平台：linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
 
+      # ── 构建并发布**上游**容器镜像（issue #241）───────────────────────
+      #
+      # 管理端镜像按设计不含上游（见 Dockerfile 头注释），要跑多个上游容器做分组
+      # 的用户此前只能自己 build：先拉 golang 基础镜像、再编译 6 个二进制，国内
+      # 网络常常卡在拉基础镜像那一步，或者被拿到的第三方镜像版本拖偏（issue #241
+      # 的现场：「更新 2.8.0 之后显示与项目上游源码不一致」）。
+      #
+      # 这里用**发布包里那份源码**（= upstream-src 资产 + 全部补丁，前面已校验
+      # 过补丁一条不少）原样构建，镜像与面板随包上游是同一份代码，不存在版本漂移。
+      # 取不到上游源码（has_upstream=0）时整段跳过，不阻断发布。
+      #
+      # 首次发布后要在仓库 Packages 里把该包设为 **public**：GHCR 新建包默认私有，
+      # 用户在未登录状态下 `docker pull` 会 401（管理端镜像当年也踩过这一步）。
+      - name: 解析上游镜像名
+        # GHCR 仓库名必须全小写（与上面管理端镜像同理）
+        if: steps.pack.outputs.has_upstream == '1' && (github.event_name == 'push' || inputs.tag != '')
+        id: upstream_image
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/workbuddy2api"
+          echo "name=${IMAGE,,}" >> $GITHUB_OUTPUT
+
+      - name: 构建并推送上游镜像（amd64 + arm64）
+        # 与管理端镜像同属**附属产物**：推不上去只影响这一步，发布结果不受牵连。
+        continue-on-error: true
+        if: steps.pack.outputs.has_upstream == '1' && (github.event_name == 'push' || inputs.tag != '')
+        id: build_upstream
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ steps.pack.outputs.stage }}/upstream
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.upstream_image.outputs.name }}:${{ steps.vars.outputs.version }}
+            ${{ steps.upstream_image.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+            dev.workbuddy.upstream-id=${{ steps.pack.outputs.upstream_id }}
+          provenance: false
+
+      - name: 记录上游镜像 digest
+        if: steps.build_upstream.outcome == 'success'
+        run: |
+          echo "上游镜像：${{ steps.upstream_image.outputs.name }}@${{ steps.build_upstream.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+
       - name: 部署说明
         run: |
           cat <<'EOF' >> $GITHUB_STEP_SUMMARY
-          ## 发布完成
+          ## 发布完成（**草稿**，尚未对用户可见）
 
           资产：
           - `${{ steps.pack.outputs.stage }}.tar.gz`
           - `${{ steps.pack.outputs.stage }}.zip`
 
-          > ⚠️ **本工作流不签名**。私钥不允许进 CI —— 恶意 PR 合并后可以改
-          > workflow 里的任意步骤，密钥放这里等于直接交给攻击者。
-          > 因此签名由维护者在**本机**对最终产物执行：
+          > 这次创建的是**草稿** Release：`releases/latest`（面板与更新器的版本
+          > 检查都走它）会跳过草稿，所以在核对并发布之前，用户侧只会看到上一个
+          > 已发布的版本 —— 不会再出现「点了更新却拿到半成品」那种窗口期
+          > （issue #127/#129）。
+
+          收尾只有一步：**核对**（下载 → 比对发布说明里的 sha256 → 抽查包内版本号）
+          之后把草稿发布出去：
 
           ```bash
-          # 在本机（私钥所在机器）：
-          gh release download ${{ steps.vars.outputs.tag }} \
-            --pattern '${{ steps.pack.outputs.stage }}.tar.gz'
-          ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file \
-            '${{ steps.pack.outputs.stage }}.tar.gz'
-          gh release upload ${{ steps.vars.outputs.tag }} \
-            '${{ steps.pack.outputs.stage }}.tar.gz.sig'
+          gh release edit ${{ steps.vars.outputs.tag }} --draft=false
           ```
 
-          > 一键更新（deploy/update.py）会校验该签名，**没有 .sig 的 Release
-          > 会被所有用户拒绝安装**。所以这一步不是可选的。
+          > 用户侧一键更新（deploy/update.py）会核对发布页给的 sha256 与文件大小，
+          > 不符即拒绝安装。**发布**是让版本对用户生效的那一步，漏了它用户永远
+          > 看不到这个版本。2026-10-14 起不再有「维护者离线私钥签名」这一步，
+          > 取舍见 docs/release-signing.md。
 
           部署方式（解压后）：
           ```bash
-          # 下载后先验签，再安装（手动部署同样建议校验）
+          # 下载后先核对摘要（不给第二个参数就打印本地值，与发布页对一眼）
           bash deploy/verify-release.sh ${{ steps.pack.outputs.stage }}.tar.gz
           tar xzf ${{ steps.pack.outputs.stage }}.tar.gz
           cd ${{ steps.pack.outputs.stage }}
@@ -321,4 +515,82 @@ jobs:
           ```bash
           docker pull ghcr.io/${{ github.repository_owner }}/workbuddy-manager:${{ steps.vars.outputs.version }}
           ```
+
+          上游也可以直接用预构建镜像（可选，省掉本地编译）：
+          ```bash
+          docker pull ghcr.io/${{ github.repository_owner }}/workbuddy2api:${{ steps.vars.outputs.version }}
+          ```
           EOF
+
+  # ── Windows 安装器（单文件 exe，随包分发给桌面用户）────────────────────
+  #
+  # 为什么单独一个作业：exe 用 Windows 自带的 csc 编译（.NET Framework 4.x），
+  # 产不出在 ubuntu runner 上。它内嵌 payload（server/ + 前端产物 + 上游
+  # wb2api.exe + 预置 Python 运行时），所以必须等 release 作业把 Release 建好
+  # 之后再把 exe 挂上去。
+  #
+  # 构建脚本自己会取依赖（Go 工具链、Python 运行时从官方源下载，上游源码从
+  # 本仓库的 upstream-src 载体 Release），并自带缓存与降级：取不到运行时就用
+  # uv.exe 兜底（首次启动联网准备环境），不阻断出包。
+  installer:
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          # build.ps1 用 git describe 取版本号写进 exe 的文件属性
+          fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 这个 tag 有没有 launcher
+        id: check
+        shell: pwsh
+        run: |
+          # 安装器是 v1.0.88 才有的；给更早的 tag 补跑工作流时（workflow_dispatch），
+          # 这里必须**跳过而不是失败** —— 否则一个「老版本补产物」的动作会把 CI 标红。
+          $has = Test-Path 'windows/launcher/build.ps1'
+          "has_launcher=$($has.ToString().ToLower())" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          if (-not $has) { "::warning::这个 tag 里没有 windows/launcher，跳过安装器构建" }
+
+      - name: 构建安装器（含上游编译与预置运行时）
+        if: steps.check.outputs.has_launcher == 'true'
+        shell: pwsh
+        run: windows/launcher/build.ps1
+
+      - name: 记录安装器摘要
+        if: steps.check.outputs.has_launcher == 'true'
+        shell: pwsh
+        run: |
+          $exe = 'windows/launcher/dist/WorkBuddyManagerSetup.exe'
+          if (-not (Test-Path $exe)) { throw '构建脚本没有产出安装器' }
+          $hash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+          $size = (Get-Item $exe).Length
+          "安装器：$exe（{0:N1} MB）" -f ($size / 1MB) | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          "sha256：$hash" | Tee-Object -Append -FilePath $env:GITHUB_STEP_SUMMARY
+          # 同名 .sha256 文本随资产一起发，用户下载后可以自己核对
+          "$hash  WorkBuddyManagerSetup.exe" | Set-Content -Encoding ascii "$exe.sha256"
+          "installer_exe=$exe" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+        id: hash
+
+      - name: 挂到 Release 上（已发布则不覆盖）
+        if: steps.check.outputs.has_launcher == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.release.outputs.tag }}"
+          if gh release view "$TAG" --json assets -q '.assets[].name' | grep -qx 'WorkBuddyManagerSetup.exe'; then
+            echo "Release $TAG 上已有 WorkBuddyManagerSetup.exe —— 不覆盖（换掉同名资产会让已下载的人对不上摘要）"
+            echo "  确需重出：先删掉该资产（gh release delete-asset）再重跑本作业"
+            exit 0
+          fi
+          gh release upload "$TAG" \
+            windows/launcher/dist/WorkBuddyManagerSetup.exe \
+            windows/launcher/dist/WorkBuddyManagerSetup.exe.sha256
+          echo "已上传 Windows 安装器（含 .sha256）"

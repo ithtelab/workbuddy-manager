@@ -37,7 +37,7 @@ def read_config(user: dict = Depends(security.current_user)) -> dict:
 
 @router.post('/config')
 def write_config(body: ConfigIn, request: Request,
-                 user: dict = Depends(security.require_admin)) -> dict:
+                 user: dict = Depends(security.require_session_admin)) -> dict:
     cfg = body.model_dump()
     db.set_setting('security', cfg)
     # 改 IP 管控开关/模式会直接影响对外放行策略，必须留痕
@@ -56,7 +56,7 @@ def list_rules(user: dict = Depends(security.current_user)) -> list[dict]:
 
 
 @router.post('/rules')
-def add_rule(body: RuleIn, user: dict = Depends(security.require_admin)) -> dict:
+def add_rule(body: RuleIn, user: dict = Depends(security.require_session_admin)) -> dict:
     # 校验 CIDR 合法性（便于尽早发现错误输入）
     if not ip_matches('0.0.0.0', body.cidr) and not ip_matches('::', body.cidr):
         # ip_matches 对非法 CIDR 返回 False，这里额外做一次严格校验
@@ -75,7 +75,7 @@ def add_rule(body: RuleIn, user: dict = Depends(security.require_admin)) -> dict
 
 
 @router.delete('/rules/{rule_id}')
-def delete_rule(rule_id: int, user: dict = Depends(security.require_admin)) -> dict:
+def delete_rule(rule_id: int, user: dict = Depends(security.require_session_admin)) -> dict:
     if not db.query_one('SELECT id FROM ip_rules WHERE id = ?', (rule_id,)):
         raise HTTPException(status_code=404, detail='规则不存在')
     db.execute('DELETE FROM ip_rules WHERE id = ?', (rule_id,))
@@ -101,6 +101,6 @@ def access_logs(limit: int = 200, user: dict = Depends(security.current_user)) -
 
 
 @router.post('/logs/clear')
-def clear_logs(user: dict = Depends(security.require_admin)) -> dict:
+def clear_logs(user: dict = Depends(security.require_session_admin)) -> dict:
     db.execute('DELETE FROM ip_access_logs')
     return {'ok': True}

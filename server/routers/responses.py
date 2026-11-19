@@ -43,7 +43,8 @@ import uuid
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import config, keysvc
+from .. import config, keysvc, upstreamsvc
+from ..services import tap as tap_svc
 from . import gateway
 
 logger = logging.getLogger('workbuddy.responses')
@@ -54,6 +55,10 @@ router = APIRouter(tags=['responses'])
 # 事件里的 index 由我们分配、与上游数组同长；上游给的畸形数据不该让我们无限
 # 追加对象（正常一次回答只有几个 item）。
 MAX_OUTPUT_ITEMS = 256
+
+
+class ToolSearchArgumentsError(ValueError):
+    """A client tool search must contain complete JSON object arguments."""
 
 
 class CustomToolArgumentsError(ValueError):
@@ -76,16 +81,45 @@ def _sanitize_tool_name(name: str) -> str:
 
 
 class _ToolBridge:
-    """Flatten namespace children for Chat, then restore Responses names/types."""
+    """展开 namespace 子工具供 Chat 使用，并在回程还原 Responses 元数据。"""
 
-    def __init__(self, tools: object):
+    def __init__(self, tools: object, inputs: object = None):
         self.chat_tools: list[dict] = []
         self.custom_names: set[str] = set()
         self._forward: dict[str, str] = {}
-        self._reverse: dict[str, tuple[str, str]] = {}
+        self._reverse: dict[str, tuple[str, str, str | None]] = {}
         self._taken: set[str] = set()
+        self.search_names: set[str] = set()
+        self.search_name = ''
+        self._seen: set[tuple[str, ...]] = set()
+        history = inputs if isinstance(inputs, list) else []
+        declarations = [t for t in tools if isinstance(t, dict)
+                        and t.get('type') == 'tool_search'] if isinstance(tools, list) else []
+        if any(t.get('execution', 'server') != 'client' for t in declarations):
+            raise ToolSearchArgumentsError('This gateway supports client-executed tool search only.')
+        search_history = [i for i in history if isinstance(i, dict)
+                          and i.get('type') in ('tool_search_call', 'tool_search_output')]
+        if any(i.get('execution', 'client') != 'client' for i in search_history):
+            raise ToolSearchArgumentsError('Hosted tool search history is not supported.')
+        history_search = bool(search_history)
+        self.discovery = bool(declarations or history_search)
         if isinstance(tools, list):
             self._walk(tools, ())
+        for item in history:
+            if isinstance(item, dict) and item.get('type') in ('tool_search_output', 'additional_tools'):
+                loaded = item.get('tools')
+                if isinstance(loaded, list):
+                    self._walk(loaded, (), loaded=True)
+        if self.discovery:
+            self.search_name = self._unique('tool_search', 'codex_tool_search')
+            self.search_names.add(self.search_name)
+            spec = declarations[0] if declarations else {}
+            self.chat_tools.append({'type': 'function', 'function': {
+                'name': self.search_name,
+                'description': spec.get('description') or 'Search for additional tools to load for the next model call. The client executes this search.',
+                'parameters': spec.get('parameters') or {'type': 'object', 'properties': {
+                    'query': {'type': 'string'}, 'limit': {'type': 'number'}}, 'required': ['query']},
+            }})
 
     def _unique(self, preferred: str, fallback: str) -> str:
         base = _sanitize_tool_name(preferred) if preferred else _sanitize_tool_name(fallback)
@@ -97,19 +131,27 @@ class _ToolBridge:
         self._taken.add(name)
         return name
 
-    def _walk(self, tools: list, path: tuple[str, ...]) -> None:
+    def _walk(self, tools: list, path: tuple[str, ...], *, loaded: bool = False) -> None:
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
             kind = tool.get('type')
+            if kind == 'tool_search':
+                continue
+            if self.discovery and tool.get('defer_loading') and not loaded:
+                continue
             name = _tool_name(tool)
             if kind == 'namespace':
                 children = tool.get('tools')
                 if isinstance(children, list) and name:
-                    self._walk(children, path + (name,))
+                    self._walk(children, path + (name,), loaded=loaded)
                 continue
             if not name:
                 continue
+            identity = path + (name,)
+            if identity in self._seen:
+                continue
+            self._seen.add(identity)
             preferred = name if name not in self._taken else '__'.join(path + (name,))
             chat_name = self._unique(preferred, '__'.join(path + (name,)))
             self._forward.setdefault(name, chat_name)
@@ -118,7 +160,8 @@ class _ToolBridge:
                 self._forward['.'.join(path + (name,))] = chat_name
                 self._forward['__'.join(path + (name,))] = chat_name
             restored_kind = 'custom' if kind == 'custom' else 'function'
-            self._reverse[chat_name] = (name, restored_kind)
+            namespace = '.'.join(path) if path else None
+            self._reverse[chat_name] = (name, restored_kind, namespace)
             spec = {
                 'type': 'function',
                 'function': {
@@ -157,13 +200,31 @@ class _ToolBridge:
                     )
             self.chat_tools.append(spec)
 
-    def outbound_name(self, name: object) -> str:
+    def outbound_name(self, name: object, namespace: object = None) -> str:
         value = name if isinstance(name, str) else ''
+        if isinstance(namespace, str) and namespace:
+            qualified = f'{namespace}.{value}'
+            if qualified in self._forward:
+                return self._forward[qualified]
         return self._forward.get(value, value)
 
-    def restore(self, name: object) -> tuple[str, str]:
+    def restore(self, name: object) -> tuple[str, str, str | None]:
         value = name if isinstance(name, str) else ''
-        return self._reverse.get(value, (value, 'custom' if value in self.custom_names else 'function'))
+        return self._reverse.get(
+            value,
+            (value, 'custom' if value in self.custom_names else 'function', None),
+        )
+
+    def authorize_search(self, choice: object) -> None:
+        allowed = choice not in ('none',)
+        if isinstance(choice, dict):
+            allowed = choice.get('type') == 'tool_search' or (
+                choice.get('type') == 'allowed_tools' and any(
+                    isinstance(t, dict) and t.get('type') == 'tool_search'
+                    for t in choice.get('tools', [])
+                )
+            )
+        self.search_names = {self.search_name} if allowed and self.search_name else set()
 
 
 def _custom_tool_names(body: dict) -> set[str]:
@@ -271,6 +332,18 @@ def _text_of_parts(content: object) -> tuple[str, list[dict]]:
         if kind in ('input_text', 'output_text', 'text', 'summary_text'):
             text = part.get('text')
             if isinstance(text, str) and text:
+                texts.append(text)
+                blocks.append({'type': 'text', 'text': text})
+        elif kind == 'encrypted_content':
+            text = part.get('encrypted_content')
+            if isinstance(text, str) and text:
+                if text.startswith('gAAAAA'):
+                    # 本层无法解密 Fernet 风格载荷；不把密文放进提示词或日志。
+                    logger.warning(
+                        '忽略无法解密的 encrypted_content 输入块'
+                    )
+                    continue
+                # 部分客户端把明文任务放进这个字段，按普通文本保留，不能静默丢弃。
                 texts.append(text)
                 blocks.append({'type': 'text', 'text': text})
         elif kind in ('input_image', 'image_url'):
@@ -411,21 +484,72 @@ def _convert_tool_choice(choice: object, bridge: _ToolBridge | None = None) -> o
     if isinstance(choice, str):
         return choice
     if isinstance(choice, dict):
+        if choice.get('type') == 'tool_search' and bridge and bridge.search_name:
+            return {'type': 'function', 'function': {'name': bridge.search_name}}
+        if choice.get('type') == 'allowed_tools' and isinstance(choice.get('tools'), list):
+            return choice.get('mode') if choice.get('mode') in ('auto', 'required', 'none') else 'auto'
         name = choice.get('name')
         if not name and isinstance(choice.get('function'), dict):
             name = choice['function'].get('name')
         if not name and isinstance(choice.get('custom'), dict):
             name = choice['custom'].get('name')
         if name:
-            mapped = bridge.outbound_name(name) if bridge else str(name)
+            mapped = bridge.outbound_name(name, choice.get('namespace')) if bridge else str(name)
             return {'type': 'function', 'function': {'name': mapped}}
     return None
+
+
+def _structured_output_instruction(body: dict) -> str:
+    """把 Responses 的 `text.format` 转成模型可执行的 JSON 约束。
+
+    上游 Chat Completions 不消费 Responses 的 `text` 对象；只在网关侧丢掉它，
+    模型就会按自然语言回答（Codex guardian 的 JSON 校验因此恒失败，issue #258）。
+    这里把 json_schema / json_object 写成一条 system 指令，至少让模型知道必须返回
+    合法 JSON。`text.format.type == "text"`（默认）不产生任何改写。
+    """
+    text = body.get('text')
+    if not isinstance(text, dict):
+        return ''
+    fmt = text.get('format')
+    if not isinstance(fmt, dict):
+        return ''
+    kind = str(fmt.get('type') or '').strip().lower()
+    if kind == 'json_object':
+        return ('You must respond with a single valid JSON object. '
+                'Do not wrap it in markdown fences or add any text outside the JSON object.')
+    if kind != 'json_schema':
+        return ''
+    schema = fmt.get('schema')
+    if schema is None:
+        return ''
+    try:
+        schema_text = json.dumps(schema, ensure_ascii=False, separators=(',', ':'))
+    except (TypeError, ValueError):
+        return ''
+    name = str(fmt.get('name') or '').strip()
+    label = f' named {name!r}' if name else ''
+    return (f'You must respond with a single valid JSON object{label} that conforms '
+            f'exactly to this JSON Schema:\n{schema_text}\n'
+            'Do not wrap it in markdown fences or add any text outside the JSON object.')
+
+
+def _inject_structured_output(messages: list[dict], body: dict) -> None:
+    """把 JSON 约束接到第一条 system/developer 消息上；没有就新建一条。"""
+    instruction = _structured_output_instruction(body)
+    if not instruction:
+        return
+    if (messages and messages[0].get('role') in ('system', 'developer')
+            and isinstance(messages[0].get('content'), str)):
+        messages[0]['content'] = messages[0]['content'].rstrip() + '\n\n' + instruction
+    else:
+        messages.insert(0, {'role': 'system', 'content': instruction})
 
 
 def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                     bridge: _ToolBridge | None = None) -> dict:
     """Responses 请求体 → Chat Completions 请求体。"""
-    bridge = bridge or _ToolBridge(body.get('tools'))
+    bridge = bridge or _ToolBridge(body.get('tools'), body.get('input'))
+    bridge.authorize_search(body.get('tool_choice'))
     custom_tool_names = custom_tool_names if custom_tool_names is not None else bridge.custom_names
     # `stream` 必须**转告上游**：上游靠这个字段决定是回 SSE 还是回一次性 JSON。
     # 漏掉它会得到一个"看起来很成功"的结果——网关按流式解析，上游却回了 JSON，
@@ -453,6 +577,18 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
         # 一次 assistant 回合里的多个工具调用同属一条消息，拆成多条会让上游
         # 在「上一个工具结果还没回」的校验上直接 400。
         pending_calls: list[dict] = []
+        # 当前一组连续工具结果里提升出来的图片，攒到组结束再合并成一条 user
+        # 消息（见 flush_tool_group）：多条 tool 结果之间插 user 消息会
+        # 破坏上游的成组配对校验（400 / 11148）；组内夹带的 system/developer
+        # 通知同理，也要延后到整组 tool 结果之后。
+        pending_tool_images: list[dict] = []
+        # 组内夹带的 system/developer 通知（例如客户端插入的
+        # `<image_resize_notice>`）：同样必须等本组 tool 结果全部排完再落。
+        # 否则它会插在两条 tool 结果之间，上游照样报 11148
+        # （线上实证：tool → user(图) → system(通知) → tool → user 全被拒）。
+        pending_tool_notices: list[dict] = []
+        # 是否处于「已发 assistant.tool_calls、tool 结果还没排完」的窗口。
+        tool_group_open = False
         # 待挂到下一条 assistant 消息上的推理文本（见下面 `kind == 'reasoning'`）。
         # 用 None 表示「没见到 reasoning item」，空串表示「见到了但没文本」——
         # 两者必须区分：上游的触发条件是**字段存在**，空串一样能触发它的回填。
@@ -460,6 +596,12 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
         # **累积**而不是覆盖：客户端可能把一段推理拆成多个 reasoning item 下发，
         # 只留最后一个会把前文丢掉（自审发现的边界）。
         pending_reasoning: str | None = None
+
+        # 已发出、尚未被结果消费的 tool_call id。
+        # 客户端可能只下发 function_call_output 而没有对应的 function_call
+        # （Codex 的 agent 创建会话就是这种形状），原样写成 role=tool 会让
+        # 上游以 11148 tool_call_mismatch 拒绝整段历史。
+        open_call_ids: list[str] = []
 
         def take_reasoning() -> str | None:
             """取走累积的推理文本并把状态清空。"""
@@ -470,29 +612,94 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
             return value
 
         def flush_calls() -> None:
+            nonlocal tool_group_open
             if pending_calls:
-                msg: dict = {
-                    'role': 'assistant',
-                    'content': None,
-                    'tool_calls': list(pending_calls),
-                }
+                # Responses represents one assistant turn as separate reasoning,
+                # message and call items. Chat must preserve that single turn:
+                # splitting its text and calls creates a synthetic assistant
+                # message and leaves the real reasoning off the tool-call turn.
+                reuse_previous = bool(
+                    messages
+                    and messages[-1].get('role') == 'assistant'
+                    and not messages[-1].get('tool_calls')
+                )
+                if reuse_previous:
+                    msg = messages[-1]
+                    msg['tool_calls'] = list(pending_calls)
+                else:
+                    msg = {
+                        'role': 'assistant',
+                        'content': None,
+                        'tool_calls': list(pending_calls),
+                    }
                 # 工具调用回合也可能带推理（模型先思考再调工具），一并保留，
                 # 否则这类多轮同样会因缺痕迹被腾讯拒。
                 pending = take_reasoning()
                 if pending is not None:
+                    existing = msg.get('reasoning') or msg.get('reasoning_content')
+                    if isinstance(existing, str) and existing.strip():
+                        if not pending.strip():
+                            pending = existing
+                        elif existing != pending:
+                            pending = existing + '\n' + pending
                     attach_reasoning(msg, pending)
-                messages.append(msg)
+                if not reuse_previous:
+                    messages.append(msg)
+                tool_group_open = True
+                open_call_ids.extend(
+                    str(call.get('id') or '') for call in pending_calls if call.get('id')
+                )
                 pending_calls.clear()
+
+        def flush_tool_group() -> None:
+            """一组工具结果收尾：图片合并成一条 user，夹带通知排在其后。
+
+            为什么不是每个 tool 后面紧跟自己的图片：上游对历史做
+            「assistant.tool_calls 后必须**成组连续**跟着 tool 结果」的配对
+            校验。user 消息插在两条 tool 结果中间（tool→user→tool→user）
+            会直接 400 `11148 tool calls and tool results do not match`，
+            该会话从此不可继续（线上实际失败：同一轮两个工具结果各带一
+            张图，客户端重试同一段历史仍全部被拒）。所以等整组 tool 结果
+            都排完后，才补这一条携带本组全部图片的 user 消息。
+
+            组内夹带的 system/developer 通知同理：它们（如客户端插入的
+            `<image_resize_notice>`）可能落在两条 tool 结果之间，直接透传
+            会把 tool 结果再次隔断，所以一并延后、排在图片之后
+            （通知原文说的是「preceding tool output」，放图片后语义仍对）。
+            """
+            nonlocal pending_tool_images, pending_tool_notices, tool_group_open
+            if pending_tool_images:
+                messages.extend(_images_as_user_messages(pending_tool_images))
+                pending_tool_images = []
+            if pending_tool_notices:
+                messages.extend(pending_tool_notices)
+                pending_tool_notices = []
+            tool_group_open = False
 
         for item in raw_input:
             if not isinstance(item, dict):
                 continue
             kind = str(item.get('type') or '')
+            if kind == 'additional_tools':
+                continue
+            if kind == 'tool_search_call':
+                item = {**item, 'type': 'function_call', 'name': bridge.search_name,
+                        'arguments': _normalize_tool_arguments(item.get('arguments'))}
+                kind = 'function_call'
+            elif kind == 'tool_search_output':
+                item = {**item, 'type': 'function_call_output',
+                        'output': json.dumps({'tools': _loaded_tool_overview(item.get('tools', [])),
+                                              'status': item.get('status', 'completed')}, ensure_ascii=False)}
+                kind = 'function_call_output'
             if kind in ('function_call', 'custom_tool_call'):
+                # 防御性收尾：工具结果后若直接跟新调用（非正常历史），先把
+                # 本组图片落成 user，保持「tool 组 → user 图片」先于新的
+                # assistant（与旧行为一致）。
+                flush_tool_group()
                 if kind == 'custom_tool_call' and not isinstance(item.get('input'), str):
                     raise CustomToolArgumentsError(
                         'Custom tool history input must be a string.')
-                name = bridge.outbound_name(item.get('name'))
+                name = bridge.outbound_name(item.get('name'), item.get('namespace'))
                 raw_arguments = (
                     json.dumps({'input': item.get('input')}, ensure_ascii=False)
                     if kind == 'custom_tool_call'
@@ -511,6 +718,24 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                 })
                 continue
 
+            defer_notice = (
+                # 「调用已排队但 assistant 还没落」或「assistant 落了、结果还没排完」
+                # 都算在工具窗口内：通知落进来都会隔断 tool 结果配对。
+                (tool_group_open or bool(pending_calls))
+                and kind not in ('function_call_output', 'custom_tool_call_output')
+                and kind != 'reasoning'
+                and str(item.get('role') or '') in ('developer', 'system')
+            )
+            if kind not in ('function_call_output', 'custom_tool_call_output') \
+                    and kind != 'reasoning' and not defer_notice:
+                # 一组连续工具结果到此结束：先把本组图片按原顺序补成一条
+                # user，再让 flush_calls 落 assistant 消息。
+                # reasoning 不落消息、不打断分组（它与 tool 结果同批出现时
+                # 也不该把 user 插进 tool 之间）。
+                # 组内夹带的 system/developer 通知（defer_notice）同样不打断
+                # 分组：延后到本组 tool 结果排完再落，见 flush_tool_group。
+                flush_tool_group()
+
             flush_calls()
 
             if kind in ('function_call_output', 'custom_tool_call_output'):
@@ -519,17 +744,44 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                 # 只取文字会让工具输出的图片**静默丢失**（模型看不到图）；
                 # 而把整段内容 repr 成字符串更糟 —— 图片 base64 会被当文本分词，
                 # 一张几 MB 的图就能算出上百万 token，直接撑爆上下文。
-                # 所以：文字留在 tool 消息里，图片提取出来并入紧随其后的 user 消息。
+                # 所以：文字留在 tool 消息里；图片提取出来先攒着，等这一组
+                # tool 结果全部排完后，统一合并进一条 user 消息（见
+                # flush_tool_group；顺序即语义，图片属于这批工具调用）。
                 output = item.get('output')
                 out_text, out_images = _split_tool_output(output)
-                messages.append({
-                    'role': 'tool',
-                    'tool_call_id': str(item.get('call_id') or ''),
-                    'content': out_text,
-                })
-                # 图片必须紧跟其后（顺序即语义：它们属于这次工具调用）
-                for chunk in _images_as_user_messages(out_images):
-                    messages.append(chunk)
+                raw_call_id = str(item.get('call_id') or '')
+                if raw_call_id:
+                    # 保持既有契约：带 call_id 的结果一律按 tool 消息处理
+                    if raw_call_id in open_call_ids:
+                        open_call_ids.remove(raw_call_id)
+                    messages.append({
+                        'role': 'tool',
+                        'tool_call_id': raw_call_id,
+                        'content': out_text,
+                    })
+                elif open_call_ids:
+                    # 客户端未下发 call_id：若恰好有未消费调用，按声明顺序配对
+                    matched_id = open_call_ids.pop(0)
+                    messages.append({
+                        'role': 'tool',
+                        'tool_call_id': matched_id,
+                        'content': out_text,
+                    })
+                else:
+                    # 无 call_id 且没有未消费调用 = 孤儿工具结果。
+                    # Codex 的 agent 创建会话就是这种形状：只有
+                    # function_call_output，没有对应的 function_call。
+                    # 直接写 role=tool 会被上游以 11148 tool_call_mismatch
+                    # 拒绝整段历史，这里降级为 user 消息以保留内容
+                    # （委派任务就在 output 里）。
+                    tool_name = str(item.get('name') or 'tool')
+                    messages.append({
+                        'role': 'user',
+                        'content': f'[tool output: {tool_name}]\n{out_text}',
+                    })
+                # 图片**不立即落**：插在两条 tool 结果之间会破坏上游的
+                # 成组配对校验（11148），等组结束由 flush_tool_group 补。
+                pending_tool_images.extend(out_images)
                 continue
             if kind == 'reasoning':
                 # reasoning item **不能丢**：它是 DeepSeek 多轮对话的一致性凭据。
@@ -592,6 +844,11 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
             else:
                 msg = None
             if msg is not None:
+                if defer_notice:
+                    # 这条通知落在 tool 结果之间：延后到整组排完（排在图片后），
+                    # 否则会把 tool 结果隔断触发上游 11148。
+                    pending_tool_notices.append(msg)
+                    continue
                 # 只在 assistant 消息上挂推理 —— 腾讯的校验针对 assistant 回合。
                 # 客户端把 reasoning 放在别处（少见）时不硬塞，免得造出上游不认的组合。
                 #
@@ -603,7 +860,11 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                     if pending is not None:
                         attach_reasoning(msg, pending)
                 messages.append(msg)
+        # 历史以工具结果收尾时，本组图片还没补 user 消息。
         flush_calls()
+        # 先落未收尾的 assistant（含 tool_calls），再补图片与延后的通知，
+        # 保证「assistant → tool 组 → user 图片 → 通知」的顺序。
+        flush_tool_group()
 
         # 收尾：推理项排在**最后一条 assistant 之后**时，循环里没有「下一条
         # assistant」可以挂，它仍是待挂状态。回填到已发出的最后一条 assistant 上
@@ -615,6 +876,7 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                     attach_reasoning(prev, take_reasoning())
                     break
 
+    _inject_structured_output(messages, body)
     out['messages'] = messages
 
     if body.get('max_output_tokens') is not None:
@@ -624,11 +886,32 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
             out[key] = body[key]
 
     tools = _convert_tools(body.get('tools'), bridge)
+    raw_choice = body.get('tool_choice')
+    if isinstance(raw_choice, dict) and raw_choice.get('type') == 'allowed_tools':
+        allowed = {
+            converted['function']['name']
+            for t in raw_choice.get('tools', [])
+            if isinstance((converted := _convert_tool_choice(t, bridge)), dict)
+            and isinstance(converted.get('function'), dict)
+        }
+        tools = [t for t in tools or [] if t['function']['name'] in allowed]
     if tools:
         out['tools'] = tools
     choice = _convert_tool_choice(body.get('tool_choice'), bridge)
     if choice is not None:
         out['tool_choice'] = choice
+
+    # `parallel_tool_calls` 在 Responses 与 Chat Completions 里是**同名同语义**的
+    # 顶层字段，但两者缺省不同：Responses 缺省 true，而上游 Chat 侧把「没写」
+    # 当成自己的默认。所以只在客户端**显式给了布尔值**时才转告上游——缺省不写，
+    # 与 `anthropic.py` 里 `disable_parallel_tool_use` 的映射同口径（只有明确
+    # false 才改行为）。
+    #
+    # 漏了这一段的表现：客户端传 `parallel_tool_calls: false`（Claude Code、
+    # Codex 这类客户端在单工具回合里会传）时上游照样并发出多个工具调用，
+    # 客户端按「只该有一个」解析，多出来的那个会被丢掉或直接报参数错。
+    if isinstance(body.get('parallel_tool_calls'), bool):
+        out['parallel_tool_calls'] = body['parallel_tool_calls']
 
     reasoning = body.get('reasoning')
     if isinstance(reasoning, dict) and isinstance(reasoning.get('effort'), str):
@@ -678,7 +961,12 @@ def _split_tool_output(output: object) -> tuple[str, list[dict]]:
 
 
 def _images_as_user_messages(images: list[dict]) -> list[dict]:
-    """把提升出来的图片包成 user 消息（放进 content 块数组）。"""
+    """把提升出来的图片（一组）合并成一条 user 消息（content 块数组）。
+
+    调用点只有 `to_chat_request` 里的 `flush_tool_group`：必须等**整组**
+    tool 结果都排完再补这条消息，而不是紧跟每个 tool —— 见该函数注释
+    （上游成组配对校验，tool→user→tool 会 400 / 11148）。
+    """
     if not images:
         return []
     return [{'role': 'user', 'content': images}]
@@ -708,18 +996,31 @@ def _usage_object(usage: dict) -> dict:
     }
 
 
-def _message_item(text: str, item_id: str) -> dict:
+def _message_phase(finish: str | None, has_tools: bool) -> str:
+    # Chat has no native assistant phase. Tool preambles belong to the working
+    # timeline; only a complete, tool-free answer closes the assistant turn.
+    return 'final_answer' if finish == 'stop' and not has_tools else 'commentary'
+
+
+def _message_item(text: str, item_id: str, phase: str = 'final_answer') -> dict:
     return {
         'type': 'message',
         'id': item_id,
         'status': 'completed',
         'role': 'assistant',
+        'phase': phase,
         'content': [{'type': 'output_text', 'text': text, 'annotations': []}],
     }
 
 
-def _function_call_item(call_id: str, item_id: str, name: str, arguments: str) -> dict:
-    return {
+def _function_call_item(
+    call_id: str,
+    item_id: str,
+    name: str,
+    arguments: str,
+    namespace: str | None = None,
+) -> dict:
+    item = {
         'type': 'function_call',
         'id': item_id,
         'call_id': call_id,
@@ -727,6 +1028,9 @@ def _function_call_item(call_id: str, item_id: str, name: str, arguments: str) -
         'arguments': arguments,
         'status': 'completed',
     }
+    if namespace:
+        item['namespace'] = namespace
+    return item
 
 
 def _custom_call_item(call_id: str, item_id: str, name: str, raw_input: str) -> dict:
@@ -767,12 +1071,64 @@ def _normalize_tool_arguments(raw: object) -> str:
     return json.dumps(raw, ensure_ascii=False)
 
 
+MAX_SEARCH_ARGUMENT_BYTES = 64 * 1024
+
+
+def _loaded_tool_overview(tools: object, namespace: str = '') -> list[dict]:
+    """Schemas are in the active catalog; history only needs loaded identities."""
+    out = []
+    for tool in tools if isinstance(tools, list) else []:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get('type') == 'namespace':
+            name = str(tool.get('name') or '')
+            qualified = '.'.join(part for part in (namespace, name) if part)
+            out.extend(_loaded_tool_overview(tool.get('tools'), qualified))
+        elif name := _tool_name(tool):
+            out.append({'name': name, **({'namespace': namespace} if namespace else {})})
+    return out
+
+
+def _search_arguments(raw: object) -> dict:
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate key')
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f'Invalid JSON constant: {value}')
+
+    if isinstance(raw, str):
+        if len(raw.encode()) > MAX_SEARCH_ARGUMENT_BYTES:
+            raise ToolSearchArgumentsError('Tool search arguments exceed the supported limit.')
+        try:
+            raw = json.loads(raw, object_pairs_hook=unique_object,
+                             parse_constant=reject_constant)
+        except (ValueError, TypeError) as exc:
+            raise ToolSearchArgumentsError('Tool search arguments are not complete JSON.') from exc
+    # Client search defines its own argument schema (e.g. query or goal).
+    # Validate the transport shape without inventing required schema fields.
+    if not isinstance(raw, dict):
+        raise ToolSearchArgumentsError('Tool search arguments must be a JSON object.')
+    return raw
+
+
+def _search_call_item(call_id: str, item_id: str, arguments: object) -> dict:
+    return {'type': 'tool_search_call', 'id': 'tsc_' + item_id.removeprefix('fc_'),
+            'call_id': call_id, 'execution': 'client', 'status': 'completed',
+            'arguments': _search_arguments(arguments)}
+
+
 def to_responses_object(
     data: dict,
     model: str,
     resp_id: str,
     custom_tool_names: set[str] | None = None,
     bridge: _ToolBridge | None = None,
+    parallel_tool_calls: bool | None = None,
 ) -> dict:
     """Chat Completions 非流式响应 → Responses 响应体。"""
     custom_tool_names = custom_tool_names or set()
@@ -789,6 +1145,10 @@ def to_responses_object(
     if isinstance(reasoning, str) and reasoning:
         output.append(_reasoning_item(reasoning, 'rs_' + uuid.uuid4().hex[:20]))
     calls = [call for call in message.get('tool_calls') or [] if isinstance(call, dict)]
+    text = message.get('content')
+    if isinstance(text, str) and text:
+        output.append(_message_item(text, 'msg_' + uuid.uuid4().hex[:20],
+                                    _message_phase(finish, bool(calls))))
     custom_calls = [
         call for call in calls
         if isinstance(call.get('function'), dict)
@@ -798,7 +1158,13 @@ def to_responses_object(
         raise CustomToolArgumentsError(
             'Custom tool response ended without a complete tool turn.')
     # A length-truncated custom call must never be exposed as executable output.
-    suppress_tools = bool(custom_calls) and finish == 'length'
+    search_calls = [c for c in calls if isinstance(c.get('function'), dict) and c['function'].get('name') in bridge.search_names]
+    if search_calls and finish not in ('stop', 'tool_calls', 'length'):
+        raise ToolSearchArgumentsError('Tool search response ended without a complete tool turn.')
+    for call in search_calls:
+        if finish != 'length':
+            _search_arguments(call['function'].get('arguments'))
+    suppress_tools = bool(custom_calls or search_calls) and finish == 'length'
     for call in custom_calls:
         _custom_input((call.get('function') or {}).get('arguments'))
     for call in ([] if suppress_tools else calls):
@@ -806,7 +1172,11 @@ def to_responses_object(
             continue
         fn = call.get('function') or {}
         raw_name = str(fn.get('name') or '')
-        name, restored_kind = bridge.restore(raw_name)
+        if raw_name in bridge.search_names:
+            output.append(_search_call_item(str(call.get('id') or f'call_{uuid.uuid4().hex[:12]}'),
+                                            'fc_' + uuid.uuid4().hex[:20], fn.get('arguments')))
+            continue
+        name, restored_kind, namespace = bridge.restore(raw_name)
         is_custom = restored_kind == 'custom' or raw_name in custom_tool_names
         output.append(_custom_call_item(
             str(call.get('id') or f'call_{uuid.uuid4().hex[:12]}'),
@@ -818,11 +1188,8 @@ def to_responses_object(
             'fc_' + uuid.uuid4().hex[:20],
             name,
             _normalize_tool_arguments(fn.get('arguments')),
+            namespace,
         ))
-    text = message.get('content')
-    if isinstance(text, str) and text:
-        output.append(_message_item(text, 'msg_' + uuid.uuid4().hex[:20]))
-
     status, incomplete = ('completed', None) if finish != 'length' else (
         'incomplete', {'reason': 'max_output_tokens'})
     return {
@@ -833,7 +1200,9 @@ def to_responses_object(
         'model': model,
         'output': output,
         'output_text': text if isinstance(text, str) else '',
-        'parallel_tool_calls': True,
+        # 回显客户端给的值；未给时保持历史默认（true），与 OpenAI 的缺省一致。
+        'parallel_tool_calls': (parallel_tool_calls
+                                if isinstance(parallel_tool_calls, bool) else True),
         'error': None,
         'incomplete_details': incomplete,
         'usage': _usage_object(data.get('usage') or {}),
@@ -860,6 +1229,7 @@ class _StreamTranslator:
         resp_id: str,
         custom_tool_names: set[str] | None = None,
         bridge: _ToolBridge | None = None,
+        defer_finish: bool = False,
     ) -> None:
         self.model = model
         self.resp_id = resp_id
@@ -868,6 +1238,7 @@ class _StreamTranslator:
         self.finished = False
         self.next_index = 0
         self.items: list[dict] = []
+        self.item_indices: dict[str, int] = {}
 
         self.reason_index: int | None = None
         self.reason_id = ''
@@ -883,12 +1254,23 @@ class _StreamTranslator:
 
         self.saw_content = False
         self.finish_reason: str | None = None
+        self.defer_finish = defer_finish
+        self.pending_finish: str | None = None
         self.usage: dict = {}
         self.custom_tool_names = custom_tool_names or set()
         self.bridge = bridge or _ToolBridge([])
         self.failed = False
+        self.buffer_tool_events = bool(self.custom_tool_names or self.bridge.search_names)
+        self.tool_error: ToolSearchArgumentsError | None = None
 
     # ── 事件构造 ──
+    def _record_item(self, index: int, item: dict) -> None:
+        self.item_indices[item['id']] = index
+        self.items.append(item)
+        # Buffered tool calls may complete after later text. The terminal
+        # output array must preserve their original output_index order.
+        self.items.sort(key=lambda value: self.item_indices[value['id']])
+
     def _created(self) -> list[bytes]:
         self.started = True
         return [_event('response.created', {
@@ -904,6 +1286,7 @@ class _StreamTranslator:
         })]
 
     def _open_reason(self) -> list[bytes]:
+        self.reason_buf = ''
         self.reason_index = self.next_index
         self.next_index += 1
         self.reason_id = 'rs_' + uuid.uuid4().hex[:20]
@@ -926,7 +1309,7 @@ class _StreamTranslator:
         # 客户端在 `output_item.done` 上取这个字段（issue #36：此前从没发过，
         # 于是客户端拿不到凭据，下一轮不带推理痕迹，上游报 11155）。
         item = _reasoning_item(self.reason_buf, self.reason_id)
-        self.items.append(item)
+        self._record_item(index, item)
         return [_event('response.output_item.done', {
             'type': 'response.output_item.done',
             'output_index': index,
@@ -934,6 +1317,7 @@ class _StreamTranslator:
         })]
 
     def _open_text(self) -> list[bytes]:
+        self.text_buf = ''
         self.text_index = self.next_index
         self.next_index += 1
         self.text_id = 'msg_' + uuid.uuid4().hex[:20]
@@ -947,6 +1331,7 @@ class _StreamTranslator:
                     'id': self.text_id,
                     'status': 'in_progress',
                     'role': 'assistant',
+                    'phase': 'commentary',
                     'content': [],
                 },
             }),
@@ -959,13 +1344,13 @@ class _StreamTranslator:
             }),
         ]
 
-    def _close_text(self) -> list[bytes]:
+    def _close_text(self, phase: str = 'commentary') -> list[bytes]:
         if self.text_index is None:
             return []
         index, self.text_index = self.text_index, None
         part = {'type': 'output_text', 'text': self.text_buf, 'annotations': []}
-        item = _message_item(self.text_buf, self.text_id)
-        self.items.append(item)
+        item = _message_item(self.text_buf, self.text_id, phase)
+        self._record_item(index, item)
         return [
             _event('response.output_text.done', {
                 'type': 'response.output_text.done',
@@ -1002,7 +1387,7 @@ class _StreamTranslator:
         self.tool_order.append(seq)
         # A custom tool's name may arrive in several upstream fragments.
         # Buffer tool events until the final name/arguments can be validated.
-        if self.custom_tool_names:
+        if self.buffer_tool_events:
             return []
         return [_event('response.output_item.added', {
             'type': 'response.output_item.added',
@@ -1025,6 +1410,11 @@ class _StreamTranslator:
             for seq, state in self.tools.items()
             if state['name'] in self.custom_tool_names
         }
+        # Validate the complete buffered batch before exposing any executable
+        # call. A bad search must not leave an earlier tool partially emitted.
+        for state in self.tools.values():
+            if state['name'] in self.bridge.search_names:
+                _search_arguments(state['args'])
         for seq in self.tool_order:
             state = self.tools.get(seq)
             if not state or state.get('closed'):
@@ -1034,15 +1424,29 @@ class _StreamTranslator:
             # custom、而 `custom_inputs` 里没有这一项，下面取值就会 KeyError 并把
             # 整条流打断。`custom_inputs` 的键恰好就是 custom 的判据
             # （名字在 custom_names 里的 seq），所以两处都用它。
-            restored_name, _kind = self.bridge.restore(state['name'])
+            restored_name, _kind, namespace = self.bridge.restore(state['name'])
+            if state['name'] in self.bridge.search_names:
+                item = _search_call_item(state['call_id'], state['id'], state['args'])
+                self._record_item(state['index'], item)
+                out.extend([
+                    _event('response.output_item.added', {'type': 'response.output_item.added',
+                        'output_index': state['index'], 'item': {**item, 'arguments': {}, 'status': 'in_progress'}}),
+                    _event('response.output_item.done', {'type': 'response.output_item.done',
+                        'output_index': state['index'], 'item': item}),
+                ])
+                continue
             custom = seq in custom_inputs
             value = custom_inputs[seq] if custom else state['args']
             field = 'input' if custom else 'arguments'
             family = 'custom_tool_call_input' if custom else 'function_call_arguments'
-            item = (_custom_call_item if custom else _function_call_item)(
-                state['call_id'], state['id'], restored_name, value)
-            self.items.append(item)
-            if self.custom_tool_names:
+            if custom:
+                item = _custom_call_item(
+                    state['call_id'], state['id'], restored_name, value)
+            else:
+                item = _function_call_item(
+                    state['call_id'], state['id'], restored_name, value, namespace)
+            self._record_item(state['index'], item)
+            if self.buffer_tool_events:
                 out.append(_event('response.output_item.added', {
                     'type': 'response.output_item.added',
                     'output_index': state['index'],
@@ -1083,6 +1487,10 @@ class _StreamTranslator:
         usage = obj.get('usage')
         if isinstance(usage, dict):
             self.usage.update(usage)
+        if self.pending_finish is not None:
+            # Chat stream_options.include_usage sends a separate final usage
+            # chunk after finish_reason. Keep it, but ignore any later content.
+            return out
 
         choices = obj.get('choices')
         if not isinstance(choices, list) or not choices:
@@ -1101,6 +1509,10 @@ class _StreamTranslator:
             out.append(_event('response.reasoning_summary_text.delta', {
                 'type': 'response.reasoning_summary_text.delta',
                 'output_index': self.reason_index,
+                # summary_index 是规范里的必填字段（summary 为数组，这里恒为第 0 段）。
+                # 缺了它，ai-sdk 的 zod 校验匹配不上任何具名分支，整帧落进
+                # unknown_chunk 兜底并被静默丢弃 —— 客户端只看到空的思考块（issue #348）。
+                'summary_index': 0,
                 'item_id': self.reason_id,
                 'delta': reasoning,
             }))
@@ -1141,7 +1553,7 @@ class _StreamTranslator:
                     str(name or ''),
                 )
             state = self.tools[seq]
-            if self.custom_tool_names:
+            if self.buffer_tool_events:
                 # The first fragment is already stored by _open_tool. Later
                 # fragments may continue a split name; repeated full names
                 # are ignored so they do not become "BashBash".
@@ -1154,8 +1566,12 @@ class _StreamTranslator:
             # 分片参数原样透传，拼接交给客户端
             args = fn.get('arguments')
             if isinstance(args, str) and args:
-                state['args'] += args
-                if not self.custom_tool_names:
+                if not self.tool_error:
+                    state['args'] += args
+                if self.bridge.search_names and len(state['args'].encode()) > MAX_SSE_BUFFER:
+                    self.tool_error = ToolSearchArgumentsError('Buffered tool arguments exceed the supported limit.')
+                    state['args'] = ''
+                if not self.buffer_tool_events:
                     out.append(_event('response.function_call_arguments.delta', {
                         'type': 'response.function_call_arguments.delta',
                         'output_index': state['index'],
@@ -1165,20 +1581,24 @@ class _StreamTranslator:
 
         finish = choice.get('finish_reason')
         if finish:
-            out += self.finish(str(finish))
+            if self.defer_finish:
+                self.pending_finish = str(finish)
+            else:
+                out += self.finish(str(finish))
         return out
 
     def finish(self, finish_reason: str | None = None, *, force: bool = False) -> list[bytes]:
         """收尾：关掉打开的输出项并下发终止事件（幂等）。"""
         if self.finished:
             return []
+        finish_reason = finish_reason or self.pending_finish
         self.finished = True
         self.finish_reason = finish_reason
         out: list[bytes] = []
         if not self.started:
             out += self._created()
 
-        out += self._close_text()
+        out += self._close_text(_message_phase(finish_reason, bool(self.tools)))
         out += self._close_reason()
 
         # 上游出现过工具调用却没给 finish_reason 时，仍按工具收尾更贴近实际：
@@ -1186,6 +1606,8 @@ class _StreamTranslator:
         if force and finish_reason is None and self.tools:
             finish_reason = 'tool_calls'
         try:
+            if self.tool_error:
+                raise self.tool_error
             has_custom = any(
                 state['name'] in self.custom_tool_names
                 for state in self.tools.values()
@@ -1198,7 +1620,12 @@ class _StreamTranslator:
             ):
                 raise CustomToolArgumentsError(
                     'Upstream tool call has no complete tool name.')
-            if finish_reason == 'length' and has_custom:
+            has_search = any(state['name'] in self.bridge.search_names for state in self.tools.values())
+            if has_search and finish_reason not in ('stop', 'tool_calls', 'length'):
+                raise ToolSearchArgumentsError('Tool search response ended without a complete tool turn.')
+            if finish_reason == 'length' and has_search:
+                pass  # Never execute a truncated discovery call.
+            elif finish_reason == 'length' and has_custom:
                 # A complete wrapper at a length stop is still incomplete and
                 # must not be exposed as an executable custom call.
                 for state in self.tools.values():
@@ -1206,7 +1633,7 @@ class _StreamTranslator:
                         _custom_input(state['args'])
             else:
                 out += self._close_tools()
-        except CustomToolArgumentsError as exc:
+        except (CustomToolArgumentsError, ToolSearchArgumentsError) as exc:
             self.failed = True
             out.append(_event('response.failed', {
                 'type': 'response.failed',
@@ -1218,7 +1645,7 @@ class _StreamTranslator:
                     'model': self.model,
                     'output': self.items,
                     'error': {
-                        'code': 'invalid_custom_tool_arguments',
+                        'code': 'invalid_tool_search_arguments' if isinstance(exc, ToolSearchArgumentsError) else 'invalid_custom_tool_arguments',
                         'message': str(exc),
                     },
                     'usage': _usage_object(self.usage),
@@ -1265,6 +1692,10 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     if not isinstance(model, str) or not model.strip():
         return _failed('model 必须是字符串', 400, 'invalid_request_error', 'invalid_model')
 
+    # 客户端原样的 Responses 请求体（快照要在 clamp_max_tokens 之前 —— 那一步
+    # 会就地改 `max_output_tokens`，之后就看不出客户端原本要了多少）。
+    client_body = tap_svc.snapshot(body)
+
     # 鉴权：与 gateway._authorize 同一套检查、同一顺序（含版本隔离与配额）
     # 映射先算：版本归属判的是**映射后**的实际模型名（issue #47）
     mapped = gateway._map_model(model)
@@ -1272,20 +1703,30 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     if auth_err:
         return auth_err
 
+    # 越界的 max_output_tokens 会被上游包装成 503（见 gateway.clamp_max_tokens
+    # 的说明）；转换前压回上限，to_chat_request 拿到的就是已收敛的值。
+    gateway.clamp_max_tokens(body)
+
     ua = request.headers.get('user-agent')
     stream = bool(body.get('stream'))
-    bridge = _ToolBridge(body.get('tools'))
-    custom_tool_names = bridge.custom_names
-
     try:
+        bridge = _ToolBridge(body.get('tools'), body.get('input'))
+        custom_tool_names = bridge.custom_names
         payload = to_chat_request(body, custom_tool_names, bridge)
     except Exception as exc:  # noqa: BLE001
-        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
         return _failed(f'请求转换失败：{exc}', 400)
 
     if not payload.get('messages'):
         return _failed('input 为空：Responses 请求必须带 input 或 instructions',
                        400, 'invalid_request_error', 'empty_input')
+
+    # 思考档位（issue #319）：与 chat 路径同口径，把**实际发往上游**的
+    # reasoning_effort 记进请求日志。取转换后的 payload 而不是原始 body ——
+    # Responses 的档位藏在 reasoning.effort 里，转换后才变成 reasoning_effort。
+    effort = payload.get('reasoning_effort')
+    effort = effort.strip()[:16] if isinstance(effort, str) and effort.strip() else None
 
     if mapped:
         payload['model'] = mapped
@@ -1295,13 +1736,29 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
             payload['stream_options'].setdefault('include_usage', True)
 
     resp_id = 'resp_' + uuid.uuid4().hex[:24]
-    url = f'{config.WB2API_BASE}/v1/chat/completions'
+    # 上游按密钥解析（多上游 / 分组隔离）；绑定缺失或停用时明确报错，不回落。
+    try:
+        upstream = upstreamsvc.resolve_for_key(key)
+    except upstreamsvc.UpstreamUnavailable as exc:
+        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False,
+                        account_expected=False)
+        return _failed(str(exc), 503, 'api_error', 'upstream_unavailable')
+    url = f'{upstream["base_url"]}/v1/chat/completions'
+    # 转发头只构造一次：既给 httpx，也给抓包（双视角的一半）
+    up_headers = gateway._upstream_headers(upstream)
+    # 关联键：让上游的出站转储能精确对回这一轮（见 gateway 同名注释）
+    # 关联键只服务抓包：关闭时不发这个头，交给上游自己按会话生成 32 位 ID。
+    # 开着时也用 32 位 hex（与上游/官方客户端同形），16 位会改变出站头的形状。
+    trace_id = uuid.uuid4().hex if tap_svc.enabled() else None
+    if trace_id:
+        up_headers['X-Trace-ID'] = trace_id
     started = time.time()
 
     if not stream:
         try:
             async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=payload, headers=gateway._upstream_headers())
+                resp = await client.post(url, json=payload,
+                                         headers=up_headers)
             latency = int((time.time() - started) * 1000)
             usage: dict = {}
             try:
@@ -1309,11 +1766,31 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 usage = data.get('usage') or {}
             except Exception:  # noqa: BLE001
                 data = None
+            # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段
+            # 都在这一份里，分开取就会出现「某条协议缓存永远是空的」（issue #69）。
             gateway._record(
                 key, ip, model, mapped or '', resp.status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                credit=gateway._usage_credit(usage),
+                usage=usage, effort=effort,
+            )
+            # 客户端视角：Responses 客户端实际收到的报文（翻译后的形态）。
+            client_doc = None
+            if resp.status_code < 400 and isinstance(data, dict):
+                try:
+                    client_doc = to_responses_object(
+                        data, model, resp_id, custom_tool_names, bridge,
+                        body.get('parallel_tool_calls'))
+                except Exception:  # noqa: BLE001 - 翻译失败不该影响抓包
+                    client_doc = None
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/responses', protocol='responses',
+                status=resp.status_code, latency_ms=latency, stream=False,
+                payload=data, usage=usage,
+                error=None if resp.status_code < 400 else str(data)[:500],
+                upstream_body=payload, upstream_headers=up_headers,
+                trace_id=trace_id, client_response=client_doc,
             )
             if resp.status_code >= 400:
                 return _failed(_upstream_error_text(data, resp), resp.status_code,
@@ -1324,31 +1801,47 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 # 内容作为错误暴露出来，让问题可见。
                 return _failed('上游返回了无法解析的响应：' + resp.text[:300],
                                502, 'api_error', 'upstream_invalid_body')
+            # bridge 必须一起传：它负责把展开后的 Chat 名还原成客户端原名
+            # （命名空间子工具 / 重名改名）。漏传时非流式路径会把 `read_file_2`
+            # 这类内部名原样发给客户端，而**同一个请求只要带上 stream 就会还原**
+            # ——同一个请求换个标志就得到两套工具名，客户端按名字回传下一轮时
+            # 会匹配不上。
+            #
+            # 复用上面为抓包算好的那份：翻译一次就够（同一份数据翻译两次，除了
+            # 多花时间，还可能因两次取值不同而让界面与实际响应对不上）。
             return JSONResponse(
-                # bridge 必须一起传：它负责把展开后的 Chat 名还原成客户端原名
-                # （命名空间子工具 / 重名改名）。漏传时非流式路径会把
-                # `read_file_2` 这类内部名原样发给客户端，而**同一个请求只要带上
-                # stream 就会还原**——同一个请求换个标志就得到两套工具名，
-                # 客户端按名字回传下一轮时会匹配不上。
-                to_responses_object(data, model, resp_id, custom_tool_names, bridge)
+                client_doc if client_doc is not None else
+                to_responses_object(data, model, resp_id, custom_tool_names, bridge,
+                                    body.get('parallel_tool_calls'))
             )
-        except CustomToolArgumentsError as exc:
+        except (CustomToolArgumentsError, ToolSearchArgumentsError) as exc:
             return _failed(
-                str(exc), 502, 'api_error', 'invalid_custom_tool_arguments')
+                str(exc), 502, 'api_error',
+                'invalid_tool_search_arguments' if isinstance(exc, ToolSearchArgumentsError)
+                else 'invalid_custom_tool_arguments')
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False,
+                            account_expected=gateway._account_expected_after_error(exc))
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/responses', protocol='responses', status=502,
+                latency_ms=latency, stream=False, error=str(exc),
+                upstream_body=payload, upstream_headers=up_headers, trace_id=trace_id,
+            )
             return _failed(f'上游不可用：{exc}', 502)
 
     # ── 流式 ──
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
     try:
-        req = client.build_request('POST', url, json=payload, headers=gateway._upstream_headers())
+        req = client.build_request('POST', url, json=payload,
+                                   headers=up_headers)
         resp = await client.send(req, stream=True)
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True,
+                        account_expected=gateway._account_expected_after_error(exc))
         return _failed(f'上游不可用：{exc}', 502)
 
     # 上游直接报错：**开流之前**用真实状态码回掉。
@@ -1357,11 +1850,13 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     if resp.status_code >= 400:
         raw = b''
         try:
-            async with resp:
-                raw = await resp.aread()
+            # send(..., stream=True) returns an HTTPX Response, which does not
+            # implement the async context-manager protocol. Read it directly.
+            raw = await resp.aread()
         except Exception:  # noqa: BLE001
             raw = b''
         finally:
+            await resp.aclose()
             await client.aclose()
         text = raw.decode('utf-8', errors='replace')[:500]
         parsed = None
@@ -1375,16 +1870,25 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         return _failed(_upstream_error_text(parsed, None, fallback=text),
                        resp.status_code, hint=gateway._error_hint(parsed))
 
+    # 抓包用的原始流缓冲（`pending` 会被逐行消费，拼不出完整响应，同 gateway）
+    raw_stream = tap_svc.RawStream()
+    # 回给客户端的那条流（Responses 事件）。`raw_stream` 是上游 OpenAI 形态，
+    # 这一份才是客户端手里的报文。
+    client_stream = tap_svc.RawStream()
+
     async def gen():
         pending = ''
         translator = _StreamTranslator(
-            model, resp_id, custom_tool_names=custom_tool_names, bridge=bridge)
+            model, resp_id, custom_tool_names=custom_tool_names, bridge=bridge,
+            defer_finish=True)
         error_text: str | None = None
         first_token_ms: int | None = None
 
         try:
             async for chunk in resp.aiter_bytes():
-                pending += chunk.decode('utf-8', errors='ignore')
+                piece = chunk.decode('utf-8', errors='ignore')
+                raw_stream.feed(piece)
+                pending += piece
 
                 if len(pending) > MAX_SSE_BUFFER:
                     logger.warning('SSE 缓冲超过 %d 字节仍未见换行，中止转发', MAX_SSE_BUFFER)
@@ -1420,6 +1924,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                         break
 
                     for event in translator.feed(obj):
+                        client_stream.feed(event.decode('utf-8', 'ignore'))
                         yield event
 
                     if translator.saw_content and first_token_ms is None:
@@ -1431,7 +1936,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
             if error_text:
                 # 收尾事件已发出就不能再报错了（客户端已按成功处理），所以
                 # 先发终止事件之外的失败事件、**不**走 finish()
-                yield _event('response.failed', {
+                failed_event = _event('response.failed', {
                     'type': 'response.failed',
                     'response': {
                         'id': resp_id,
@@ -1443,8 +1948,11 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                         'error': {'code': 'upstream_error', 'message': error_text},
                     },
                 })
+                client_stream.feed(failed_event.decode('utf-8', 'ignore'))
+                yield failed_event
             else:
                 for event in translator.finish(None, force=True):
+                    client_stream.feed(event.decode('utf-8', 'ignore'))
                     yield event
         finally:
             await resp.aclose()
@@ -1462,7 +1970,15 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 _as_int(usage.get('prompt_tokens')),
                 _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
-                credit=gateway._usage_credit(usage), first_token=first_token_ms,
+                usage=usage, first_token=first_token_ms, effort=effort,
+            )
+            tap_svc.capture(
+                body=client_body, headers=request.headers.items(), key=key, ua=ua,
+                path='/v1/responses', protocol='responses', status=200,
+                latency_ms=latency, first_token_ms=first_token_ms, stream=True,
+                text=raw_stream.text(), usage=usage, error=error_text,
+                upstream_body=payload, upstream_headers=up_headers,
+                trace_id=trace_id, client_response=client_stream.text() or None,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

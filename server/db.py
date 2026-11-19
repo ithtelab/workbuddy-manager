@@ -1,8 +1,10 @@
 """SQLite 存储层：密钥、日志、用量、IP 规则与全局设置。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -44,6 +46,28 @@ def day_sql(column: str = 'ts') -> str:
     分组聚合**（GROUP BY 日期）时才用它——那种场景没法避免表达式。
     """
     return f"strftime('%Y-%m-%d', {column}, 'unixepoch', 'localtime')"
+
+
+def hour_of(ts: float | None = None) -> int:
+    """本地小时（0-23）。与 day_of 同一口径：**本地时区**，不是 UTC。"""
+    t = time.time() if ts is None else float(ts)
+    return int(time.strftime('%H', time.localtime(t)))
+
+
+def hour_sql(column: str = 'ts') -> str:
+    """在 SQL 里按本地小时分桶（'2026-09-29 09'）——「今日」按小时聚合用。
+
+    与 day_sql 同样的注意事项：表达式包住列就没法走索引，所以过滤条件仍应写成
+    `ts >= ?`（用 day_start_ts / hour_start_ts 换算），只有 GROUP BY 才用它。
+    """
+    return f"strftime('%Y-%m-%d %H', {column}, 'unixepoch', 'localtime')"
+
+
+def hour_start_ts(day: str | None = None, hour: int = 0) -> int:
+    """某天某小时（本地时区）的**起点时间戳**。day 为 None 时取今天。"""
+    d = day or day_of()
+    y, m, dd = (int(x) for x in d.split('-'))
+    return int(time.mktime((y, m, dd, max(0, min(23, int(hour))), 0, 0, 0, 0, -1)))
 
 
 def day_start_ts(day: str | None = None) -> int:
@@ -94,10 +118,34 @@ CREATE TABLE IF NOT EXISTS api_keys (
   -- （如 0.05 表示一次调用的倍率扣费）。
   quota_credit  REAL    NOT NULL DEFAULT 0,
   used_credit   REAL    NOT NULL DEFAULT 0,
+  -- 每日 token 限额：0 = 不限。与总额度 quota 各自独立，任一超限即拒绝。
+  -- daily_used_tokens 只记 daily_used_day 那一天（本地日期，与 usage_daily 同口径）；
+  -- 日期一变即视为 0，不需要定时任务去清零。
+  daily_quota       INTEGER NOT NULL DEFAULT 0,
+  daily_used_tokens INTEGER NOT NULL DEFAULT 0,
+  daily_used_day    TEXT    NOT NULL DEFAULT '',
   created_at    INTEGER NOT NULL,
-  last_used_at  INTEGER
+  last_used_at  INTEGER,
+  -- 密钥明文（供管理员在密钥页再次查看 / 复制）。
+  --
+  -- 为什么密钥也存一份明文
+  -- ----------------------
+  -- 网关校验走的是 `key_hash`（明文永不参与比对），这一列**只为「再看一眼」**：
+  -- 用户把密钥发给同事后自己手上没有，只能删掉重建 —— 而重建会让所有客户端
+  -- 配置同时失效。这与 `red_packet_shares.token` 是同一个取舍（那里是因为
+  -- 领取者抽奖时才需要明文），理由一致：面板刻意保持窄依赖，不自己写加密
+  -- （自造的加密比明文更危险 —— 会让人以为它是安全的）。
+  --
+  -- 代价必须说清：**能读到这份库文件 = 能拿到全部密钥**（原先只有哈希）。
+  -- 缓解：这一列只经 `POST /api/keys/{id}/reveal` 输出，那条接口要求会话管理员、
+  -- 每次都写审计日志；列表接口（只读账号也能调）永远不带它。
+  -- 存量密钥这一列为空（本列引入前建的），界面上会明确说明「无法取回」。
+  key_plain     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_keys_prefix ON api_keys(prefix);
+-- 注意：`key_hash` 的**唯一索引不在这里建**，而在 `_migrate()` 里（先清存量重复
+-- 再建）。写进 SCHEMA 会让「升级前就有重复 hash 的库」在建索引这一步抛错、
+-- 进而起不来 —— 而那种重复恰恰是最需要启动起来处理的情形。
 
 CREATE TABLE IF NOT EXISTS api_key_ips (
   key_id     INTEGER NOT NULL,
@@ -127,12 +175,27 @@ CREATE TABLE IF NOT EXISTS request_logs (
   stream            INTEGER DEFAULT 0,
   -- 本次调用的真实扣费（来自上游 usage.credit）；NULL = 上游未返回，不等于 0
   credit            REAL,
+  -- 按 DeepSeek 官方价估算的费用（元，issue #380）。NULL = 模型未收录价目，
+  -- 或该行写入时价目表里还没有这个模型 —— 界面显示「—」，不显示 0。
+  cost              REAL,
   -- 版本（cn / global）：由请求的模型名前缀判定（上游的路由协议）。
   -- 为什么必须存：界面按版本切换时，日志与统计要跟着切；不存就无法回溯过滤。
   -- NULL = 该字段上线前的历史记录（或模型名无前缀）——按 cn 归类，见 realm_of_model。
-  realm             TEXT
+  realm             TEXT,
+  -- 客户端渠道（issue #233）：由 User-Agent 归类（codex / vscode / cli / web …）。
+  -- 用来回答「哪类客户端在把账号打进 429」，网关行为本身不因它改变。
+  channel           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON request_logs(ts);
+
+-- 一条上游日志只能回填一个请求；消费记录独立于日志行保留，手动清空请求日志
+-- 或重启采集器后也不能把同一事件重新分配给邻近请求。
+CREATE TABLE IF NOT EXISTS request_account_matches (
+  event_id       TEXT PRIMARY KEY,
+  request_log_id INTEGER NOT NULL UNIQUE,
+  ts             INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_account_matches_ts ON request_account_matches(ts);
 
 CREATE TABLE IF NOT EXISTS usage_daily (
   day               TEXT    NOT NULL,
@@ -143,10 +206,47 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   -- 当日实际扣费合计（来自上游 usage.credit；上游未返回时不计入）
   credit            REAL    NOT NULL DEFAULT 0,
+  -- 输入侧缓存命中 / 未命中的 token 合计（issue #380）。
+  -- 为什么统计表也要存：费用 = 命中×命中价 + 未命中×未命中价 + 输出×输出价，
+  -- 而命中价与未命中价差约 50 倍，只有 prompt_tokens 一个数算不出费用。
+  -- 上游没给这两个字段时保持 0（「未采集」），与「命中 0」在费用上同价，
+  -- 差异由请求日志那三列如实保留。
+  cache_hit_tokens  INTEGER NOT NULL DEFAULT 0,
+  cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+  -- 按 DeepSeek 官方价估算的费用（元，issue #380）。
+  -- **可空**：NULL = 该行没有可用的价目（模型未收录 / 本列上线前的历史行），
+  -- 界面显示「—」而不是 0 —— 与 credit 那条「NULL 不等于 0」同一个道理。
+  -- 值在写入时算好（当时的价目、当时的峰谷），所以事后调价不会改动历史账。
+  cost              REAL,
   -- 版本（cn / global）；NULL 归 cn。主键含它，使两个版本的同名模型分开累计。
   realm             TEXT    NOT NULL DEFAULT 'cn',
   PRIMARY KEY (day, key_id, model, realm)
 );
+
+-- 按小时的用量累计：给「今日」趋势图用（粒度随范围走，见 stats 页）。
+-- 为什么不直接查下面那张业务无关的请求日志：日志会被保留期裁剪、也能被用户
+-- 手动清空（「日志」页有清除入口），而页头卡片来自 usage_daily —— 两处一旦
+-- 不同源，清完日志就会出现「卡片 338、图上一片空」的自相矛盾。
+-- 所以小时维度**与 usage_daily 同一写入路径、同一口径**，只是多一个 hour 列。
+CREATE TABLE IF NOT EXISTS usage_hourly (
+  day               TEXT    NOT NULL,
+  hour              INTEGER NOT NULL,
+  key_id            INTEGER NOT NULL,
+  model             TEXT    NOT NULL,
+  requests          INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  credit            REAL    NOT NULL DEFAULT 0,
+  -- 与 usage_daily 同名的三列（issue #380）。小时维度也必须存费用：
+  -- 峰谷价按时段分档，只有按小时的行才能算准，按天聚合后再算会把午休与
+  -- 夜间的空闲价摊成高峰价。
+  cache_hit_tokens  INTEGER NOT NULL DEFAULT 0,
+  cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+  cost              REAL,
+  realm             TEXT    NOT NULL DEFAULT 'cn',
+  PRIMARY KEY (day, hour, key_id, model, realm)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_hourly_day ON usage_hourly(day);
 
 -- 管理端审计日志：登录、改密码、增删用户、改安全配置等敏感操作留痕。
 -- 为什么单独一张表：这些操作不产生请求日志（那是网关的），出了事无从追溯。
@@ -184,6 +284,26 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT
 );
 
+-- 账号备注（issue #67）：给账号起个「人记得住」的名字。
+--
+-- 为什么本端存而不是写进账号文件：账号文件是**上游的**文件（它按自己 schema 读写，
+-- 也会原子回写），往里塞自定义字段既可能被上游覆盖，也超出它的 schema。备注是
+-- 「我们这边怎么看这些号」，按 uid 关联即可——uid 是账号的稳定标识，改文件名
+-- （临时停用）或重新启用都不变，所以备注不会因为用户点了停用就丢。
+CREATE TABLE IF NOT EXISTS account_notes (
+  uid        TEXT PRIMARY KEY,
+  note       TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- 本面板实际记录的添加时间；旧账号没有可靠历史时间，不用令牌文件 mtime 冒充。
+CREATE TABLE IF NOT EXISTS account_additions (
+  scope TEXT NOT NULL,
+  uid TEXT NOT NULL,
+  added_at REAL NOT NULL,
+  PRIMARY KEY (scope, uid)
+);
+
 -- 签到 / 保活结果记录。上游只在失败时打日志、成功静默，
 -- 因此本表用于留下我们自己触发的签到结果，便于事后追溯。
 CREATE TABLE IF NOT EXISTS checkin_logs (
@@ -214,6 +334,219 @@ CREATE TABLE IF NOT EXISTS task_logs (
   dedup_key TEXT NOT NULL UNIQUE
 );
 CREATE INDEX IF NOT EXISTS idx_task_logs_ts ON task_logs(ts);
+
+-- 管理面**作用域化 API Token**（见 docs/api-tokens.md）。
+--
+-- 与 api_keys（数据面网关密钥）是**两套东西**：api_keys 只授权模型调用，
+-- 与后台权限无关；本表授权的是管理面 /api/*，所以要求更严：
+--   · 明文形如 wbt_<base64url>，**库中只存 SHA-256 哈希**，明文仅在创建时返回一次；
+--   · prefix 用于定位（先按前缀取候选行，再常量时间比哈希），避免全表扫描；
+--   · scope 决定角色（readonly → viewer，admin → admin）；
+--   · 可吊销（enabled）与可过期（expires_at），鉴权时逐次校验、即时生效。
+--
+-- 历史教训：2026-09-14 的事故源于 users.json 里一个直接授予 admin 的
+-- X-API-Key 数组。本表的形态与它**刻意不同**：在数据库而非配置文件、
+-- 只存哈希、有 scope、可吊销、全程审计。
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  name         TEXT    NOT NULL,
+  token_hash   TEXT    NOT NULL,
+  prefix       TEXT    NOT NULL,
+  scope        TEXT    NOT NULL,
+  enabled      INTEGER NOT NULL DEFAULT 1,
+  expires_at   INTEGER,
+  created_at   INTEGER NOT NULL,
+  created_by   TEXT    NOT NULL DEFAULT '',
+  last_used_at INTEGER,
+  last_used_ip TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tokens_prefix ON api_tokens(prefix);
+
+-- 红包：一次创建 N 个密钥，额度按拼手气或均分分配（见 server/redpacket.py）。
+--
+-- 为什么只记「这批是怎么来的」，不重复存密钥信息：密钥本体（配额、用量、
+-- 启停、过期）都在 api_keys 里，这里只用 key_id 指向它。同一件事存两份，
+-- 迟早会出现「红包说额度 100、密钥实际是 80」的不一致。
+CREATE TABLE IF NOT EXISTS red_packets (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  title         TEXT    NOT NULL DEFAULT '',
+  -- 额度类别：credit（限制真实扣费）/ token（限制 token 数）。两者口径不同，
+  -- 见 redpacket.py 模块头。
+  quota_kind    TEXT    NOT NULL,
+  total_amount  REAL    NOT NULL,
+  shares        INTEGER NOT NULL,
+  -- 分配方式：lucky（拼手气）/ even（均分）
+  mode          TEXT    NOT NULL,
+  -- 抽奖码（分享链接用）。高熵随机串，**没有它就拿不到红包里的密钥**，
+  -- 所以它本身就是凭据 —— 界面上只展示给管理员，不写进日志。
+  code          TEXT,
+  -- 这批密钥限定的模型（JSON 数组）。
+  --
+  -- **token 红包必须非空，积分红包必须为空**（见 redpacket.validate）：
+  -- 积分是「钱」（按真实扣费算，任何模型都能用），token 是「量」（与模型强
+  -- 相关——同一段上下文在不同模型下的 token 数、输出长度、上下文窗口都不同，
+  -- 不限定的话「10 万 token」这个说法就是浮动的）。记下来是为了在详情页
+  -- 能回答「这个红包当初限的是哪几个模型」——密钥本身也有这份白名单，
+  -- 但红包视角下看更直接。
+  models        TEXT    NOT NULL DEFAULT '[]',
+  created_by    TEXT    NOT NULL DEFAULT '',
+  created_at    INTEGER NOT NULL,
+  -- 这批密钥的失效时刻。默认 7 天（发出去的东西收不回，给个期限让它们自动清理）。
+  expires_at    INTEGER NOT NULL
+);
+
+-- 每一份红包 = 一个密钥。amount 是这一份分到的额度，各份之和
+-- **精确等于** red_packets.total_amount（浮点余数由 split_amount 兜底到最后一份）。
+--
+-- 为什么存明文 token（而 api_keys 里只存哈希）
+-- -------------------------------------------
+-- 密钥通常在创建时返回一次明文、之后只留哈希——但红包要**过一段时间**才由
+-- 领取者抽走，抽的那一刻必须把明文给他。两个选择：
+--   a) 抽奖时现场生成密钥（那就不能同时支持「管理员直接把 key 发出去」）；
+--   b) 创建时把明文存下来，抽奖时取出来。
+-- 这里选了 b，因为一个红包要能**同时**支持两种分发（管理员自己发 / 分享链接）。
+--
+-- 代价说清楚：库被读走 = 这批红包的密钥泄露。缓解措施是它们的**寿命短**
+-- （默认 7 天）且**额度有限**（红包的本质就是小额分发）；而库里本来就有
+-- 同等敏感的东西。真要更严，得引入加密依赖——但项目刻意保持窄依赖
+-- （只有 fastapi/uvicorn/httpx/pydantic），自己写加密比明文更危险
+-- （会让人以为它是安全的）。
+CREATE TABLE IF NOT EXISTS red_packet_shares (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  packet_id INTEGER NOT NULL,
+  key_id    INTEGER NOT NULL,
+  amount    REAL    NOT NULL,
+  -- 密钥明文。抽奖时原样返回给领取者；管理员自己发时也不用再查别处。
+  token     TEXT    NOT NULL DEFAULT '',
+  -- 领取者 IP 与时刻。NULL = 还没人抽到这一份。
+  -- **每 IP 对同一个红包只能抽一次**，由 redpacket.draw 在事务里保证
+  -- （不去建 UNIQUE 约束：SQLite 加约束要重建表，而这里靠事务已足够）。
+  claimed_by_ip TEXT,
+  claimed_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_packet_shares ON red_packet_shares(packet_id);
+
+-- 多上游接入点（账号池分组）。
+--
+-- 为什么需要：本服务是**转发型**反代 —— 账号由上游挑，本端只做鉴权 / 限流 /
+-- 记日志。要让「不同下游密钥走不同账号池」，本端唯一能落地的形态就是配置多个
+-- 上**游接入点**，再让密钥绑定其中之一；每个接入点天然就是一个账号池分组。
+--
+-- 默认上游（环境变量 / 上游 config.json 那套）**不在这里** —— 它不是一行数据，
+-- 而是 config.WB2API_BASE + config.upstream_api_key() 的运行时结果。这样存量
+-- 部署升级后一行都不用改：密钥的 upstream_id 为空 = 走默认上游，行为与从前一致。
+--
+-- api_key 明文存储：与上游 config.json 里的 api_key 同等敏感，而本库权限已收到
+-- 仅属主可读写（见 _restrict_db_permissions）。不引加密依赖的理由同 red_packet_shares
+-- 的注释：自己写加密比明文更危险（会让人以为它是安全的）。
+CREATE TABLE IF NOT EXISTS upstreams (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT    NOT NULL,
+  base_url   TEXT    NOT NULL,
+  api_key    TEXT    NOT NULL DEFAULT '',
+  note       TEXT    NOT NULL DEFAULT '',
+  enabled    INTEGER NOT NULL DEFAULT 1,
+  -- 该分组的**本地账号目录**：面板按它列账号 / 添号 / 移动账号（见迁移注释）。
+  auth_dir   TEXT    NOT NULL DEFAULT '',
+  -- 该分组上游实例的容器名（可选）：面板「重启该分组」按它 docker restart。
+  container  TEXT    NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- ── 调用抓包（Trace Tap，见 services/tap.py）──────────────────────────────
+--
+-- 为什么单独两张表、而不是给 request_logs 加列：两者的取舍正好相反。
+-- request_logs 是**计量**数据（谁、何时、多少 token），字段少、行数多、长期聚合；
+-- 抓包是**排障证据**（这一轮到底发了什么），单行可到几百 KB，只能按保留期滚动删。
+-- 混在一张表里的后果是双向的：抓包开关会拖慢每一次日志查询，清日志也会把证据
+-- 一起清掉 —— 而「清完日志还想看当时发了什么」正是排障里最常见的一步。
+CREATE TABLE IF NOT EXISTS tap_sessions (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- 会话指纹：system + 首条 user 消息 + 协议 的哈希（见 tap._fingerprint）。
+  -- 同一轮 agent 任务的每次请求都带着同样的 system 与同一条开头的 user 消息，
+  -- 因此能把「一次任务」里的多轮请求归成一组，不需要客户端配合上报 run id。
+  fingerprint       TEXT    NOT NULL,
+  key_id            INTEGER,
+  -- 客户端家族（claude / codex / dsh / cursor / cli / <UA 的 product token>）：
+  -- 由 UA 归类；认不出来时直接用 UA 首个 token，而不是一律 `other`。
+  client            TEXT,
+  -- 原始 UA。版本号从这里取（同一客户端不同版本行为会变），也用于把旧记录
+  -- 重新归类（`client` 是**派生**值，UA 才是事实）。
+  client_ua         TEXT,
+  -- 首条 user 消息（截断）。存下来是为了把**辅助调用**挂回它所属的主会话：
+  -- 标题生成这类请求会把人类消息原文塞在自己的 user 内容里，用它做包含匹配
+  -- 就能精确对上，不必猜时间窗。
+  first_user        TEXT,
+  -- 会话类型：main（一轮对话）/ title（会话标题生成）等辅助调用。
+  -- 辅助调用有自己的 system prompt，指纹必然与主会话不同 —— 不标记的话，
+  -- 一次对话会在列表里显示成两条，看起来像"重复记录"（实测反馈）。
+  kind              TEXT    NOT NULL DEFAULT 'main',
+  -- 辅助调用所属的主会话 id（对不上时为 NULL）。
+  parent_id         INTEGER,
+  -- 客户端说的协议（chat / anthropic / responses）。上游一律是 OpenAI 形态，
+  -- 这个字段记的是**进来时**的协议 —— 它决定请求体怎么解读。
+  protocol          TEXT    NOT NULL DEFAULT 'chat',
+  model             TEXT,
+  started_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL,
+  turns             INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tap_sessions_updated ON tap_sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_tap_sessions_fp ON tap_sessions(fingerprint, key_id, protocol);
+
+CREATE TABLE IF NOT EXISTS tap_turns (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id        INTEGER NOT NULL,
+  -- 会话内序号，从 1 开始。用序号而不是时间戳：并发的两轮请求秒级时间戳会
+  -- 并列，而界面的「和上一轮比」依赖一个确定的先后。
+  seq               INTEGER NOT NULL,
+  ts                INTEGER NOT NULL,
+  path              TEXT,
+  protocol          TEXT,
+  model             TEXT,
+  mapped_model      TEXT,
+  status            INTEGER,
+  stream            INTEGER NOT NULL DEFAULT 0,
+  latency_ms        INTEGER,
+  first_token_ms    INTEGER,
+  prompt_tokens     INTEGER,
+  completion_tokens INTEGER,
+  cache_hit_tokens  INTEGER,
+  cache_miss_tokens INTEGER,
+  cost              REAL,
+  -- 请求体（已脱敏、已按 max_body 截断）的 JSON 文本。truncated=1 时界面按
+  -- 原文展示，而不是假装还能解析成结构。
+  request_json      TEXT,
+  -- 请求体的**摘要**（在截断**之前**算好）：消息逐条的 role + 内容哈希、工具
+  -- 名列表、顶层参数。
+  --
+  -- 为什么必须有：请求体常有两三 MB，而单条上限默认 512 KB —— 截断会把两轮都
+  -- 切在**同一个字节位置**，抢救出的前缀逐字相同，于是「与上一轮对比」会说
+  -- 「完全一致」，那是**假信息**（实测：325 条消息的会话，真实差异全在末尾）。
+  -- 摘要在截断前算，体积只有几 KB，与截断无关，永远可比。
+  request_digest    TEXT,
+  -- 上游原始响应：流式是 SSE 原文，非流式是 JSON 文本，同样脱敏并截断。
+  response_text     TEXT,
+  -- **回给客户端的**响应。chat 是透传（与 response_text 相同），Anthropic /
+  -- Responses 两条协议是**翻译后**的形态 —— 同一个请求，「上游说了什么」与
+  -- 「客户端收到了什么」是两份不同的报文，排查协议转换只能两边对着看。
+  client_response_text TEXT,
+  -- 关联键：manager 发往上游时带的 X-Trace-ID，用来把「上游出站转储」里的
+  -- 请求 / 响应两行精确对回这一轮（腾讯视角）。NULL = 该记录写于本功能之前，
+  -- 或上游没开转储。
+  trace_id          TEXT,
+  -- 从上面那段响应里重建出的「模型到底说了什么」：正文、思考、工具调用。
+  -- 流式响应没法直接读；不重建，用户在界面上只能看到一堆 `data:` 行。
+  recon_json        TEXT,
+  usage_json        TEXT,
+  error             TEXT,
+  truncated         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_tap_turns_session ON tap_turns(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_tap_turns_ts ON tap_turns(ts);
 """
 
 
@@ -251,6 +584,10 @@ def _explain_db_open_failure(exc: Exception) -> str:
 
     上游自己的 compose 对 `./data` 写了 chown 提示，我们的漏了 —— 于是同样的坑
     在管理端这边表现为一条 sqlite 报错，用户完全猜不到是权限。
+
+    光给 chown 还不够：NAS / 群晖这类环境的目录属主根本改不了（或没开 SSH），
+    所以说明里同时给出「切到命名卷」这条不需要动宿主权限的路（见 compose 的
+    `WB_DATA_VOLUME` 开关）。
     """
     import os as _os
 
@@ -275,12 +612,18 @@ def _explain_db_open_failure(exc: Exception) -> str:
     lines.append(
         '  最常见的成因是**目录属主不对**：容器以 uid 10001 运行，而 bind mount\n'
         '  （compose 里的 `./data:/app/data`）属主由宿主机决定 —— docker 首次自动\n'
-        '  创建该目录时归 root，容器内的 10001 写不进去。宿主机执行一次即可：\n'
-        '    chown -R 10001:10001 ./data\n'
-        '  （在 docker-compose.yml 所在目录执行；10001 是镜像内 app 用户的 uid）\n'
-        '  若目录是网络文件系统（NFS/SMB）且不支持属主修改，改用命名卷：\n'
-        '    volumes:\n      - wb-manager-data:/app/data\n'
-        '  volumes:\n    wb-manager-data:'
+        '  创建该目录时归 root，容器内的 10001 写不进去。两种修法任选其一：\n'
+        '  ① 能改属主：在 docker-compose.yml 所在目录执行\n'
+        '       sudo chown -R 10001:10001 ./data\n'
+        '       docker restart workbuddy-manager\n'
+        '     （10001 是镜像内 app 用户的 uid；只重启、别重建，\n'
+        '       否则面板更新过的代码会退回镜像里的版本）\n'
+        '  ② 改不了属主（NAS 的 SMB/NFS、群晖 Container Manager、没开 SSH）：\n'
+        '     在 compose 同目录的 .env 里加一行\n'
+        '       WB_DATA_VOLUME=wb-manager-data\n'
+        '     再执行 docker compose up -d —— 命名卷首次创建会继承镜像内目录的\n'
+        '     属主，不需要 chown。旧版 compose 没有这个变量时，把挂载整行改成\n'
+        '     `- wb-manager-data:/app/data`，并在文件末尾加顶层 `volumes:` 声明。'
     )
     return '\n'.join(lines)
 
@@ -309,13 +652,128 @@ def connect() -> sqlite3.Connection:
         _conn.commit()
         # 建表之后再收紧权限：库文件此刻才确定存在，WAL 伴生文件也在初始化后出现
         _restrict_db_permissions()
+        # 升级兜底：usage_hourly 是后加的表，存量库升级后它是空的 —— 用户点开
+        # 「今日」趋势图会是一片空白，而卡片数字明明有值。用请求日志补一次今天
+        # （幂等、只补今天、失败不影响启动）。
+        ensure_hourly_today()
+        # 启动时也清一次侧表：低流量部署可能很久攒不够触发周期清理的写入量。
+        _prune_side_tables()
     return _conn
+
+
+def _close_connection_locked() -> None:
+    """关掉共享连接。调用方必须持有 `_lock`。
+
+    先做一次 TRUNCATE checkpoint：WAL 模式下未合并的页还在 `-wal` 里，只 close
+    不 checkpoint 的话，随后删除伴生文件会连带丢掉最后那批已提交的数据。
+    """
+    global _conn
+    conn, _conn = _conn, None
+    if conn is None:
+        return
+    try:
+        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    except sqlite3.Error:
+        pass
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def replace_database(staging: Path) -> None:
+    """用 *staging* 替换当前数据库，并重新打开共享连接。
+
+    **调用方不得持有 `_lock`**：这里是「先关闭、再改名、再重开」的窗口，
+    只在替换的瞬间持锁（毫秒级）；耗时的那部分（把镜像写进临时库）由调用方
+    在锁外完成 —— 这正是恢复不再阻塞网关的原因。
+
+    staging 必须是本进程独占的完整 SQLite 库（调用方负责关闭它的连接）。
+    """
+    staging = Path(staging)
+    if not staging.is_file():
+        raise FileNotFoundError(f'待替换的数据库不存在：{staging}')
+
+    target = Path(config.DB_PATH)
+    old = Path(str(target) + '.swap-old')
+    wal = Path(str(target) + '-wal')
+    shm = Path(str(target) + '-shm')
+
+    with _lock:
+        # 上一次替换在第 1、2 步之间崩溃时，正式库不在、.swap-old 才是最后
+        # 一份成功数据。先把它放回去再继续，绝不能当成残骸删掉。
+        if not target.exists() and old.exists():
+            os.replace(old, target)
+        # 清掉上一次异常中断留下的残骸（正常路径下不存在）。
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass
+
+        _close_connection_locked()
+        # 关闭连接时 SQLite 会做最后一次 checkpoint 并删除 WAL。若还剩非空
+        # WAL，说明还有未合并的已提交数据（异常关闭/别的连接占着），此时
+        # 删掉它就等于丢数据 —— 重开连接、放弃换库，让旧库连同 WAL 原样保留。
+        if wal.exists() and wal.stat().st_size > 0:
+            connect()
+            raise RuntimeError('数据库 WAL 未能合并，已放弃替换以免丢数据')
+        # WAL/SHM 必须在连接关闭之后删：Windows 上打开着的句柄不能删，
+        # 硬删会抛 WinError 32；POSIX 上虽然能删，但旧 WAL 留在原地更危险。
+        for path in (wal, shm):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        moved = False
+        try:
+            if target.exists():
+                os.replace(target, old)
+                moved = True
+            os.replace(staging, target)
+            # 旧库的 WAL/SHM **绝不能**留给新库：文件名相同，SQLite 会把它们
+            # 当成新库自己的日志重放，轻则数据对不上，重则直接损坏。
+            for path in (wal, shm):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            connect()
+            if moved:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            # 回滚：关掉可能已经打开的新库，把旧文件放回去再重开。
+            # 这一步失败意味着磁盘/权限出了大问题，只能留日志让人工处理。
+            _close_connection_locked()
+            try:
+                if moved:
+                    if target.exists():
+                        target.unlink()
+                    if old.exists():
+                        os.replace(old, target)
+                connect()
+            except Exception:
+                logger.exception('数据库替换回滚失败，需要人工检查：%s', target)
+            raise
 
 
 # 增量迁移：SQLite 的 CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
 # 因此新增字段必须显式 ALTER。每条用 PRAGMA 检测后再加，可重复执行。
 _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # (表名, 列名, 列定义)
+    # 抓包要能对着看「上游说的」与「客户端收到的」：存量库缺这一列时，
+    # 界面按「未采集」处理，而不是把上游原文冒充成客户端视角。
+    ('tap_turns', 'client_response_text', 'TEXT'),
+    # 腾讯视角的关联键（见 tap_turns.trace_id 的说明）
+    ('tap_turns', 'trace_id', 'TEXT'),
+    # 抓包会话的原始 UA（版本号从这里取；旧记录按它重新归类）
+    ('tap_sessions', 'client_ua', 'TEXT'),
+    ('tap_turns', 'request_digest', 'TEXT'),
+    ('tap_sessions', 'first_user', 'TEXT'),
+    ('tap_sessions', 'kind', "TEXT NOT NULL DEFAULT 'main'"),
+    ('tap_sessions', 'parent_id', 'INTEGER'),
     ('request_logs', 'credit', 'REAL'),
     ('usage_daily', 'credit', 'REAL NOT NULL DEFAULT 0'),
     # 首字延迟：可空（历史记录与非流式请求为 NULL）
@@ -332,14 +790,42 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 人家正在用的密钥悄悄限死（那会让线上调用突然 403）。管理员在界面上
     # 看到「未限定」标记后可按需补填。
     ('api_keys', 'realm', "TEXT NOT NULL DEFAULT ''"),
+    # 密钥绑定的上游接入点（多上游 / 分组隔离）。可空 = **默认上游** ——
+    # 存量密钥一律为空，行为与升级前完全一致（走 WB2API_BASE 那一套）。
+    # 不设外键约束：SQLite 的外键要开 PRAGMA 且删除上游时语义是「级联删密钥」还是
+    # 「拒绝删」都不合适 —— 本项目在应用层做「被引用就拒绝删」（见 upstreamsvc）。
+    ('api_keys', 'upstream_id', 'INTEGER'),
+    # 分组（账号池）的**本地账号目录**：面板据此列账号 / 添号 / 移动账号。
+    # 空 = 不做账号管理（该分组只用于密钥转发）。默认分组的目录来自 WB_AUTH_DIR，
+    # 是运行时结果、不落库——与「默认上游不是数据库里的一行」同一个道理。
+    ('upstreams', 'auth_dir', "TEXT NOT NULL DEFAULT ''"),
+    # 分组上游实例的容器名（可选）：面板的「重启」用 `docker restart <name>`。
+    # 空 = 从面板重启该分组时明确报错；绝不猜一个名字去重启别的服务。
+    ('upstreams', 'container', "TEXT NOT NULL DEFAULT ''"),
     # 积分额度与已用量（issue #27）。存量密钥为 0/0 = **不限积分**，行为不变。
     #
     # 为什么要在 token 之外单独记一笔：两者**不成比例** —— 同样 1M token，
     # 便宜模型与贵模型的实际扣费能差几十倍，按 token 限额估不出花了多少积分
     # （提需求的人遇到的正是这个问题）。上游从 2026-09-13 起在末帧 usage 里
     # 带回真实 credit，我们已按请求存进 request_logs.credit，所以这里算得准。
+    # 提示词缓存的三段 token（issue #69）：腾讯在流式末帧 usage 里给
+    # prompt_cache_hit_tokens / prompt_cache_miss_tokens / prompt_cache_write_tokens。
+    # **可空**：老上游不给这三个字段时是 NULL（「没数据」），与「给了但是 0」不是
+    # 一回事——后者代表这次请求真的没命中缓存，而前者代表我们不知道。
+    ('request_logs', 'cache_hit_tokens', 'INTEGER'),
+    ('request_logs', 'cache_miss_tokens', 'INTEGER'),
+    ('request_logs', 'cache_write_tokens', 'INTEGER'),
     ('api_keys', 'quota_credit', 'REAL NOT NULL DEFAULT 0'),
     ('api_keys', 'used_credit', 'REAL NOT NULL DEFAULT 0'),
+    # 每日 token 限额。存量密钥为 0 = **不限**，行为不变。
+    # 已用量按本地日期记在 daily_used_day 名下，跨天自动归零（读时判断，写时重置）。
+    ('api_keys', 'daily_quota', 'INTEGER NOT NULL DEFAULT 0'),
+    ('api_keys', 'daily_used_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+    ('api_keys', 'daily_used_day', "TEXT NOT NULL DEFAULT ''"),
+    # 密钥明文（供「密钥页再次查看 / 复制」，见 SCHEMA 里这一列的说明）。
+    # 存量密钥为空串 = 取不回明文：那一版只存哈希，界面上要说清「去重建一把」，
+    # 而不是显示一个空密钥让人以为复制坏了。
+    ('api_keys', 'key_plain', "TEXT NOT NULL DEFAULT ''"),
     # 入站请求被拦的**原因**（issue #33）。
     #
     # 此前这张表只有一个 blocked 布尔：界面显示「已拦截」，但看不出是「没带
@@ -348,6 +834,57 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # ——实测有用户发了 issue 也说不清是哪一种。
     # 存量记录为 NULL（那时没记原因），界面按「未记录」展示。
     ('ip_access_logs', 'reason', 'TEXT'),
+    # 本次请求**实际用了哪个上游账号**（issue #69）。
+    #
+    # 为什么需要单独记：账号是**上游**选的，本端转发时并不知道。此前日志里
+    # 只有「请求了什么」，没有「谁答的」，于是两件事都无法回答：
+    #   · 同一把密钥的连续请求是否被分散到了不同账号（上游的轮换是否在工作）；
+    #   · 某个账号是不是在拖后腿（错误率/延迟异常）。
+    # 客户端的 system prompt 命中缓存时，同一账号才会命中同一份前缀缓存——
+    # 所以这一列也是判断「为什么这次没走缓存」的线索。
+    #
+    # 值形如 `昵称(uid8)`，与上游日志里的写法一致；脱敏与截断在写入侧做。
+    # NULL = 未关联上（采集不可用、或该条在上游日志里已滚掉），界面显示「—」。
+    ('request_logs', 'account', 'TEXT'),
+    # 0 = 本地拒绝，根本没有上游对话日志；NULL = 旧记录，保持兼容。
+    # 不能按 HTTP 状态排除：上游 400/429/503 同样可能已选账号。
+    ('request_logs', 'account_expected', 'INTEGER'),
+    # 输入侧命中缓存的 token 数（上游 usage.prompt_cache_hit_tokens）。
+    #
+    # 为什么值得单独记：prompt_tokens 是**含**缓存的，光看它看不出这次省了
+    # 多少——同一段 8k 前缀，命中与不命中的扣费能差约 17 倍（上游实测）。
+    # 缓存是否生效与「账号是否稳定」强相关，和上面那列一起看才有意义。
+    # NULL = 上游未返回该字段（旧版上游/非对话类请求），与「命中 0」是两回事。
+    ('request_logs', 'cache_hit_tokens', 'INTEGER'),
+    # 红包的抽奖支持：抽奖码 + 明文密钥 + 领取记录。
+    #
+    # 必须走迁移而不只是改建表语句：`CREATE TABLE IF NOT EXISTS` 对**已存在**
+    # 的表什么都不做（红包那两张表在本功能的前半部分就建好了），不补列的话
+    # 升级上来的部署一抽奖就报「no such column」。新装不受影响，两条路径
+    # 都要能走通，所以建表语句与迁移两处都得有。
+    ('red_packets', 'code', 'TEXT'),
+    ('red_packet_shares', 'token', "TEXT NOT NULL DEFAULT ''"),
+    ('red_packet_shares', 'claimed_by_ip', 'TEXT'),
+    ('red_packet_shares', 'claimed_at', 'INTEGER'),
+    # 思考强度（reasoning_effort）：客户端显式传的档位（low / medium / high / max…）。
+    # NULL = 客户端没传（走模型默认档）或该字段上线前的历史记录——两者界面都显示
+    # 「—」，不做推断，避免把「默认」写成某个具体档位误导排查。
+    ('request_logs', 'effort', 'TEXT'),
+    # 客户端渠道（issue #233）：UA 归类结果，用于排查「哪类客户端在打冷账号」。
+    # 旧记录为 NULL（界面显示「—」），不推断。
+    ('request_logs', 'channel', 'TEXT'),
+    # DeepSeek 官方价估算的费用（issue #380）。三张表都要加：
+    #   · request_logs —— 日志页逐条显示；
+    #   · usage_daily / usage_hourly —— 统计页按模型 / 按密钥 / 趋势图求和。
+    # 三处都**可空**：存量行没有费用（那时还没这功能），NULL 表示「算不出」，
+    # 与「确实是 0 元」不同。历史行要补，点统计页的「重建用量」从请求日志重算。
+    ('request_logs', 'cost', 'REAL'),
+    ('usage_daily', 'cache_hit_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+    ('usage_daily', 'cache_miss_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+    ('usage_daily', 'cost', 'REAL'),
+    ('usage_hourly', 'cache_hit_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+    ('usage_hourly', 'cache_miss_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+    ('usage_hourly', 'cost', 'REAL'),
 )
 
 
@@ -365,6 +902,48 @@ def _migrate(conn: sqlite3.Connection) -> None:
             # 并发启动时可能已被另一进程加过，忽略即可
             pass
     _rebuild_usage_daily_pk(conn)
+    _ensure_keys_hash_unique(conn)
+
+
+def _ensure_keys_hash_unique(conn: sqlite3.Connection) -> None:
+    """给 `api_keys.key_hash` 建唯一索引（issue #447）。
+
+    为什么需要：放开自定义密钥形态后，"检查是否已存在"（路由层）与 "INSERT"
+    之间有竞态窗口。实测 8 个线程并发用同一个 token 创建，会落下 **8 行同 hash**
+    的密钥 —— 之后鉴权随机命中任意一行，额度与日志归属全部错乱。应用层的 409
+    只负责友好提示，真正防重的必须是数据库约束。
+
+    为什么放在迁移里而不是 SCHEMA：默认的 `wbk_` 随机串撞车可忽略，但**手工
+    改过库**或旧版本遗留的数据可能有重复。若把唯一索引写进 SCHEMA，
+    `executescript` 会在启动时直接抛错、服务起不来 —— 而那种库恰恰最需要能
+    启动起来处理。
+
+    处理策略：先删重复**只保留 id 最小的一行**（最早创建的那把），再建索引。
+    删掉的重复行在功能上本来就等价于「同一个 token 的多份副本」，保留最早一份
+    不会让任何调用方失效。
+    """
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_keys_hash'"
+        ).fetchone()
+        if exists:
+            return
+        dup = conn.execute(
+            'SELECT key_hash FROM api_keys GROUP BY key_hash HAVING COUNT(*) > 1 LIMIT 1'
+        ).fetchone()
+        if dup:
+            conn.execute(
+                'DELETE FROM api_keys WHERE key_hash = ? AND id NOT IN '
+                '(SELECT MIN(id) FROM api_keys WHERE key_hash = ?)',
+                (dup[0], dup[0]))
+            conn.commit()
+            logger.warning('清理了重复的密钥哈希（保留最早一行）：%s…', str(dup[0])[:12])
+        conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_keys_hash ON api_keys(key_hash)')
+        conn.commit()
+    except sqlite3.Error as exc:
+        # 建不上也不该让服务起不来：应用层的检查仍然在，只是没有数据库兜底。
+        logger.warning('未能建立 api_keys.key_hash 唯一索引（%s）；并发创建同名密钥'
+                       '可能产生重复，请检查表中是否有重复 key_hash', exc)
 
 
 def _rebuild_usage_daily_pk(conn: sqlite3.Connection) -> bool:
@@ -429,15 +1008,26 @@ def _rebuild_usage_daily_pk(conn: sqlite3.Connection) -> bool:
                   prompt_tokens     INTEGER NOT NULL DEFAULT 0,
                   completion_tokens INTEGER NOT NULL DEFAULT 0,
                   credit            REAL    NOT NULL DEFAULT 0,
+                  -- 缓存两列与费用（issue #380）必须一起建：这张新表**替换**旧表，
+                  -- 漏掉哪一列，迁移完成后那一列就彻底没了（后续写入直接报
+                  -- 「no such column」，而统计是旁路，只会静默失败）。
+                  cache_hit_tokens  INTEGER NOT NULL DEFAULT 0,
+                  cache_miss_tokens INTEGER NOT NULL DEFAULT 0,
+                  cost              REAL,
                   realm             TEXT    NOT NULL DEFAULT 'cn',
                   PRIMARY KEY (day, key_id, model, realm)
                 )
             ''')
             conn.execute('''
                 INSERT OR REPLACE INTO usage_daily_new
-                  (day, key_id, model, requests, prompt_tokens, completion_tokens, credit, realm)
+                  (day, key_id, model, requests, prompt_tokens, completion_tokens, credit,
+                   cache_hit_tokens, cache_miss_tokens, cost, realm)
                 SELECT day, key_id, model, requests, prompt_tokens, completion_tokens,
-                       credit, realm
+                       credit,
+                       -- 旧库没有这两列：给 0（「未采集」），费用保持 NULL（算不出），
+                       -- 而不是 0 元。补历史请用统计页的「重建用量」。
+                       COALESCE(cache_hit_tokens, 0), COALESCE(cache_miss_tokens, 0), cost,
+                       realm
                 FROM usage_daily
             ''')
             conn.execute('DROP TABLE usage_daily')
@@ -473,7 +1063,18 @@ def query_one(sql: str, args: Iterable[Any] = ()) -> sqlite3.Row | None:
 def execute(sql: str, args: Iterable[Any] = ()) -> int:
     with _lock:
         conn = connect()
-        cur = conn.execute(sql, tuple(args))
+        try:
+            cur = conn.execute(sql, tuple(args))
+        except Exception:
+            # 失败必须回滚：sqlite3 在 execute 抛错时**不会**自动结束隐式事务，
+            # 连接上会留着写锁 —— 之后所有写操作都变成 "database is locked"
+            # （实测：一个 UNIQUE 冲突就能让整个进程的后续写入卡死）。
+            # 这条是既有缺陷，唯一索引只是让它变得容易复现。
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         conn.commit()
         return int(cur.lastrowid or 0)
 
@@ -481,7 +1082,15 @@ def execute(sql: str, args: Iterable[Any] = ()) -> int:
 def executemany(sql: str, seq: Iterable[Iterable[Any]]) -> None:
     with _lock:
         conn = connect()
-        conn.executemany(sql, [tuple(x) for x in seq])
+        try:
+            conn.executemany(sql, [tuple(x) for x in seq])
+        except Exception:
+            # 同 execute：失败不回滚会让写锁挂在连接上
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         conn.commit()
 
 
@@ -494,6 +1103,47 @@ def get_setting(key: str, default: Any = None) -> Any:
         return json.loads(row['value'])
     except Exception:
         return default
+
+
+# ── 账号备注（issue #67）────────────────────────────────
+#
+# 备注按 **uid** 关联，不按文件名：临时停用会把文件改成 `.disabled`，按文件名存
+# 会让备注在停用/启用之间丢掉。调用方负责先解析出 uid（见 accounts 路由）。
+def set_account_note(uid: str, note: str) -> None:
+    execute(
+        'INSERT INTO account_notes(uid, note, updated_at) VALUES(?, ?, ?) '
+        'ON CONFLICT(uid) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at',
+        (str(uid), str(note), int(time.time())),
+    )
+
+
+def delete_account_note(uid: str) -> None:
+    execute('DELETE FROM account_notes WHERE uid = ?', (str(uid),))
+
+
+def account_notes() -> dict[str, str]:
+    """全部备注 {uid: note}。账号列表一次取回，避免按账号逐条查。"""
+    return {str(r['uid']): str(r['note']) for r in query('SELECT uid, note FROM account_notes')}
+
+
+def account_added_times(directory: Path | str) -> dict[str, float]:
+    return {r['uid']: r['added_at'] for r in query(
+        'SELECT uid, added_at FROM account_additions WHERE scope=?',
+        (str(Path(directory).resolve()),))}
+
+
+def record_account_added(uid: str, directory: Path | str | None) -> None:
+    execute('''INSERT INTO account_additions(scope,uid,added_at) VALUES(?,?,?)
+        ON CONFLICT(scope,uid) DO UPDATE SET added_at=excluded.added_at''',
+        (str(Path(directory or config.AUTH_DIR).resolve()), str(uid), time.time()))
+
+
+def move_account_added(uid: str, source: Path, target: Path) -> None:
+    with _lock:
+        execute('''INSERT OR IGNORE INTO account_additions(scope,uid,added_at)
+            SELECT ?,uid,added_at FROM account_additions WHERE scope=? AND uid=?''',
+            (str(target.resolve()), str(source.resolve()), uid))
+        execute('DELETE FROM account_additions WHERE scope=? AND uid=?', (str(source.resolve()), uid))
 
 
 def set_setting(key: str, value: Any) -> None:
@@ -512,24 +1162,83 @@ def bump_usage(
     completion_tokens: int,
     credit: float | None = None,
     realm: str | None = None,
+    cache_hit: int | None = None,
+    cache_miss: int | None = None,
+    ts: float | None = None,
 ) -> None:
     """累计当日用量。credit 为本次真实扣费，缺省不计入（不按 0 记）。
 
     realm（cn / global）由调用方按模型名前缀判定后传入；缺省归 cn
     （与 realm_of_model 的口径一致：无前缀即国内版）。
+
+    cache_hit / cache_miss / ts（issue #380）：费用要按「命中价 / 未命中价」
+    与「高峰 / 空闲」两个维度分别计价，所以这三样必须一起进来。**费用在这里
+    算一次、按当时的价目与当时的时段落库**——事后调价不改历史账；同理，
+    按天与按小时两张表拿的是同一个值，不会出现两处对不上。
     """
-    day = day_of()
+    day = day_of(ts)
     r = realm if realm in ('cn', 'global') else realm_of_model(model)
+    cost = _estimate_cost(model, prompt_tokens, completion_tokens, cache_hit, cache_miss, ts)
+    hit = int(cache_hit or 0)
+    miss = int(cache_miss or 0)
     execute(
-        'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, completion_tokens, credit, realm) '
-        'VALUES(?, ?, ?, 1, ?, ?, ?, ?) '
+        'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, completion_tokens, '
+        'credit, cache_hit_tokens, cache_miss_tokens, cost, realm) '
+        'VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?) '
         'ON CONFLICT(day, key_id, model, realm) DO UPDATE SET '
         '  requests = requests + 1, '
         '  prompt_tokens = prompt_tokens + excluded.prompt_tokens, '
         '  completion_tokens = completion_tokens + excluded.completion_tokens, '
-        '  credit = credit + excluded.credit',
-        (day, key_id, model, prompt_tokens, completion_tokens, float(credit or 0), r),
+        '  credit = credit + excluded.credit, '
+        '  cache_hit_tokens = cache_hit_tokens + excluded.cache_hit_tokens, '
+        '  cache_miss_tokens = cache_miss_tokens + excluded.cache_miss_tokens, '
+        # cost 为 NULL 表示算不出（模型没收录价目）：累加时把 NULL 当 0，
+        # 但**只有当整行都没价时才保持 NULL** —— 用 COALESCE 两边兜住，
+        # 否则一条没价的行会把当天合计变成 NULL（显示「—」而不是已算出的金额）。
+        # 两边都没价时保持 NULL（「算不出」），不能变成 0（「免费」）
+        '  cost = CASE WHEN cost IS NULL AND excluded.cost IS NULL THEN NULL '
+        'ELSE COALESCE(cost, 0) + COALESCE(excluded.cost, 0) END',
+        (day, key_id, model, prompt_tokens, completion_tokens, float(credit or 0),
+         hit, miss, cost, r),
     )
+    # 同一份数据的**小时**维度，给「今日」趋势图用。两处必须一起写：只写一处
+    # 就会出现「卡片有数、小时图没有」或反过来的分歧（口径一致性见建表注释）。
+    execute(
+        'INSERT INTO usage_hourly(day, hour, key_id, model, requests, prompt_tokens, '
+        'completion_tokens, credit, cache_hit_tokens, cache_miss_tokens, cost, realm) '
+        'VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?) '
+        'ON CONFLICT(day, hour, key_id, model, realm) DO UPDATE SET '
+        '  requests = requests + 1, '
+        '  prompt_tokens = prompt_tokens + excluded.prompt_tokens, '
+        '  completion_tokens = completion_tokens + excluded.completion_tokens, '
+        '  credit = credit + excluded.credit, '
+        '  cache_hit_tokens = cache_hit_tokens + excluded.cache_hit_tokens, '
+        '  cache_miss_tokens = cache_miss_tokens + excluded.cache_miss_tokens, '
+        # 两边都没价时保持 NULL（「算不出」），不能变成 0（「免费」）
+        '  cost = CASE WHEN cost IS NULL AND excluded.cost IS NULL THEN NULL '
+        'ELSE COALESCE(cost, 0) + COALESCE(excluded.cost, 0) END',
+        (day, hour_of(ts), key_id, model, prompt_tokens, completion_tokens,
+         float(credit or 0), hit, miss, cost, r),
+    )
+
+
+def _estimate_cost(model: str | None,
+                   prompt_tokens: int | None,
+                   completion_tokens: int | None,
+                   cache_hit: int | None,
+                   cache_miss: int | None,
+                   ts: float | None) -> float | None:
+    """按 DeepSeek 官方价估算一次调用（元）。模型没收录价目时返回 None。
+
+    延迟导入：pricing 反过来要 import db 读覆盖价目，顶层互相导入会成环。
+    旁路计算，任何异常都不能影响请求本身——失败就返回 None（界面显示「—」）。
+    """
+    try:
+        from .services import pricing
+        return pricing.cost_of(model, prompt_tokens, completion_tokens,
+                               cache_hit=cache_hit, cache_miss=cache_miss, ts=ts)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def realm_of_model(model: str | None) -> str:
@@ -562,6 +1271,27 @@ def add_checkin_log(
         'VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
         (int(time.time()), uid or '', nickname or '', source, kind, 1 if success else 0, code, message),
     )
+
+
+def checkin_done_since(ts_from: int) -> dict[str, int]:
+    """每个账号在 `ts_from` 之后**最近一次成功**签到的时刻（uid → ts）。
+
+    没有记录的账号不出现在结果里，调用方用 `.get(uid)` 判空即可。
+
+    为什么成功判定直接用 `success = 1` 而不看 code：签到侧把两种都记成成功——
+    `0`（本次签到成功）与 `10001`（今天已签过）——而这两者对「今天签没签」是
+    同一个答案。`-2`（国际版无签到体系）与各种失败都是 `success = 0`，不会污染。
+    换句话说：这里问的是「今天签到这件事有没有办成过」，不是「是谁办的」。
+
+    仅取时间不取 code / source：界面要的是「签没签、什么时候签的」，多取列反而
+    得为「同一 ts 多条」写去重。
+    """
+    rows = query(
+        'SELECT uid, MAX(ts) AS ts FROM checkin_logs '
+        "WHERE success = 1 AND ts >= ? AND uid != '' GROUP BY uid",
+        (int(ts_from),),
+    )
+    return {str(r['uid']): int(r['ts']) for r in rows if r['ts'] is not None}
 
 
 # days 参数的统一上限。**必须有上限**：超大整数在 SQLite 绑定时会溢出抛错
@@ -736,8 +1466,44 @@ _REQUEST_LOG_CHECK_EVERY = 2000
 _request_log_writes = 0
 
 
+# 侧表保留策略（审计 2026-10-18）：这几张表以前只增不减。
+#   · usage_hourly：每天 × 每密钥 × 每模型 × 24 行，长期跑会拖慢查询与备份；
+#   · task_logs：采集器持续写入；
+#   · audit_logs：**未认证路径也能写**（失败令牌会留痕），没有上限等于给了一个
+#     填磁盘的入口（请求日志有 90 天保留，审计反而没有）。
+_HOURLY_RETAIN_DAYS = 90
+_TASK_LOG_RETAIN_DAYS = 90
+_AUDIT_LOG_MAX_ROWS = 20000
+
+
+def _prune_side_tables() -> None:
+    """给只增不减的侧表加保留期 / 条数上限。旁路操作，失败绝不影响主流程。"""
+    now = int(time.time())
+    # 时钟早于保留期（测试桩把 time.time 打到 0、或系统钟异常）时没有可清理的旧
+    # 数据；而 Windows 的 localtime 不接受负时间戳（OSError: Invalid argument）。
+    if now <= _HOURLY_RETAIN_DAYS * 86400:
+        return
+    hourly_cutoff = time.strftime('%Y-%m-%d',
+                                  time.localtime(now - _HOURLY_RETAIN_DAYS * 86400))
+    task_cutoff = now - _TASK_LOG_RETAIN_DAYS * 86400
+    for sql, args in (
+        ('DELETE FROM usage_hourly WHERE day < ?', (hourly_cutoff,)),
+        ('DELETE FROM task_logs WHERE ts < ?', (task_cutoff,)),
+        ('DELETE FROM request_account_matches WHERE ts < ?',
+         (now - _REQUEST_LOG_RETAIN_DAYS * 86400,)),
+        # 保留最新 N 行：删除 id <= 第 N+1 新那行的 id；不足 N 行时子查询为 NULL，
+        # `id <= NULL` 不成立，什么都不会删。
+        ('DELETE FROM audit_logs WHERE id <= (SELECT id FROM audit_logs '
+         'ORDER BY id DESC LIMIT 1 OFFSET ?)', (_AUDIT_LOG_MAX_ROWS,)),
+    ):
+        try:
+            execute(sql, args)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _prune_request_logs() -> None:
-    """按保留期清理请求日志（滚动删除最旧的）。
+    """按保留期清理请求日志（滚动删除最旧的），顺手清理侧表。
 
     旁路操作：任何失败都不能影响写入本身（更不能影响转发）。
     """
@@ -746,6 +1512,7 @@ def _prune_request_logs() -> None:
         execute('DELETE FROM request_logs WHERE ts < ?', (cutoff,))
     except Exception:  # noqa: BLE001
         pass
+    _prune_side_tables()
 
 
 def add_request_log(**fields: object) -> None:
@@ -757,22 +1524,170 @@ def add_request_log(**fields: object) -> None:
     `rebuild` 随即因 `NOT NULL constraint failed` 崩掉）。这里显式按列序展开。
     """
     global _request_log_writes
+    # 费用在这里补算（issue #380）：调用方不必逐个记得传，四条协议路径
+    # （chat / Responses / Anthropic / 测试台）共用这一个入口。已显式给了 cost
+    # 的（重建、测试桩）原样尊重，不覆盖。
+    cost = fields.get('cost')
+    if 'cost' not in fields:
+        cost = _estimate_cost(fields.get('mapped_model') or fields.get('model'),
+                              fields.get('prompt_tokens'), fields.get('completion_tokens'),
+                              fields.get('cache_hit_tokens'), fields.get('cache_miss_tokens'),
+                              fields.get('ts'))
     execute(
         'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '
         'prompt_tokens, completion_tokens, latency_ms, first_token_ms, ua, error, '
-        'stream, credit, realm) '
-        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'stream, credit, realm, account, cache_hit_tokens, cache_miss_tokens, '
+        'cache_write_tokens, effort, channel, cost, account_expected) '
+        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (fields.get('ts'), fields.get('key_id'), fields.get('ip'),
          fields.get('model'), fields.get('mapped_model'), fields.get('status'),
          fields.get('prompt_tokens'), fields.get('completion_tokens'),
          fields.get('latency_ms'), fields.get('first_token_ms'), fields.get('ua'),
          fields.get('error'), fields.get('stream'), fields.get('credit'),
-         fields.get('realm')),
+         fields.get('realm'), fields.get('account'), fields.get('cache_hit_tokens'),
+         fields.get('cache_miss_tokens'), fields.get('cache_write_tokens'),
+         fields.get('effort'), fields.get('channel'), cost, fields.get('account_expected')),
     )
     _request_log_writes += 1
     if _request_log_writes >= _REQUEST_LOG_CHECK_EVERY:
         _request_log_writes = 0
         _prune_request_logs()
+
+
+# 账号回填的匹配窗口（秒）。
+#
+# 上游日志的时间戳是「请求结束」时刻，与本端 `request_logs.ts` 同义（也在
+# 请求结束时取的 `int(time.time())`），所以能直接比。实测两者相差 < 1 秒
+# （RTT + 双方时钟），窗口给 3 秒覆盖慢链路与时钟漂移。
+_ACCOUNT_MATCH_WINDOW = 3
+
+
+def _pick_account_row(rows, total_ms):
+    """从候选行里挑出唯一最可能的一条；不确定就返回 None。
+
+    原先的规则是「时间距离最近者，等距就放弃」。放弃本身是对的（v2.11.10 修
+    「相邻请求显示别人的账号」时定的安全边界），但判据只有「模型 + 秒级时间
+    戳」，而秒级时间戳在**同秒并发**时必然等距 —— 同一秒到达两条同模型请求，
+    两边距离都是 0，于是这批记录永久留在 account IS NULL，界面一直提示
+    「存在超过 60 秒仍未回填账号的近期请求」。
+
+    这里给等距分支补一个确定性判据：上游日志行的 `total=20.1s` 与本端
+    `request_logs.latency_ms` 是**同一请求的同一个量**（总耗时），精度远高于
+    秒级时间戳。于是：
+
+      · 时间距离不等距 → 仍取最近者（原语义，完全不变）；
+      · 等距且带耗时  → 取 |total_ms - latency_ms| 最小者，唯一胜出才填；
+      · 连耗时都分不开 → 返回 None，继续保持不猜。
+
+    `rows` 已按 (distance, id) 排序。并列的候选可能多于两条，因此要把整个
+    并列集合纳入比较，而不是只看前两条。
+    """
+    if not rows:
+        return None
+    best = rows[0]
+    if len(rows) == 1:
+        return best
+    tied = [r for r in rows if r['distance'] == best['distance']]
+    if len(tied) == 1:
+        return best
+    if total_ms is None:
+        return None
+    scored = []
+    for r in tied:
+        lat = r['latency_ms']
+        if lat is None:
+            continue
+        scored.append((abs(int(lat) - int(total_ms)), r))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (item[0], item[1]['id']))
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    return scored[0][1]
+
+
+def attach_request_accounts(entries: Iterable[dict]) -> int:
+    """把从上游日志采集到的账号回填到对应的请求日志行（issue #69）。返回回填条数。
+
+    entries 形如 `[{'ts': 结束时刻(epoch 秒), 'model': 上游侧模型名,
+    'account': '昵称(uid8)'}]`。
+
+    匹配规则：**同模型 + 时间最接近 + 尚未回填 + 事件尚未消费**。
+
+    两端时刻只有秒级精度，就近匹配仍是启发式。最近候选等距时留空，不能猜。
+    事件消费与回填在同一事务里提交：重复 tail、重启和并发采集都不能把一条日志
+    填给第二个请求。未匹配的事件不消费，下一轮仍可匹配稍晚写入的本地记录。
+
+    模型名两边都取**映射后**的名字（`mapped_model`），另兼看 `model` ——
+    映射表变更时两边可能只对得上一个。
+    """
+    filled = 0
+    for e in entries:
+        ts = e.get('ts')
+        acct = _clean(e.get('account'), 64)
+        # bool 是 int 的子类：`ts=True` 会当成「1970-01-01 00:00:01」，虽然只会
+        # 匹配到空窗（几乎没有这种行），但没有时间戳就不该参与匹配。
+        if not isinstance(ts, int) or isinstance(ts, bool) or not acct:
+            continue
+        model = _clean(e.get('model'), 128)
+        # 模型名为空时**不能**匹配：`model = ''` 会命中「模型列也是空」的那些行
+        # （历史记录里存在），等于把账号填到一条毫不相干的日志上。宁可漏填。
+        if not model:
+            continue
+        # 解析器提供包含原始时间戳和序号的事件标识；兼容旧调用方的三字段条目。
+        event = e.get('event_id') or json.dumps([ts, model, acct], ensure_ascii=False)
+        event_id = hashlib.sha256(
+            json.dumps([e.get('source', ''), event], ensure_ascii=False).encode('utf-8'),
+        ).hexdigest()
+        try:
+            with _lock:
+                conn = connect()
+                try:
+                    conn.execute('BEGIN IMMEDIATE')
+                    if conn.execute('SELECT 1 FROM request_account_matches WHERE event_id = ?',
+                                    (event_id,)).fetchone():
+                        conn.rollback()
+                        continue
+                    rows = conn.execute(
+                        'SELECT r.id, r.account, r.latency_ms, ABS(r.ts - ?) AS distance '
+                        'FROM request_logs r '
+                        'WHERE COALESCE(r.account_expected, 1) = 1 '
+                        '  AND r.ts BETWEEN ? AND ? AND (r.mapped_model = ? OR r.model = ?) '
+                        # 已由事件明确关联的行不再占新事件的候选；消费检查仍阻止重放。
+                        # 未建立关联的历史已填行保留，保护升级首次采集不串填。
+                        '  AND NOT EXISTS (SELECT 1 FROM request_account_matches a '
+                        '                  WHERE a.request_log_id = r.id) '
+                        # 并列候选可能超过 2 条（同一秒 3 条并发），取够再消歧。
+                        'ORDER BY distance, r.id LIMIT 8',
+                        (ts, ts - _ACCOUNT_MATCH_WINDOW, ts + _ACCOUNT_MATCH_WINDOW,
+                         model, model),
+                    ).fetchall()
+                    if not rows:
+                        conn.rollback()
+                        continue
+                    row = _pick_account_row(rows, e.get('total_ms'))
+                    if row is None:
+                        conn.rollback()
+                        continue
+                    # 升级前已填的最近行也要占住事件，不能因它不再为 NULL 就跳到邻行。
+                    # 未建立事件关联的历史账号不一致时不猜；保留原值。
+                    if row['account'] is not None and row['account'] != acct:
+                        conn.rollback()
+                        continue
+                    if row['account'] is None:
+                        conn.execute('UPDATE request_logs SET account = ? WHERE id = ? AND account IS NULL',
+                                     (acct, row['id']))
+                    conn.execute('INSERT INTO request_account_matches(event_id, request_log_id, ts) '
+                                 'VALUES(?, ?, ?)', (event_id, row['id'], ts))
+                    conn.commit()
+                    filled += int(row['account'] is None)
+                except Exception:
+                    conn.rollback()
+                    raise
+        except Exception:  # noqa: BLE001
+            # 回填是旁路：任何异常都不能影响采集循环的其余部分
+            continue
+    return filled
 
 
 def add_ip_access_log(ip: object, path: object, blocked: bool, ua: object,
@@ -917,6 +1832,33 @@ def clear_task_logs() -> None:
 
 
 # ── 用量回填 ─────────────────────────────────────────────
+# 归一化表达式：**必须同时**用在 SELECT 与 GROUP BY，且空串要与 Python 的
+# `or 'cn'` 同一规则。为什么这么讲究，见 rebuild_usage_from_logs 的长注释
+# （GROUP BY 复用别名会绑定到源列 → 撞 usage_daily 主键 → 接口 500）。
+# 收成常量是为了让「按天」与「按小时」两条回填路径共用同一份规则 —— 分别写就会漂移。
+_USAGE_MODEL_EXPR = "COALESCE(NULLIF(model,''),'')"
+_USAGE_REALM_EXPR = "COALESCE(NULLIF(realm,''),'cn')"
+
+
+def _usage_expected_rows(bucket_expr: str) -> list[dict]:
+    """按 `bucket_expr`（`day_sql('ts')` 或 `hour_sql('ts')`）聚合请求日志。
+
+    返回的每一行是「这个桶 × 密钥 × 模型 × 版本」应有的用量 —— 回填与重建都以
+    它为准（请求日志是唯一的原始事实）。
+    """
+    return query(
+        f"SELECT {bucket_expr} AS bucket, key_id, "
+        f"{_USAGE_MODEL_EXPR} AS model, {_USAGE_REALM_EXPR} AS realm, "
+        "COUNT(*) AS requests, COALESCE(SUM(prompt_tokens),0) AS pt, "
+        "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr, "
+        # 缓存两列（issue #380）：重建用量时要把它们一起还原，否则重建之后
+        # 费用会退化成「整段输入按未命中价」——比重建前更贵，且看不出来。
+        "COALESCE(SUM(cache_hit_tokens),0) AS ch, "
+        "COALESCE(SUM(cache_miss_tokens),0) AS cm "
+        "FROM request_logs WHERE key_id IS NOT NULL "
+        f"GROUP BY {bucket_expr}, key_id, {_USAGE_MODEL_EXPR}, {_USAGE_REALM_EXPR}"
+    )
+
 def backfill_usage_from_logs() -> dict:
     """把 request_logs 里尚未计入 usage_daily 的用量补进统计。
 
@@ -930,13 +1872,15 @@ def backfill_usage_from_logs() -> dict:
     # 归一化表达式同样要**同时**用在 SELECT 与 GROUP BY，且空串也要折成默认值
     # （原因见 rebuild_usage_from_logs 里的说明：GROUP BY 复用别名会绑定到源列；
     #   SQL 的 COALESCE 不处理空串、Python 的 `or` 会 —— 两边规则必须一致）。
-    model_expr = "COALESCE(NULLIF(model,''),'')"
-    realm_expr = "COALESCE(NULLIF(realm,''),'cn')"
+    model_expr = _USAGE_MODEL_EXPR
+    realm_expr = _USAGE_REALM_EXPR
     day_expr = day_sql('ts')
     expected = query(
         f"SELECT {day_expr} AS day, key_id, {model_expr} AS model, {realm_expr} AS realm, "
         "COUNT(*) AS requests, COALESCE(SUM(prompt_tokens),0) AS pt, "
-        "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr "
+        "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr, "
+        "COALESCE(SUM(cache_hit_tokens),0) AS ch, "
+        "COALESCE(SUM(cache_miss_tokens),0) AS cm "
         f"FROM request_logs WHERE key_id IS NOT NULL "
         f"GROUP BY {day_expr}, key_id, {model_expr}, {realm_expr}"
     )
@@ -978,11 +1922,89 @@ def backfill_usage_from_logs() -> dict:
         added_requests += max(0, d_req)
         added_tokens += max(0, d_pt) + max(0, d_ct)
 
+    # 小时维度用同一套规则再补一遍（「今日」趋势图读这张表）。与上面**同源同规则**：
+    # 请求日志 → 应有值 → 与现值比差额 → MAX 写入，所以重复执行不会重复计数。
+    fixed_h = _backfill_hourly_from_logs()
+
     return {
         'repaired': fixed,
+        'repaired_hourly': fixed_h,
         'requests': added_requests,
         'tokens': added_tokens,
     }
+
+
+def _backfill_hourly_from_logs() -> int:
+    """按小时回填 usage_hourly（幂等，MAX 语义，与按天那条同一规则）。返回修复桶数。"""
+    expected = _usage_expected_rows(hour_sql('ts'))
+    current = {
+        (r['day'], r['hour'], r['key_id'], r['model'], r['realm'] or 'cn'): r
+        for r in query('SELECT day, hour, key_id, model, realm, requests, prompt_tokens, '
+                       'completion_tokens FROM usage_hourly')
+    }
+    fixed = 0
+    for row in expected:
+        bucket = str(row['bucket'] or '')
+        if len(bucket) < 13:            # 'YYYY-MM-DD HH' —— 形态不对就跳过（不猜）
+            continue
+        day, hour = bucket[:10], int(bucket[11:13])
+        key = (day, hour, row['key_id'], row['model'], row['realm'] or 'cn')
+        cur = current.get(key)
+        cur_req = int(cur['requests']) if cur else 0
+        cur_pt = int(cur['prompt_tokens']) if cur else 0
+        cur_ct = int(cur['completion_tokens']) if cur else 0
+        if (int(row['requests']) <= cur_req and int(row['pt']) <= cur_pt
+                and int(row['ct']) <= cur_ct):
+            continue
+        execute(
+            'INSERT INTO usage_hourly(day, hour, key_id, model, requests, prompt_tokens, '
+            'completion_tokens, credit, realm) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(day, hour, key_id, model, realm) DO UPDATE SET '
+            '  requests = MAX(requests, excluded.requests), '
+            '  prompt_tokens = MAX(prompt_tokens, excluded.prompt_tokens), '
+            '  completion_tokens = MAX(completion_tokens, excluded.completion_tokens), '
+            '  credit = MAX(credit, excluded.credit)',
+            (day, hour, row['key_id'], row['model'], int(row['requests']),
+             int(row['pt']), int(row['ct']), float(row['cr'] or 0),
+             str(row['realm'] or 'cn')),
+        )
+        fixed += 1
+    return fixed
+
+
+def ensure_hourly_today() -> bool:
+    """升级兜底：今天的小时表若还是空的，就用请求日志补一次（幂等）。
+
+    为什么需要它：这张表是后加的，存量库升级后它一行都没有 —— 用户点开「今日」
+    趋势图会看到一片空白，而卡片数字明明有值（那正是最不想看到的观感）。
+    只补**今天**：它只被「今日」用到，补历史没有意义；代价是一次聚合查询。
+    返回是否真的补了。
+    """
+    try:
+        today = day_of()
+        if query_one('SELECT 1 FROM usage_hourly WHERE day = ? LIMIT 1', (today,)):
+            return False
+        if not query_one('SELECT 1 FROM request_logs WHERE ts >= ? LIMIT 1',
+                         (day_start_ts(today),)):
+            return False                # 今天还没有任何请求（或日志被清过）：无从补起
+        _backfill_hourly_from_logs()
+        return True
+    except Exception:                   # noqa: BLE001
+        return False                    # 旁路操作：失败不影响启动
+
+
+def hourly_rows(day: str, realm: str | None = None) -> list[dict]:
+    """某天**按小时**的用量（`/api/stats/hourly` 用）。realm 为空不过滤。"""
+    rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
+    args: tuple = (day,) + ((realm,) if rf else ())
+    return query(
+        'SELECT hour, SUM(requests) AS requests, '
+        'SUM(prompt_tokens) AS prompt_tokens, '
+        'SUM(completion_tokens) AS completion_tokens, '
+        'COALESCE(SUM(credit),0) AS credit '
+        f'FROM usage_hourly WHERE day = ?{rf} GROUP BY hour ORDER BY hour ASC',
+        args,
+    )
 
 
 def rebuild_usage_from_logs() -> dict:
@@ -1011,16 +2033,33 @@ def rebuild_usage_from_logs() -> dict:
     # `x or 'cn'` 连空串一起兜住 —— 两边规则不同就会出现「SQL 分成两组、写库时
     # 都变成 cn」的第二次撞键。所以 SQL 侧用 NULLIF 把空串也折成 NULL，
     # 与 Python 的 `or 'cn'` 完全一致。
-    model_expr = "COALESCE(NULLIF(model,''),'')"
-    realm_expr = "COALESCE(NULLIF(realm,''),'cn')"
+    model_expr = _USAGE_MODEL_EXPR
+    realm_expr = _USAGE_REALM_EXPR
     day_expr = day_sql('ts')
     expected = query(
         f"SELECT {day_expr} AS day, key_id, {model_expr} AS model, {realm_expr} AS realm, "
         "COUNT(*) AS requests, COALESCE(SUM(prompt_tokens),0) AS pt, "
-        "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr "
+        "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr, "
+        "COALESCE(SUM(cache_hit_tokens),0) AS ch, "
+        "COALESCE(SUM(cache_miss_tokens),0) AS cm "
         f"FROM request_logs WHERE key_id IS NOT NULL "
         f"GROUP BY {day_expr}, key_id, {model_expr}, {realm_expr}"
     )
+    # 费用按**小时桶**重算（issue #380）：峰谷价按时段分档，按天聚合后
+    # 再算会把午休与夜间的空闲价摊成高峰价。所以先算每小时，再把同一天的加起来。
+    hourly_expected = [row for row in _usage_expected_rows(hour_sql('ts'))
+                       if len(str(row['bucket'] or '')) >= 13]
+    hourly_cost: list[tuple[dict, float | None]] = []
+    day_cost: dict[tuple, float] = {}
+    for row in hourly_expected:
+        bucket = str(row['bucket'])
+        hour_ts = hour_start_ts(bucket[:10], int(bucket[11:13]))
+        cost = _estimate_cost(row['model'], int(row['pt']), int(row['ct']),
+                              int(row['ch']), int(row['cm']), hour_ts)
+        hourly_cost.append((row, cost))
+        if cost is not None:
+            key = (bucket[:10], row['key_id'], row['model'], str(row['realm'] or 'cn'))
+            day_cost[key] = day_cost.get(key, 0.0) + cost
     before = query_one('SELECT COUNT(*) AS c, COALESCE(SUM(requests),0) AS r, '
                        'COALESCE(SUM(prompt_tokens+completion_tokens),0) AS t FROM usage_daily')
     # 删除与重建必须在**同一个事务**里。此前是「先 DELETE（已提交）再逐条 INSERT」，
@@ -1035,10 +2074,27 @@ def rebuild_usage_from_logs() -> dict:
             conn.execute('DELETE FROM usage_daily')
             conn.executemany(
                 'INSERT INTO usage_daily(day, key_id, model, requests, prompt_tokens, '
-                'completion_tokens, credit, realm) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
+                'completion_tokens, credit, cache_hit_tokens, cache_miss_tokens, cost, realm) '
+                'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 [(row['day'], row['key_id'], row['model'], int(row['requests']),
                   int(row['pt']), int(row['ct']), float(row['cr'] or 0),
+                  int(row['ch']), int(row['cm']),
+                  day_cost.get((str(row['day']), row['key_id'], row['model'],
+                                str(row['realm'] or 'cn'))),
                   str(row['realm'] or 'cn')) for row in expected],
+            )
+            # 小时维度与按天**同一事务**重建：只重建一处会让「今日」图与卡片
+            # 在重建后对不上，而那正是分两张表要避免的事。
+            conn.execute('DELETE FROM usage_hourly')
+            conn.executemany(
+                'INSERT INTO usage_hourly(day, hour, key_id, model, requests, prompt_tokens, '
+                'completion_tokens, credit, cache_hit_tokens, cache_miss_tokens, cost, realm) '
+                'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [(str(row['bucket'])[:10], int(str(row['bucket'])[11:13]), row['key_id'],
+                  row['model'], int(row['requests']), int(row['pt']), int(row['ct']),
+                  float(row['cr'] or 0), int(row['ch']), int(row['cm']), cost,
+                  str(row['realm'] or 'cn'))
+                 for row, cost in hourly_cost],
             )
             conn.commit()
         except Exception:

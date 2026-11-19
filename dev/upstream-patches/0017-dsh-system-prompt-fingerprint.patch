@@ -1,0 +1,188 @@
+--- a/internal/upstream/sanitize.go
++++ b/internal/upstream/sanitize.go
+@@ -18,8 +18,8 @@
+ 	"You are Claude Code",        // 身份句（截断前缀即可命中）
+ 	"Main branch (",              // 注入指令句（截断前缀即可命中）
+ 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
+-	"github.com/anthropics/",     // 反馈句里的 Anthropic 仓库链接
+-	"11128",                      // 上游反探测：裸数字错误码
++	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
++	"11128",                                           // 上游反探测：裸数字错误码
+ }
+ 
+ // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
+@@ -78,6 +78,40 @@
+ 	},
+ }
+ 
++// sanitizeDshRe 通配层：客户端「自我介绍句」的模板匹配（issue #246）。
++//
++// 上游不只看具体品牌，它把一整类自我介绍句当指纹：DeepSeek Harness（DSH）把
++// system 首句写成 "You are an AI agent powered by DeepSeek Harness."，
++// 命中的是这类**句式结构**而不是品牌名——把品牌换成别的、或换成
++// "You are an AI assistant built on …" / "You are an assistant built on …"
++// （DSH 的第二句就是 "You are a coding agent powered by the <model> model."）
++// 同样 400 code=11-128（issue #246 逐项实测，与请求规模、tools、stream 无关）。
++//
++// 所以这里按句式而不是按品牌匹配，整句换成通用自我介绍：
++//
++//	"You are an [AI] [coding] agent|assistant (powered by|built on) … ."
++//
++// 为什么不用逐字替换表（sanitizeRewrites）：品牌/模型名是变量（"DeepSeek Harness"、
++// "the deepseek-v4.1-flash model"），逐字表一旦漏了某个变体就静默失效——这正是
++// sanitizeFeatures 那条大小写敏感快速路径踩过的坑（原文 "AI agent" 大写，小写特征
++// 串永远命中不到，两句根本进不了清洗分支）。
++//
++// 三个边界细节：
++//   - 句尾按「点 + 空白/行尾」收口，不能用 `[^\n]*\.` 直到第一个点为止：
++//     模型名自带点（deepseek-v4.1-flash），那样只会吃掉 "…v4." 留下 "1-flash model."。
++//     `{0,120}` 是宽松上限，防止某行没有可用的句尾时一路吃到行尾。
++//   - 整句（含句号）一起替换：只改前半句会留下 "You are a helpful AI assistant.DeepSeek
++//     Harness." 这种残句；替换串自带句号，语义上就是「一个普通的助手」。
++//   - 命中位置不限行首：真实请求里这句是 system 第一条，但客户端也可能把它嵌在
++//     模板里（"<system>You are …"）。放宽的代价只是把一句自我介绍换个说法。
++var sanitizeDshRe = regexp.MustCompile(
++	`(?i)\byou are (?:a|an) (?:ai )?(?:coding )?(?:agent|assistant) (?:powered by|built on) [^\n]{0,120}?\.(\s|$)`)
++
++// sanitizeDshRepl 是上面那句的替身：中性、无品牌，不含任何已知指纹片段。
++// `${1}` 把句尾那个空白/行尾原样接回去——不接的话 "…Harness. Use the read tool"
++// 会粘成 "assistant.Use"，把两条指令并成一条。
++const sanitizeDshRepl = "You are a helpful AI assistant.${1}"
++
+ // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
+ func sanitizeText(text string) string {
+ 	if !hasFingerprint(text) {
+@@ -86,6 +120,7 @@
+ 	for _, rw := range sanitizeRewrites {
+ 		text = strings.ReplaceAll(text, rw[0], rw[1])
+ 	}
++	text = sanitizeDshRe.ReplaceAllString(text, sanitizeDshRepl)
+ 	if sanitizeHdrRe.MatchString(text) {
+ 		text = sanitizeHdrRe.ReplaceAllString(text, "")
+ 	}
+@@ -111,6 +146,13 @@
+ 		if strings.Contains(text, f) {
+ 			return true
+ 		}
++	}
++	// DSH 句式指纹（见 sanitizeDshRe）：**必须在这里也认**，否则预检直接
++	// return，改写层根本执行不到——issue #246 里上游 hub 版的补丁就踩过这个
++	// 坑：特征表是大小写敏感的 strings.Contains，而原文是 "AI agent"，
++	// 补进去的小写串永远命中不到。本正则自带 (?i)，不依赖原文大小写。
++	if sanitizeDshRe.MatchString(text) {
++		return true
+ 	}
+ 	return sanitizeBareHdrRe.MatchString(text)
+ }
+--- a/internal/upstream/sanitize_test.go
++++ b/internal/upstream/sanitize_test.go
+@@ -431,8 +431,8 @@
+ 		"You are Claude Code",        // 身份句（截断前缀即可命中）
+ 		"Main branch (",              // 注入指令句（截断前缀即可命中）
+ 		"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
+-		"github.com/anthropics/",     // 反馈句里的 Anthropic 仓库链接
+-		"11128",                      // 上游反探测：裸数字错误码
++		"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
++		"11128",                                           // 上游反探测：裸数字错误码
+ 	}
+ 	if len(sanitizeFeatures) != len(features) {
+ 		t.Fatalf("sanitizeFeatures 项数=%d want %d（快照与实现不同步，见测试头注释的验证步骤）", len(sanitizeFeatures), len(features))
+@@ -495,3 +495,98 @@
+ 		}
+ 	}
+ }
++
++// ── issue #246：DeepSeek Harness（DSH）system 首句指纹 ─────────────────
++//
++// 上游拦的是**句式**而不是品牌名：system 首句写成
++// "You are an AI agent powered by <brand>." 或
++// "You are a coding agent powered by the <model> model." 都会 400 code=11-128，
++// 网关随后回退 /console 拿到 11102、把 (账号,模型) 打进 6 小时冷却 → 整池 503。
++// 下面几条是 issue 里的真实抓包原文（冠词、大小写、句号照抄）。
++func TestDshSystemPromptRewritten(t *testing.T) {
++	cases := []string{
++		"You are an AI agent powered by DeepSeek Harness.",
++		"You are a coding agent powered by the deepseek-v4.1-flash model.",
++		"You are an AI assistant built on DeepSeek Harness.",
++		"You are an assistant built on the deepseek-v4.1-flash model.",
++	}
++	for _, in := range cases {
++		if out := sanitizeText(in); out != "You are a helpful AI assistant." {
++			t.Errorf("DSH 句式未按整句替换: %q -> %q", in, out)
++		}
++	}
++}
++
++// 大小写：预检的 strings.Contains 快速路径是大小写敏感的，而 DSH 原文是
++// 大写 "AI"。若只在特征表里补小写串，hasFingerprint 会提前 return、
++// 改写层根本不执行（上游 hub 版补丁就踩过这个坑）。
++func TestDshFingerprintCaseInsensitive(t *testing.T) {
++	if out := sanitizeText("YOU ARE AN AI AGENT POWERED BY DEEPSEEK HARNESS."); out != "You are a helpful AI assistant." {
++		t.Errorf("大写变体未命中: %q -> %q", "YOU ARE AN AI AGENT POWERED BY DEEPSEEK HARNESS.", out)
++	}
++	if !hasFingerprint("you are an ai agent powered by x.") {
++		t.Error("hasFingerprint 应认得小写句式")
++	}
++}
++
++// 模型名自带点（deepseek-v4.1-flash）：句尾必须按「点 + 空白/行尾」收口，
++// 否则会停在 "v4."、把 "1-flash model." 留在正文里——比不替换更难查。
++func TestDshModelNameWithDotsFullyReplaced(t *testing.T) {
++	in := "You are a coding agent powered by the deepseek-v4.1-flash model."
++	out := sanitizeText(in)
++	if strings.Contains(out, "1-flash") || strings.Contains(out, "model.") {
++		t.Errorf("句子只替换了一半: %q -> %q", in, out)
++	}
++}
++
++// 句号后的内容必须原样保留：DSH 后文是工具使用契约，改了就换了客户端行为。
++func TestDshFollowingInstructionsPreserved(t *testing.T) {
++	in := "You are an AI agent powered by DeepSeek Harness.\nUse the read tool to inspect files.\nDo not guess."
++	out := sanitizeText(in)
++	if !strings.Contains(out, "Use the read tool to inspect files.\nDo not guess.") {
++		t.Errorf("后文被改动: %q", out)
++	}
++	if strings.Contains(out, "DeepSeek Harness") {
++		t.Errorf("指纹残留: %q", out)
++	}
++	// 同一行后接内容时，句尾空白不能被吃掉：吃掉了两条句子会粘成
++	// "assistant.Then answer briefly."
++	if out2 := sanitizeText("You are an AI agent powered by DeepSeek Harness. Then answer briefly."); !strings.Contains(out2, "assistant. Then answer briefly.") {
++		t.Errorf("句尾空白被吃掉: %q", out2)
++	}
++}
++
++// 幂等：网关对同一 body 会多次预处理（PrepareBody 与 ChatStream 各一次）。
++func TestDshRewriteIdempotent(t *testing.T) {
++	once := sanitizeText("You are an AI agent powered by DeepSeek Harness.")
++	if twice := sanitizeText(once); twice != once {
++		t.Errorf("非幂等: %q -> %q", once, twice)
++	}
++}
++
++// 反例：普通自我介绍与无关句子不能被误改。
++func TestDshPlainTextNotTouched(t *testing.T) {
++	for _, in := range []string{
++		"You are a helpful assistant.",
++		"You are a helpful AI assistant built for coding tasks",
++		"The agent powered by the harness failed.",
++		"please use main branch for this repo",
++	} {
++		if out := sanitizeText(in); out != in {
++			t.Errorf("不应改写: %q -> %q", in, out)
++		}
++	}
++}
++
++// 出站边界：PrepareBody 之后 wire body 里不得残留 DSH 句式。
++func TestPrepareBodySanitizesDshPrompt(t *testing.T) {
++	in := "You are an AI agent powered by DeepSeek Harness."
++	body := []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"system","content":"` + in + `"}]}`)
++	out := PrepareBodyOpt(body, true)
++	if strings.Contains(string(out), "powered by DeepSeek Harness") {
++		t.Errorf("PrepareBody 未净化 DSH 指纹: %s", out)
++	}
++	if !strings.Contains(string(out), "helpful AI assistant") {
++		t.Errorf("替换文本缺失: %s", out)
++	}
++}

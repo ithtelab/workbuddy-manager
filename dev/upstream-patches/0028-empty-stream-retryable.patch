@@ -1,0 +1,43 @@
+diff --git a/internal/upstream/sse.go b/internal/upstream/sse.go
+--- a/internal/upstream/sse.go
++++ b/internal/upstream/sse.go
+@@ -623,12 +623,12 @@
+ 			if raw, err := json.Marshal(normalizeFrame(obj)); err == nil {
+ 				payload = string(raw)
+ 			}
+-		valid = 1
+-		// 收尾观测：出现过 finish_reason 即算上游正常收了尾（与开关无关）。
+-		if frameHasFinish(obj) {
+-			sawFinish = true
+-		}
+-		// 帧序修正：出现 finish_reason 后（含本条）先缓冲，等补发正文后再发。
++			valid = 1
++			// 收尾观测：出现过 finish_reason 即算上游正常收了尾（与开关无关）。
++			if frameHasFinish(obj) {
++				sawFinish = true
++			}
++			// 帧序修正：出现 finish_reason 后（含本条）先缓冲，等补发正文后再发。
+ 			// 开关关闭时整段不执行 —— 与改造前逐字节一致。
+ 			if ReasoningFallbackEnabled() && (tailing || frameHasFinish(obj)) {
+ 				tailing = true
+@@ -685,7 +685,7 @@
+ 	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
+ 	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
+ 	if validFrames == 0 {
+-		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
++		_ = writeRaw(`{"error":{"message":"upstream stream ended before completion (empty upstream stream)","type":"upstream_error","code":"upstream_parse"}}`)
+ 	}
+ 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
+ 	// reasoningBackfill：整轮无正文、无工具调用，但思考通道有内容 —— 补发一帧
+diff --git a/internal/upstream/sse_test.go b/internal/upstream/sse_test.go
+--- a/internal/upstream/sse_test.go
++++ b/internal/upstream/sse_test.go
+@@ -944,7 +944,7 @@
+ 						continue
+ 					}
+ 					if json.Unmarshal([]byte(payload), &e) == nil {
+-						if em, ok := e["error"].(map[string]any); ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" && em["code"] == "upstream_parse" {
++						if em, ok := e["error"].(map[string]any); ok && em["message"] == "upstream stream ended before completion (empty upstream stream)" && em["type"] == "upstream_error" && em["code"] == "upstream_parse" {
+ 							found = true
+ 						}
+ 					}

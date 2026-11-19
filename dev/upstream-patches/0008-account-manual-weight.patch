@@ -1,0 +1,371 @@
+diff --git a/internal/auth/auth.go b/internal/auth/auth.go
+index 18f6c31..eb8bc53 100644
+--- a/internal/auth/auth.go
++++ b/internal/auth/auth.go
+@@ -6,6 +6,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"log"
++	"math"
+ 	"os"
+ 	"path/filepath"
+ 	"sort"
+@@ -50,6 +51,53 @@ type Auth struct {
+ 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
+ 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
+ 	DeviceToken string
++
++	// Weight 账号级手写权重（issue #187），来源 auth 文件顶层 `weight` 字段，
++	// 由面板的「权重」写入。0 = 未设置（等价 1.0）。
++	//
++	// 语义是**乘数**而非优先级：选号本来就按「余额 + 快过期占比 + 闲置时长」
++	// 三因子加权随机（见 pool.weightOf），这里把结果再乘上该值 —— 权重 3 表示
++	// 同等条件下被抽中的机会约为默认的 3 倍。之所以不做成「权重高的恒定优先」：
++	// 那会让低权重的号一直闲置，积分用不完就过期（正是 #187 另一半诉求要避免的）。
++	// 硬门槛（冷却 / 熔断 / 禁用 / 在途占满）与成本分层不受本字段影响。
++	Weight float64
++}
++
++// 手写权重的取值区间：低于 MinWeight 等于「几乎不用」（但仍留一丝机会，与
++// pickWeighted 的权重保底 ≥1 同口径），高于 MaxWeight 没有实际意义。
++const (
++	MinWeight = 0.1
++	MaxWeight = 100.0
++)
++
++// PickWeight 返回用于选号的权重乘数：未设置（0）或非法值给 1，合法值钳制在
++// [MinWeight, MaxWeight]。选号侧只读本方法、不直读字段 —— 钳制口径只有一处，
++// 否则「文件里写了 1e9」这种输入会把选号直接压成一号独大。
++func (a *Auth) PickWeight() float64 {
++	w := a.Weight
++	if math.IsNaN(w) || math.IsInf(w, 0) || w <= 0 {
++		return 1
++	}
++	if w < MinWeight {
++		return MinWeight
++	}
++	if w > MaxWeight {
++		return MaxWeight
++	}
++	return w
++}
++
++// sanitizeWeight 解析期清洗：非有限值与负数一律当「未设置」（0）。合法但越界的
++// 值**保留原样**，由 PickWeight 在选号时钳制 —— 面板靠原值回显「用户填了什么」，
++// 这里改写会让界面显示与文件内容不一致。手改坏的值打一行 WARN，否则「权重没生效」
++// 会变成没有线索的悬案。
++func sanitizeWeight(w float64) float64 {
++	if math.IsNaN(w) || math.IsInf(w, 0) || w < 0 {
++		log.Printf("WARN: [auth] 忽略非法的 weight=%v（按未设置处理，应为 %v..%v）",
++			w, MinWeight, MaxWeight)
++		return 0
++	}
++	return w
+ }
+ 
+ // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
+@@ -240,6 +288,8 @@ func Parse(raw []byte) (*Auth, error) {
+ 			DeviceToken string `json:"device_token"`
+ 			// Proxy 顶层 proxy（线路名，面板写入；见 Auth.ProxyName）。
+ 			Proxy string `json:"proxy"`
++			// Weight 顶层 weight（手写权重，面板写入；见 Auth.Weight）。
++			Weight float64 `json:"weight"`
+ 		}
+ 		if err := json.Unmarshal(raw, &n); err != nil {
+ 			return nil, fmt.Errorf("storage_parse_error: %w", err)
+@@ -255,6 +305,7 @@ func Parse(raw []byte) (*Auth, error) {
+ 			Nickname:     n.Account.Nickname,
+ 			DeviceToken:  n.DeviceToken,
+ 			ProxyName:    strings.TrimSpace(n.Proxy),
++			Weight:       sanitizeWeight(n.Weight),
+ 		}
+ 	} else {
+ 		var f struct {
+@@ -268,6 +319,11 @@ func Parse(raw []byte) (*Auth, error) {
+ 			Nickname     string `json:"nickname"`
+ 			DeviceToken  string `json:"device_token"`
+ 			Proxy        string `json:"proxy"`
++
++			// Weight 顶层 weight（与 proxy 同层级，面板写入；见 Auth.Weight）。
++			// 单独成组（上方空行）是为了不改动既有字段的对齐 —— 补丁切片只描述
++			// 自己的增量，gofmt 顺手重排别人的行会让前一个补丁的「已应用」判定失效。
++			Weight float64 `json:"weight"`
+ 		}
+ 		if err := json.Unmarshal(raw, &f); err != nil {
+ 			return nil, fmt.Errorf("storage_parse_error: %w", err)
+@@ -283,6 +339,7 @@ func Parse(raw []byte) (*Auth, error) {
+ 			Nickname:     f.Nickname,
+ 			DeviceToken:  f.DeviceToken,
+ 			ProxyName:    strings.TrimSpace(f.Proxy),
++			Weight:       sanitizeWeight(f.Weight),
+ 		}
+ 	}
+ 	if strings.TrimSpace(a.AccessToken) == "" {
+@@ -328,6 +385,12 @@ func (a *Auth) SaveAtomic() error {
+ 	if a.ProxyName != "" {
+ 		doc["proxy"] = a.ProxyName
+ 	}
++	// Weight 同理只在非零时写回（issue #187）：刷新 token 会整份重建文件，
++	// 不保留等于把用户设的权重静默清零。0 = 未设置，不写键（面板把 1 当默认，
++	// 手改过的文件也不会因此多出 weight: 1 这种噪音）。
++	if a.Weight != 0 {
++		doc["weight"] = a.Weight
++	}
+ 	raw, err := json.MarshalIndent(doc, "", "  ")
+ 	if err != nil {
+ 		return err
+diff --git a/internal/auth/weight_test.go b/internal/auth/weight_test.go
+new file mode 100644
+index 0000000..fcfda46
+--- /dev/null
++++ b/internal/auth/weight_test.go
+@@ -0,0 +1,138 @@
++package auth
++
++import (
++	"encoding/json"
++	"math"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// 账号手写权重（issue #187）：面板写在 auths/*.json 顶层 `weight`，上游必须
++// 解析出来，并且在刷新 token 整份重写文件时保留（否则等于静默清零）。
++func TestParseWeight(t *testing.T) {
++	nested := []byte(`{"auth":{"accessToken":"at","refreshToken":"rt","expiresAt":1,"domain":"d","realm":"cn"},
++		"account":{"uid":"u1","nickname":"n"},"weight":2.5}`)
++	a, err := Parse(nested)
++	if err != nil {
++		t.Fatalf("nested parse: %v", err)
++	}
++	if a.Weight != 2.5 {
++		t.Errorf("嵌套形的顶层 weight 没解析出来：%v", a.Weight)
++	}
++
++	flat := []byte(`{"accessToken":"at","expiresAt":1,"uid":"u2","weight":3}`)
++	b, err := Parse(flat)
++	if err != nil {
++		t.Fatalf("flat parse: %v", err)
++	}
++	if b.Weight != 3 {
++		t.Errorf("扁平形的 weight 没解析出来：%v", b.Weight)
++	}
++
++	none := []byte(`{"accessToken":"at","expiresAt":1,"uid":"u3"}`)
++	c, err := Parse(none)
++	if err != nil {
++		t.Fatalf("no-weight parse: %v", err)
++	}
++	if c.Weight != 0 {
++		t.Errorf("没写 weight 时应当是「未设置」(0)：%v", c.Weight)
++	}
++}
++
++// 负数/非有限值当「未设置」；越界的合法值保留原样（钳制在 PickWeight 做，
++// 面板要按原值回显「用户填了什么」）。
++func TestParseWeightSanitizesOnlyInvalid(t *testing.T) {
++	cases := []struct {
++		name string
++		raw  string
++		want float64
++	}{
++		{"负数当未设置", `{"accessToken":"at","expiresAt":1,"uid":"u","weight":-2}`, 0},
++		{"太小保留原样", `{"accessToken":"at","expiresAt":1,"uid":"u","weight":0.01}`, 0.01},
++		{"太大保留原样", `{"accessToken":"at","expiresAt":1,"uid":"u","weight":1e9}`, 1e9},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			a, err := Parse([]byte(tc.raw))
++			if err != nil {
++				t.Fatalf("parse: %v", err)
++			}
++			if a.Weight != tc.want {
++				t.Errorf("weight=%v want %v", a.Weight, tc.want)
++			}
++		})
++	}
++}
++
++func TestPickWeightClamps(t *testing.T) {
++	cases := []struct {
++		name string
++		in   float64
++		want float64
++	}{
++		{"未设置=1", 0, 1},
++		{"正常值原样", 2.5, 2.5},
++		{"低于下限钳到 MinWeight", 0.01, MinWeight},
++		{"高于上限钳到 MaxWeight", 1e9, MaxWeight},
++		{"负数=默认", -3, 1},
++		{"NaN=默认", math.NaN(), 1},
++		{"Inf=默认", math.Inf(1), 1},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			a := &Auth{Weight: tc.in}
++			if got := a.PickWeight(); got != tc.want {
++				t.Errorf("PickWeight(%v)=%v want %v", tc.in, got, tc.want)
++			}
++		})
++	}
++}
++
++func TestSaveAtomicPreservesWeight(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "workbuddy-u1.json")
++	if err := os.WriteFile(path, []byte(`{"accessToken":"old","expiresAt":1,"uid":"u1","weight":4}`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	a, err := Parse(mustRead(t, path))
++	if err != nil {
++		t.Fatal(err)
++	}
++	a.FilePath = path
++	a.AccessToken = "new" // 模拟刷新后的写回
++	if err := a.SaveAtomic(); err != nil {
++		t.Fatalf("save: %v", err)
++	}
++	var doc map[string]any
++	if err := json.Unmarshal(mustRead(t, path), &doc); err != nil {
++		t.Fatal(err)
++	}
++	if got, ok := doc["weight"].(float64); !ok || got != 4 {
++		t.Errorf("刷新写回后 weight 丢了：%v", doc["weight"])
++	}
++}
++
++// 没有权重的文件不该被凭空加上 weight 键（否则每次刷新都在所有账号上留噪音）。
++func TestSaveAtomicOmitsUnsetWeight(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "workbuddy-u2.json")
++	if err := os.WriteFile(path, []byte(`{"accessToken":"old","expiresAt":1,"uid":"u2"}`), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	a, err := Parse(mustRead(t, path))
++	if err != nil {
++		t.Fatal(err)
++	}
++	a.FilePath = path
++	if err := a.SaveAtomic(); err != nil {
++		t.Fatalf("save: %v", err)
++	}
++	var doc map[string]any
++	if err := json.Unmarshal(mustRead(t, path), &doc); err != nil {
++		t.Fatal(err)
++	}
++	if _, ok := doc["weight"]; ok {
++		t.Errorf("未设置权重时不该写入 weight 键：%v", doc["weight"])
++	}
++}
+diff --git a/internal/pool/pick.go b/internal/pool/pick.go
+index 5db4818..52b3629 100644
+--- a/internal/pool/pick.go
++++ b/internal/pool/pick.go
+@@ -302,12 +302,15 @@ const expiringWeight = 8.0
+ 
+ // pickWeighted 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
+ //
+-//		weight = credits 比例 × 10 + 快过期积分占比 × expiringWeight + idleWeight
++//	weight = (credits 比例 × 10 + 快过期积分占比 × expiringWeight + idleWeight) × 手写权重
+ //
+-//	  - credits 比例 = 该号 credits / 全集最大 credits（避免量纲爆炸；全集口径：
+-//	    tier 过滤前的全部 healthy 候选，与截断排序共享基准——见 weighted 预计算注释）
+-//	  - 快过期积分占比 = creditsExpiring/credits（×8，issue:积分过期）
+-//	  - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)；从未使用给满分
++// 最后一项即 auth.Auth.PickWeight（面板「权重」，默认 1 = 与改造前逐位一致，
++// issue #187）；它只缩放抽签权重，不改变候选资格。
++//
++//   - credits 比例 = 该号 credits / 全集最大 credits（避免量纲爆炸；全集口径：
++//     tier 过滤前的全部 healthy 候选，与截断排序共享基准——见 weighted 预计算注释）
++//   - 快过期积分占比 = creditsExpiring/credits（×8，issue:积分过期）
++//   - idleWeight = min(距 lastUsed 小时数 × idleWeightPerHour, idleWeightMax)；从未使用给满分
+ //
+ // credits 全 0 时仍按 idle+expiring 加权（不退化均匀随机）。
+ // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
+@@ -388,5 +391,11 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
+ 	// （原第 3 因子「成功率 EMA ×3」已删，success-ema-review §4：双饱和计数器对
+ 	// 真实成功率不敏感、成熟池退化为与默认值重合的常数 1.5、失败侧与熔断器
+ 	// 100% 同源——机制名存实亡且冗余，删除后 weightOf 为三因子。）
++	//
++	// 4. 手写权重乘数（issue #187）：面板给该号设的权重，未设置 = 1（分布与改造前
++	// 逐位一致）。放在**最后乘**而不是压平上面三项：三因子决定「同条件谁更强」，
++	// 权重只放大/缩小这个结论。硬门槛（healthy / 在途 / 成本分层）在本函数之前
++	// 已经过滤完，所以调大权重也不能把冷却号或已实测收费的号塞进候选。
++	w *= e.a.PickWeight()
+ 	return w
+ }
+diff --git a/internal/pool/pick_weight_test.go b/internal/pool/pick_weight_test.go
+new file mode 100644
+index 0000000..01d296f
+--- /dev/null
++++ b/internal/pool/pick_weight_test.go
+@@ -0,0 +1,68 @@
++package pool
++
++import (
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++// 手写权重（issue #187）只缩放抽签概率，不改变候选资格。
++//
++// 语义定案：**乘数**而非固定优先级。理由写在 auth.Auth.Weight 上——固定优先会让
++// 低权重号一直闲置、积分过期作废，而那正是同一条 issue 里另一半诉求要避免的。
++func TestPickHonoursManualWeight(t *testing.T) {
++	withNoPickGap(t)
++	p := New("")
++	heavy := &auth.Auth{UID: "heavy", Weight: 9}
++	light := &auth.Auth{UID: "light"}
++	p.Add(heavy)
++	p.Add(light)
++
++	const rounds = 4000
++	counts := map[string]int{}
++	for i := 0; i < rounds; i++ {
++		counts[p.Pick("").UID]++
++	}
++	share := float64(counts["heavy"]) / rounds
++	// 两个号条件完全相同（都未用过、credits 都为 0），所以抽签比例理论上
++	// 就是 9:1 → 0.9。留足容差只为抗随机波动，不放宽到「比另一个多就行」——
++	// 那样权重失效（乘数没生效）也可能因为随机偏差而通过。
++	if share < 0.80 {
++		t.Errorf("权重 9 的账号只被抽中 %.1f%%，期望接近 90%%（counts=%v）", share*100, counts)
++	}
++}
++
++// 不设权重（0）与显式 1.0 必须等价：否则「默认值」会随文件里有没有这个键而漂移。
++func TestManualWeightOneEqualsUnset(t *testing.T) {
++	withNoPickGap(t)
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1", Weight: 1})
++	p.Add(&auth.Auth{UID: "u2"})
++
++	const rounds = 2000
++	counts := map[string]int{}
++	for i := 0; i < rounds; i++ {
++		counts[p.Pick("").UID]++
++	}
++	share := float64(counts["u1"]) / rounds
++	if share < 0.45 || share > 0.55 {
++		t.Errorf("权重 1 与未设置应当等价，实际占比 %.1f%%（counts=%v）", share*100, counts)
++	}
++}
++
++// 权重不能越过健康门槛：冷却中的号即使权重拉满也不该被选中。
++func TestManualWeightDoesNotBypassCooling(t *testing.T) {
++	withNoPickGap(t)
++	p := New("")
++	p.Add(&auth.Auth{UID: "cooling", Weight: 100})
++	p.Add(&auth.Auth{UID: "ok"})
++	p.Cooldown("cooling", CoolSoft, time.Hour, "test")
++
++	for i := 0; i < 50; i++ {
++		got := p.Pick("")
++		if got == nil || got.UID != "ok" {
++			t.Fatalf("冷却中的高权重号被选中了：%+v", got)
++		}
++	}
++}

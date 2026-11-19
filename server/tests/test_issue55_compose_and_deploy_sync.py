@@ -75,7 +75,7 @@ class _Rep:
     def step(self, msg: str) -> None:
         self.lines.append(('step', msg))
 
-    def set_signature(self, *a, **k) -> None:
+    def set_integrity(self, *a, **k) -> None:
         pass
 
     def set_target_version(self, *a, **k) -> None:

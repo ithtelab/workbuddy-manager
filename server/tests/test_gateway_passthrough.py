@@ -128,7 +128,14 @@ class GatewayPassthroughTest(unittest.TestCase):
         有人复核，静默放行会让这条约束慢慢失效。
         """
         # 例外：协议转换层（不是转发热路径）
-        allow = {'routers/anthropic.py', 'routers/responses.py'}
+        #   · services/tencent.py：账号探测（issue #270）不是转发路径 —— 它扫一遍
+        #     SSE 判断「模型是否真的产出内容」，读 tool_calls 是为了识别「只有角色
+        #     预告/心跳」的假成功，不改写、不转发给客户端。
+        #   · services/tap.py：抓包（Trace Tap）只**读**流式响应，把分片的
+        #     tool_calls 参数按 index 拼回完整调用供界面回放；它不改写、不转发，
+        #     也不在请求路径上产生任何副作用（写入失败只丢一条证据）。
+        allow = {'routers/anthropic.py', 'routers/responses.py', 'services/tencent.py',
+                 'services/tap.py'}
         root = Path(__file__).resolve().parents[2] / 'server'
         hits = []
         for f in root.rglob('*.py'):

@@ -1,0 +1,17 @@
+diff --git a/Dockerfile b/Dockerfile
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -19,8 +19,12 @@
+  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/activity_bin ./cmd/activity
+ 
+ FROM alpine:3.20
++# Alpine 官方 CDN 在国内经常超时（面板重建上游会卡到 900s）。构建参数可覆盖：
++#   docker compose build --build-arg APK_MIRROR=dl-cdn.alpinelinux.org
++ARG APK_MIRROR=mirrors.aliyun.com
+ # python3：login.sh 的 JSON 解析 / 签到 / 落盘；bash：shell 脚本体。
+-RUN apk add --no-cache wget ca-certificates tzdata python3 bash \
++RUN if [ -n "$APK_MIRROR" ]; then sed -i "s#dl-cdn.alpinelinux.org#$APK_MIRROR#g" /etc/apk/repositories; fi \
++ && apk add --no-cache wget ca-certificates tzdata python3 bash \
+  && adduser -D -u 10001 app \
+  && mkdir -p /app/auths /app/data \
+  && chown -R app:app /app

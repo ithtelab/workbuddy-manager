@@ -1,0 +1,277 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index 06b2e0d..9fe8372 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -30,6 +30,9 @@ type Config struct {
+ 		// SoftRateMax 软冷却指数退避的封顶，默认 "2h"。
+ 		// 空值回落默认，非法值报错（处理风格同 soft_rate）。
+ 		SoftRateMax string `json:"soft_rate_max"` // "2h"
++		// CreditExhausted 积分耗尽后的冷却时长（如 "10m"）。空 = 旧行为：硬冷却到次日 04:00
++		// （等签到恢复）。配了就只退出这一小段，到期回到候选池（issue #78）。
++		CreditExhausted string `json:"credit_exhausted"`
+ 	} `json:"cooldown"`
+ 
+ 	Schedule config.Schedule `json:"schedule"`
+@@ -117,17 +120,17 @@ type Config struct {
+ 	} `json:"upstash"`
+ 
+ 	Pool struct {
+-		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+-		MaxInFlightGlobal  int     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+-		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+-		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+-		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
++		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
++		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
++		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
++		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
++		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+ 		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
+ 		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
+ 		// 并存取更长者不叠加。默认 5 次 / 10m。
+-		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+-		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+-		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
++		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
++		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
++		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
+ 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
+ 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+ 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
+@@ -150,6 +153,7 @@ type Config struct {
+ 	// 解析后
+ 	SoftRateDur         time.Duration `json:"-"`
+ 	SoftRateMaxDur      time.Duration `json:"-"`
++	CreditExhaustedDur  time.Duration `json:"-"`
+ 	BreakerCooldownDur  time.Duration `json:"-"`
+ 	BreakerCooldownMaxD time.Duration `json:"-"`
+ 	DegradeCooldownDur  time.Duration `json:"-"`
+@@ -248,6 +252,9 @@ func applyEnv(c *Config) {
+ 	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
+ 		c.Cooldown.SoftRateMax = v
+ 	}
++	if v := os.Getenv("WB2A_CREDIT_EXHAUSTED"); v != "" {
++		c.Cooldown.CreditExhausted = v
++	}
+ 	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
+ 		if n, err := strconv.Atoi(v); err == nil {
+ 			c.Upstream.TimeoutSeconds = n
+@@ -319,6 +326,20 @@ func (c *Config) normalize() error {
+ 	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
+ 		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
+ 	}
++	// 积分耗尽后的冷却时长（issue #78）：空 = 保持「硬冷却到次日 04:00」的旧行为；
++	// 填了必须是正时长（负值会让冷却立即到期，等于没冷却 —— 与其静默放行，不如报错）。
++	if v := strings.TrimSpace(c.Cooldown.CreditExhausted); v == "" {
++		c.CreditExhaustedDur = 0
++	} else {
++		d, perr := time.ParseDuration(v)
++		if perr != nil {
++			return fmt.Errorf("cooldown.credit_exhausted: %w", perr)
++		}
++		if d <= 0 {
++			return fmt.Errorf("cooldown.credit_exhausted: must be a positive duration, got %q", v)
++		}
++		c.CreditExhaustedDur = d
++	}
+ 	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
+ 		return fmt.Errorf("pool.breaker_cooldown: %w", err)
+ 	}
+diff --git a/cmd/server/credit_exhausted_config_test.go b/cmd/server/credit_exhausted_config_test.go
+new file mode 100644
+index 0000000..5134b92
+--- /dev/null
++++ b/cmd/server/credit_exhausted_config_test.go
+@@ -0,0 +1,41 @@
++package main
++
++import (
++	"strings"
++	"testing"
++	"time"
++)
++
++// cooldown.credit_exhausted（issue #78）：空 = 旧行为（0，硬冷却到次日 04:00）；
++// 填了必须是正时长；非法值报错而不是静默放行。
++func TestCreditExhaustedConfig(t *testing.T) {
++	c := Default()
++	if err := c.normalize(); err != nil {
++		t.Fatalf("default normalize: %v", err)
++	}
++	if c.CreditExhaustedDur != 0 {
++		t.Errorf("默认应是 0（保持旧行为），got %v", c.CreditExhaustedDur)
++	}
++
++	c = Default()
++	c.Cooldown.CreditExhausted = "10m"
++	if err := c.normalize(); err != nil {
++		t.Fatalf("10m: %v", err)
++	}
++	if c.CreditExhaustedDur != 10*time.Minute {
++		t.Errorf("10m 解析成 %v", c.CreditExhaustedDur)
++	}
++
++	for _, bad := range []string{"不是时长", "-5m", "0s"} {
++		c = Default()
++		c.Cooldown.CreditExhausted = bad
++		err := c.normalize()
++		if err == nil {
++			t.Errorf("%q 应报错（正时长校验）", bad)
++			continue
++		}
++		if !strings.Contains(err.Error(), "cooldown.credit_exhausted") {
++			t.Errorf("%q 的报错没点出键名：%v", bad, err)
++		}
++	}
++}
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index 6343c19..ba22f2b 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -83,6 +83,7 @@ func main() {
+ 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
+ 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
+ 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
++	p.SetCreditExhausted(cfg.CreditExhaustedDur)       // 积分耗尽后的冷却时长（credit_exhausted，0 = 旧行为）               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+ 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+ 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+ 
+diff --git a/internal/pool/cooldown.go b/internal/pool/cooldown.go
+index d363d89..df0ed43 100644
+--- a/internal/pool/cooldown.go
++++ b/internal/pool/cooldown.go
+@@ -285,7 +285,18 @@ func (p *Pool) recordBreakerFailureLocked(e *entry) {
+ 
+ // CooldownUntilTomorrow4AM 冷却到下一个 04:00（本地时区）。
+ // 用于 ErrHardCredit 场景：积分耗尽账号等签到任务（09:00/21:00）恢复。
++//
++// 配了 cooldown.credit_exhausted（分钟级时长）时不走这里：改用 **软冷却** 只退出
++// 那一段，到期即回到候选池（P0：#78「不要等薅完积分冷却一整天」）。软冷却的时长
++// 就是配置值、不做指数堆加（见 Cooldown 的说明），所以它**不会**被连续触发拉长。
+ func (p *Pool) CooldownUntilTomorrow4AM(uid string, reason string) {
++	p.mu.RLock()
++	short := p.creditExhausted
++	p.mu.RUnlock()
++	if short > 0 {
++		p.Cooldown(uid, CoolSoft, short, reason)
++		return
++	}
+ 	now := time.Now()
+ 	p.Cooldown(uid, CoolHard, nextDay4AM(now).Sub(now), reason)
+ }
+diff --git a/internal/pool/credit_exhausted_test.go b/internal/pool/credit_exhausted_test.go
+new file mode 100644
+index 0000000..a246b9f
+--- /dev/null
++++ b/internal/pool/credit_exhausted_test.go
+@@ -0,0 +1,80 @@
++package pool
++
++import (
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++)
++
++// 默认（没有 cooldown.credit_exhausted）必须保持旧行为：硬冷却到次日 04:00。
++// 这条是「不配就一点都别变」的护栏 —— 老部署升级后行为必须逐字不变。
++func TestCreditExhaustedDefaultKeepsHardCooldown(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.CooldownUntilTomorrow4AM("u1", "余额不足")
++
++	st, ok := p.Status("u1")
++	if !ok {
++		t.Fatal("no status")
++	}
++	if !st.Cooling {
++		t.Fatalf("should be cooling: %+v", st)
++	}
++	if st.Until.Hour() != 4 {
++		t.Errorf("until hour=%d want 4（旧行为是硬冷却到次日 04:00）", st.Until.Hour())
++	}
++	if e := p.byUID["u1"]; e.coolKind != CoolHard {
++		t.Errorf("coolKind=%v want CoolHard", e.coolKind)
++	}
++}
++
++// 配了 credit_exhausted：改成软冷却、时长就是配置值，不再挂到次日 04:00。
++// 这是 issue #78 的核心诉求：用完积分的号只退出这一小段。
++func TestCreditExhaustedShortCooldown(t *testing.T) {
++	p := New("")
++	p.SetCreditExhausted(10 * time.Minute)
++	p.Add(&auth.Auth{UID: "u1"})
++
++	before := time.Now()
++	p.CooldownUntilTomorrow4AM("u1", "余额不足")
++	after := time.Now()
++
++	st, ok := p.Status("u1")
++	if !ok {
++		t.Fatal("no status")
++	}
++	if !st.Cooling {
++		t.Fatalf("should be cooling: %+v", st)
++	}
++	if st.Until.Hour() == 4 {
++		t.Errorf("until=%v 仍落在 04:00 —— 短冷却没生效", st.Until)
++	}
++	if e := p.byUID["u1"]; e.coolKind != CoolSoft {
++		t.Errorf("coolKind=%v want CoolSoft", e.coolKind)
++	}
++	d := st.Until.Sub(before)
++	if d < 9*time.Minute || d > 11*time.Minute {
++		t.Errorf("冷却跨度 %v 不是配置的 10m（±1m 容差，now 落在 %v..%v）", d, before, after)
++	}
++}
++
++// 窗口过去就回到候选池（不是等一整天）。
++func TestCreditExhaustedReturnsAfterWindow(t *testing.T) {
++	p := New("")
++	p.SetCreditExhausted(5 * time.Minute)
++	p.Add(&auth.Auth{UID: "u1"})
++	p.CooldownUntilTomorrow4AM("u1", "余额不足")
++
++	if st, _ := p.Status("u1"); !st.Cooling {
++		t.Fatal("冷却期内应处于 cooling")
++	}
++	// 把截止时间拨到过去 = 窗口过去
++	p.mu.Lock()
++	p.byUID["u1"].until = time.Now().Add(-time.Second)
++	p.mu.Unlock()
++	st, _ := p.Status("u1")
++	if st.Cooling {
++		t.Errorf("窗口过后不该还在冷却：%+v", st)
++	}
++}
+diff --git a/internal/pool/pool.go b/internal/pool/pool.go
+index b6e191e..f6c9831 100644
+--- a/internal/pool/pool.go
++++ b/internal/pool/pool.go
+@@ -25,6 +25,10 @@ type Pool struct {
+ 	breakerCooldownMax time.Duration
+ 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
+ 	softRateMax time.Duration
++	// creditExhausted 积分耗尽后的冷却时长（SetCreditExhausted 注入；0 = 旧行为
++	// 「硬冷却到次日 04:00，等签到恢复」）。配了就只退出这一小段，到期回到候选池
++	// —— 用户可能在期间充值、上游也可能刷新额度，挂一整天是浪费。
++	creditExhausted time.Duration
+ 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
+ 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
+ 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
+@@ -122,6 +126,14 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
+ 	}
+ }
+ 
++// SetCreditExhausted 注入「积分耗尽后的冷却时长」（cooldown.credit_exhausted）。
++// 0 = 不启用（保持「冷却到次日 04:00」的旧行为）。
++func (p *Pool) SetCreditExhausted(d time.Duration) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.creditExhausted = d
++}
++
+ // SetCostExploreInterval 注入 costTier 条件探索窗口（main 从 config 解析后调用，
+ // issue #136）。0 = 关停（完全回到现状行为）；正值覆盖默认 30m。
+ // 注意：与 SetSoftRateMax「非正值保留默认」不同，0 在这里是**合法值**（关停开关，

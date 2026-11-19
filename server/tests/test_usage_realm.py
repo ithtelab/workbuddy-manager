@@ -540,12 +540,17 @@ class UpstreamPoolCountsTest(unittest.TestCase):
         断言写成「必须存在 perRealm.healthy 的读取」，而不是「必须没有 .healthy」——
         后者会误伤两处**合法**用法：顶层汇总的 `upstream?.healthy`（老上游回退）
         与展示用的 `pool.healthy`。正向断言既精确又不会被无关代码绊倒。
+
+        2026-09-27 跟随后续改动：这段判定搬进了 `web/lib/account-status.ts` 的
+        `poolTotals()`（首页要按分组逐块显示池计数，判定只能有一处）。所以现在断言
+        **那个模块**读了 realm_totals，并额外要求**仪表盘不再自己读** —— 两边各算
+        一份正是当初「首页说在线、账号页说未加载」的成因。
         """
-        src = (Path(__file__).resolve().parents[2] / 'web' / 'app' / '(main)'
-               / 'dashboard' / 'page.tsx').read_text(encoding='utf-8')
+        root = Path(__file__).resolve().parents[2] / 'web'
+        src = (root / 'lib' / 'account-status.ts').read_text(encoding='utf-8')
         # 1) 真的读了上游按版本分组的计数
         self.assertIn('.realm_totals?.[realm]', src,
-                      '仪表盘没有实际读 realm_totals —— 上游已按版本分好组，别自己数')
+                      'account-status 没有实际读 realm_totals —— 上游已按版本分好组，别自己数')
         # 2) 健康数取自该分组（而不是从明细条目上取）
         self.assertIn('perRealm.healthy', src, '没有从 realm_totals 取 healthy')
         self.assertIn('perRealm.cooling', src, '没有从 realm_totals 取 cooling')
@@ -558,6 +563,13 @@ class UpstreamPoolCountsTest(unittest.TestCase):
             (r'\bit\s*\.\s*healthy\b', '在账号明细条目 it 上取 healthy'),
         ):
             self.assertIsNone(re.search(pat, src), f'{why} —— 该字段不存在，会恒为 0')
+        # 4) 仪表盘用这个函数，且不再自己算一份（判定只允许有一处）
+        page = (root / 'app' / '(main)' / 'dashboard' / 'page.tsx').read_text(encoding='utf-8')
+        self.assertIn('poolTotals(', page,
+                      '仪表盘没有用共用的 poolTotals() —— 池计数判定又分家了')
+        self.assertNotIn('.realm_totals', page,
+                         '仪表盘自己又读了一次 realm_totals —— 判定必须只有一处'
+                         '（两处各算一份，正是「首页说在线、账号页说未加载」的成因）')
 
     def test_type_declares_realm_totals(self) -> None:
         ts = (Path(__file__).resolve().parents[2] / 'web' / 'lib' / 'types.ts'

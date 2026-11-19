@@ -1,0 +1,83 @@
+diff --git a/internal/upstream/sanitize.go b/internal/upstream/sanitize.go
+index 840bbcf..dfce1a6 100644
+--- a/internal/upstream/sanitize.go
++++ b/internal/upstream/sanitize.go
+@@ -21,6 +21,7 @@ var sanitizeFeatures = []string{
+ 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
+ 	"11128",                                           // 上游反探测：裸数字错误码
+ 	"workspace root",                                  // DSH file-reference 提示词（上游 2026-10-27 新增词，见 CangShui/workbuddy-gateway#28）
++	"Tokens prefixed with @",                          // DSH file-reference 提示词首句（issue #321）
+ }
+ 
+ // sanitizeExtraFeatures 运行期从 config 追加的特征（features.sanitize_extra_features）。
+@@ -95,6 +96,14 @@ var sanitizeRewrites = [][2]string{
+ 		"workspace root",
+ 		"workspace base",
+ 	},
++	{
++		// file-reference 首句（issue #321 二分实测）：DSH 0.2.1 起 system 里带
++		// "Tokens prefixed with @ are paths the user explicitly referenced."，
++		// 上游对这句原样出现判 11128；仅把 "@" 换成 "the at-sign" 即 200。
++		// 只改这一处字面量，后文 `@"..."` 的示例写法不动，语义不变。
++		"Tokens prefixed with @ are paths the user explicitly referenced",
++		"Tokens prefixed with the at-sign are paths the user explicitly referenced",
++	},
+ }
+ 
+ // sanitizeDshRe 通配层：客户端「自我介绍句」的模板匹配（issue #246）。
+diff --git a/internal/upstream/sanitize_test.go b/internal/upstream/sanitize_test.go
+index 90acb08..acc680d 100644
+--- a/internal/upstream/sanitize_test.go
++++ b/internal/upstream/sanitize_test.go
+@@ -417,8 +417,8 @@ func TestReasoningContentSanitized(t *testing.T) {
+ 	}
+ }
+ 
+-// TestSanitizeLiteralByteExact 逐字节快照护栏：把 sanitizeFeatures 8 项 +
+-// sanitizeRewrites 6 对 + 3 个正则的当前字节值硬编码断言。
++// TestSanitizeLiteralByteExact 逐字节快照护栏：把 sanitizeFeatures 9 项 +
++// sanitizeRewrites 7 对 + 3 个正则的当前字节值硬编码断言。
+ // 这些字面量是实验逆向出的上游内容审核黑名单（无契约可引用），上游按逐字精确
+ // 匹配拦截，一字之差即漏拦（400 code=11128）或误伤。任何未来改动（含看似无害的
+ // 统一常量/抽配置）都会先红在本测试——必须走 analysis 报告 #6 的逐字节验证
+@@ -434,6 +434,7 @@ func TestSanitizeLiteralByteExact(t *testing.T) {
+ 		"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
+ 		"11128",                                           // 上游反探测：裸数字错误码
+ 		"workspace root",                                  // DSH file-reference 提示词（2026-10-27 新增词）
++		"Tokens prefixed with @",                          // DSH file-reference 提示词首句（issue #321）
+ 	}
+ 	if len(sanitizeFeatures) != len(features) {
+ 		t.Fatalf("sanitizeFeatures 项数=%d want %d（快照与实现不同步，见测试头注释的验证步骤）", len(sanitizeFeatures), len(features))
+@@ -469,6 +470,10 @@ func TestSanitizeLiteralByteExact(t *testing.T) {
+ 			"workspace root",
+ 			"workspace base",
+ 		},
++		{
++			"Tokens prefixed with @ are paths the user explicitly referenced",
++			"Tokens prefixed with the at-sign are paths the user explicitly referenced",
++		},
+ 	}
+ 	if len(sanitizeRewrites) != len(rewrites) {
+ 		t.Fatalf("sanitizeRewrites 对数=%d want %d（快照与实现不同步，见测试头注释的验证步骤）", len(sanitizeRewrites), len(rewrites))
+@@ -747,3 +752,20 @@ func TestConfigureSanitizeExtraTerms(t *testing.T) {
+ 		t.Error("清空后仍命中")
+ 	}
+ }
++
++// TestSanitizeDshFileReferenceTokens issue #321：DSH file-reference 首句单独出现
++// （不带 workspace root）也必须进入净化并被改写；`@"..."` 示例写法保持原样。
++func TestSanitizeDshFileReferenceTokens(t *testing.T) {
++	in := `Tokens prefixed with @ are paths the user explicitly referenced. @"..." quotes a path containing spaces.`
++	if !hasFingerprint(in) {
++		t.Fatalf("特征预检未命中: %q", in)
++	}
++	got := sanitizeText(in)
++	if strings.Contains(got, "Tokens prefixed with @") {
++		t.Fatalf("改写后仍含触发句: %q", got)
++	}
++	want := `Tokens prefixed with the at-sign are paths the user explicitly referenced. @"..." quotes a path containing spaces.`
++	if got != want {
++		t.Fatalf("got %q want %q", got, want)
++	}
++}
+ 

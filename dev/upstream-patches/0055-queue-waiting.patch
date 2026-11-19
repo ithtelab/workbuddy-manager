@@ -1,0 +1,179 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index bcb38c5..9f5a615 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -1202,6 +1202,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			status = http.StatusTooManyRequests
+ 			code = "rate_limit_exceeded"
+ 			msg = "rate limited: all accounts are cooling down, please wait a moment and try again"
++		case upstream.ErrUpstreamQueue:
++			// 排队是全局队列，不是账号问题；仍返回 429 让客户端等待。
++			status = http.StatusTooManyRequests
++			code = "rate_limit_exceeded"
++			msg = "upstream model is queueing: peak-hour wait list, please retry later"
+ 		case upstream.ErrWafBlock:
+ 			if h.wafIP.active() {
+ 				// IP 级拦截措辞（fail-fast 终止路径）：空 body 时给出明确可读文案——
+@@ -1356,6 +1361,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
+ 	case upstream.ErrSessionDead:
+ 		h.cfg.Pool.Disable(uid, "12153 session dead")
++	case upstream.ErrUpstreamQueue:
++		// 排队是全局队列，与账号无关：不冷却、不计数、不禁用。本次请求仍由调用方
++		// 继续轮转（MaxRotate 兜住总次数），最终映射为 429 让客户端等待。
+ 	case upstream.ErrAuthRejected:
+ 		// 纯 401（无 12153、无业务信封）：凭证被上游拒绝，但单次可能是网关抖动
+ 		// 或 token 轮换竞态 —— 不直接 Disable（chat 路径误判一次就是永久杀号），
+diff --git a/internal/server/handler_test.go b/internal/server/handler_test.go
+index 776c3e5..ed23724 100644
+--- a/internal/server/handler_test.go
++++ b/internal/server/handler_test.go
+@@ -665,6 +665,28 @@ func TestApplyErrorPolicyConversationIDMissingCools(t *testing.T) {
+ // 保留有界冷却，但**冷却中的兜底探测不得翻倍**（这正是旧实现「越重试越冷」的根因，
+ // 全池被推到 2h 封顶的元凶）。时长断言全部取自注入值，不依赖真实等待。
+ // Classify→applyErrorPolicy 的接线由 TestChatSoftCoolsOnRateLimitBody 端到端覆盖。
++// TestApplyErrorPolicyUpstreamQueueDoesNotCool 6020 排队不是账号限流：不得冷却/
++// 计数/禁用（issue #416）。换号不会改变全局队列位置，罚号只会扩大伤害。
++func TestApplyErrorPolicyUpstreamQueueDoesNotCool(t *testing.T) {
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
++
++	h.applyErrorPolicy("u1", upstream.ErrUpstreamQueue,
++		`{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":5580,"retry_after":40}}`,
++		"kimi-k3.1-pro", &upstream.Error{Kind: upstream.ErrUpstreamQueue, Status: 429})
++	st, ok := p.Status("u1")
++	if !ok {
++		t.Fatal("u1 missing")
++	}
++	if st.Cooling || st.Disabled {
++		t.Fatalf("排队不应冷却/禁用账号: %+v", st)
++	}
++	if st.SoftStreak != 0 {
++		t.Errorf("排队不应推进 soft_streak: %d", st.SoftStreak)
++	}
++}
++
+ func TestApplyErrorPolicySoftRateNoDoubleWhenCooling(t *testing.T) {
+ 	p := pool.New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index 35b746e..bfc5a07 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -58,6 +58,10 @@ const (
+ 	// 一次误判就是永久杀号。故单列一类，由 handler 走「连续 N 次才禁用」的计数
+ 	// 路径（与 12153 的 NoteSessionDead 同口径、共用计数器）。
+ 	ErrAuthRejected
++	// ErrUpstreamQueue 上游「排队等待」（429 + 业务码 6020 / queue.waiting.title）
++	// 不是账号级限流：队列按账号等级全局共享，换号不会改变排队位置。账号不冷却、
++	// 不计数、不禁用；请求仍按 MaxRotate 轮转，最终以 429 返回让客户端等待。
++	ErrUpstreamQueue
+ )
+ 
+ func (k ErrKind) String() string {
+@@ -94,6 +98,8 @@ func (k ErrKind) String() string {
+ 		return "fallback_model_missing"
+ 	case ErrAuthRejected:
+ 		return "auth_rejected"
++	case ErrUpstreamQueue:
++		return "upstream_queue"
+ 	case ErrClient:
+ 		return "client"
+ 	default:
+@@ -602,6 +608,20 @@ func isToolCallMismatch(lower string) bool {
+ 		codeMarker(lower, "11148")
+ }
+ 
++// IsUpstreamQueue 是否为「上游排队」而非账号限流：429 + 6020 / queue.waiting。
++//
++// 6020 的 queue_position 只随全局队列推进，换账号不会变好；把它当账号级 429
++// 会按 600s 冷却每个被轮到的号（任务现场 6 条请求冷 18 个健康号）。
++func IsUpstreamQueue(body string) bool {
++	if strings.TrimSpace(body) == "" {
++		return false
++	}
++	if strings.Contains(strings.ToLower(body), "queue.waiting") {
++		return true
++	}
++	return hasBusinessCode(body, "6020")
++}
++
+ func Classify(status int, body string) ErrKind {
+ 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
+ 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 虽不含余额词、
+@@ -645,6 +665,11 @@ func Classify(status int, body string) ErrKind {
+ 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
+ 		return ErrHardCredit
+ 	}
++	// 6020「排队等待」不是账号级限流：队列全局共享，账号不该被冷却。必须判在
++	// 通用 429 兜底之前（issue #416）。只认 429，200 + 6020 文案不改变分类。
++	if status == http.StatusTooManyRequests && IsUpstreamQueue(body) {
++		return ErrUpstreamQueue
++	}
+ 	// status==429 先于 hardRule（fork-scan-absorb T-3）：限流响应 body
+ 	// 高频携带 "quota exceeded"/"额度不足" 等跨两界措辞，hardRule 先判会误归
+ 	// ErrHardCredit 硬冷却到次日 04:00。402 真余额在上层已判；非 429 的 quota
+diff --git a/internal/upstream/client_test.go b/internal/upstream/client_test.go
+index ba68600..6165e4c 100644
+--- a/internal/upstream/client_test.go
++++ b/internal/upstream/client_test.go
+@@ -107,6 +107,11 @@ func TestClassify(t *testing.T) {
+ 		// hardRule 在 429 之前会误判 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。
+ 		// 状态码是比关键词更权威的信号：真余额耗尽走 402，非 429 的 quota 措辞
+ 		// 仍归 hardRule（上方 {200,"quota exceeded"} 语义不变）。
++		// 6020「排队等待」是全局队列，不是账号级限流（issue #416）：429 + queue.waiting
++		// 必须单独分类，账号不冷却；换号不会改变队列位置。
++		{429, `{"code":6020,"msg":"queue.waiting.title","data":{"queue_position":5580,"retry_after":40}}`, ErrUpstreamQueue},
++		{429, `{"code": 6020, "msg": "queue.waiting.title"}`, ErrUpstreamQueue},
++		{200, `{"code":6020,"msg":"queue.waiting.title"}`, ErrNone},
+ 		{429, `quota exceeded`, ErrSoftRate},
+ 		{429, `{"code":1,"msg":"quota exceeded, please wait"}`, ErrSoftRate},
+ 		{429, `insufficient credits`, ErrSoftRate},
+diff --git a/internal/upstream/hint.go b/internal/upstream/hint.go
+index a138020..2a89378 100644
+--- a/internal/upstream/hint.go
++++ b/internal/upstream/hint.go
+@@ -59,6 +59,8 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
+ 		return "account session expired at upstream; the account is disabled until re-login"
+ 	case ErrAuthRejected:
+ 		return "account credential rejected by upstream (401); the gateway disables this account after repeated hits"
++	case ErrUpstreamQueue:
++		return "upstream model is queueing (peak-hour wait list); switching accounts does not help, retry after the queue clears"
+ 	case ErrHardCredit:
+ 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
+ 	case ErrModelBlocked:
+diff --git a/internal/upstream/hint_test.go b/internal/upstream/hint_test.go
+index e4e76fb..69f4a98 100644
+--- a/internal/upstream/hint_test.go
++++ b/internal/upstream/hint_test.go
+@@ -27,6 +27,7 @@ func TestGatewayHintKindMap(t *testing.T) {
+ 		{"11115 prompt too long", ErrPromptTooLong, `{"code":11115,"msg":"prompt is too long"}`, "request context exceeds the model's limit; reduce history/message size"},
+ 		{"WAF 403", ErrWafBlock, `<html><head><title>403 Forbidden</title></head></html>`, "upstream WAF blocked the gateway; retry after the block window"},
+ 		{"429 soft rate", ErrSoftRate, `{"code":6004,"msg":"rate limited"}`, "rate limited by upstream; retry after reset"},
++		{"6020 queue", ErrUpstreamQueue, `{"code":6020,"msg":"queue.waiting.title"}`, "upstream model is queueing (peak-hour wait list); switching accounts does not help, retry after the queue clears"},
+ 		{"11140 account fault", ErrAccountFault, `{"code":11140,"msg":"request illegal"}`, "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"},
+ 		{"12153 session dead", ErrSessionDead, `{"code":12153,"msg":"Offline user session not found"}`, "account session expired at upstream; the account is disabled until re-login"},
+ 		{"402 hard credit", ErrHardCredit, `{"code":1,"msg":"余额不足"}`, "account credits exhausted at upstream; waiting for daily check-in to restore"},
+@@ -132,9 +133,9 @@ func TestGatewayHintImageForms(t *testing.T) {
+ // 字符串形态 + extError 深层 marker + displayMsg 文案家族。
+ func TestGatewayHintMarkerTolerance(t *testing.T) {
+ 	variants := []string{
+-		body11133,                                                     // 实测原始 body
+-		`{"code":"11133","msg":"..."}`,                                // code 字符串形态
+-		`{"extError":{"code":"model_param_invalid"}}`,                 // extError 深层 marker
++		body11133,                      // 实测原始 body
++		`{"code":"11133","msg":"..."}`, // code 字符串形态
++		`{"extError":{"code":"model_param_invalid"}}`,                                 // extError 深层 marker
+ 		`{"msg":"The request parameters do not meet the current model requirements"}`, // displayMsg en 文案
+ 	}
+ 	for _, v := range variants {
+@@ -143,7 +144,7 @@ func TestGatewayHintMarkerTolerance(t *testing.T) {
+ 		}
+ 	}
+ 	v11135 := []string{
+-		body11135,                                     // 实测原始 body
++		body11135, // 实测原始 body
+ 		`{"extError":{"code":"invalid_image_data"}}`, // extError 深层 marker
+ 	}
+ 	for _, v := range v11135 {

@@ -1,0 +1,476 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 5ec741e..3841802 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -6,6 +6,7 @@ import (
+ 	"crypto/subtle"
+ 	"encoding/json"
+ 	"errors"
++	"fmt"
+ 	"io"
+ 	"log"
+ 	"net/http"
+@@ -652,7 +653,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	//       也空走 NewMessageID 请求级（TurnRequestID 空键行为）——轮转内捕获
+ 	//       一次即共享。
+ 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
+-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
++	//   - conversationID：客户端给了就透传原值；**没给时派生一个同会话稳定的值**
++	//     （issue #193：上游对部分账号灰度启用渠道校验，缺 X-Conversation-ID 即判
++	//     11-128「conversation id missing」，被灰度到的账号每次被选中都失败）。
++	//     派生锚点见 session.ConversationIDForHeaders 的注释；只补**头**、不往 body
++	//     里塞 conversationId —— #193 的剥离实测证明校验对象是头，body 那个字段不是
++	//     必填项。
++	chatMeta := upstream.ChatMeta{ConversationID: session.ConversationIDForHeaders(body, sessKey)}
+ 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
+ 		chatMeta.ConversationRequestID = v
+ 	} else if turnKey != "" && sessKey != "" {
+@@ -1054,6 +1061,25 @@ func rotateBackoff(i int, ctx context.Context) bool {
+ //
+ // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
+ // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
++// upstreamCodeLabel 给「禁用/冷却理由」用的短标签：优先取响应体里的**真实业务码**
++// （数字，或 11-128 这种带横线的字符串），取不到再回落到 HTTP 状态。
++//
++// 不写死具体码是刻意的（issue #201 缺陷 1）：这条分支历史上只见过 11140，于是理由
++// 里写死了它；现场实际是 `http 400 + code 11-128`，排障的人拿着 11140 去搜方向全错
++// （11140 指向"UA 平台段送错"，而真实原因是渠道校验）。
++func upstreamCodeLabel(body string, uerr *upstream.Error) string {
++	if code := upstream.CodeOf(body); code != "" {
++		if uerr != nil && uerr.Status > 0 {
++			return fmt.Sprintf("code %s, http %d", code, uerr.Status)
++		}
++		return "code " + code
++	}
++	if uerr != nil && uerr.Status > 0 {
++		return fmt.Sprintf("http %d", uerr.Status)
++	}
++	return "unknown code"
++}
++
+ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
+ 	switch kind {
+ 	case upstream.ErrHardCredit:
+@@ -1104,16 +1130,33 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。
+ 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
+ 	case upstream.ErrAccountFault:
+-		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultMarkers 一致）：
+-		//   - "request illegal"（code 11140）→ 账号级**授权封禁**：软冷却到期也不会自动
+-		//     恢复（需重新 OAuth 登录），到期后重新选号只会再撞 403 浪费一次轮换——
+-		//     硬禁用（Disable），不再参与选号。/status 以 disabled + disabled_reason 呈现。
++		// 账号级授权/配额故障按 msg 分野（口径与 Classify 的 accountFaultRule 一致）：
++		//   - "request illegal"（本机实测是 11-128；历史注释里的 11140 是 403 平台段
++		//     错误场景）→ 账号级**授权封禁**：软冷却到期也不会自动恢复（需重新 OAuth
++		//     登录），到期后重新选号只会再撞一次同样的答复、白费一次轮换——硬禁用
++		//     （Disable），不再参与选号。/status 以 disabled + disabled_reason 呈现。
++		//   - "conversation id missing"（同为 11-128）→ 上游**按账号灰度**启用的渠道
++		//     校验（issue #193）。出站已补会话头族（session.ConversationIDForHeaders），
++		//     仍撞上说明该账号被灰度到了别的口径：按账号级**软冷却**处理 —— 只换号不
++		//     禁用（灰度随时可能放开，禁用会让用户白重新登录），但必须把它暂时挪出池子，
++		//     否则它留在池里"显示健康、每次被选中都失败"（issue #201 缺陷 2）。
+ 		//   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
+ 		//     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
+-		// 两条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
++		// 三条路径对坏号都立刻换号（同一请求轮转出池），只是后续可恢复性不同。
+ 		// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
+-		if strings.Contains(strings.ToLower(body), "request illegal") {
+-			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
++		lowerBody := strings.ToLower(body)
++		if strings.Contains(lowerBody, "request illegal") {
++			// 理由里带**响应自己的码**（issue #201 缺陷 1：此前写死 11140，而真实响应
++			// 是 http 400 + code 11-128 —— 按 11140 去搜会把排障方向带偏）。
++			h.cfg.Pool.Disable(uid, fmt.Sprintf(
++				"account banned by upstream (request illegal, %s), re-login required",
++				upstreamCodeLabel(body, uerr),
++			))
++			return
++		}
++		if strings.Contains(lowerBody, "conversation id missing") {
++			h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown,
++				"channel check (conversation id missing, "+upstreamCodeLabel(body, uerr)+")")
+ 			return
+ 		}
+ 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.cfg.SoftCooldown, "account fault (14017)")
+diff --git a/internal/server/handler_ids_test.go b/internal/server/handler_ids_test.go
+index c20e50f..a231d95 100644
+--- a/internal/server/handler_ids_test.go
++++ b/internal/server/handler_ids_test.go
+@@ -137,6 +137,58 @@ func TestChatConversationIDPassthrough(t *testing.T) {
+ 	}
+ }
+ 
++// TestChatConversationIDDerivedWhenClientOmitsIt 客户端**没带** conversationId 时，
++// 出站仍要发 X-Conversation-ID，且同一会话多轮派生出同一个值（issue #193）。
++//
++// 为什么必须发：上游 2026-10-16 起对部分账号灰度启用渠道校验，缺这个头即判
++// 11-128「conversation id missing」——被灰度到的账号每次被选中都失败（同池实测：
++// 被拦账号必拦、未灰度账号零交叉）。旧行为是"客户端没给就不发（不伪造）"，灰度推开
++// 后等于把那些账号判了死刑；补一个稳定值既过校验，也保住后台按会话聚合的语义。
++func TestChatConversationIDDerivedWhenClientOmitsIt(t *testing.T) {
++	var headers []http.Header
++	up := &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			headers = append(headers, r.Header.Clone())
++			return &http.Response{
++				StatusCode: 200,
++				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
++				Body:       io.NopCloser(strings.NewReader(sseOK)),
++			}, nil
++		})},
++		ChatBaseCN:    "https://fake.example",
++		BillingBaseCN: "https://fake.example",
++	}
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up})
++
++	// 同一会话的两轮：首条 user 消息不变，末尾那句变（真实 agent 多轮的形态）。
++	turns := []string{
++		`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"帮我改这个函数"},{"role":"assistant","content":"好"},{"role":"user","content":"再优化一下"}]}`,
++		`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"帮我改这个函数"},{"role":"assistant","content":"好"},{"role":"user","content":"换个思路"}]}`,
++	}
++	for _, body := range turns {
++		rec := httptest.NewRecorder()
++		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
++		if rec.Code != 200 {
++			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
++		}
++	}
++	if len(headers) != len(turns) {
++		t.Fatalf("出站次数=%d want %d", len(headers), len(turns))
++	}
++	first := headers[0].Get("X-Conversation-ID")
++	if first == "" {
++		t.Fatal("客户端没给 conversationId 时，出站 X-Conversation-ID 仍必须发（否则 11-128 渠道校验必拦）")
++	}
++	if got := headers[1].Get("X-Conversation-ID"); got != first {
++		t.Errorf("同会话两轮派生出不同值：%q vs %q —— 后台会把一个会话拆成多条", first, got)
++	}
++	// 会话级 ≠ 轮级：两者形态相同（32 hex）但语义不同，别让实现退化成"都取同一个值"。
++	if first == headers[0].Get("X-Conversation-Request-ID") {
++		t.Error("X-Conversation-ID 与 X-Conversation-Request-ID 不该是同一个值（会话级 vs 轮级）")
++	}
++}
++
+ // TestChatConversationRequestIDInboundPassthrough 入站自带 X-Conversation-Request-ID →
+ // 出站原样透传（客户端已有自己的对话轮 ID 时以客户端为准）。
+ func TestChatConversationRequestIDInboundPassthrough(t *testing.T) {
+diff --git a/internal/server/handler_test.go b/internal/server/handler_test.go
+index 9ece615..776c3e5 100644
+--- a/internal/server/handler_test.go
++++ b/internal/server/handler_test.go
+@@ -511,7 +511,9 @@ func TestChatAccountFault11140Disables(t *testing.T) {
+ 	if !st.Disabled {
+ 		t.Fatalf("bad 应被硬禁用（11140 封禁需重登，不可自愈）: %+v", st)
+ 	}
+-	wantReason := "account banned by upstream (11140 request illegal), re-login required"
++	// 理由里带**响应自己的码**（issue #201：此前写死 11140，现场真实响应是 11-128，
++	// 拿着 11140 去搜方向全错）。本用例的响应体是 11140 + 403，理由如实反映它。
++	wantReason := "account banned by upstream (request illegal, code 11140, http 403), re-login required"
+ 	if st.DisabledReason != wantReason {
+ 		t.Errorf("disabled_reason=%q want %q", st.DisabledReason, wantReason)
+ 	}
+@@ -587,7 +589,7 @@ func TestChatAccountFault14017Rotates(t *testing.T) {
+ // 分类下按 msg 分野——"request illegal"(11140) → 硬禁用；"trial"(14017) → 软冷却不禁用。
+ // 端到端接线由上方 TestChatAccountFault11140Disables / TestChatAccountFault14017Rotates 覆盖。
+ func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
+-	const why11140 = "account banned by upstream (11140 request illegal), re-login required"
++	const why11140 = "account banned by upstream (request illegal, code 11140), re-login required"
+ 
+ 	t.Run("11140 request illegal disables", func(t *testing.T) {
+ 		p := pool.New("")
+@@ -626,6 +628,39 @@ func TestApplyErrorPolicyAccountFaultSplit(t *testing.T) {
+ 	})
+ }
+ 
++// TestApplyErrorPolicyConversationIDMissingCools 11-128「conversation id missing」
++// 按**账号级软冷却**处理（issue #193 / #201 缺陷 2）。
++//
++// 上游对部分账号灰度启用了渠道校验：出站缺 X-Conversation-ID 头族即被判
++// 11-128。网关已在出站补会话头族（session.ConversationIDForHeaders），仍撞上说明
++// 该账号被灰度到了别的口径 —— 这时**不能**像以前那样归到通用 4xx「只换号不罚号」：
++// 那会让坏号留在池里"显示健康、每次被选中都失败"（报告里 14 个号中 7 个被拦死、
++// 却只有 2 个被禁用）。也不硬禁用：灰度随时可能放开，禁用会让用户白重新登录。
++func TestApplyErrorPolicyConversationIDMissingCools(t *testing.T) {
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
++
++	// 上游实测形态：HTTP 400 + code 11-128，且 code 的值**没加引号**（非法 JSON）。
++	// 理由里的码必须照实取到 —— 这条用例同时钉住 CodeOf 对非法 JSON 的容忍。
++	h.applyErrorPolicy("u1", upstream.ErrAccountFault,
++		`{"code":11-128,"msg":"conversation id missing","requestId":"x","displayMsg":{"zh":"请求被拦截，请重新发送"}}`,
++		"glm-5.2", &upstream.Error{Kind: upstream.ErrAccountFault, Status: 400, Msg: "conversation id missing"})
++	st, _ := p.Status("u1")
++	if st.Disabled {
++		t.Fatalf("渠道校验不应硬禁用（灰度可能放开，禁用等于让用户白重登）: %+v", st)
++	}
++	if !st.Cooling || st.CoolKind != "soft_rate" {
++		t.Fatalf("应 soft_rate 软冷却（挪出池子但可自愈）: %+v", st)
++	}
++	if !strings.Contains(st.Reason, "11-128") {
++		t.Errorf("冷却理由应带真实码，否则排障按错码去搜: %q", st.Reason)
++	}
++	if strings.Contains(st.Reason, "11140") {
++		t.Errorf("理由里不该出现写死的 11140（issue #201 缺陷 1）: %q", st.Reason)
++	}
++}
++
+ // TestApplyErrorPolicySoftRateNoDoubleWhenCooling handler 层回归：无重置时间的 429
+ // 保留有界冷却，但**冷却中的兜底探测不得翻倍**（这正是旧实现「越重试越冷」的根因，
+ // 全池被推到 2h 封顶的元凶）。时长断言全部取自注入值，不依赖真实等待。
+diff --git a/internal/session/conversation_id_test.go b/internal/session/conversation_id_test.go
+new file mode 100644
+index 0000000..1edfe60
+--- /dev/null
++++ b/internal/session/conversation_id_test.go
+@@ -0,0 +1,103 @@
++package session
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++// 会话头族的 conversationId（issue #193）：客户端给了就透传；**没给要派生一个
++// 同会话稳定的值** —— 上游对部分账号灰度启用了渠道校验，出站缺 X-Conversation-ID
++// 即判 11-128「conversation id missing」，被灰度到的账号每次被选中都失败。
++
++func bodyWith(messages ...map[string]any) []byte {
++	b, _ := json.Marshal(map[string]any{"messages": messages})
++	return b
++}
++
++func userMsg(text string) map[string]any {
++	return map[string]any{"role": "user", "content": text}
++}
++
++func TestConversationIDPrefersClientValue(t *testing.T) {
++	body := bodyWith(
++		map[string]any{"role": "system", "content": "sys"},
++		userMsg("你好"),
++	)
++	// 顶层 conversationId 原值透传（不重新派生 —— 派生值会让后台按对话聚合的键
++	// 与客户端自己记的对不上）。
++	withField := func(key string, v any) []byte {
++		var obj map[string]any
++		_ = json.Unmarshal(body, &obj)
++		obj[key] = v
++		out, _ := json.Marshal(obj)
++		return out
++	}
++	for _, key := range []string{"conversationId", "conversation_id"} {
++		if got := ConversationIDForHeaders(withField(key, "client-conv-1"), "sess"); got != "client-conv-1" {
++			t.Errorf("%s 没透传：got %q", key, got)
++		}
++	}
++	// metadata 形态同样透传
++	meta, _ := json.Marshal(map[string]any{
++		"messages": []map[string]any{userMsg("你好")},
++		"metadata": map[string]any{"conversationId": "meta-conv"},
++	})
++	if got := ConversationIDForHeaders(meta, ""); got != "meta-conv" {
++		t.Errorf("metadata.conversationId 没透传：got %q", got)
++	}
++}
++
++func TestConversationIDStableAcrossTurns(t *testing.T) {
++	// 同一会话的多轮：首条 user 消息不变、末尾消息在变 → 必须派生同一个值，
++	// 否则后台会把一个会话拆成几十条（这正是「稳定」要保住的语义）。
++	first := bodyWith(
++		map[string]any{"role": "system", "content": "sys"},
++		userMsg("帮我改这个函数"),
++	)
++	second := bodyWith(
++		map[string]any{"role": "system", "content": "sys"},
++		userMsg("帮我改这个函数"),
++		map[string]any{"role": "assistant", "content": "改好了"},
++		userMsg("再优化一下"),
++	)
++	a := ConversationIDForHeaders(first, "")
++	b := ConversationIDForHeaders(second, "")
++	if a == "" || a != b {
++		t.Fatalf("同会话两轮派生不一致：%q vs %q", a, b)
++	}
++	if len(a) != 32 || strings.ContainsFunc(a, func(r rune) bool { return !isHex(r) }) {
++		t.Errorf("派生值形态不是 32 hex（B3 TraceId 也用它）：%q", a)
++	}
++}
++
++func TestConversationIDDiffersAcrossConversations(t *testing.T) {
++	a := ConversationIDForHeaders(bodyWith(userMsg("会话甲的第一句")), "")
++	b := ConversationIDForHeaders(bodyWith(userMsg("会话乙的第一句")), "")
++	if a == b {
++		t.Errorf("不同会话派生出同一个值：%q —— 后台会把两条对话并成一条", a)
++	}
++}
++
++func TestConversationIDFallbacks(t *testing.T) {
++	// 无 user 消息（探测请求：只有 system）→ 回落会话键
++	probe := bodyWith(map[string]any{"role": "system", "content": "You are a helpful assistant."},
++		userMsg(""))
++	withSess := ConversationIDForHeaders(probe, "sess-key")
++	again := ConversationIDForHeaders(probe, "sess-key")
++	if withSess == "" || withSess != again {
++		t.Errorf("无 user 文本时没有按会话键稳定派生：%q vs %q", withSess, again)
++	}
++	if withSess == ConversationIDForHeaders(probe, "another-sess") {
++		t.Error("不同会话键派生出了同一个值")
++	}
++	// 什么都没有 → 仍要给出一个非空的 32 hex（头族必发，校验才不会 11-128）
++	bare := ConversationIDForHeaders(nil, "")
++	if len(bare) != 32 {
++		t.Errorf("空请求也要给出合法值，got %q", bare)
++	}
++}
++
++func isHex(r rune) bool {
++	return (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')
++}
+diff --git a/internal/session/ids.go b/internal/session/ids.go
+index 08a32cc..96402db 100644
+--- a/internal/session/ids.go
++++ b/internal/session/ids.go
+@@ -77,6 +77,33 @@ func RequestIDForKey(key string) string {
+ 	return hex.EncodeToString(sum[:16])
+ }
+ 
++// ConversationIDForHeaders 给出站会话头族要用的 X-Conversation-ID：客户端给了就用
++// 它的原值，没给就**派生一个同一会话稳定的值**。
++//
++// 为什么不再"客户端没给就不发"（issue #193）：上游 2026-10-16 起对**部分账号**
++// 灰度启用了渠道校验，出站缺 X-Conversation-ID 即判 `11-128 conversation id missing`
++// —— 被灰度到的账号在池里每次被选中都失败（实测同一账号必拦、未灰度的账号零交叉）。
++// 头族本身是官方客户端的形态，补一个稳定值既让校验通过，也保住后台按会话聚合的
++// 语义（同会话多轮恒同值）。issue #193 的剥离实测：校验对象是**头**，body 里的
++// conversationId **不是**必填项，所以这里只补头、不改 body。
++//
++// 稳定性锚点取**首条 user 消息**（firstUserText）：一次会话内它不变，所以同会话的
++// 多轮请求、换号重试、降级重发都派生出同一个值；不同会话首条消息不同 → 不会被并成
++// 一个会话。回落顺序：首条 user 消息 → 会话键（sessKey）→ 请求级随机（此时没有任何
++// "会话"可供聚合，随机值只为满足校验，与 RequestIDForKey 的空键语义一致）。
++func ConversationIDForHeaders(body []byte, sessKey string) string {
++	if v := ResolveConversationID(body); v != "" {
++		return v
++	}
++	if anchor := firstUserText(body); anchor != "" {
++		return RequestIDForKey("conv:" + anchor)
++	}
++	if sessKey != "" {
++		return RequestIDForKey("conv:" + sessKey)
++	}
++	return NewMessageID()
++}
++
+ // TurnKey 派生「对话轮级」聚合键：body 里**最后一条** role=="user" 消息的
+ // 「序号 + 文本」。
+ //
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index 1142fa2..d89cbeb 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -138,6 +138,24 @@ func (e *Error) Error() string {
+ 	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
+ }
+ 
++// codeRe 从上游响应体里抽业务码：数字（11140）与带横线的字符串（11-128）两种形态。
++// 上游偶尔给出**非法 JSON**（`"code":11-128` 没加引号，见 issue #201 的原始响应），
++// 所以这里用正则而不是 json.Unmarshal —— 解析失败的响应也要能报出码来。
++var codeRe = regexp.MustCompile(`"code"\s*:\s*"?([0-9]{2,8}(?:-[0-9]{1,4})?)"?`)
++
++// CodeOf 取上游响应体里的业务码字面值；取不到返回 ""。
++//
++// 存在的理由（issue #201 缺陷 1）：禁用/冷却理由里此前**写死**了 11140，而真实
++// 响应是 HTTP 400 + code 11-128 —— 排障时按 11140 去搜会得到完全错误的方向
++// （"UA 平台段送错"）。理由里带上响应自己的码，才不会把人带偏。
++func CodeOf(body string) string {
++	m := codeRe.FindStringSubmatch(body)
++	if len(m) < 2 {
++		return ""
++	}
++	return m[1]
++}
++
+ // hardRule 余额不足关键词（大小写不敏感 + 中文原文双通道）。
+ var hardRule = errorRule{kind: ErrHardCredit, mode: matchFold, patterns: []string{
+ 	"insufficient credit", "no credit", "credit exhausted", "credits exhausted", "out of credit",
+@@ -223,6 +241,13 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
+ 	"request illegal",
+ 	"trial not activated",
+ 	"trial version is not yet activated",
++	// 11-128「conversation id missing」：上游按账号灰度启用的渠道校验（issue #193/#201）。
++	// 出站已补会话头族（session.ConversationIDForHeaders），仍撞上说明该账号被灰度到
++	// 了别的口径 —— **它是账号级的持续性故障**，不是"客户端请求有问题"：同一账号必拦、
++	// 未灰度账号零交叉（#193 的账号维度实测）。此前它落通用 4xx → 只换号不罚号，坏号
++	// 留在池里"显示健康、每次被选中都失败"（#201 缺陷 2）。归到本类由
++	// applyErrorPolicy 按账号级处理（软冷却，不禁用：可能随上游灰度调整自愈）。
++	"conversation id missing",
+ }}
+ 
+ // promptTooLongRule 11115「prompt is too long」判定（任务书 prompt-too-long §1）。
+diff --git a/internal/upstream/code_of_test.go b/internal/upstream/code_of_test.go
+new file mode 100644
+index 0000000..8e5c43e
+--- /dev/null
++++ b/internal/upstream/code_of_test.go
+@@ -0,0 +1,59 @@
++package upstream
++
++import "testing"
++
++// CodeOf 从上游响应体里取业务码（issue #201 缺陷 1）。
++//
++// 为什么需要它：禁用/冷却的理由里此前**写死**了 11140，而现场真实响应是
++// `http 400 + code 11-128` —— 排障的人拿着 11140 去搜会得到完全错误的方向
++// （11140 指向"UA 平台段送错"，真实原因是渠道校验）。理由里带响应自己的码，
++// 才不会把人带偏。
++func TestCodeOf(t *testing.T) {
++	cases := []struct {
++		name string
++		body string
++		want string
++	}{
++		{"数字形态", `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, "11140"},
++		{"字符串形态", `{"code":"11148","msg":"tool calls and tool results do not match"}`, "11148"},
++		{"带横线的字符串形态", `{"code":"11-128","msg":"conversation id missing"}`, "11-128"},
++		// 上游偶尔给出**非法 JSON**：code 的值没加引号（issue #201 的原始响应就长这样）。
++		// 用 json.Unmarshal 会整条解析失败 → 取不到码，所以这里必须是正则容忍。
++		{"裸值 11-128（非法 JSON）", `{"code":11-128,"msg":"conversation id missing","requestId":"x"}`, "11-128"},
++		{"带空格", `{ "code" : 14018 , "msg" : "no credit" }`, "14018"},
++		{"没有 code 字段", `{"msg":"boom"}`, ""},
++		{"空体", ``, ""},
++		{"HTML 拦截页", `<html><body>403</body></html>`, ""},
++		// requestId 里出现数字不该被当成业务码（只认 "code" 键）
++		{"只有 requestId", `{"requestId":"11140-abc","msg":"x"}`, ""},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := CodeOf(tc.body); got != tc.want {
++				t.Errorf("CodeOf(%q)=%q want %q", tc.body, got, tc.want)
++			}
++		})
++	}
++}
++
++// 11-128「conversation id missing」必须归入账号级故障（issue #193/#201 缺陷 2）。
++//
++// 它此前落通用 4xx → "只换号不罚号"，坏号留在池里"显示健康、每次被选中都失败"
++// （报告里 14 个号中 7 个被拦死、却只有 2 个被禁用）。归到 ErrAccountFault 之后由
++// applyErrorPolicy 按账号级处理（软冷却，不禁用）。
++func TestClassifyConversationIDMissingIsAccountFault(t *testing.T) {
++	bodies := []string{
++		`{"code":"11-128","msg":"conversation id missing"}`,
++		`{"code":11-128,"msg":"conversation id missing"}`, // 非法 JSON 形态
++		`{"code":11-128,"msg":"Conversation ID Missing"}`, // 大小写不敏感
++	}
++	for _, body := range bodies {
++		if got := Classify(400, body); got != ErrAccountFault {
++			t.Errorf("Classify(400, %q)=%v want ErrAccountFault", body, got)
++		}
++	}
++	// 不带该文案的 11-128（其它渠道校验原因）仍走原分类，不被这条规则吞掉。
++	if got := Classify(400, `{"code":"11-128","msg":"请求被拦截，请重新发送"}`); got == ErrAccountFault {
++		t.Error("只有 conversation id missing 该归账号级；其它 11-128 文案不该被吞进账号级分类")
++	}
++}

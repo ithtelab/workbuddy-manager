@@ -22,7 +22,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-from .. import db
+from .. import config, db, upstreamsvc
 from . import wb2api
 
 # docker --timestamps 前缀
@@ -276,6 +276,15 @@ def _parse_checkin_summary(ts: int, rest: str) -> dict:
     fail = kv.get('fail', '0')
     skipped = kv.get('skipped', '0')
     msg = f'本轮签到完成：共 {total} 个，成功 {ok}，已签到 {already}，失败 {fail}，跳过 {skipped}'
+    # 新版汇总行把失败拆成「签到失败 / 余额查询失败」（issue #256）：口径不同，
+    # 前者影响当天积分，后者只是余额没刷新，排障时不能混为一谈。
+    split = []
+    if 'fail_checkin' in kv:
+        split.append(f"签到失败 {kv['fail_checkin']}")
+    if 'fail_resource' in kv:
+        split.append(f"余额查询失败 {kv['fail_resource']}")
+    if split:
+        msg += f"（{'，'.join(split)}）"
     level = 'warn' if fail not in ('0', '') else 'ok'
     return _event(ts, 'checkin', '', level, 0, msg)
 
@@ -320,6 +329,11 @@ def parse_line(line: str) -> dict | None:
     # 形态 3：每轮汇总（先判，避免 `checkin done:` 被当成 uid=done）
     m = _SUMMARY_LINE.search(body)
     if m and m.group(2):
+        if m.group(2) == 'keepalive':
+            counts = dict(re.findall(r'(checked|ok|failed|skipped)=(\d+)', m.group(3)))
+            return _event(ts, 'keepalive', '', 'warn' if int(counts.get('failed', 0)) else 'ok', 0,
+                          '本轮保活：尝试 {checked}，成功 {ok}，失败 {failed}，跳过 {skipped}'.format(
+                              **{key: counts.get(key, '0') for key in ('checked', 'ok', 'failed', 'skipped')}))
         return _parse_checkin_summary(ts, m.group(3).strip())
 
     # 形态 4：计划阶段跳过
@@ -540,13 +554,43 @@ def state() -> dict:
 TAIL_LINES = 3000
 
 
+def _log_containers() -> list[str | None]:
+    """本次要读日志的容器：默认上游 + 各分组登记的上游容器（issue #389）。
+
+    默认上游用 `None` 表示「按当前部署模式读取」（原生文件 / systemd / 默认容器）；
+    分组容器必须显式给名字，走 `docker logs`。同一容器只读一次——默认容器与某个
+    分组填了同一个名字时，否则会把同一批日志解析两遍（dedup 虽然会挡住入库，但
+    浪费一次 `docker logs`，而且 `parsed` 统计会翻倍）。
+    """
+    out: list[str | None] = [None]
+    default = str(config.WB2API_CONTAINER or '').strip()
+    seen = {default} if default else set()
+    for upstream in upstreamsvc.list_upstreams(include_default=False):
+        name = str(upstream.get('container') or '').strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+async def _read_logs(name: str | None, limit: int) -> list[str]:
+    if name is None:
+        return await asyncio.to_thread(wb2api.read_container_logs, limit, True)
+    return await asyncio.to_thread(
+        wb2api.read_container_logs, limit, True, container=name)
+
+
 async def _collect_once(limit: int = TAIL_LINES) -> tuple[int, int]:
-    """读一次容器日志并入库，返回 (解析到的任务行数, 新增条数)。"""
-    lines = await asyncio.to_thread(wb2api.read_container_logs, limit, True)
-    events = parse_lines(lines)
+    """读一次所有上游容器的日志并入库，返回 (解析到的任务行数, 新增条数)。"""
+    events: list[dict] = []
+    for name in _log_containers():
+        lines = await _read_logs(name, limit)
+        events.extend(parse_lines(lines))
     if not events:
         return 0, 0
     added = await asyncio.to_thread(db.add_task_logs, events)
+    from . import accountrisk
+    await accountrisk.handle_tasks(events)
     return len(events), added
 
 
