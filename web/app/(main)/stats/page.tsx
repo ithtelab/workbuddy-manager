@@ -30,7 +30,9 @@ import {
   chartSpecFor,
   dailySeries,
   hourlySeries,
+  hourlyTargetFor,
   todayKeyLocal,
+  yesterdayKeyLocal,
   type ChartPoint,
 } from '@/lib/usage-chart';
 import {fmtCompact, fmtNumber, fmtCredit, fmtMoney } from '@/lib/format';
@@ -129,9 +131,20 @@ export default function StatsPage() {
   const [customStart, setCustomStart] = useState('');
   const [customEnd, setCustomEnd] = useState('');
   const isCustom = days === 'custom';
+  const isYesterday = days === 'yesterday';
+  const yesterday = yesterdayKeyLocal();
   const range: StatsRange | undefined =
-    isCustom && customStart && customEnd ? {start: customStart, end: customEnd} : undefined;
+    isCustom && customStart && customEnd
+      ? {start: customStart, end: customEnd}
+      : isYesterday
+        ? {start: yesterday, end: yesterday}
+        : undefined;
+  /** 趋势图按小时画时该查哪一天（`null` = 这个范围按天画） */
+  const hourlyTarget = hourlyTargetFor({
+    days, customStart, customEnd, todayKey: todayKeyLocal(),
+  });
   const spanDays = (() => {
+    if (isYesterday) return 1;
     if (!isCustom || !customStart || !customEnd) return Number(days) || 1;
     const a = Date.parse(customStart), b = Date.parse(customEnd);
     if (!Number.isFinite(a) || !Number.isFinite(b)) return 30;
@@ -157,10 +170,13 @@ export default function StatsPage() {
     {
       summary: () => statsApi.summary(realm),
       daily: () => statsApi.daily(d, realm, range),
-      // 「今日」的图按小时画（见 lib/usage-chart.ts 的说明）：只有这个范围需要
-      // 小时数据，其它范围直接给空数组，省一次请求。
-      hourly: () => (days === '1' ? statsApi.hourly(undefined, realm)
-                                  : Promise.resolve([] as UsageHourPoint[])),
+      // 单日（今日 / 昨日 / 自定义同一天）按小时画，多日按天画。判据收在
+      // `hourlyTargetFor()` 里：自定义选同一天曾经漏了这一步，图上 24 根柱子全 0。
+      hourly: () => {
+        const target = hourlyTargetFor({days, customStart, customEnd, todayKey: todayKeyLocal()});
+        return target ? statsApi.hourly(target.day, realm)
+                      : Promise.resolve([] as UsageHourPoint[]);
+      },
       byModel: () => statsApi.byModel(d, realm, range),
       byKey: () => statsApi.byKey(d, realm, range),
       byAccount: () => statsApi.byAccount(d, realm, range),
@@ -225,7 +241,7 @@ export default function StatsPage() {
    *  · 多日 → 按天并补齐到窗口长度（缺的那天不再是「凭空消失」而是画成 0）。
    */
   const chartData: ChartPoint[] = spec.granularity === 'hour'
-    ? hourlySeries(hourly, new Date().getHours())
+    ? hourlySeries(hourly, hourlyTarget?.isToday ? new Date().getHours() : undefined)
     : dailySeries(daily, d, todayKeyLocal());
 
   /** 今日失败总数（4xx + 5xx）。单独来自请求日志——用量汇总只含成功请求。 */
@@ -247,6 +263,7 @@ export default function StatsPage() {
             <SelectContent>
               {/* 「今日」排在第一位并作为默认：与上方卡片的「今日」口径对齐 */}
               <SelectItem value="1">{t('stats.today')}</SelectItem>
+              <SelectItem value="yesterday">{t('stats.yesterday')}</SelectItem>
               <SelectItem value="7">{t('stats.last7')}</SelectItem>
               <SelectItem value="30">{t('stats.last30')}</SelectItem>
               <SelectItem value="90">{t('stats.last90')}</SelectItem>

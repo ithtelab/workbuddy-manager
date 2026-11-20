@@ -1194,25 +1194,80 @@ def _parse_model_payload(data: object, realm: Realm) -> tuple[dict[str, dict], l
     return items, order
 
 
+# 非对话模型的 tag 白名单（剔除）。除上游已有的 `text-to-image`，这里补上
+# **视频 / 音频**这类「产出不是文本」的模型（issue #461）。
+#
+# 为什么必须剔：模型中心是给人**挑模型**的地方，而本网关只转发 chat 协议。
+# 列出 `kling-video-v3` 这种视频模型，用户选它 → 调用必然失败，且失败信息
+# 讲的是「模型不支持」，用户很难判断是网关的问题还是模型本身不能这么用。
+# 这与 `text-to-image` 是同一类问题，只是当初只想到图片。
+_NON_CHAT_TAGS = frozenset({
+    'text-to-image',
+    'text-to-video',
+    'image-to-video',
+    'image-to-image',
+    'text-to-speech',
+    'text-to-audio',
+    'video-generation',
+    'audio-generation',
+    # 保留字，防上游将来用更宽的名字
+    'video',
+    'audio',
+})
+
+# id 里出现这些**完整片段**即视为非对话模型。
+#
+# 刻意收得紧一点：只要裸的 `video` 会把「视频理解」这类**多模态对话**模型也剔掉
+# （它们能读视频、但产出仍是文本，是能用的）。所以只认「生成类」的组合形态。
+_NON_CHAT_ID_MARKERS = (
+    '-video-',          # kling-video-v3 / minimax-video-h3 这类
+    'video-gen',
+    '-tts', 'tts-',
+    'text-to-image', 'image-to-video', 'image-to-image',
+    '-audio-gen', 'audio-gen-',
+)
+# 以这些**结尾**的也剔：`hunyuan-video` 这种没有后缀版本号，上面那组片段匹配不到。
+# 单独一组而不是塞进上面，是因为「结尾」比「片段」更强——`xxx-video` 一定是视频
+# 模型，而 `video-xxx` 可能是视频理解。
+_NON_CHAT_ID_SUFFIXES = ('-video', '-tts', '-audio')
+
+
+# 明确是**多模态对话**的 id 片段：能读图/视频/音频，但产出仍是文本，是可用的。
+# 先于 `_NON_CHAT_ID_MARKERS` 判定 —— 否则 `xxx-video-understanding` 这种会被
+# 视频规则误伤。宁可漏剔一个，也别剔掉用户能用的模型。
+_CHAT_MULTIMODAL_MARKERS = ('understanding', '-vl', 'vl-', 'vision', 'multimodal', 'omni')
+
+
 def _non_chat_model(mid: str, max_output_tokens: int, tags: list) -> bool:
     """是否非对话模型（应从可选列表里剔除）。
 
-    镜像上游 nonChatModel（2026-09-14 新增，来源 harness buddy.ts:547-555）。
-    三类：
+    镜像上游 nonChatModel（2026-09-14 新增，来源 harness buddy.ts:547-555），
+    并在其上补了视频/音频（issue #461）：
       * id 前缀 `nes-` / `completion-` / `codewise-`：嵌入 / 补全 / 代码专用，
         选了会报 `code=11102`；
       * `maxOutputTokens <= 256`：输出上限过小，属 tiny 非对话模型；
-      * tags 含 `text-to-image`：图片生成，不是本网关用途。
+      * tags 命中 `_NON_CHAT_TAGS`（图片 / 视频 / 音频生成）；
+      * id 里带生成类片段（视频模型的命名没有统一前缀，见上）。
 
     为什么要跟：模型中心是给用户**挑模型**的地方，列出选不了的东西
     等于制造一次必然失败的尝试。
+
+    ⚠️ 只在国内版生效（调用方按 `realm != GLOBAL` 判定）：那套规则源自国内版
+    harness，套到国际版会重犯「用国内版口径裁剪国际版」的错误。
     """
     low = (mid or '').strip().lower()
     if low.startswith(('nes-', 'completion-', 'codewise-')):
         return True
     if 0 < max_output_tokens <= 256:
         return True
-    return any(str(t) == 'text-to-image' for t in tags)
+    if any(str(t).strip().lower() in _NON_CHAT_TAGS for t in tags):
+        return True
+    # 多模态**对话**优先放行：它们读视频/图片但产出文本，剔掉就是误伤
+    if any(marker in low for marker in _CHAT_MULTIMODAL_MARKERS):
+        return False
+    if any(low.endswith(suffix) for suffix in _NON_CHAT_ID_SUFFIXES):
+        return True
+    return any(marker in low for marker in _NON_CHAT_ID_MARKERS)
 
 
 def _as_int(v: object) -> int:

@@ -18,6 +18,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from server.services import modelcatalog  # noqa: E402
+from server.services.tencent import _non_chat_model as non_chat_model
 
 
 def _m(mid: str, name: str = '', ctx: int = 0, out: int = 0, efforts=None) -> dict:
@@ -254,3 +255,53 @@ class CacheTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NonChatFilterTest(unittest.TestCase):
+    """非对话模型的过滤规则（issue #461：视频模型能被选中但调用必然失败）。
+
+    背景：模型中心是给人**挑模型**的地方，而本网关只转发 chat 协议。上游只在
+    「国内版」剔除 `text-to-image`，但 `kling-video-v3` / `minimax-video-h3`
+    这类视频生成模型没有任何过滤 —— 它们出现在列表里，用户点了就失败，而失败
+    信息讲的是「模型不支持」，看不出是模型本身的用途问题。
+
+    这里把规则补到视频/音频，并**额外加一条否决**：能读视频但产出文本的多模态
+    对话模型（`glm-4v`、`qwen-vl`、`*-video-understanding`）必须保留 —— 剔掉
+    可用模型比漏剔一个更糟。
+    """
+
+    def test_video_generation_is_filtered(self) -> None:
+        for mid in ('kling-video-v3', 'minimax-video-h3', 'hunyuan-video-pro',
+                    'some-video-gen-1', 'foo-tts-bar'):
+            self.assertTrue(non_chat_model(mid, 8192, []), mid)
+
+    def test_bare_type_suffix_is_filtered(self) -> None:
+        """以 `-video` / `-tts` / `-audio` **结尾**的也要剔。
+
+        `hunyuan-video` 这种没有后缀版本号，`-video-`（带尾连字符）匹配不到 ——
+        自测时发现的遗漏。
+        """
+        for mid in ('hunyuan-video', 'some-tts', 'x-audio'):
+            self.assertTrue(non_chat_model(mid, 8192, []), mid)
+
+    def test_video_tags_are_filtered(self) -> None:
+        for tag in ('text-to-video', 'image-to-video', 'text-to-speech', 'video-generation'):
+            self.assertTrue(non_chat_model('whatever', 8192, [tag]), tag)
+
+    def test_chat_models_pass(self) -> None:
+        for mid in ('glm-4.6', 'deepseek-v4.1-flash', 'hy4flash-free', 'kimi-k2'):
+            self.assertFalse(non_chat_model(mid, 8192, []), mid)
+
+    def test_multimodal_chat_is_not_filtered(self) -> None:
+        """能读视频/图片但产出文本的模型必须保留 —— 剔掉可用模型更糟。"""
+        for mid in ('glm-4v', 'qwen2.5-vl-72b', 'xxx-video-understanding',
+                    'gpt-4o-audio-preview', 'gemini-omni'):
+            self.assertFalse(non_chat_model(mid, 8192, []), mid)
+
+    def test_existing_rules_still_hold(self) -> None:
+        """既有三类规则不能因为这次扩规则而失效。"""
+        self.assertTrue(non_chat_model('nes-embed', 8192, []), '嵌入模型')
+        self.assertTrue(non_chat_model('completion-x', 8192, []), '补全模型')
+        self.assertTrue(non_chat_model('codewise-y', 8192, []), '代码专用')
+        self.assertTrue(non_chat_model('tiny', 128, []), 'tiny 输出')
+        self.assertTrue(non_chat_model('img', 8192, ['text-to-image']), 'tag 图片')
