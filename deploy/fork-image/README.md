@@ -32,7 +32,7 @@ git push
 完成后拉取：
 
 ```bash
-docker pull ghcr.io/<你的用户名>/workbuddy-manager-multiarch:latest
+docker pull ghcr.io/<你的用户名>/workbuddy-manager-multiarch-v2:latest
 ```
 
 `<你的用户名>` 不用自己拼：那次运行页面的摘要里会直接列出可以原样粘贴的命令。
@@ -61,18 +61,23 @@ docker pull ghcr.io/<你的用户名>/workbuddy-manager-multiarch:latest
 services:
   workbuddy-manager:
     # 用你自己的镜像，不再本地构建
-    image: ghcr.io/<你的用户名>/workbuddy-manager-multiarch:latest
+    image: ghcr.io/<你的用户名>/workbuddy-manager-multiarch-v2:latest
 ```
 
-> 镜像名比上游多一个 `-multiarch` 后缀，**不是笔误**。用上游那个
+> 镜像名比上游多一个 `-multiarch-v2` 后缀，**不是笔误**。用上游那个
 > `workbuddy-manager` 包名时，该名字在命名空间下可能已被一个**没有链接到本仓库**
 > 的同名包占用 —— 那种包你的 fork 拿不到写权限，推送会直接失败。换个包名最省事，
 > 顺带也避免和上游的镜像混在一起认不出来。
 
-## 为什么镜像名多一个 -multiarch
+## 为什么镜像名多一个 -multiarch-v2
 
-同上。这一条被测试钉着（`server/tests/test_docker_deploy.py` 里专门有一组约束），
-所以别顺手改回上游的包名 —— 改了在部分账号下会推送失败，而且失败信息
+同一个坑踩过两次：包名从 `workbuddy-manager` 换到 `workbuddy-manager-multiarch`
+后，后者又被占用、推送失败。这种「包存在但写不进去」的状态，即使把包链接到仓库
+也未必能解，所以再换成 `-v2`。GITHUB_TOKEN 首次推一个全新包名时会自动建包并
+关联到仓库，权限就是干净的。
+
+这一条被测试钉着（`server/tests/test_docker_deploy.py` 里专门有一组约束），
+所以别顺手改回旧包名 —— 改了在部分账号下会推送失败，而且失败信息
 （`denied: permission_denied: write_package`）不容易联想到包名冲突。
 
 ## 可选：同时推 Docker Hub
@@ -87,7 +92,7 @@ services:
 Token 在 <https://hub.docker.com/settings/security> 生成，权限选 **Read & Write**。
 两个 Secret 缺任一时，Docker Hub 那几步会自动跳过，**不会**把工作流标红 ——
 「没配」是正常状态，不是失败。推上去的名字是
-`docker.io/<DOCKERHUB_USERNAME>/workbuddy-manager-multiarch`。
+`docker.io/<DOCKERHUB_USERNAME>/workbuddy-manager-multiarch-v2`。
 
 ## 它不做什么
 
