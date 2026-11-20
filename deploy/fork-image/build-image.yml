@@ -15,7 +15,7 @@
 #   推上去会自动构建（也可到 Actions 页手动触发「Build Image」）。完成后拉取
 #   你自己那一份：
 #
-#     docker pull ghcr.io/<你的用户名>/workbuddy-manager-multiarch-v2:latest
+#     docker pull ghcr.io/<你的用户名>/workbuddy-manager:latest
 #
 #   <你的用户名> 不用自己算：构建完到那次运行页面的摘要里看，会直接列出可以粘贴
 #   的拉取命令。
@@ -31,18 +31,17 @@
 #                  fork 与那次提交，日后能核对「拉到的是哪来的镜像」
 #     · Docker Hub → 有那两个 Secret 就推、没有就跳过，同样不用改文件
 #
-# ── 为什么镜像名比上游多一个 -multiarch-v2 ──────────────────────
+# ── 关于镜像名 workbuddy-manager ─────────────────────────────────
 #
-# 不用上游那个 workbuddy-manager 包名，是因为它可能已经被一个**没有链接到本
-# 仓库**的同名包占用 —— 那种包 fork 的令牌拿不到写权限，推送会被拒（报错
-# `denied: permission_denied: write_package`）。这种「包存在但写不进去」的僵局，
-# 即便在网页上把它链接到仓库也未必能解，删包重建又常被权限挡住；最省事的
-# 办法就是换一个全新包名 —— GITHUB_TOKEN 首次推送时会自动建包并关联到本
-# 仓库，权限就是干净的。
+# 用短名 workbuddy-manager —— 即 ghcr.io/<你的用户名>/workbuddy-manager，和上游
+# 官方包同名，但在你自己的命名空间下（拉取时别漏了用户名这一段）。
 #
-# 历史上的包名演进：workbuddy-manager → workbuddy-manager-multiarch →
-# workbuddy-manager-multiarch-v2。前两个都先后被占用而推不动，所以不要「顺手
-# 改回去」。换包名后记得同步更新 deploy/fork-image/README.md 里的拉取命令。
+# 注意：这个名字曾被一个未链接到仓库的同名包占用，导致 fork 推送被拒
+# （`denied: permission_denied: write_package`）。如果重跑后仍报这个错，不要
+# 改包名，去 GHCR 网页把 ghcr.io/<你的用户名>/workbuddy-manager 这个旧包删掉：
+# GITHUB_TOKEN 下次推送会自动建包并正确关联到本仓库，权限就是干净的。
+#
+# 换包名后记得同步更新 deploy/fork-image/README.md 里的拉取命令。
 #
 # ── 它不做什么 ─────────────────────────────────────────────────
 #
@@ -153,7 +152,7 @@ jobs:
           # 下面这行小写转换**不能省**：GHCR 要求镜像名全小写，而用户名可能含
           # 大写字母，直接拼进去会被拒收（报 repository name must be lowercase）。
           # 改这里之前请看 server/tests/test_docker_deploy.py 里的说明。
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/workbuddy-manager-multiarch-v2"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/workbuddy-manager"
           IMAGE="${IMAGE,,}"
           SHORT="${GITHUB_SHA::7}"
 
@@ -163,7 +162,7 @@ jobs:
           NAMES="${IMAGE}"
 
           if [ "${{ steps.hub.outputs.enabled }}" = "1" ]; then
-            HUB="docker.io/${HUB_USER}/workbuddy-manager-multiarch-v2"
+            HUB="docker.io/${HUB_USER}/workbuddy-manager"
             TAGS="${TAGS}"$'\n'"${HUB}:latest"$'\n'"${HUB}:sha-${SHORT}"
             NAMES="${NAMES}"$'\n'"${HUB}"
           fi

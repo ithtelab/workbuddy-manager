@@ -1077,10 +1077,11 @@ class ForkImageWorkflowTest(unittest.TestCase):
     正式发布包，在 fork 上造一个没有 .sig 的 Release 只会产出"看起来能装、实际
     装不上"的东西（用户侧一键更新会拒绝安装）。
 
-    最值得锁的是**镜像名**：原包名 `ghcr.io/<owner>/workbuddy-manager` 在该命名
-    空间下已被一个未链接到本仓库的包占用，fork 的 token 对它没有写权限，推送必然
-    失败（实测 `denied: permission_denied: write_package`）。换成新包名后推送成功。
-    这个坑很容易被"顺手改回原包名"重新踩到。
+    最值得锁的是**镜像名**：用户名这一段必须来自 `GITHUB_REPOSITORY_OWNER` 并转
+    小写（GHCR 不接受大写、也不能写死成维护者的名字），包名则是短名
+    `workbuddy-manager`。历史上这个名字曾被一个未链接到仓库的同名包占用，推送报
+    `denied: permission_denied: write_package`；遇到时正确做法是删掉旧包重建，
+    而不是改包名 —— 所以这里也把包名本身钉住，避免反复改名。
     """
 
     def _wf(self) -> str:
@@ -1093,10 +1094,12 @@ class ForkImageWorkflowTest(unittest.TestCase):
                              f'fork 工作流不该动 Release（{forbidden}）—— 未签名的 Release '
                              f'会被用户的一键更新拒绝安装')
 
-    def test_uses_standalone_package_name(self) -> None:
+    def test_uses_short_package_name(self) -> None:
         wf = self._wf()
-        self.assertIn('workbuddy-manager-multiarch', wf,
-                      '镜像名被改回原包名了？该包未链接到本仓库，fork 推送会被拒')
+        self.assertIn('/workbuddy-manager"', wf,
+                      '镜像名应是短名 workbuddy-manager（遇占用应删旧包，不要改名）')
+        self.assertNotIn('workbuddy-manager-multiarch', wf,
+                         '不应再带 -multiarch/-v2 后缀')
 
     def test_builds_both_architectures(self) -> None:
         wf = self._wf()
