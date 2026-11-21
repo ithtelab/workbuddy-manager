@@ -876,7 +876,7 @@ onMounted(() => {
    - 可以在 1Panel 创建反代站点 `wb.example.com` 指向 `127.0.0.1:7864`。
    - 开启 HTTPS，直接通过浏览器进行手机扫码与号池管理。
 3. **接入分销 (sub2api)**：
-   - 后台通过 WebUI 纳管所有腾讯账号后，底层由 `workbuddy2api` 负责轮询并发，上层由 sub2api 负责给下游发放 Key 和计算 Token 计费。
+   - 后台通过 WebUI 纳管所有腾讯账号后，底层由 `workbuddy2api` 负责轮询并发，上层由 sub2api 负责给调用方发放 Key 和计算 Token 计费。
 
 ---
 

@@ -49,7 +49,7 @@ python -m unittest discover -s server/tests -t . -v
 # 架构
 
 ```
-   下游客户端 / sub2api（OpenAI SDK）
+   调用方客户端 / sub2api（OpenAI SDK）
               │  Authorization: Bearer wbk_xxx
               ▼
    ┌──────────────────────────────────────────────┐

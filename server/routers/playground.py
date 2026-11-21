@@ -59,7 +59,7 @@ async def chat(body: ChatIn, request: Request, user: dict = Depends(security.req
     管理员限定：测试台会**真实消耗积分**，而默认部署里存在一个弱口令的 guest
     账号，放开给所有登录用户等于把额度暴露出去。
     """
-    # 测试台没有下游密钥（管理员会话直连），固定走默认上游 —— 与从前一致。
+    # 测试台没有调用方密钥（管理员会话直连），固定走默认上游 —— 与从前一致。
     # 走 upstreamsvc 而不是直接读 config：默认上游的取值只有一处事实来源。
     upstream = upstreamsvc.default_upstream()
     ip = client_ip(request)

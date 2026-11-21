@@ -4,7 +4,7 @@
 
 **腾讯 CodeBuddy 账号池管理控制台 · OpenAI 兼容反代网关**
 
-面向 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 的 Web 管理端：扫码纳管、定时签到与保活、密钥分发、IP 与模型白名单、日志与用量统计；上游源码随发布包分发（MIT），迁移见[部署指南](deploy/README.md#〇上游源码从哪来随发布包分发)。
+面向 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 的 Web 管理端：扫码纳管、定时签到与保活、密钥分发、IP 与模型白名单、日志与用量统计；反代源码随发布包分发（MIT），迁移见[部署指南](deploy/README.md#〇反代源码从哪来随发布包分发)。
 
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)
@@ -52,24 +52,24 @@
 | 服务器上跑 `login.sh` 扫码加号 | 点「添加账号」扫码，自动签到并纳管 |
 | `curl /status` 看哪个号挂了 | 仪表盘实时展示健康度、冷却、有效期 |
 | 手动改 `config.json` 调签到/并发 | 中文可视化设置，开关 + 数字框 |
-| 所有下游共用一个全局 Key | 多密钥分发，各自独立配额、IP 与模型白名单 |
+| 所有调用方共用一个全局 Key | 多密钥分发，各自独立配额、IP 与模型白名单 |
 | 无法知道谁用了多少 | 每次调用的模型、Token、延迟、来源 IP 全量留痕 |
 | 无任何 IP 防护 | 入站白/黑名单 + 每密钥 IP 上限与白名单 |
 
 **与 workbuddy2api 的关系**：本项目是为它做**可视化**的配套项目 —— 让能力强大的
-上游网关变得看得见、管得动。面板不侵入上游：**没有修改它一行代码**，账号轮询、
+反代服务变得看得见、管得动。面板不侵入反代服务：**没有修改它一行代码**，账号轮询、
 并发与熔断仍由它负责。两者配合的方式很自然：
 
-- **上游负责能力，面板负责呈现**：账号调度、令牌刷新、限流熔断由 workbuddy2api
+- **反代服务负责能力，面板负责呈现**：账号调度、令牌刷新、限流熔断由 workbuddy2api
   完成；面板把这些能力可视化，并补上密钥分发、IP 管控、用量统计这些运营环节
-- **互为参照、一起演进**：上游新增能力时本项目跟随适配，面板侧发现的运营需求也
-  会反哺上游。上游在它的 README 里把本项目列为「社区前端面板」之一，我们希望
+- **互为参照、一起演进**：反代服务新增能力时本项目跟随适配，面板侧发现的运营需求也
+  会反哺反代服务。反代服务在它的 README 里把本项目列为「社区前端面板」之一，我们希望
   一起把这个生态做得更好用
-- **上游专注自己的核心**：面板不要求上游为它改代码，让上游能保持精简
+- **反代服务专注自己的核心**：面板不要求反代服务为它改代码，让反代服务能保持精简
 
-欢迎参与共建：面板与上游源码的问题、想法都提到
+欢迎参与共建：面板与反代服务源码的问题、想法都提到
 [本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
-（上游源码随本项目的发布包分发）。
+（反代源码随本项目的发布包分发）。
 
 ---
 
@@ -77,7 +77,7 @@
 
 ### 账号管理
 
-- **扫码纳管** —— 微信 / QQ 扫码授权，成功后自动每日签到、写授权文件、重载上游
+- **扫码纳管** —— 微信 / QQ 扫码授权，成功后自动每日签到、写授权文件、重载反代服务
 - **有效期监控** —— 进度条 + 临期预警；一键续期、连通性探测、手动签到
 - **账号分组** —— 多个账号池分组管理，列表、签到、密钥各自独立
 - **积分与到期** —— 实时余额、按余额分级着色、快过期积分倒计时
@@ -87,7 +87,7 @@
 
 - **OpenAI 兼容** —— 标准 SDK 直连，流式与非流式都支持
 - **多密钥分发** —— 每把密钥独立设版本、有效期、IP 数、IP / 模型白名单与额度
-- **模型别名映射** —— 把下游在用的名字映到实际模型，迁移无感
+- **模型别名映射** —— 把调用方在用的名字映到实际模型，迁移无感
 - **模型中心** —— 账号可用模型单列一页：上下文、最大输出、思考档位
 - **全量审计** —— 每次调用记密钥、IP、模型、状态码、首字延迟、扣费与缓存命中
 
@@ -133,9 +133,9 @@
 
 客户端视角：客户端**原样**发出的请求头与请求体（密钥打码，保留前 6 位）
 
-<img src="docs/images/traces-headers-gateway.png" alt="网关视角：网关改写后发往上游的请求" width="100%" />
+<img src="docs/images/traces-headers-gateway.png" alt="网关视角：网关改写后发往反代服务的请求" width="100%" />
 
-网关视角：网关改写后发往上游的请求，顶部列出被改写的字段（模型映射、参数钳制…）
+网关视角：网关改写后发往反代服务的请求，顶部列出被改写的字段（模型映射、参数钳制…）
 
 <img src="docs/images/traces-diff.png" alt="与上一轮对比" width="100%" />
 
@@ -175,7 +175,7 @@
 6. 需要升级时点控制窗口的 **检查更新**：查询本仓库最新 Release，下载安装包并用发布页
    的 SHA-256 校验，校验通过后启动安装向导（`.env`、账号与 `data` 保留）。
 
-> 默认成功构建的单文件安装包内置全部运行环境（Python 运行时、上游网关、前端页面），
+> 默认成功构建的单文件安装包内置全部运行环境（Python 运行时、反代服务、前端页面），
 > 目标机器**无需安装任何依赖**，Windows 10 (1903+) / 11 双击即用。当前安装器没有
 > Authenticode 签名，SmartScreen 可能显示警告；请确认文件来自可信 Release 或自行构建。
 > 安装器自身不会自动升级，升级时重新获取新 exe 并覆盖安装即可；`.env`、账号和 `data`
@@ -197,7 +197,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 
 装完浏览器打开 `http://<服务器>:7864`，首次启动的日志里会打印初始管理员密码。
 
-> 上游源码随发布包一起分发，装完即可用。反向代理与 HTTPS、端口收敛、Windows 原生
+> 反代源码随发布包一起分发，装完即可用。反向代理与 HTTPS、端口收敛、Windows 原生
 > 部署（无需 Docker）、本地开发等细节见 [部署指南](deploy/README.md) 与
 > [开发与架构](docs/development.md)。
 
@@ -205,7 +205,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 
 ## 使用指南
 
-日常就三步：**纳管账号 → 分发密钥 → 把下游指到 `/v1`**。每步怎么做、下游接入示例
+日常就三步：**纳管账号 → 分发密钥 → 把调用方指到 `/v1`**。每步怎么做、调用方接入示例
 （OpenAI SDK、cc-switch 等）与常见问题见 [使用指南](docs/usage.md)。
 
 ---
@@ -232,7 +232,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 | `POST` | `/api/auth/start` `/api/auth/poll` | 管理员 | 扫码授权流程 |
 | `POST` | `/api/accounts/{file}/checkin` `/test` `/refresh` | 管理员 | 签到 / 测活 / 刷新 |
 | `DELETE` | `/api/accounts/{file}` | 管理员 | 删除账号 |
-| `GET/POST/PATCH/DELETE` | `/api/keys[/{id}]` | 会话 / 管理员 | 密钥管理（发给下游调模型） |
+| `GET/POST/PATCH/DELETE` | `/api/keys[/{id}]` | 会话 / 管理员 | 密钥管理（发给调用方调模型） |
 | `GET/POST/PATCH/DELETE` | `/api/upstreams[/{id}]` | 会话（管理员） | 多上游接入点（密钥绑定上游 = 账号池分组）；`POST /api/upstreams/{id}/probe` 探测连通性 |
 | `GET/POST/PATCH/DELETE` | `/api/tokens[/{id}]` | 会话（管理员） | 管理面 API Token（给脚本 / CI，见 [docs/api-tokens.md](docs/api-tokens.md)） |
 | `GET` | `/api/logs` `/api/stats/*` | 会话 | 日志与用量 |
@@ -258,7 +258,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 
 ## 已知限制
 
-- **账号出口线路**：管理端支持按账号绑定命名 HTTP/HTTPS 代理。聊天和上游后台任务还需 workbuddy2api 配套支持，配置与兼容条件见 [账号出口线路](docs/account-proxy-routes.md)。
+- **账号出口线路**：管理端支持按账号绑定命名 HTTP/HTTPS 代理。聊天和反代服务后台任务还需 workbuddy2api 配套支持，配置与兼容条件见 [账号出口线路](docs/account-proxy-routes.md)。
 - **不支持图片生成**：网关只桥接对话 / Responses / Messages 接口，不提供 `/v1/images/generations`；模型目录里的 `supports_images` 表示「可以看图」（图片输入），不是「可以生图」。官方 App 的画布 / 生图走独立链路，反代没有对应入口。
 - 请求的**请求体 / 响应体内容默认不留存**，仅记录元数据（模型、状态、Token、延迟、来源），以保护隐私。需要排查「模型为什么这么答」时，可在底栏「轨迹」里显式打开抓包：内容只写本机、密钥类字段先脱敏、按保留期自动清理（见 [调用抓包](docs/api-traffic-tap.md)）。
 - 用量统计按「天 × 密钥 × 模型」聚合；如需小时粒度可扩展 `usage_daily` 表。
@@ -267,7 +267,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 
 ## 更多文档
 
-- [使用指南](docs/usage.md) —— 三部曲怎么点、下游怎么接
+- [使用指南](docs/usage.md) —— 三部曲怎么点、调用方怎么接
 - [功能一览（完整版）](docs/features.md) —— 每条功能的细节
 - [界面预览（全部）](docs/screenshots.md) —— 全部截图
 - [开发与架构](docs/development.md) —— 本地开发、架构、目录结构
@@ -276,8 +276,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 - [账号出口线路](docs/account-proxy-routes.md) —— 每个账号走不同代理出口
 - [API 令牌](docs/api-tokens.md) —— 只读令牌与作用域
 - [调用抓包](docs/api-traffic-tap.md) —— 回放每一次调用的完整上下文
-- [Web 搜索透传](docs/web-search-passthrough.md) —— `/v1/tools/search` 的用法与上游补丁要求
-- [页面监控](docs/watchdog.md) —— 上游网页改版检测、LLM 判读与邮件 / QQ 通知
+- [Web 搜索透传](docs/web-search-passthrough.md) —— `/v1/tools/search` 的用法与反代服务补丁要求
+- [页面监控](docs/watchdog.md) —— 反代服务网页改版检测、LLM 判读与邮件 / QQ 通知
 - [QQ 机器人通知与开放接口](docs/qq-bot.md) —— AstrBot 对接、UMO 与机器人控制边界
 
 ---
@@ -291,8 +291,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
   [功能建议](https://github.com/ithtelab/workbuddy-manager/issues/new?template=feature_request.yml)
 
 > 反馈时请附上版本号与错误日志，并**先移除其中的密钥、Token 等敏感信息**。
-> 上游 workbuddy2api 自身的问题也提到[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
-> ——上游源码随本项目的发布包分发。
+> 反代服务 workbuddy2api 自身的问题也提到[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
+> ——反代源码随本项目的发布包分发。
 
 ### 版本发布流程
 

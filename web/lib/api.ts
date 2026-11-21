@@ -689,7 +689,7 @@ export const claimApi = {
 };
 
 /* ── 访问令牌（管理面作用域化 API Token）──────────────────
- * 与 keyApi 是两套：那个是给下游调模型的网关密钥，这个授权管理接口。
+ * 与 keyApi 是两套：那个是给调用方调模型的网关密钥，这个授权管理接口。
  * 明文只在创建时返回一次。 */
 export const tokenApi = {
   list: () => get<ApiToken[]>('/api/tokens'),

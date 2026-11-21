@@ -1,27 +1,27 @@
 # 部署指南
 
-本项目管理端**依赖上游 workbuddy2api**（提供账号池调度与 OpenAI 兼容接口）。
+本项目管理端**依赖反代服务 workbuddy2api**（提供账号池调度与 OpenAI 兼容接口）。
 单独 clone 本仓库是跑不起来的 —— 为此我们提供了一键脚本，会在干净机器上安装好两者。
 
-> **重要**：请勿把本项目管理端的数据目录与上游账号目录提交或公开分享，
+> **重要**：请勿把本项目管理端的数据目录与反代服务账号目录提交或公开分享，
 > 其中含账号授权凭据。
 
 ---
 
-## 〇、上游源码从哪来（随发布包分发）
+## 〇、反代源码从哪来（随发布包分发）
 
-上游 workbuddy2api 的源码**随本项目的发布包一起分发**（包内 `upstream/`），
+反代服务 workbuddy2api 的源码**随本项目的发布包一起分发**（包内 `upstream/`），
 装的时候不用去任何外部地址取。影响如下：
 
 | 场景 | 现在的状态 |
 |---|---|
-| **已经在跑**的部署 | **不受影响**。上游源码在你机器上、镜像也是本地构建的；面板的一键更新会沿用现有源码重建上游，面板自己照常更新 |
+| **已经在跑**的部署 | **不受影响**。反代服务源码在你机器上、镜像也是本地构建的；面板的一键更新会沿用现有源码重建反代服务，面板自己照常更新 |
 | **新装** | 直接用包内那份（下面的脚本会自动识别） |
-| **更新上游代码** | 跟着管理端一起更新（一键更新会把包内那份同步进来）；要改代码就改本地那份，或用 `UPSTREAM_SRC` 换一份 |
+| **更新反代服务代码** | 跟着管理端一起更新（一键更新会把包内那份同步进来）；要改代码就改本地那份，或用 `UPSTREAM_SRC` 换一份 |
 
 ### 包内自带，开箱即用
 
-最新版本的 Release 包内含 `upstream/`（上游源码），装的时候直接用，
+最新版本的 Release 包内含 `upstream/`（反代服务源码），装的时候直接用，
 **不需要联网取任何外部源码**：
 
 ```bash
@@ -37,18 +37,18 @@ sudo bash deploy/install.sh          # 自动使用包内的 upstream/
 sudo UPSTREAM_SRC=/opt/workbuddy2api bash deploy/install.sh
 sudo UPSTREAM_SRC=/path/to/workbuddy2api-<版本>.tar.gz bash deploy/install.sh
 
-# 2) 上游已手工装好，只想装面板
+# 2) 反代服务已手工装好，只想装面板
 sudo bash deploy/install.sh --skip-upstream
 ```
 
 优先级：`UPSTREAM_SRC` → 发布包自带的 `upstream/` → 目标目录里已有的完整源码。
-上游已由本项目维护，不再从外部 git 仓库克隆。`UPSTREAM_DIR` 默认 `/opt/workbuddy2api`。
+反代服务已由本项目维护，不再从外部 git 仓库克隆。`UPSTREAM_DIR` 默认 `/opt/workbuddy2api`。
 
-### 以后怎么更新上游代码
+### 以后怎么更新反代服务代码
 
-用面板里的**一键更新**即可 —— 它会把包内那份上游源码同步进 `/opt/workbuddy2api`
+用面板里的**一键更新**即可 —— 它会把包内那份反代服务源码同步进 `/opt/workbuddy2api`
 （只增改，不动 `config.json` / `auths/` / `data/`），**有变化才重建容器**。
-随包分发的上游没有 `git pull` 可拉；要改代码请改本地那份（或用 `UPSTREAM_SRC`
+随包分发的反代服务没有 `git pull` 可拉；要改代码请改本地那份（或用 `UPSTREAM_SRC`
 覆盖一份新的），再：
 
 ```bash
@@ -57,18 +57,18 @@ cd /opt/workbuddy2api && docker compose up -d --build
 
 这三样务必保留：`config.json`（含 `api_key`）、`auths/`（账号授权）、`data/`。
 
-### 直接用预构建的上游镜像（不想本地构建时）
+### 直接用预构建的反代服务镜像（不想本地构建时）
 
-每次发版也会把**上游**构建成镜像推到 GHCR。它和管理端镜像**同源**：都用发布包里
-那份源码（= `upstream-src` 资产 + 我们的全部补丁），所以不会出现「第三方上游镜像
-与项目上游源码不一致」的版本漂移。
+每次发版也会把**反代服务**构建成镜像推到 GHCR。它和管理端镜像**同源**：都用发布包里
+那份源码（= `upstream-src` 资产 + 我们的全部补丁），所以不会出现「第三方反代服务镜像
+与项目反代服务源码不一致」的版本漂移。
 
 ```bash
 docker pull ghcr.io/ithtelab/workbuddy2api:<版本>
 # latest 指向最近一次发布；长期跑建议钉版本号（理由同管理端镜像）
 ```
 
-要跑多个上游（分组 / 多号池）时，把各自目录里 compose 的 `build: .` 换成 `image:`
+要跑多个反代服务（分组 / 多号池）时，把各自目录里 compose 的 `build: .` 换成 `image:`
 即可，端口与卷不变：
 
 ```yaml
@@ -92,17 +92,17 @@ services:
 - 镜像里**不带**真实配置（只有 `config.example.json`），`config.json` 必须自己挂；
   首次使用可从发布包的 `upstream/config.example.json` 复制一份再改。
 - 镜像是**多架构**（amd64 / arm64），与管理端镜像一致。
-- 用镜像之后，上游就**不再由面板的一键更新维护**（那条路同步源码并
-  `docker compose up -d --build`）：升级上游 = 改 `image:` 的版本号 +
-  `docker compose up -d`。面板「全部更新」里针对上游源码的那一步对镜像部署无效，
+- 用镜像之后，反代服务就**不再由面板的一键更新维护**（那条路同步源码并
+  `docker compose up -d --build`）：升级反代服务 = 改 `image:` 的版本号 +
+  `docker compose up -d`。面板「全部更新」里针对反代服务源码的那一步对镜像部署无效，
   这是预期行为。
 - 镜像自带 `dev.workbuddy.upstream-id` label，面板读运行中容器的这个 label 判断
-  「镜像部署且与本次发布同源」，同源时不会提示「随包上游与本机不一致」。读不到
+  「镜像部署且与本次发布同源」，同源时不会提示「随包反代服务与本机不一致」。读不到
   label 的旧镜像（≤ 2.8.2）仍按部署目录的 `.upstream-id` 判定，行为不变。
 
 ### 许可
 
-上游为 MIT 许可（版权归原作者）。继续使用、修改、再分发都需保留它的 `LICENSE`
+反代服务为 MIT 许可（版权归原作者）。继续使用、修改、再分发都需保留它的 `LICENSE`
 与版权声明 —— 源码目录里那份 `LICENSE` 不要删。
 
 ---
@@ -115,14 +115,14 @@ wget https://github.com/ithtelab/workbuddy-manager/releases/latest/download/work
 tar xzf workbuddy-manager-*.tar.gz
 cd workbuddy-manager-*
 
-# 2) 一键部署（自动检测上游；上游源码用 UPSTREAM_SRC 指定，见上一节）
+# 2) 一键部署（自动检测反代服务；反代服务源码用 UPSTREAM_SRC 指定，见上一节）
 sudo bash deploy/install.sh
 ```
 
 脚本会自动完成：
 
 1. 环境预检（Python ≥3.9、Docker、端口占用检查）
-2. **安装上游 workbuddy2api** —— 取源码（本地目录或 git 地址）、生成随机 `api_key`、
+2. **安装反代服务 workbuddy2api** —— 取源码（本地目录或 git 地址）、生成随机 `api_key`、
    设置目录属主、构建并启动容器、等待就绪
 3. 安装管理端 —— 部署代码、装依赖、注册 systemd 服务
 4. 验证两条链路并打印访问地址与初始密码
@@ -149,7 +149,7 @@ sudo bash deploy/install.sh
 
 ## 三、已有 workbuddy2api 的情况
 
-若已自行部署上游，用参数跳过安装，脚本不会改动已有配置与账号：
+若已自行部署反代服务，用参数跳过安装，脚本不会改动已有配置与账号：
 
 ```bash
 sudo bash deploy/install.sh --skip-upstream
@@ -167,19 +167,19 @@ sudo APP_DIR=/opt/wbm \
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `APP_DIR` | `/opt/workbuddy-manager` | 管理端目录 |
-| `UPSTREAM_DIR` | `/opt/workbuddy2api` | 上游目录 |
+| `UPSTREAM_DIR` | `/opt/workbuddy2api` | 反代服务目录 |
 | `MANAGER_PORT` | `7864` | 管理端端口 |
-| `UPSTREAM_PORT` | `7863` | 上游端口 |
+| `UPSTREAM_PORT` | `7863` | 反代服务端口 |
 | `PY` | `/usr/bin/python3` | Python 解释器路径 |
 
-### 上游由 systemd 托管（非 docker）
+### 反代服务由 systemd 托管（非 docker）
 
-上游直接以二进制运行、由 systemd 管理时，在管理端 `.env` 里写明，否则「清除冷却 /
-设定冷却 / 重启上游」会因为找不到 docker 而失败：
+反代服务直接以二进制运行、由 systemd 管理时，在管理端 `.env` 里写明，否则「清除冷却 /
+设定冷却 / 重启反代服务」会因为找不到 docker 而失败：
 
 ```dotenv
 WB2API_MODE=systemd
-WB2API_SERVICE=workbuddy2api   # 上游的 unit 名，按实际填写
+WB2API_SERVICE=workbuddy2api   # 反代服务的 unit 名，按实际填写
 ```
 
 管理端服务账号（install.sh 默认 `workbuddy`）不是 root 时，需要允许它启停这一个
@@ -199,8 +199,8 @@ sudo usermod -aG systemd-journal workbuddy
 sudo systemctl restart workbuddy-web
 ```
 
-只是 `11102` 误判造成的模型限流，或面板设的强制冷却，开启上游 `admin.enabled`
-（「设置 → 上游」）后会在线清除，不需要上面的授权，也不会重启上游。
+只是 `11102` 误判造成的模型限流，或面板设的强制冷却，开启反代服务 `admin.enabled`
+（「设置 → 上游」）后会在线清除，不需要上面的授权，也不会重启反代服务。
 
 ---
 
@@ -220,8 +220,8 @@ journalctl -u workbuddy-web | grep -A3 '初始管理员'
 
 浏览器打开管理端 → 「账号」页 → 「添加账号」→ 用微信 / QQ 扫码。
 
-授权成功后会自动签到、落盘并重载上游，无需手工操作。
-（上游的扫码是交互式的，因此无法在脚本里自动化，必须由你扫码一次。）
+授权成功后会自动签到、落盘并重载反代服务，无需手工操作。
+（反代服务的扫码是交互式的，因此无法在脚本里自动化，必须由你扫码一次。）
 
 ### 3. 配置 HTTPS 反向代理
 
@@ -401,14 +401,14 @@ location /workbuddy-manager/ {
 
 | 模式 | 作用 | 适用场景 |
 |---|---|---|
-| **全部更新** | 上游 + 管理端 | 常规升级 |
-| **仅上游** | 只更新 workbuddy2api | 上游有修复 / 新模型 |
+| **全部更新** | 反代服务 + 管理端 | 常规升级 |
+| **仅反代服务** | 只更新 workbuddy2api | 反代服务有修复 / 新模型 |
 | **仅管理端** | 只更新本控制台 | 界面或管理功能升级 |
 
 更新在后台执行，页面实时显示进度与日志；期间服务可能短暂重启
-（页面会自动重连）。**账号授权、上游配置、密钥与日志数据都会保留。**
+（页面会自动重连）。**账号授权、反代服务配置、密钥与日志数据都会保留。**
 
-> 上游更新会自动把端口绑定重新收敛为 `127.0.0.1`，避免上游仓库里的
+> 反代服务更新会自动把端口绑定重新收敛为 `127.0.0.1`，避免反代服务仓库里的
 > `7863:7863` 覆盖本项目的安全基线。
 
 ### 方式二：命令行
@@ -485,10 +485,10 @@ docker compose up -d --build workbuddy-manager
 所以这一步既能救砖、也能把镜像升到最新。`./data` 与 `../workbuddy2api` 都是挂载卷，
 不会被覆盖。
 
-#### 容器内操作 docker（更新上游 / 重载配置）
+#### 容器内操作 docker（更新反代服务 / 重载配置）
 
 **默认不挂 docker.sock**：挂上它等于把宿主 root 权限交给管理端容器（`docker run -v /:/host`
-即可拿到宿主文件系统），这不该是默认状态。需要「保存设置后自动重载上游容器 / 一键更新上游」
+即可拿到宿主文件系统），这不该是默认状态。需要「保存设置后自动重载反代服务容器 / 一键更新上游」
 这些界面功能时，再按下面两步显式开启：
 
 1. 把 `docker-compose.yml` 里 `docker.sock` 挂载与 `group_add` 两段的注释解开；
@@ -500,7 +500,7 @@ echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
 docker compose up -d workbuddy-manager
 ```
 
-不配也不会静默失败：更新上游时会提示你去取真实 GID。不挂 socket 时，相关功能
+不配也不会静默失败：更新反代服务时会提示你去取真实 GID。不挂 socket 时，相关功能
 会如实降级为「请到宿主机执行 docker compose ...」。
 
 ---
@@ -527,7 +527,7 @@ docker compose up -d workbuddy-manager
 ```bash
 # 日志
 journalctl -u workbuddy-web -f                    # 管理端
-cd /opt/workbuddy2api && docker compose logs -f   # 上游
+cd /opt/workbuddy2api && docker compose logs -f   # 反代服务
 
 # 重启
 systemctl restart workbuddy-web
@@ -535,11 +535,11 @@ cd /opt/workbuddy2api && docker compose restart
 
 # 状态
 systemctl status workbuddy-web
-curl -s http://127.0.0.1:7864/healthz             # 含上游连通性
+curl -s http://127.0.0.1:7864/healthz             # 含反代服务连通性
 
 # 升级
 cd /opt/workbuddy-manager && git pull              # 管理端代码
-cd /opt/workbuddy2api && git pull && docker compose up -d --build  # 上游
+cd /opt/workbuddy2api && git pull && docker compose up -d --build  # 反代服务
 ```
 
 ---
@@ -560,11 +560,11 @@ rm -rf /opt/workbuddy2api        # 注意：会删除账号授权文件
 ## 八、常见问题
 
 **Q：脚本提示「未检测到 Docker」**
-上游只提供 Docker 部署方式。请先安装 Docker 与 compose 插件，或用
-`--skip-upstream` 跳过并自行部署上游。
+反代服务只提供 Docker 部署方式。请先安装 Docker 与 compose 插件，或用
+`--skip-upstream` 跳过并自行部署反代服务。
 
-**Q：管理端显示「反代上游不可用」**
-上游容器未运行或端口不通。检查：
+**Q：管理端显示「反代服务不可用」**
+反代服务容器未运行或端口不通。检查：
 
 ```bash
 cd /opt/workbuddy2api && docker compose ps
@@ -647,10 +647,10 @@ token，「IP 访问日志」记谁被拦、为什么，都能按条件过滤。
 docker compose logs workbuddy-manager --tail=80     # 看最近的日志
 ```
 
-**Q：首次构建上游很慢**
-上游是 Go 项目，首次 `docker compose up --build` 需拉取基础镜像并编译，
+**Q：首次构建反代服务很慢**
+反代服务是 Go 项目，首次 `docker compose up --build` 需拉取基础镜像并编译，
 视网络情况可能需要几分钟，属正常现象。不想本地编译就把 compose 的 `build: .`
-换成预构建镜像（见「〇、上游源码从哪来 → 直接用预构建的上游镜像」）。
+换成预构建镜像（见「〇、反代源码从哪来 → 直接用预构建的反代服务镜像」）。
 
 **Q：构建管理端镜像失败 / 启动后打开页面显示 ERR_CONNECTION_REFUSED**
 
@@ -687,7 +687,7 @@ docker compose up -d
 可选镜像：`mirrors.aliyun.com` / `mirrors.tuna.tsinghua.edu.cn` / `mirrors.ustc.edu.cn`。
 
 **Q：扫码后账号没出现**
-检查上游日志与账号文件：
+检查反代服务日志与账号文件：
 
 ```bash
 docker compose -f /opt/workbuddy2api/docker-compose.yml logs --tail 50
@@ -696,8 +696,8 @@ ls -l /opt/workbuddy2api/auths/
 
 **Q：打开 `http://127.0.0.1:7863` 显示「404 page not found」，是不是装坏了？**
 
-**不是，这是正常现象。** 7863 是**上游网关 workbuddy2api**，它是一个**纯 API 服务，
-本身没有网页界面**——上游的定位就是「网关核心保持精简，不内嵌 Web 管理面板」，
+**不是，这是正常现象。** 7863 是**反代服务 workbuddy2api**，它是一个**纯 API 服务，
+本身没有网页界面**——反代服务的定位就是「网关核心保持精简，不内嵌 Web 管理面板」，
 因此根路径没有任何页面，访问任意非接口路径都会返回 Go 默认的 `404 page not found`。
 
 两个端口的分工：
@@ -705,9 +705,9 @@ ls -l /opt/workbuddy2api/auths/
 | 地址 | 是什么 | 怎么用 |
 |---|---|---|
 | `127.0.0.1:7864` | **WorkBuddy Manager（本管理端）** | 用浏览器打开，账号 / 密钥 / 日志 / 设置都在这里 |
-| `127.0.0.1:7863` | 上游网关（workbuddy2api） | 只提供接口，用命令行或下游客户端调用 |
+| `127.0.0.1:7863` | 反代服务（workbuddy2api） | 只提供接口，用命令行或调用方客户端调用 |
 
-上游真正提供的接口只有这四个：
+反代服务真正提供的接口只有这四个：
 
 ```bash
 # 健康检查（无需鉴权）：healthy / total 即为账号数
@@ -719,36 +719,36 @@ curl -s -H "Authorization: Bearer <api_key>" http://127.0.0.1:7863/status
 # 可用模型
 curl -s -H "Authorization: Bearer <api_key>" http://127.0.0.1:7863/v1/models
 
-# 对话补全（OpenAI 兼容，下游客户端用这个）
+# 对话补全（OpenAI 兼容，调用方客户端用这个）
 POST http://127.0.0.1:7863/v1/chat/completions
 ```
 
-`api_key` 在上游的 `config.json` 里：
+`api_key` 在反代服务的 `config.json` 里：
 
 ```bash
 grep api_key /opt/workbuddy2api/config.json
 ```
 
-> **想看上游状态的话，不需要开 7863**：管理端已经把它可视化了——
-> 「仪表盘 → 反代上游」显示连接状态、健康 / 冷却 / 禁用账号数与粘性会话；
-> 「设置 → 上游配置 → 服务信息」显示上游地址与接入密钥（已隐藏）。
-> 这正是本管理端存在的意义：把上游的命令行能力变成看得见的界面。
+> **想看反代服务状态的话，不需要开 7863**：管理端已经把它可视化了——
+> 「仪表盘 → 反代服务」显示连接状态、健康 / 冷却 / 禁用账号数与粘性会话；
+> 「设置 → 反代服务配置 → 服务信息」显示反代服务地址与接入密钥（已隐藏）。
+> 这正是本管理端存在的意义：把反代服务的命令行能力变成看得见的界面。
 
-> **顺带一提（安全）**：管理端默认只绑 `127.0.0.1:7864`，而上游默认监听
-> `0.0.0.0:7863`——也就是**公网可直接访问上游端口**（仍需 api_key，但少一层
+> **顺带一提（安全）**：管理端默认只绑 `127.0.0.1:7864`，而反代服务默认监听
+> `0.0.0.0:7863`——也就是**公网可直接访问反代服务端口**（仍需 api_key，但少一层
 > 暴露少一类风险）。
 >
-> 想收紧的话，**别直接照抄「改成 127.0.0.1」**：上游能不能只绑回环，取决于
+> 想收紧的话，**别直接照抄「改成 127.0.0.1」**：反代服务能不能只绑回环，取决于
 > 管理端怎么连它。
 >
 > - 管理端**跑在宿主机**（systemd 部署，连 `127.0.0.1:7863`）：可以绑回环。
 > - 管理端**跑在容器里**（compose 部署，连 `host.docker.internal:7863`）：
->   这个地址并非回环，绑回环后**可能连不上上游**。实测 Docker Desktop
+>   这个地址并非回环，绑回环后**可能连不上反代服务**。实测 Docker Desktop
 >   （Windows / macOS）会把 `host.docker.internal` 转发到宿主回环、连得上；
 >   而 Linux 上容器访问宿主回环通常**不通**。
 >
 > 一键更新会自动处理这个差异：检测到 `WB2API_BASE` 用的是
-> `host.docker.internal` 时，把上游端口绑到宿主网桥地址（如 `172.17.0.1`），
+> `host.docker.internal` 时，把反代服务端口绑到宿主网桥地址（如 `172.17.0.1`），
 > 容器可达且不对公网开放；Docker Desktop 仍用 `127.0.0.1`。要指定别的地址
 > （例如只绑内网网卡），在管理端环境变量里设 `WB_UPSTREAM_BIND=192.168.1.10`
 > 后重新执行一次更新。
@@ -756,25 +756,25 @@ grep api_key /opt/workbuddy2api/config.json
 > 更可靠的做法有两条，按你的部署形态选：
 >
 > **① 让两个容器进同一个 Docker 网络（推荐，最干净）**
-> 这样管理端用**服务名**直连上游，上游**根本不需要对外发布端口**：
+> 这样管理端用**服务名**直连反代服务，反代服务**根本不需要对外发布端口**：
 >
 > ```yaml
-> # 管理端 compose：把上游地址写成服务名
+> # 管理端 compose：把反代服务地址写成服务名
 > WB2API_BASE: http://workbuddy2api:7863
 > ```
 >
-> 然后删掉上游 compose 里的 `ports: ["7863:7863"]`（或改成
+> 然后删掉反代服务 compose 里的 `ports: ["7863:7863"]`（或改成
 > `"127.0.0.1:7863:7863"` 只留给宿主调试）。本仓库 compose 里
 > 已经把这个地址作为推荐值写在注释里了。
 >
 > **② 只绑到内网网卡**
-> 把上游的端口映射从 `"7863:7863"` 改成 `"<服务器内网IP>:7863:7863"`，
+> 把反代服务的端口映射从 `"7863:7863"` 改成 `"<服务器内网IP>:7863:7863"`，
 > 公网访问不到，而管理端仍连得上。
 >
 > ⚠️ 别指望用 `ufw deny 7863` 之类的**宿主机防火墙规则**去挡：Docker 发布端口
 > 走的是 iptables 的 `DOCKER` 链，会绕过 ufw 的 `INPUT` 规则，看着配了实际没生效。
 >
-> 无论用哪种方式，改完都回管理端「仪表盘 → 反代上游」确认仍是「正常」——
+> 无论用哪种方式，改完都回管理端「仪表盘 → 反代服务」确认仍是「正常」——
 > 别只看端口在监听。
 
 **Q：公网访问点「添加账号」二维码加载不出来**
@@ -824,14 +824,14 @@ powershell -ExecutionPolicy Bypass -File .\windows\service-tools.ps1 start
 > 目录的上一级当项目根（找 `server/`、`web/out`、`.env`、`upstream/`）。双击
 > `windows\start.cmd` 前台启动（关窗口即停）、`stop.cmd` 停止、`update.cmd` 一键更新；
 > 后台常驻用 `windows\service-tools.ps1 start`。Windows 原生模式支持
-保存配置后重启上游及读取上游日志；网页一键更新依赖 Linux/Docker，当前会明确拒绝，
+保存配置后重启反代服务及读取反代服务日志；网页一键更新依赖 Linux/Docker，当前会明确拒绝，
 请手动更新代码后重启服务。
 
-> **启停脚本优先用上游自带的**：上游 `workbuddy2api` 2026-09-18 起自带
+> **启停脚本优先用反代服务自带的**：反代服务 `workbuddy2api` 2026-09-18 起自带
 > `start/stop/status-workbuddy2api.cmd`（PID 文件 + 进程路径校验，不会误杀同名进程），
-> 直接把 `WB2API_START_SCRIPT` / `WB2API_STOP_SCRIPT` 指过去即可。若你的上游目录里
-> 没有这三个文件（旧版上游），`windows-native/` 下有一对可直接改用的模板。
+> 直接把 `WB2API_START_SCRIPT` / `WB2API_STOP_SCRIPT` 指过去即可。若你的反代服务目录里
+> 没有这三个文件（旧版反代服务），`windows-native/` 下有一对可直接改用的模板。
 
-> **两个约定必须满足**（上游脚本已满足）：启动脚本要**立即返回**（前台运行会让
+> **两个约定必须满足**（反代服务脚本已满足）：启动脚本要**立即返回**（前台运行会让
 > 「重启」等到超时才报失败），日志要写到 `WB2API_LOG_FILE`（否则「任务记录」读不到
 > 自动任务日志）。细节见 `windows-native/README.md`。

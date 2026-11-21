@@ -1023,8 +1023,8 @@ async def list_models(request: Request):
         # 客户端选中后才 503。模型中心直连腾讯的目录是当前可用的权威清单，
         # 取得到且来源是腾讯时按它裁一次；取不到就原样透传。
         payload = await _drop_models_outside_catalog(payload, key)
-        # 能力字段兜底（issue #211）：随包上游的版本可能比面板旧 —— 补丁只在上游
-        # 侧时，下游经面板拿到的清单仍缺字段，客户端会整条跳过模型。
+        # 能力字段兜底（issue #211）：随包反代服务的版本可能比面板旧 —— 补丁只在反代服务
+        # 侧时，调用方经面板拿到的清单仍缺字段，客户端会整条跳过模型。
         payload = _listing_compat_models(payload)
         # 国内版 id 去掉 `cn:` 前缀，与模型中心显示的名字一致（裸名 = 国内版）。
         payload = _bare_cn_model_ids(payload)
@@ -1079,7 +1079,7 @@ def _model_realm_of(m: object) -> str:
 def _alias_entries(items: list, allow: list[str]) -> list[dict]:
     """白名单里写的是**别名**时，补一条以别名为 id 的模型条目（issue #46）。
 
-    别名（设置页「模型映射」）是给下游用的名字，它**不在上游模型清单里**。
+    别名（设置页「模型映射」）是给调用方用的名字，它**不在反代服务模型清单里**。
     若只按清单字面裁剪，白名单填成别名的密钥会拿到**空列表**——而那个别名明明
     能调用（鉴权判的是请求里的名字，模型映射发生在鉴权**之后**）。空列表比不裁
     更糟：客户端会显示「没有可用模型」，用户看不出是自己把名字写成了别名。
@@ -1129,7 +1129,7 @@ def _filter_catalog_models(payload: object, key: dict | None,
                            realm: str, catalog_ids: set[str]) -> object:
     """按模型中心的实时目录裁掉已下架的 id（issue #239）。
 
-    上游 `/v1/models` 的表里仍留着腾讯已经收缩掉的旧模型；下游把它当选择器，
+    反代服务 `/v1/models` 的表里仍留着腾讯已经收缩掉的旧模型；调用方把它当选择器，
     选中后才 503。模型中心直连腾讯的目录是当前可用的权威清单，取得到时以它
     为准。白名单里的**别名**要继续保留（它指向的模型仍在目录里）。
     """
@@ -1221,7 +1221,7 @@ def _scope_models(payload: object, key: dict | None) -> object:
         return {**payload, 'data': in_realm}
 
     scoped = [m for m in in_realm if keysvc.model_allowed(key, m.get('id'))]
-    # 别名：白名单可能写的是下游熟悉的别名，它不在清单里，要补进来
+    # 别名：白名单可能写的是调用方熟悉的别名，它不在清单里，要补进来
     scoped += _alias_entries(in_realm, allow)
     return {**payload, 'data': scoped}
 
@@ -1266,9 +1266,9 @@ def _bare_cn_model_ids(payload: object) -> object:
 def _listing_compat_models(payload: object) -> object:
     """补齐第三方模型目录客户端要读的能力字段（issue #211）。
 
-    上游从 #156 起在它自己的 `/v1/models` 里补了 `modalities` /
-    `supported_reasoning_levels`。但面板是**独立进程**，随包分发的上游可能比面板
-    旧（补丁只打在上游），于是下游经面板拿到的清单仍缺字段 —— 报告人的 Magpie
+    反代服务从 #156 起在它自己的 `/v1/models` 里补了 `modalities` /
+    `supported_reasoning_levels`。但面板是**独立进程**，随包分发的反代服务可能比面板
+    旧（补丁只打在反代服务），于是调用方经面板拿到的清单仍缺字段 —— 报告人的 Magpie
     就是这样整条跳过模型、看不到多模态与推理档位的。
 
     这里在面板侧再补一遍，口径与上游的 `addListingCompat` 一致，且**只增不改**：
@@ -1554,7 +1554,7 @@ async def gateway_health() -> dict:
 
 
 # ── agenttool web search 透传（/v1/tools/search）────────────────
-# 把下游的 web_search 请求原样转发到上游网关的 agenttool 搜索端点
+# 把调用方的 web_search 请求原样转发到上游网关的 agenttool 搜索端点
 # （workbuddy2api 0057-web-search-tool.patch：账号池轮转 + 15001 配额冷却）。
 #
 # 为什么加这条路由：DSH 的 web-search-workbuddy 插件用**同一把密钥**既调模型

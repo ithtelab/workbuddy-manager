@@ -98,7 +98,7 @@ export default function ClaimPage() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
-  // 下游调用地址：只有浏览器知道当前 origin（静态导出阶段为空）。
+  // 调用方调用地址：只有浏览器知道当前 origin（静态导出阶段为空）。
   // 子路径部署时网关也挂在前缀下，所以必须带上 basePath，否则会给一个 404 的地址。
   const endpoint =
     typeof window !== 'undefined' ? `${window.location.origin}${BASE_PATH}/v1` : '';

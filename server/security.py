@@ -660,7 +660,7 @@ def current_user(request: Request) -> dict:
     数组中的 `X-API-Key`，只要命中就直接授予 admin。那是一条提权后门，已彻底
     移除。现在的 token 走 SQLite `api_tokens` 表：**只存哈希**、有 scope、
     可吊销、有审计——与那次事故的形态刻意不同（见设计文档的「必须避免重蹈的
-    覆辙」一节）。下游调用请用网关的 `/v1/*`（那套密钥走 `api_keys` 表、
+    覆辙」一节）。调用方调用请用网关的 `/v1/*`（那套密钥走 `api_keys` 表、
     只授权模型调用，与后台权限无关）。
     """
     cfg = load_users()

@@ -5,11 +5,11 @@
 
 ## 这是什么
 
-把下游客户端的 `web_search` 请求**原样转发**到上游网关的 agenttool 搜索端点
+把调用方客户端的 `web_search` 请求**原样转发**到上游网关的 agenttool 搜索端点
 （`https://www.workbuddy.cn/agenttool/v1/search`）。manager 在这里只做代理：
 
 ```
-下游（DSH / 任意 OpenAI 兼容客户端，wbk_ 密钥）
+调用方（DSH / 任意 OpenAI 兼容客户端，wbk_ 密钥）
    │  POST {manager}:7864/v1/tools/search
    ▼
 manager  ← 鉴权（_authorize）→ 按密钥解析上游（_upstream_for）→ 换上游 api_key 转发
@@ -20,7 +20,7 @@ wb2api-go  ← 账号池轮转（无粘性）→ 15001 配额软冷却换号 →
 workbuddy.cn/agenttool/v1/search
 ```
 
-价值：**一把密钥走全部数据面**——下游用同一把 wbk_ 密钥既调模型
+价值：**一把密钥走全部数据面**——调用方用同一把 wbk_ 密钥既调模型
 （`/v1/chat/completions`）又调搜索，不用为搜索另立凭证；搜索调用自动进
 面板的调用日志、轨迹抓包、密钥配额与多分组隔离体系。
 
@@ -115,7 +115,7 @@ cd workbuddy2api && git apply dev/upstream-patches/0057-web-search-tool.patch
 - `internal/server/tool_search_test.go` — 8 例（鉴权/校验/轮转/冷却/透传）；
 - 路由注册 + `AgentToolBaseOverride` 字段（各 3-5 行）。
 
-## 下游接入示例（DeepSeek Harness）
+## 调用方接入示例（DeepSeek Harness）
 
 DSH 的 `dsh-web-search-workbuddy` 插件（npm：[`dsh-web-search-workbuddy`](https://www.npmjs.com/package/dsh-web-search-workbuddy)、
 GitHub：[WaveBird/dsh-web-search-workbuddy](https://github.com/WaveBird/dsh-web-search-workbuddy)）

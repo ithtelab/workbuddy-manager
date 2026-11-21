@@ -1,6 +1,6 @@
 """模型别名映射（设置页「模型映射」）的查表语义与兜底模型（issue #173）。
 
-为什么要单独一个模块：映射表被三处消费 —— 转发时把下游的名字换成真名
+为什么要单独一个模块：映射表被三处消费 —— 转发时把调用方的名字换成真名
 （`routers/gateway.py::_map_model`，chat / responses / anthropic 三条路都走它）、
 密钥白名单里的别名补条目（`routers/gateway.py` 的别名条目生成）、别名合法性检查
 （`routers/keys.py`）。**兜底那条（键为 `*`）三处必须一致**，否则会出现「能调用
@@ -49,7 +49,7 @@ def fallback(mapping: object) -> str | None:
 
 
 def target_for(mapping: object, model: str | None) -> str | None:
-    """下游传来的模型名 → 实际要调用的模型名。
+    """调用方传来的模型名 → 实际要调用的模型名。
 
     顺序：**精确别名** → **兜底** → **原样返回**（没有兜底时保持旧行为）。
     """

@@ -723,7 +723,7 @@ export function ManagementBar() {
                         {/* 吊销全部会话：与「退出登录」的区别是它**让服务端所有已签发的
                             cookie 立即失效**，而不只是清掉本机这一个。用于怀疑会话被人
                             拿到（在别人电脑上登过、旧设备没退、备份里有 cookie）——
-                            不必改密码（那会连带影响下游配置）。 */}
+                            不必改密码（那会连带影响调用方配置）。 */}
                         <div className="mt-2 flex justify-end">
                           <ConfirmDialog
                             title={t('profile.revokeTitle')}

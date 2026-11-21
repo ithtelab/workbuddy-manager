@@ -148,7 +148,7 @@ async def probe_upstream(upstream_id: int,
     """探测某个上游是否可达（走它的 /healthz）。
 
     为什么要有：多上游部署里最常见的失误是「地址填对了但容器没起」或
-    「填了另一个网段的地址」。等到下游调用失败才发现，排查成本高得多。
+    「填了另一个网段的地址」。等到调用方调用失败才发现，排查成本高得多。
     探测结果原样返回失败原因（探测是管理员主动发起的，不是未认证端点）。
     """
     upstream = upstreamsvc.get_upstream(upstream_id)
