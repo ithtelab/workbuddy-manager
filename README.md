@@ -2,9 +2,9 @@
 
 # WorkBuddy Manager
 
-**腾讯 CodeBuddy 账号池管理控制台 · OpenAI 兼容反代网关**
+**腾讯 CodeBuddy 账号池管理控制台 · OpenAI 兼容管理网关**
 
-面向 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 的 Web 管理端：扫码纳管、定时签到与保活、密钥分发、IP 与模型白名单、日志与用量统计；反代源码随发布包分发（MIT），迁移见[部署指南](deploy/README.md#〇反代源码从哪来随发布包分发)。
+面向 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 的 Web 管理端：扫码纳管、定时签到与保活、密钥分发、IP 与模型白名单、日志与用量统计；账号池服务源码随发布包分发（MIT），迁移见[部署指南](deploy/README.md#〇账号池服务源码从哪来随发布包分发)。
 
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)
@@ -43,7 +43,7 @@
 
 ## 这是什么
 
-`workbuddy2api` 是一个把腾讯 CodeBuddy 账号池包装成 OpenAI 兼容接口的反代服务（Go 编写）。它的能力很完整，但只有命令行：加账号要跑脚本、看状态要 `curl /status`、发密钥没有界面。
+`workbuddy2api` 是一个把腾讯 CodeBuddy 账号池包装成 OpenAI 兼容接口的账号池服务（Go 编写）。它的能力很完整，但只有命令行：加账号要跑脚本、看状态要 `curl /status`、发密钥没有界面。
 
 本项目补上这一块 —— 一个可以公网运营的 Web 控制台：
 
@@ -57,19 +57,19 @@
 | 无任何 IP 防护 | 入站白/黑名单 + 每密钥 IP 上限与白名单 |
 
 **与 workbuddy2api 的关系**：本项目是为它做**可视化**的配套项目 —— 让能力强大的
-反代服务变得看得见、管得动。面板不侵入反代服务：**没有修改它一行代码**，账号轮询、
+账号池服务变得看得见、管得动。面板不侵入账号池服务：**没有修改它一行代码**，账号轮询、
 并发与熔断仍由它负责。两者配合的方式很自然：
 
-- **反代服务负责能力，面板负责呈现**：账号调度、令牌刷新、限流熔断由 workbuddy2api
+- **账号池服务负责能力，面板负责呈现**：账号调度、令牌刷新、限流熔断由 workbuddy2api
   完成；面板把这些能力可视化，并补上密钥分发、IP 管控、用量统计这些运营环节
-- **互为参照、一起演进**：反代服务新增能力时本项目跟随适配，面板侧发现的运营需求也
-  会反哺反代服务。反代服务在它的 README 里把本项目列为「社区前端面板」之一，我们希望
+- **互为参照、一起演进**：账号池服务新增能力时本项目跟随适配，面板侧发现的运营需求也
+  会反哺账号池服务。账号池服务在它的 README 里把本项目列为「社区前端面板」之一，我们希望
   一起把这个生态做得更好用
-- **反代服务专注自己的核心**：面板不要求反代服务为它改代码，让反代服务能保持精简
+- **账号池服务专注自己的核心**：面板不要求账号池服务为它改代码，让账号池服务能保持精简
 
-欢迎参与共建：面板与反代服务源码的问题、想法都提到
+欢迎参与共建：面板与账号池服务源码的问题、想法都提到
 [本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
-（反代源码随本项目的发布包分发）。
+（账号池服务源码随本项目的发布包分发）。
 
 ---
 
@@ -77,13 +77,13 @@
 
 ### 账号管理
 
-- **扫码纳管** —— 微信 / QQ 扫码授权，成功后自动每日签到、写授权文件、重载反代服务
+- **扫码纳管** —— 微信 / QQ 扫码授权，成功后自动每日签到、写授权文件、重载账号池服务
 - **有效期监控** —— 进度条 + 临期预警；一键续期、连通性探测、手动签到
 - **账号分组** —— 多个账号池分组管理，列表、签到、密钥各自独立
 - **积分与到期** —— 实时余额、按余额分级着色、快过期积分倒计时
 - **任务记录** —— 签到 / 旅行 / 活跃 / 保活的执行结果与积分流水分页可查
 
-### 反代网关（对外 `/v1`）
+### 管理网关（对外 `/v1`）
 
 - **OpenAI 兼容** —— 标准 SDK 直连，流式与非流式都支持
 - **多密钥分发** —— 每把密钥独立设版本、有效期、IP 数、IP / 模型白名单与额度
@@ -133,9 +133,9 @@
 
 客户端视角：客户端**原样**发出的请求头与请求体（密钥打码，保留前 6 位）
 
-<img src="docs/images/traces-headers-gateway.png" alt="网关视角：网关改写后发往反代服务的请求" width="100%" />
+<img src="docs/images/traces-headers-gateway.png" alt="网关视角：网关改写后发往账号池服务的请求" width="100%" />
 
-网关视角：网关改写后发往反代服务的请求，顶部列出被改写的字段（模型映射、参数钳制…）
+网关视角：网关改写后发往账号池服务的请求，顶部列出被改写的字段（模型映射、参数钳制…）
 
 <img src="docs/images/traces-diff.png" alt="与上一轮对比" width="100%" />
 
@@ -175,7 +175,7 @@
 6. 需要升级时点控制窗口的 **检查更新**：查询本仓库最新 Release，下载安装包并用发布页
    的 SHA-256 校验，校验通过后启动安装向导（`.env`、账号与 `data` 保留）。
 
-> 默认成功构建的单文件安装包内置全部运行环境（Python 运行时、反代服务、前端页面），
+> 默认成功构建的单文件安装包内置全部运行环境（Python 运行时、账号池服务、前端页面），
 > 目标机器**无需安装任何依赖**，Windows 10 (1903+) / 11 双击即用。当前安装器没有
 > Authenticode 签名，SmartScreen 可能显示警告；请确认文件来自可信 Release 或自行构建。
 > 安装器自身不会自动升级，升级时重新获取新 exe 并覆盖安装即可；`.env`、账号和 `data`
@@ -197,7 +197,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 
 装完浏览器打开 `http://<服务器>:7864`，首次启动的日志里会打印初始管理员密码。
 
-> 反代源码随发布包一起分发，装完即可用。反向代理与 HTTPS、端口收敛、Windows 原生
+> 账号池服务源码随发布包一起分发，装完即可用。反向代理与 HTTPS、端口收敛、Windows 原生
 > 部署（无需 Docker）、本地开发等细节见 [部署指南](deploy/README.md) 与
 > [开发与架构](docs/development.md)。
 
@@ -223,12 +223,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 | `GET` | `/v1/usage` | 网关密钥 | 密钥自查：已用 / 剩余额度、有效期与模型范围（只读面板记录，不产生调用） |
 | `GET` | `/api/usage/token/` | 网关密钥 | 余额协议：当前密钥的剩余额度（供 new-api 客户端余额面板） |
 | `GET` | `/api/status` | 无 | 余额协议公开元数据：只声明数值单位，不含额度 |
-| `GET` | `/api/upstream/status` | 会话 | 反代服务运行状态（由原 `/api/status` 迁来；旧路径已让给余额协议） |
-| `GET` | `/healthz` | 无 | 存活探测（含反代服务连通性） |
+| `GET` | `/api/upstream/status` | 会话 | 账号池服务运行状态（由原 `/api/status` 迁来；旧路径已让给余额协议） |
+| `GET` | `/healthz` | 无 | 存活探测（含账号池服务连通性） |
 | `GET` | `/api/me` | 会话 | 当前登录用户 |
 | `POST` | `/api/login` `/api/logout` | 无 | 登录 / 登出 |
 | `GET` | `/api/accounts` | 会话 | 账号列表 |
-| `GET` | `/api/accounts/credits-snapshot` | 会话 / 只读令牌 | 已登记积分的只读快照（给看板 / 对账脚本，不查反代服务） |
+| `GET` | `/api/accounts/credits-snapshot` | 会话 / 只读令牌 | 已登记积分的只读快照（给看板 / 对账脚本，不查账号池服务） |
 | `POST` | `/api/auth/start` `/api/auth/poll` | 管理员 | 扫码授权流程 |
 | `POST` | `/api/accounts/{file}/checkin` `/test` `/refresh` | 管理员 | 签到 / 测活 / 刷新 |
 | `DELETE` | `/api/accounts/{file}` | 管理员 | 删除账号 |
@@ -237,7 +237,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 | `GET/POST/PATCH/DELETE` | `/api/tokens[/{id}]` | 会话（管理员） | 管理面 API Token（给脚本 / CI，见 [docs/api-tokens.md](docs/api-tokens.md)） |
 | `GET` | `/api/logs` `/api/stats/*` | 会话 | 日志与用量 |
 | `GET/POST/DELETE` | `/api/security/*` | 会话 / 管理员 | IP 规则与审计 |
-| `GET/POST` | `/api/settings/*` | 会话 / 管理员 | 反代服务配置、模型映射 |
+| `GET/POST` | `/api/settings/*` | 会话 / 管理员 | 账号池服务配置、模型映射 |
 | `GET/POST` | `/api/settings/pg-sync*` | 会话（管理员） | PostgreSQL 异地备份：配置 / 测试连接 / 迁移 / 恢复 |
 
 管理端接口细节可在服务启动后访问 `/docs` 查看（Swagger UI）。
@@ -258,7 +258,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 
 ## 已知限制
 
-- **账号出口线路**：管理端支持按账号绑定命名 HTTP/HTTPS 代理。聊天和反代服务后台任务还需 workbuddy2api 配套支持，配置与兼容条件见 [账号出口线路](docs/account-proxy-routes.md)。
+- **账号出口线路**：管理端支持按账号绑定命名 HTTP/HTTPS 代理。聊天和账号池服务后台任务还需 workbuddy2api 配套支持，配置与兼容条件见 [账号出口线路](docs/account-proxy-routes.md)。
 - **不支持图片生成**：网关只桥接对话 / Responses / Messages 接口，不提供 `/v1/images/generations`；模型目录里的 `supports_images` 表示「可以看图」（图片输入），不是「可以生图」。官方 App 的画布 / 生图走独立链路，反代没有对应入口。
 - 请求的**请求体 / 响应体内容默认不留存**，仅记录元数据（模型、状态、Token、延迟、来源），以保护隐私。需要排查「模型为什么这么答」时，可在底栏「轨迹」里显式打开抓包：内容只写本机、密钥类字段先脱敏、按保留期自动清理（见 [调用抓包](docs/api-traffic-tap.md)）。
 - 用量统计按「天 × 密钥 × 模型」聚合；如需小时粒度可扩展 `usage_daily` 表。
@@ -276,8 +276,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 - [账号出口线路](docs/account-proxy-routes.md) —— 每个账号走不同代理出口
 - [API 令牌](docs/api-tokens.md) —— 只读令牌与作用域
 - [调用抓包](docs/api-traffic-tap.md) —— 回放每一次调用的完整上下文
-- [Web 搜索透传](docs/web-search-passthrough.md) —— `/v1/tools/search` 的用法与反代服务补丁要求
-- [页面监控](docs/watchdog.md) —— 反代服务网页改版检测、LLM 判读与邮件 / QQ 通知
+- [Web 搜索透传](docs/web-search-passthrough.md) —— `/v1/tools/search` 的用法与账号池服务补丁要求
+- [页面监控](docs/watchdog.md) —— 账号池服务网页改版检测、LLM 判读与邮件 / QQ 通知
 - [QQ 机器人通知与开放接口](docs/qq-bot.md) —— AstrBot 对接、UMO 与机器人控制边界
 
 ---
@@ -291,8 +291,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
   [功能建议](https://github.com/ithtelab/workbuddy-manager/issues/new?template=feature_request.yml)
 
 > 反馈时请附上版本号与错误日志，并**先移除其中的密钥、Token 等敏感信息**。
-> 反代服务 workbuddy2api 自身的问题也提到[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
-> ——反代源码随本项目的发布包分发。
+> 账号池服务 workbuddy2api 自身的问题也提到[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
+> ——账号池服务源码随本项目的发布包分发。
 
 ### 版本发布流程
 

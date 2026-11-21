@@ -212,7 +212,7 @@ jobs:
           push: true
           labels: |
             org.opencontainers.image.title=WorkBuddy Manager
-            org.opencontainers.image.description=腾讯 CodeBuddy 账号池管理控制台 · OpenAI 兼容反代网关
+            org.opencontainers.image.description=腾讯 CodeBuddy 账号池管理控制台 · OpenAI 兼容管理网关
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT

@@ -1,4 +1,4 @@
-"""WorkBuddy Manager 入口：管理 API + 对外反代网关 + 静态前端托管。"""
+"""WorkBuddy Manager 入口：管理 API + 对外管理网关 + 静态前端托管。"""
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -138,13 +138,13 @@ def _warn_weak_upstream_key() -> None:
     key = str(cfg.get('api_key') or '').strip()
     if not key:
         logger.error(
-            '反代服务配置 config.json 的 api_key 为空：%s 的全部端点（对话、状态、统计、'
+            '账号池服务配置 config.json 的 api_key 为空：%s 的全部端点（对话、状态、统计、'
             '管理）此刻不需要任何凭据。请在「设置 → 上游」立即配置强 api_key。',
             config.UPSTREAM_CONFIG,
         )
     elif key.lower() in ('test_key', 'changeme', 'your_api_key'):
         logger.error(
-            '反代服务 api_key 仍是样例值 %r：等同于公开，任何知道默认值的人都能'
+            '账号池服务 api_key 仍是样例值 %r：等同于公开，任何知道默认值的人都能'
             '消耗账号池积分。请立即改为强随机值。', key,
         )
 
@@ -689,7 +689,7 @@ def _safe_static_path(full_path: str) -> Path | None:
     由于 ASGI 会先对 %2f 解码，`/..%2f..%2fdata%2fusers.json` 这类请求
     在 `Path / str` 拼接后指向了部署目录**之外**，导致任意文件读取——
     实测可读到 `users.json`（内含签发会话的 secret，可据此伪造 admin 会话）、
-    `.env`、反代服务配置 `config.json`（api_key）与 `auths/*.json`（账号 accessToken）。
+    `.env`、账号池服务配置 `config.json`（api_key）与 `auths/*.json`（账号 accessToken）。
 
     修法：用 `resolve()` 归一化后，强制要求结果仍位于 STATIC_DIR 之内。
     这是防目录穿越的标准做法，能同时覆盖 `..`、编码斜杠、绝对路径与

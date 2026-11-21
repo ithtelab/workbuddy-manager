@@ -530,7 +530,7 @@ const PROMPT_FIELDS: Field[] = [
     desc: 'passthrough：原样透传客户端传来的 system 消息；custom：网关用自有提示词替换它；'
       + 'append：两者并用——在开头连续的 system/developer 块之后插入网关 system，既有消息逐字不动',
     caution:
-      '默认 passthrough 会把调用方的 system prompt 原样送给反代服务。若你依赖网关自己的提示词来稳定行为（或避免 system 指纹被判异常），请改为 custom；'
+      '默认 passthrough 会把调用方的 system prompt 原样送给账号池服务。若你依赖网关自己的提示词来稳定行为（或避免 system 指纹被判异常），请改为 custom；'
       + '若既要保留客户端原始 system、又要网关的提示词生效，用 append。',
     options: [
       {value: 'passthrough', label: 'passthrough（透传客户端 system，默认）'},
@@ -544,7 +544,7 @@ const PROMPT_FIELDS: Field[] = [
     kind: 'text',
     label: '自定义提示词文件',
     desc: '在 custom 与 append 模式下生效。留空使用内置默认提示词',
-    caution: '路径必须存在于上游容器内且可读；写错会导致上游启动失败、反代不可用。不确定就留空。',
+    caution: '路径必须存在于上游容器内且可读；写错会导致上游启动失败、账号池服务不可用。不确定就留空。',
     placeholder: '留空 = 使用内置默认',
     def: '',
   },

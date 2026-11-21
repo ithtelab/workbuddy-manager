@@ -34,16 +34,16 @@ services:
       # 写不进去会报「无法打开数据库文件」：宿主执行 chown -R 10001:10001 ./data，
       # 或 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷（首次创建自动继承属主）。
       - ${WB_DATA_VOLUME:-./data}:/app/data
-      # 反代数据目录：反代服务配置 config.json、auths/、scripts/task_runner.py 都在这里。
+      # 账号池数据目录：账号池服务配置 config.json、auths/、scripts/task_runner.py 都在这里。
       # 用官方发布包部署时，包内自带 upstream/，这行直接可用；数据随发布包更新。
       # 若你的目录不叫这个名字，只改冒号左边（宿主机路径），右边 /opt/workbuddy2api 不要动。
       - ./upstream:/opt/workbuddy2api
-      # 需要在容器内更新反代服务/读日志时挂 docker.sock 并放开 group_add，见 deploy/README.md。
+      # 需要在容器内更新账号池服务/读日志时挂 docker.sock 并放开 group_add，见 deploy/README.md。
       # - /var/run/docker.sock:/var/run/docker.sock
     # group_add:
     #   - "${DOCKER_GID:-999}"   # 宿主 socket 组：stat -c '%g' /var/run/docker.sock
     extra_hosts:
-      # 让容器能通过 host.docker.internal 访问宿主机上的反代服务（workbuddy2api）
+      # 让容器能通过 host.docker.internal 访问宿主机上的账号池服务（workbuddy2api）
       - "host.docker.internal:host-gateway"
 
 volumes:

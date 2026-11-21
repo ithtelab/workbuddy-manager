@@ -740,11 +740,11 @@ def upstream_state_file() -> Path:
     try:
         cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
     except FileNotFoundError as exc:
-        raise ValueError(f'未找到反代服务配置文件：{config.UPSTREAM_CONFIG}') from exc
+        raise ValueError(f'未找到账号池服务配置文件：{config.UPSTREAM_CONFIG}') from exc
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f'读取反代服务配置失败：{exc}') from exc
+        raise ValueError(f'读取账号池服务配置失败：{exc}') from exc
     if not isinstance(cfg, dict):
-        raise ValueError('反代服务配置不是 JSON 对象')
+        raise ValueError('账号池服务配置不是 JSON 对象')
     raw = str(cfg.get('state_file') or 'data/state.json').strip()
     path = Path(raw).expanduser()
     if not path.is_absolute():
@@ -832,12 +832,12 @@ def clear_account_cooling_state(uid: str) -> dict:
     try:
         state = json.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError as exc:
-        raise ValueError(f'未找到反代状态文件：{path}') from exc
+        raise ValueError(f'未找到账号池服务状态文件：{path}') from exc
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f'反代状态文件不是合法 JSON（{path}）：{exc}') from exc
+        raise ValueError(f'账号池服务状态文件不是合法 JSON（{path}）：{exc}') from exc
     accounts = state.get('accounts') if isinstance(state, dict) else None
     if not isinstance(accounts, dict):
-        raise ValueError(f'反代状态文件缺少 accounts 对象（{path}）')
+        raise ValueError(f'账号池服务状态文件缺少 accounts 对象（{path}）')
     if uid not in accounts or not isinstance(accounts.get(uid), dict):
         # 尚未进入 state.json 的账号本来就没有持久化冷却状态，无需修改文件
         return {'uid': uid, 'state_file': str(path), 'backup': '', 'before': {}}
@@ -899,9 +899,9 @@ def set_account_cooling_state(
     try:
         state = json.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError as exc:
-        raise ValueError(f'未找到反代状态文件：{path}') from exc
+        raise ValueError(f'未找到账号池服务状态文件：{path}') from exc
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f'反代状态文件不是合法 JSON（{path}）：{exc}') from exc
+        raise ValueError(f'账号池服务状态文件不是合法 JSON（{path}）：{exc}') from exc
     accounts = state.get('accounts') if isinstance(state, dict) else None
     if not isinstance(state, dict):
         state = {'accounts': {}}
@@ -1302,15 +1302,15 @@ def admin_enabled_in_config() -> tuple[bool | None, str]:
     try:
         raw = path.read_text(encoding='utf-8')
     except FileNotFoundError:
-        return None, f'未找到反代服务配置文件 {path}'
+        return None, f'未找到账号池服务配置文件 {path}'
     except OSError as exc:
-        return None, f'读取反代服务配置文件失败 {path}：{exc}'
+        return None, f'读取账号池服务配置文件失败 {path}：{exc}'
     try:
         cfg = json.loads(raw)
     except Exception as exc:  # noqa: BLE001
-        return None, f'反代服务配置文件不是合法 JSON（{path}）：{exc}'
+        return None, f'账号池服务配置文件不是合法 JSON（{path}）：{exc}'
     if not isinstance(cfg, dict):
-        return None, f'反代服务配置文件不是 JSON 对象（{path}）'
+        return None, f'账号池服务配置文件不是 JSON 对象（{path}）'
     admin = cfg.get('admin')
     return bool(isinstance(admin, dict) and admin.get('enabled')), str(path)
 
@@ -1647,23 +1647,23 @@ def load_upstream_config() -> dict:
     error: str | None = None
 
     if not path.is_file():
-        error = f'未找到反代服务配置文件 {path}'
+        error = f'未找到账号池服务配置文件 {path}'
     else:
         try:
             loaded = json.loads(path.read_text(encoding='utf-8'))
             if isinstance(loaded, dict):
                 cfg = loaded
             else:
-                error = f'反代服务配置文件不是合法的 JSON 对象: {path}'
+                error = f'账号池服务配置文件不是合法的 JSON 对象: {path}'
         except Exception as exc:  # noqa: BLE001
-            error = f'反代服务配置文件解析失败: {exc}'
+            error = f'账号池服务配置文件解析失败: {exc}'
 
     if cfg is None:
         return {
             'available': False,
             'config_path': str(path),
             'auth_dir': str(config.AUTH_DIR),
-            'error': error or '无法读取反代服务配置',
+            'error': error or '无法读取账号池服务配置',
         }
 
     # **白名单**式往外发，而不是 `dict(cfg)` 之后逐个 pop 敏感键。
@@ -1840,7 +1840,7 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             # 这是**文件路径**，不是提示词正文（issue #62）。上游对它是 fail-fast：
             # 路径非空但读不到 → 启动直接报错退出（其 normalizePrompt 注释写明
             # 「避免静默回落到内置默认」）。把正文粘进来会让上游进入 Restarting
-            # 崩溃循环，整个反代不可用——实测就有用户这么踩了。
+            # 崩溃循环，整个账号池服务不可用——实测就有用户这么踩了。
             #
             # 两条判据都来自「文件名不是正文」这个事实：
             #   · 含换行/控制字符 —— 路径不可能有；
@@ -2015,14 +2015,14 @@ def save_upstream_config(patch: dict) -> dict:
     """
     path = config.UPSTREAM_CONFIG
     if not path.is_file():
-        raise FileNotFoundError(f'未找到反代服务配置文件 {path}，已取消保存')
+        raise FileNotFoundError(f'未找到账号池服务配置文件 {path}，已取消保存')
 
     try:
         cfg = json.loads(path.read_text(encoding='utf-8'))
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f'反代服务配置文件解析失败，已取消保存: {exc}') from exc
+        raise ValueError(f'账号池服务配置文件解析失败，已取消保存: {exc}') from exc
     if not isinstance(cfg, dict):
-        raise ValueError('反代服务配置文件不是合法的 JSON 对象，已取消保存')
+        raise ValueError('账号池服务配置文件不是合法的 JSON 对象，已取消保存')
 
     for field in _EDITABLE_SECTIONS:
         if field in patch and isinstance(patch[field], dict):

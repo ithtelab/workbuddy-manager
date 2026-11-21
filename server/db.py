@@ -428,15 +428,15 @@ CREATE INDEX IF NOT EXISTS idx_packet_shares ON red_packet_shares(packet_id);
 
 -- 多上游接入点（账号池分组）。
 --
--- 为什么需要：本服务是**转发型**反代 —— 账号由反代服务挑，本端只做鉴权 / 限流 /
+-- 为什么需要：本服务是**转发型**反代 —— 账号由账号池服务挑，本端只做鉴权 / 限流 /
 -- 记日志。要让「不同调用方密钥走不同账号池」，本端唯一能落地的形态就是配置多个
 -- 上**游接入点**，再让密钥绑定其中之一；每个接入点天然就是一个账号池分组。
 --
--- 默认上游（环境变量 / 反代服务配置 config.json 那套）**不在这里** —— 它不是一行数据，
+-- 默认上游（环境变量 / 账号池服务配置 config.json 那套）**不在这里** —— 它不是一行数据，
 -- 而是 config.WB2API_BASE + config.upstream_api_key() 的运行时结果。这样存量
 -- 部署升级后一行都不用改：密钥的 upstream_id 为空 = 走默认上游，行为与从前一致。
 --
--- api_key 明文存储：与反代服务配置 config.json 里的 api_key 同等敏感，而本库权限已收到
+-- api_key 明文存储：与账号池服务配置 config.json 里的 api_key 同等敏感，而本库权限已收到
 -- 仅属主可读写（见 _restrict_db_permissions）。不引加密依赖的理由同 red_packet_shares
 -- 的注释：自己写加密比明文更危险（会让人以为它是安全的）。
 CREATE TABLE IF NOT EXISTS upstreams (

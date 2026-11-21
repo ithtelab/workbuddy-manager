@@ -41,10 +41,10 @@ WB2API_BASE = _env('WB2API_BASE', 'http://127.0.0.1:7863').rstrip('/')
 WB2API_KEY = _env('WB2API_KEY', '')
 WB2API_CONTAINER = _env('WB2API_CONTAINER', 'workbuddy2api')
 WB2API_MODE = _env('WB2API_MODE', 'docker').lower()  # docker | native | systemd
-# systemd 模式（宿主机直跑反代服务二进制、由 systemd 托管）下反代服务的 unit 名
+# systemd 模式（宿主机直跑账号池服务二进制、由 systemd 托管）下账号池服务的 unit 名
 WB2API_SERVICE = _env('WB2API_SERVICE', 'workbuddy2api')
 
-# 反代数据文件（与 workbuddy2api 共享）：反代数据目录默认 /opt/workbuddy2api
+# 账号池数据文件（与 workbuddy2api 共享）：账号池数据目录默认 /opt/workbuddy2api
 AUTH_DIR = Path(_env('WB_AUTH_DIR', '/opt/workbuddy2api/auths'))
 UPSTREAM_CONFIG = Path(_env('WB_UPSTREAM_CONFIG', '/opt/workbuddy2api/config.json'))
 UPSTREAM_DIR = Path(_env('WB_UPSTREAM_DIR', str(UPSTREAM_CONFIG.parent)))
@@ -57,7 +57,7 @@ WB2API_STOP_SCRIPT = Path(_env(
 WB2API_LOG_FILE = Path(_env(
     'WB2API_LOG_FILE', str(UPSTREAM_DIR / 'data' / 'server.err.log'),
 ))
-# 反代服务把日志**分流**写两个流：每请求一行的对话记录（含实际使用的账号）是
+# 账号池服务把日志**分流**写两个流：每请求一行的对话记录（含实际使用的账号）是
 # `fmt.Fprintf(os.Stdout, ...)`（反代 internal/server/logging.go），签到 / 活跃 /
 # 旅行等业务编排走 Go log → stderr。原生启动脚本（start-workbuddy2api.cmd）把
 # 两路分别重定向到 server.out.log 与 server.err.log。
