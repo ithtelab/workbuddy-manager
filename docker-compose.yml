@@ -14,7 +14,40 @@
 # 会降级为「请到宿主机操作」，界面如实提示。
 
 services:
+  # 一次性权限修复容器（issue #30 复发后的根治）：
+  # bind mount 的 ./data 属主由宿主机决定，首次自动创建时归 root；而管理容器
+  # 以 uid 10001 运行，直接写就会报 `sqlite3.OperationalError: unable to open
+  # database file`。镜像内的 chown 对挂载点无效，宿主机又未必有 SSH 可改属主。
+  # 这个 sidecar 以 root 启动、只做这一件事：把同一个数据卷的属主改成 10001，
+  # 成功退出后管理容器才启动。命名卷场景同样会跑一遍，保证旧卷属主正确。
+  data-perms:
+    image: alpine:3.21
+    container_name: workbuddy-manager-data-perms
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        if ! chown -R 10001:10001 /data 2>/tmp/chown.err; then
+          # 不要因为 chown 失败就拦住面板：Windows / Docker Desktop 的 bind mount
+          # 本来就不需要改属主，拦住会把本来能跑的部署搞挂。放行并留警告，
+          # 真的写不进去时 db.py 会给出详细报错与命名卷方案。
+          echo "[data-perms] 警告：无法修正 /data 属主（NFS/SMB 根用户被压扁、Windows 挂载等）。" >&2
+          echo "[data-perms] 若面板随后报数据库无法打开，请在 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷。" >&2
+          cat /tmp/chown.err >&2
+          exit 0
+        fi
+        echo "[data-perms] /data 属主已确保为 10001:10001"
+    volumes:
+      - ${WB_DATA_VOLUME:-./data}:/data
+
   workbuddy-manager:
+    # 等权限修复容器成功退出再启动，避免启动时序竞争：只重启不重建时该容器
+    # 已是 Exited(0)，Compose 会视为依赖已满足，不会重复 chown。
+    depends_on:
+      data-perms:
+        condition: service_completed_successfully
     build:
       context: .
       # 可选：Alpine 软件源镜像（镜像基于 python:3.12-alpine）。
@@ -101,6 +134,8 @@ services:
       # chown 不起作用。docker 首次自动创建 ./data 时归 root，而容器以 uid 10001
       # 运行 —— 结果是启动时报 `sqlite3.OperationalError: unable to open database
       # file`（那个报错既不说路径也不说原因，很容易误以为是路径配错了）。
+      # 上面的 data-perms sidecar 会在启动时自动 chown；只有在它明确报「无法
+      # 修正属主」（网络文件系统等）时才需要下面的人工修法。
       # 宿主机在 compose 所在目录执行一次即可：
       #   chown -R 10001:10001 ./data
       # 若目录在网络文件系统（NFS/SMB）上、改不了属主，改用命名卷：

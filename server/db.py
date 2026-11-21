@@ -612,7 +612,10 @@ def _explain_db_open_failure(exc: Exception) -> str:
     lines.append(
         '  最常见的成因是**目录属主不对**：容器以 uid 10001 运行，而 bind mount\n'
         '  （compose 里的 `./data:/app/data`）属主由宿主机决定 —— docker 首次自动\n'
-        '  创建该目录时归 root，容器内的 10001 写不进去。两种修法任选其一：\n'
+        '  创建该目录时归 root，容器内的 10001 写不进去。新版 compose 已内置\n'
+        '  data-perms sidecar 自动修正属主；看到这条说明 sidecar 也改不动\n'
+        '  （NFS/SMB 根用户被压扁等），请直接走下面的命名卷方案。\n'
+        '  两种修法任选其一：\n'
         '  ① 能改属主：在 docker-compose.yml 所在目录执行\n'
         '       sudo chown -R 10001:10001 ./data\n'
         '       docker restart workbuddy-manager\n'

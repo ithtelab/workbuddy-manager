@@ -554,6 +554,32 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         self.assertIn('wb-manager-data', (dc.get('volumes') or {}),
                       '顶层没声明 wb-manager-data，切到命名卷会失败')
 
+    def test_compose_autofixes_data_volume_ownership(self) -> None:
+        """compose 必须自带权限修复 sidecar，不再要求用户先上宿主机 chown。
+
+        实测复发过两次：.env.example 已默认命名卷，但老部署的 .env 没有该变量，
+        仍然走 root 属主的 ./data，启动照样炸。让 compose 自己在启动前 chown
+        同一个数据卷，才能覆盖「老 .env + 没 SSH」这类场景。
+        """
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        services = dc.get('services') or {}
+        sidecar = services.get('data-perms')
+        self.assertIsNotNone(sidecar, '缺少 data-perms sidecar：bind mount 属主错误会再次炸启动')
+        vols = [str(v) for v in (sidecar.get('volumes') or [])]
+        self.assertTrue(
+            any('${WB_DATA_VOLUME:-./data}:/data' in v for v in vols),
+            'sidecar 必须挂与管理容器完全相同的数据卷（含命名卷开关）')
+        cmd = ' '.join(str(x) for x in (sidecar.get('command') or []))
+        self.assertIn('chown', cmd, 'sidecar 没做 chown')
+        self.assertIn('10001:10001', cmd, '必须改成容器进程的 uid/gid')
+        app = services.get('workbuddy-manager') or {}
+        deps = app.get('depends_on') or {}
+        self.assertEqual(
+            (deps.get('data-perms') or {}).get('condition'),
+            'service_completed_successfully',
+            '管理容器必须等权限修复成功后再启动，否则仍有启动时序竞争')
+
 
 class DockerAssetsTest(unittest.TestCase):
     """部署资产存在且关键约定正确（这些错了用户装不起来）。"""

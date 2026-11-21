@@ -601,6 +601,18 @@ chmod g+s /opt/workbuddy2api/auths
 ls -ld ./data     # drwxr-xr-x root root → 中招
 ```
 
+**新版 compose 会自动修**：`docker-compose.yml` 里有一台一次性的 `data-perms`
+容器，启动管理端前会以 root 把同一个数据卷 chown 成 `10001:10001`，成功后才放行。
+所以先试：
+
+```bash
+docker compose up -d
+docker compose logs data-perms      # 应看到「/data 属主已确保为 10001:10001」
+```
+
+只有它报「无法修正属主」（NFS/SMB 根用户被压扁、只读挂载等）时才需要下面的
+手工方案。sidecar 只在第一次创建时跑；已经 `Exited(0)` 后不会被重复执行。
+
 **修法一（能 SSH、能改属主，推荐）**：只改权限，不动配置，也不用重建容器：
 
 ```bash
