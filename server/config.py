@@ -148,6 +148,17 @@ GZIP_MIN_SIZE = max(512, _env_int('WB_GZIP_MIN_SIZE', 1024))
 #
 # 需要核对「某个 IP 到底来过什么」时临时设 1 恢复全量记录。
 AUDIT_ALL_ACCESS = _env('WB_AUDIT_ALL_ACCESS', '0') == '1'
+# uvicorn 的逐请求 access log（容器 stdout 里 `INFO: 1.2.3.4 - "GET /..." 200`）。
+#
+# 默认关闭：容器日志会被健康检查（30s 一次）、前端轮询和静态资源请求刷屏，
+# 而真正要排查的访问信息在 DB 的两张结构化表里 —— request_logs（计量：谁、
+# 何时、用了什么账号 / 多少 token）与 ip_access_logs（安全审计：谁被拦、为什么），
+# 可在界面「请求日志 / IP 访问日志」页按条件过滤，比 stdout 逐行文本好用得多。
+# 需要临时抓包式看请求时设 WB_ACCESS_LOG=1（uvicorn.access 恢复 INFO）。
+ACCESS_LOG = _env_bool('WB_ACCESS_LOG', False)
+# 启动失败时额外打印精简的项目栈帧（默认开）。
+# 关掉只留一行异常摘要 + 修法说明，适合日志空间极紧的环境；排障时保持默认。
+STARTUP_FAILURE_STACK = _env_bool('WB_STARTUP_FAILURE_STACK', True)
 # 显式出口代理（可选，如 http://127.0.0.1:7890）。
 # 留空时所有请求都不使用任何代理：httpx 默认 trust_env=True 会读取系统/环境代理，
 # 会把内网请求（如 127.0.0.1:7863）也交给系统代理，导致连接被劫持或长时间超时。
