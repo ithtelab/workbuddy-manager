@@ -2583,7 +2583,7 @@ def _task_scheduler_status() -> dict:
 def _set_upstream_overlap(enabled: bool) -> bool:
     """把上游 checkin/activity 设成指定状态；返回是否真的改了配置。
 
-    只在状态不一致时写文件 + 触发重载：点「只保留上游」时上游通常本来就开着，
+    只在状态不一致时写文件 + 触发重载：点「只留反代调度」时反代调度通常本来就开着，
     没必要为一次无变化的保存重启容器（会打断正在跑的请求）。
     """
     cfg = wb2api.load_upstream_config()
@@ -2615,7 +2615,7 @@ async def keep_task_scheduler(body: dict, user: dict = Depends(security.require_
     if keep not in ('upstream', 'panel'):
         raise HTTPException(status_code=400, detail="keep 只能是 upstream 或 panel")
     if keep == 'upstream':
-        # 对称：若之前选过「只保留面板」，上游的 checkin/activity 已被关掉；
+        # 对称：若之前选过「只留面板计划」，反代的 checkin/activity 已被关掉；
         # 现在切回上游必须把它们重新打开，否则会变成「两边都没跑」。
         try:
             changed = _set_upstream_overlap(True)

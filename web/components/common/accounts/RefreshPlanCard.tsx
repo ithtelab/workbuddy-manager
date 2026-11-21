@@ -1,7 +1,7 @@
 'use client';
 
 import {useCallback, useEffect, useState} from 'react';
-import {CalendarClock, Loader2, Play, Save, TriangleAlert} from 'lucide-react';
+import {CalendarClock, CircleHelp, Loader2, Play, Save, TriangleAlert} from 'lucide-react';
 import {accountApi, errText} from '@/lib/api';
 import type {DailyPlan, DailyTask, DailyTaskConfig, RefreshPlan, TaskSchedulerStatus} from '@/lib/types';
 import {fmtDateTime} from '@/lib/format';
@@ -11,6 +11,7 @@ import {Button} from '@/components/ui/button';
 import {Input} from '@/components/ui/input';
 import {Label} from '@/components/ui/label';
 import {Switch} from '@/components/ui/switch';
+import {Tooltip, TooltipContent, TooltipTrigger} from '@/components/ui/tooltip';
 import {
   Select,
   SelectContent,
@@ -352,18 +353,33 @@ function DailyTasksSection({onRan}: {onRan?: () => void}) {
             })}
           </div>
           <div className="mt-2 flex flex-wrap gap-2">
-            <Button size="sm" variant="outline" className="rounded-full"
-                    disabled={applying !== null}
-                    onClick={() => void applyKeep('upstream')}>
-              {applying === 'upstream' ? <Loader2 className="animate-spin" /> : null}
-              {t('tasks.schedulerKeepUpstream')}
-            </Button>
-            <Button size="sm" variant="outline" className="rounded-full"
-                    disabled={applying !== null}
-                    onClick={() => void applyKeep('panel')}>
-              {applying === 'panel' ? <Loader2 className="animate-spin" /> : null}
-              {t('tasks.schedulerKeepPanel')}
-            </Button>
+            {/* 每个按钮带一个问号：按钮文案只说「留谁」，具体开关哪些任务放 tooltip 里说透 */}
+            {([
+              {keep: 'upstream' as const, labelKey: 'tasks.schedulerKeepUpstream',
+               hintKey: 'tasks.schedulerKeepUpstreamHint'},
+              {keep: 'panel' as const, labelKey: 'tasks.schedulerKeepPanel',
+               hintKey: 'tasks.schedulerKeepPanelHint'},
+            ]).map(({keep, labelKey, hintKey}) => (
+              <div key={keep} className="flex items-center gap-1">
+                <Button size="sm" variant="outline" className="rounded-full"
+                        disabled={applying !== null}
+                        onClick={() => void applyKeep(keep)}>
+                  {applying === keep ? <Loader2 className="animate-spin" /> : null}
+                  {t(labelKey)}
+                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button type="button" aria-label={t(hintKey)}
+                            className="cursor-help rounded-full p-0.5 text-muted-foreground hover:text-foreground">
+                      <CircleHelp className="h-3.5 w-3.5" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-[280px] py-2">
+                    <p className="text-left leading-4">{t(hintKey)}</p>
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+            ))}
           </div>
         </div>
       )}
