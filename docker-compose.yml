@@ -15,6 +15,11 @@ services:
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
+      # 容器内数据根：与下面 volumes 里唯一那条挂载一一对应（宿主机 ./data/ ↔ /opt/workbuddy）。
+      # 这三项必须一起给 —— 账号池目录、启停脚本、日志路径都由它们推导出来。
+      WB_DATA_DIR: /opt/workbuddy/manager
+      WB_AUTH_DIR: /opt/workbuddy/workbuddy2api/auths
+      WB_UPSTREAM_CONFIG: /opt/workbuddy/workbuddy2api/config.json
       WB2API_BASE: http://host.docker.internal:7863
       WB_TRUST_PROXY: "1"
       WB_ENABLE_DOCS: "0"
@@ -30,17 +35,21 @@ services:
       # 只监听本机：请置于 HTTPS 反向代理之后（管理端持有全部账号凭据）。
       - "127.0.0.1:7864:7864"
     volumes:
-      # 宿主机只需一个目录 ./data/，两个组件各占一个子目录（互为兄弟，不嵌套）：
-      #   data/manager/         管理网关数据（数据库、管理员账号、日志）→ /app/data
-      #   data/workbuddy2api/   账号池服务数据（config.json、auths、scripts）→ /opt/workbuddy2api
-      # 首次部署先把目录交给容器 uid，否则 SQLite 会报「无法打开数据库文件」：
-      #   mkdir -p data/manager && sudo chown -R 10001:10001 data/manager
-      # 改不了属主（NFS/SMB）就 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷。
-      - ${WB_DATA_VOLUME:-./data/manager}:/app/data
-      # 账号池数据目录：config.json、auths/、scripts/task_runner.py 都在这里。
-      # 该目录不存在时容器会直接报「Bind mount failed: ... does not exist」起不来：
-      # 先把账号池源码放进去，或只改冒号左边（宿主机路径），右边 /opt/workbuddy2api 不要动。
-      - ./data/workbuddy2api:/opt/workbuddy2api
+      # 只保留**一条**挂载：宿主机 ./data/ ↔ 容器内 /opt/workbuddy，两边子目录同名同构：
+      #   data/manager/         管理网关数据（数据库、管理员账号、日志）→ /opt/workbuddy/manager
+      #   data/workbuddy2api/   账号池服务数据（config.json、auths、scripts）→ /opt/workbuddy/workbuddy2api
+      #
+      # 为什么只挂一条：docker 会**逐条**校验挂载源，两条挂载就得先在宿主机建好两个子目录，
+      # 少建一个立刻报「Bind mount failed: ... does not exist」起不来 —— 群晖 Container
+      # Manager 与新版 docker 都是这个行为。收成一条后只校验 ./data 本身，两个子目录
+      # 由程序首次启动时自建（server/config.py 的 ensure_dirs 用 parents=True）。
+      #
+      # 首次部署把根目录交给容器 uid（容器以 10001 运行），否则 SQLite 报「无法打开数据库文件」：
+      #   mkdir -p data && sudo chown -R 10001:10001 data
+      # 改不了属主（NFS/SMB）就 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷：
+      # 卷首次创建会继承镜像内 /opt/workbuddy 的属主（10001），不需要 chown；
+      # 代价是目录不在宿主机上，账号池源码要用 docker compose cp 放进去。
+      - ${WB_DATA_VOLUME:-./data}:/opt/workbuddy
       # 需要在容器内更新账号池服务/读日志时挂 docker.sock 并放开 group_add，见 deploy/README.md。
       # - /var/run/docker.sock:/var/run/docker.sock
     # group_add:

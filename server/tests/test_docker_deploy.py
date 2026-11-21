@@ -479,7 +479,7 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         sqlite3.OperationalError: unable to open database file
 
     ——既不说路径也不说原因。最常见的成因是 **bind mount 的属主不对**：
-    容器以 uid 10001 运行，而 docker 首次自动创建 `./data/manager`
+    容器以 uid 10001 运行，而 docker 首次自动创建 `./data`
     时归 root，于是容器内的 10001 写不进去；光给一句 sqlite 报错，用户只能靠猜。
     """
 
@@ -490,7 +490,7 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         self.assertIn(str(config.DB_PATH), msg, '必须指出是哪个库文件')
         self.assertIn('chown', msg, '要给出可直接执行的修法')
         self.assertIn('10001', msg, '要说明是哪个 uid')
-        self.assertIn('data/manager', msg, '要指向宿主机上的那个目录')
+        self.assertIn('chown -R 10001:10001 ./data', msg, '要指向宿主机上的那个目录')
 
     def test_message_mentions_named_volume_fallback(self) -> None:
         """改不了属主的场景（NFS/SMB）要给替代方案，不能只说 chown。"""
@@ -528,8 +528,8 @@ class DbOpenFailureMessageTest(unittest.TestCase):
     def test_compose_documents_data_ownership(self) -> None:
         """compose 里 data 挂载必须带权限提示（上游 compose 就有，issue #30）。"""
         compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
-        idx = compose.find('- ${WB_DATA_VOLUME:-./data/manager}:/app/data')
-        self.assertGreater(idx, 0, '没找到 data 挂载（默认值应是 ./data/manager）')
+        idx = compose.find('- ${WB_DATA_VOLUME:-./data}:/opt/workbuddy')
+        self.assertGreater(idx, 0, '没找到 data 挂载（应是 ./data → /opt/workbuddy）')
         # 挂载行上方要有「为什么不可写 + 怎么修」，光报错不解决用户的实际问题
         above = compose[max(0, idx - 1400):idx]
         self.assertIn('chown', above, 'data 挂载缺少属主提示（issue #30 的成因）')
@@ -540,7 +540,7 @@ class DbOpenFailureMessageTest(unittest.TestCase):
     def test_compose_named_volume_switch_is_declared(self) -> None:
         """NAS / SMB 改不了属主时，一行 .env 就能切到命名卷（issue #30 复发）。
 
-        命名卷首次创建会继承镜像内 /app/data 的属主（10001），所以无需宿主 chown。
+        命名卷首次创建会继承镜像内 /opt/workbuddy 的属主（10001），所以无需宿主 chown。
         开关要同时满足两点：挂载行做变量插值、顶层声明同名卷 —— 只改挂载行
         而不声明卷，compose 会把它当成相对路径的 bind mount 并报错。
         """
@@ -548,8 +548,8 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
         vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
         self.assertTrue(
-            any('${WB_DATA_VOLUME:-./data/manager}:/app/data' in v for v in vols),
-            'data 挂载未做成可切换的卷；默认值应是 ./data/manager（宿主机单目录）')
+            any('${WB_DATA_VOLUME:-./data}:/opt/workbuddy' in v for v in vols),
+            'data 挂载未做成可切换的卷；默认值应是 ./data（宿主机单目录）')
         self.assertIn('wb-manager-data', (dc.get('volumes') or {}),
                       '顶层没声明 wb-manager-data，切到命名卷会失败')
 
@@ -566,7 +566,7 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         services = dc.get('services') or {}
         self.assertNotIn('data-perms', services,
                          '精简版 compose 不应再引入 alpine sidecar 服务')
-        idx = text.find('- ${WB_DATA_VOLUME:-./data/manager}:/app/data')
+        idx = text.find('- ${WB_DATA_VOLUME:-./data}:/opt/workbuddy')
         self.assertGreater(idx, 0, 'data 挂载行丢了')
         above = text[max(0, idx - 600):idx]
         self.assertIn('chown -R 10001:10001', above,
@@ -719,49 +719,61 @@ class DockerAssetsTest(unittest.TestCase):
                         '端口未绑定到 127.0.0.1 —— 管理端不应默认暴露公网')
 
     def test_compose_persists_data(self) -> None:
-        """宿主机只建一个 ./data/，两个组件各占一个兄弟子目录。
+        """宿主机只建一个 ./data/，容器内也只有一个根 /opt/workbuddy，两边同名同构。
 
-        管理网关的数据库与账号在 data/manager/（→ /app/data），账号池的
-        config.json / auths / scripts 在 data/workbuddy2api/（→ /opt/workbuddy2api）。
-        两者互不嵌套，也不共用一个子目录（账号池自己也用 data/，混放会互相踩）。
+        管理网关的数据库与账号在 data/manager/（→ /opt/workbuddy/manager），账号池的
+        config.json / auths / scripts 在 data/workbuddy2api/（→ /opt/workbuddy/workbuddy2api）。
+
+        只保留**一条**挂载是刻意的：docker 逐个校验挂载源，两条就得先在宿主机建好
+        两个子目录，少建一个直接 `Bind mount failed` 起不来（群晖 Container Manager
+        与新版 docker 都这样）。收成一条后只校验 ./data，子目录由程序自建。
         """
         import yaml
         text = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
         dc = yaml.safe_load(text)
-        vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
-        self.assertTrue(
-            any('/app/data' in v and './data/manager' in v for v in vols),
-            '管理网关数据应落在 ./data/manager')
-        self.assertTrue(
-            any('/opt/workbuddy2api' in v and './data/workbuddy2api' in v for v in vols),
-            '账号池数据应落在 ./data/workbuddy2api')
-        self.assertNotRegex(text, r'\./data:/app/data',
-                            '不再把 ./data 根直接挂给 /app/data，改挂 ./data/manager')
+        svc = dc['services']['workbuddy-manager']
+        vols = [str(v) for v in (svc.get('volumes') or [])]
+        data_vols = [v for v in vols if 'docker.sock' not in v]
+        self.assertEqual(
+            data_vols, ['${WB_DATA_VOLUME:-./data}:/opt/workbuddy'],
+            f'数据挂载应只有一条（宿主机只需建 ./data），实际：{data_vols}')
 
-    def test_upstream_dir_mounted_under_deploy_dir(self) -> None:
-        """compose 必须把账号池数据目录挂到 /opt/workbuddy2api。
+        env = svc['environment']
+        expected = {
+            'WB_DATA_DIR': '/opt/workbuddy/manager',
+            'WB_AUTH_DIR': '/opt/workbuddy/workbuddy2api/auths',
+            'WB_UPSTREAM_CONFIG': '/opt/workbuddy/workbuddy2api/config.json',
+        }
+        for key, want in expected.items():
+            self.assertEqual(env.get(key), want, f'{key} 应为 {want}')
+            # 三个路径必须都落在挂载点之内，否则数据写进容器可写层 —— 重建即丢
+            self.assertTrue(str(env[key]).startswith('/opt/workbuddy/'),
+                            f'{key} 没落在挂载点 /opt/workbuddy 下')
 
-        程序三种运行方式（Windows/Linux/Docker）都以这个固定路径读账号池服务的
-        config.json / auths / scripts，代码不做区分。所以 Docker 侧必须挂到位，
-        否则界面报「未找到账号池服务配置文件」「未找到 task_runner.py」。
+    def test_upstream_dir_under_single_root(self) -> None:
+        """账号池数据必须在那个唯一根之下，否则界面报「找不到配置文件」。
 
-        挂载源写成 `./data/workbuddy2api`：与管理网关的 `./data/manager` 同处一个
-        `./data/` 下，宿主机只建这一个目录；也不依赖部署目录的上一级（NAS 上
-        上级目录往往不存在，会让 daemon 直接 `Bind mount failed` 拒绝启动）。
+        程序读账号池服务的 config.json / auths / scripts 全靠 config.py 的三个环境
+        变量；compose 把它们指到 /opt/workbuddy/workbuddy2api 里，才与挂载对得上。
+        指错了不会报「路径不存在」，而是数据落到容器可写层 —— 重启即丢，界面上
+        表现为「未找到账号池服务配置文件」「未找到 task_runner.py」。
+
+        三条历史教训一并钉住：不用上级目录 ../workbuddy2api（NAS 上上级常不存在）、
+        不自建 ./upstream、不写死 WB_UPSTREAM_DIR（它由 config.json 父目录推导）。
         """
         import yaml
         text = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
         dc = yaml.safe_load(text)
-        vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
-        self.assertTrue(
-            any(v.startswith('./data/workbuddy2api:') and '/opt/workbuddy2api' in v for v in vols),
-            '未把 ./data/workbuddy2api 挂到 /opt/workbuddy2api —— 界面会报找不到配置')
+        env = dc['services']['workbuddy-manager']['environment']
+        self.assertEqual(env.get('WB_UPSTREAM_CONFIG'),
+                         '/opt/workbuddy/workbuddy2api/config.json',
+                         '账号池配置路径没指到挂载点下 —— 界面会报找不到配置')
         self.assertNotRegex(text, r'\.\./workbuddy2api',
                             '不要用上级目录 ../workbuddy2api —— 与 ./data 写法不一致且上级常不存在')
         self.assertNotRegex(text, r'\./upstream:',
                             '不要自建 ./upstream 挂载 —— 目录名应与部署文档一致')
         self.assertNotIn('WB_UPSTREAM_DIR', text,
-                         'WB_UPSTREAM_DIR 已移除，compose 不该再引用它')
+                         'WB_UPSTREAM_DIR 由 config.json 父目录推导，compose 不该再引用它')
         self.assertNotIn('workbuddy2api-upstream', (dc.get('volumes') or {}),
                          '顶层不该再声明已废弃的 workbuddy2api-upstream 卷')
 

@@ -579,7 +579,7 @@ def _explain_db_open_failure(exc: Exception) -> str:
 
     这个报错的原始信息**完全无法定位**（issue #30）：它既不说哪个路径，
     也不说为什么。实测最常见的原因是**目录/文件的属主不对** ——
-    容器以 uid 10001 运行，而 bind mount（`./data/manager:/app/data`）
+    容器以 uid 10001 运行，而 bind mount（`./data:/opt/workbuddy`）
     的属主由宿主机决定：docker 首次自动创建该目录时归 root，容器内的 10001 就
     写不进去 —— 于是同样的坑在管理端表现为一条 sqlite 报错，用户完全猜不到是权限。
 
@@ -609,12 +609,12 @@ def _explain_db_open_failure(exc: Exception) -> str:
     lines.append(f'  原始错误：{exc}')
     lines.append(
         '  最常见的成因是**目录属主不对**：容器以 uid 10001 运行，而 bind mount\n'
-        '  （compose 里的 `./data/manager:/app/data`）属主由宿主机\n'
+        '  （compose 里的 `./data:/opt/workbuddy`）属主由宿主机\n'
         '  决定 —— docker 首次自动创建该目录时归 root，容器内的 10001 写不进去。\n'
         '  改不了属主（NFS/SMB 根用户被压扁等）就直接走下面的命名卷方案。\n'
         '  两种修法任选其一：\n'
         '  ① 能改属主：在 docker-compose.yml 所在目录执行\n'
-        '       sudo chown -R 10001:10001 ./data/manager\n'
+        '       sudo chown -R 10001:10001 ./data\n'
         '       docker restart workbuddy-manager\n'
         '     （10001 是镜像内 app 用户的 uid；只重启、别重建，\n'
         '       否则面板更新过的代码会退回镜像里的版本）\n'
@@ -623,7 +623,7 @@ def _explain_db_open_failure(exc: Exception) -> str:
         '       WB_DATA_VOLUME=wb-manager-data\n'
         '     再执行 docker compose up -d —— 命名卷首次创建会继承镜像内目录的\n'
         '     属主，不需要 chown。旧版 compose 没有这个变量时，把挂载整行改成\n'
-        '     `- wb-manager-data:/app/data`，并在文件末尾加顶层 `volumes:` 声明。'
+        '     `- wb-manager-data:/opt/workbuddy`，并在文件末尾加顶层 `volumes:` 声明。'
     )
     return '\n'.join(lines)
 

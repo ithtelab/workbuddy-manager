@@ -588,24 +588,24 @@ chgrp -R workbuddy /opt/workbuddy2api/auths
 chmod g+s /opt/workbuddy2api/auths
 ```
 
-**Q：容器反复重启，日志报 `unable to open database file` / 「目录不可写：/app/data」**
+**Q：容器反复重启，日志报 `unable to open database file` / 「目录不可写：/opt/workbuddy/manager」**
 
 这是**权限**问题，不是数据库坏了，也不是路径配错。管理端容器以 uid 10001 运行
-（Dockerfile 里的 `USER app`），而 compose 默认把宿主 `./data/manager`
-bind mount 到 `/app/data` —— 这个目录的属主由宿主机决定，Docker 首次自动创建时归
-`root`，容器内的 10001 写不进去，SQLite 连库文件都建不了，启动即失败；配合
+（Dockerfile 里的 `USER app`），而 compose 把宿主 `./data` bind mount 到
+`/opt/workbuddy` —— 这个目录的属主由宿主机决定，Docker 首次自动创建时归
+`root`，容器内的 10001 既建不了子目录、也写不进库文件，SQLite 连库都打不开，启动即失败；配合
 `restart: unless-stopped` 就表现为一直重启、页面打不开。
 
 在 docker-compose.yml 所在目录确认一下：
 
 ```bash
-ls -ld ./data/manager     # drwxr-xr-x root root → 中招
+ls -ld ./data     # drwxr-xr-x root root → 中招
 ```
 
 **修法一（能 SSH、能改属主，推荐）**：只改权限，不动配置，也不用重建容器：
 
 ```bash
-sudo chown -R 10001:10001 ./data/manager
+sudo chown -R 10001:10001 ./data
 docker restart workbuddy-manager
 ```
 
@@ -613,13 +613,13 @@ docker restart workbuddy-manager
 > 之前通过面板「一键更新」装进容器的新代码会退回旧版（见上表）。
 
 **修法二（NAS / 群晖 / SMB / 没开 SSH，改不了属主）**：换成命名卷。命名卷首次
-创建时会继承镜像内 `/app/data` 的属主（10001），不需要 chown。
+创建时会继承镜像内目录的属主（10001），不需要 chown。
 
-- 新版 compose（挂载行是 `${WB_DATA_VOLUME:-./data/manager}:/app/data`）：
+- 当前 compose（挂载行是 `${WB_DATA_VOLUME:-./data}:/opt/workbuddy`）：
   在 compose 同目录的 `.env` 里加一行 `WB_DATA_VOLUME=wb-manager-data`，再
   `docker compose up -d`。
 - 旧版 compose（挂载行是 `- ./data:/app/data`）：把整行改成
-  `- wb-manager-data:/app/data`，并在文件末尾加：
+  `- wb-manager-data:/opt/workbuddy`，并在文件末尾加：
 
   ```yaml
   volumes:
@@ -629,9 +629,9 @@ docker restart workbuddy-manager
   然后 `docker compose up -d --force-recreate workbuddy-manager`。
 
 切过去之后数据库不再落在宿主 `./data/manager`，取备份用
-`docker compose cp workbuddy-manager:/app/data/manager.db ./manager.db`。
+`docker compose cp workbuddy-manager:/opt/workbuddy/manager/manager.db ./manager.db`。
 首次启动就失败时该目录是空的，直接切即可；若里面已有数据，先用
-`cp -a ./data/manager/ ./data/manager.bak/` 留一份再操作。
+`cp -a ./data/ ./data.bak/` 留一份再操作。
 
 **Q：容器日志太多 / 启动失败看不到原因**
 

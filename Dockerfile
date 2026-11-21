@@ -292,7 +292,8 @@ COPY CHANGELOG.md README.md /app/
 RUN addgroup -g 10001 app \
     && adduser -D -u 10001 -s /bin/sh -h /app -G app app \
     && mkdir -p /app/data /app/.local /opt/workbuddy2api \
-    && chown -R 10001:10001 /app /opt/workbuddy2api
+       /opt/workbuddy/manager /opt/workbuddy/workbuddy2api \
+    && chown -R 10001:10001 /app /opt/workbuddy /opt/workbuddy2api
 
 USER app
 
