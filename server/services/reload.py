@@ -140,7 +140,7 @@ async def restart_now(upstream: dict | None = None) -> tuple[bool, str]:
         return await wb2api.restart_container()
     container = str(upstream.get('container') or '').strip()
     if not container:
-        return False, '该分组未配置容器名，无法从面板重启（账号改动由上游热加载自动收录）'
+        return False, '该分组未配置容器名，无法从面板重启（账号改动由账号池服务热加载自动收录）'
     return await wb2api.restart_container(container)
 
 

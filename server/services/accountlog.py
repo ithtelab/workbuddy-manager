@@ -323,7 +323,7 @@ def status() -> dict:
         path = config.WB2API_CHAT_LOG_FILE
         info['exists'] = path.is_file()
         if not info['exists']:
-            info['hint'] = (f'对话日志文件不存在：{path}。确认上游以原生模式运行，'
+            info['hint'] = (f'对话日志文件不存在：{path}。确认账号池服务以原生模式运行，'
                             '并把它的 stdout 重定向到这个文件（.env 的 WB2API_CHAT_LOG_FILE）。')
             return info
         try:

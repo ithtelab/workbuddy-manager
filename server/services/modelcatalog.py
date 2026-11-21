@@ -294,9 +294,9 @@ async def _build(realm: str, force: bool = False) -> dict:
                     'via': 'workbuddy2api',
                     'errors': errors,
                 }
-            errors.append(f'上游清单里没有{"国际版" if realm == "global" else "国内版"}条目')
+            errors.append(f'账号池服务清单里没有{"国际版" if realm == "global" else "国内版"}条目')
     else:
-        errors.append(f'上游 /v1/models 失败: {data}')
+        errors.append(f'账号池服务 /v1/models 失败: {data}')
 
     return {
         'models': [],
