@@ -65,7 +65,7 @@ class OnlineFirstTest(unittest.TestCase):
             _status(cooling=True, rate_limited_models=[_BLOCK_11102]),
         ])
         self.assertFalse(ok)
-        self.assertIn('停止上游失败', msg)
+        self.assertIn('停止账号池服务失败', msg)
         cm.assert_not_awaited()
         ctl.assert_awaited()
 

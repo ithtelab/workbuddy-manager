@@ -1472,7 +1472,7 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
                             continue  # 换下一条路径再试，别当成账号问题
                         if channel_check:
                             # 两条都被拦：说清「不是账号问题」，否则用户会以为号坏了去重扫。
-                            return False, ('这次调用被上游的渠道校验拦下了（已试过 ' +
+                            return False, ('这次调用被腾讯官方的渠道校验拦下了（已试过 ' +
                                            '/'.join(paths) + '）—— 账号本身没问题；'
                                            '请先升级到最新版本，仍不行就把这句反馈给维护者')
                         return False, _explain_code(code, msg)
@@ -1488,7 +1488,7 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
                                 continue
                             raw_event = line[5:].strip()
                             if raw_event == b'[DONE]':
-                                return False, '上游流已结束，但未返回有效模型输出'
+                                return False, '响应流已结束，但未返回有效模型输出'
                             try:
                                 event = json.loads(raw_event)
                             except (ValueError, UnicodeDecodeError):
@@ -1518,7 +1518,7 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
                                     return True, f'连通正常（{model}，{elapsed}ms）'
                         if len(buffer) > 1024 * 1024:
                             return False, '探测响应格式异常'
-                    return False, '上游未返回有效模型输出'
+                    return False, '腾讯官方未返回有效模型输出'
         return False, '所有候选路径均不可用'
     except Exception as exc:  # noqa: BLE001
         return False, f'请求异常: {err_text(exc)}'
@@ -1631,7 +1631,7 @@ def _explain_code(code: int | str, msg: str = '') -> str:
         except (TypeError, ValueError):
             key = code  # 保持原样（如 "11-128"），按字符串查
     hint = _CODE_HINTS.get(key)
-    parts = [f'上游返回 code={code}']
+    parts = [f'腾讯官方返回 code={code}']
     if msg:
         parts.append(msg)
     if hint:

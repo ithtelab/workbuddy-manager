@@ -96,7 +96,7 @@ class FallbackMessageTest(unittest.TestCase):
         with mock.patch.object(wb2api, 'admin_enabled_in_config',
                               lambda: (True, '/srv/upstream/config.json')):
             msg = accounts._fallback_why('no_route', True)
-        self.assertIn('重启上游容器', msg)
+        self.assertIn('重启账号池服务容器', msg)
         self.assertIn('/srv/upstream/config.json', msg)
         self.assertIn('2026-09-19', msg)
         # 回退的代价仍要如实说清（这条不能因为加了诊断就丢掉）
@@ -108,7 +108,7 @@ class FallbackMessageTest(unittest.TestCase):
                               lambda: (False, '/srv/upstream/config.json')):
             msg = accounts._fallback_why('no_route', True)
         self.assertIn('设置 → 账号管理接口', msg)
-        self.assertNotIn('重启上游容器才生效', msg)
+        self.assertNotIn('重启账号池服务容器才生效', msg)
 
     def test_no_route_with_unreadable_config_says_so(self) -> None:
         with mock.patch.object(wb2api, 'admin_enabled_in_config',

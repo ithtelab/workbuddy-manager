@@ -36,7 +36,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 PORT = _env_int('WB_MANAGER_PORT', 7864)
 HOST = _env('WB_MANAGER_HOST', '0.0.0.0')
 
-# 上游 workbuddy2api（Go）
+# 账号池服务 workbuddy2api（Go）
 WB2API_BASE = _env('WB2API_BASE', 'http://127.0.0.1:7863').rstrip('/')
 WB2API_KEY = _env('WB2API_KEY', '')
 WB2API_CONTAINER = _env('WB2API_CONTAINER', 'workbuddy2api')

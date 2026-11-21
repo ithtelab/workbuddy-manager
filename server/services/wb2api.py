@@ -36,11 +36,11 @@ def _safe_file(filename: str, auth_dir: Path | None = None) -> Path:
     穿越防线（`/`、反斜杠、`..`、NUL）是根本；此外只接受 `workbuddy*.json`
     这一种形态，避免越权读到目录里的其他文件（例如隐藏文件或临时文件）。
 
-    **通配宽度必须与上游一致**（上游 `auth.AuthFileGlob = "workbuddy*.json"`，
+    **通配宽度必须与账号池服务一致**（账号池服务 `auth.AuthFileGlob = "workbuddy*.json"`，
     其注释写明这是它自己踩过的坑：曾用窄模式 `workbuddy-*.json`，导致
     `workbuddy_new.json` 被网关加载却被工具跳过、两边口径对不上）。
-    我们此前正是窄模式，于是那种账号**在上游池里能被选中、面板却看不到**——
-    与「面板读文件、上游读池」那个不一致是同一个问题的反方向。
+    我们此前正是窄模式，于是那种账号**在账号池服务池里能被选中、面板却看不到**——
+    与「面板读文件、账号池服务读池」那个不一致是同一个问题的反方向。
     这里的宽化不放松安全：前缀 `workbuddy`、后缀 `.json`、禁止路径分隔符
     与 `..` 三条约束都还在。
     """
@@ -95,7 +95,7 @@ WEIGHT_MAX = 100.0
 def _weight_of(raw: dict) -> float:
     """读 auth 文件顶层 `weight`：非法值按 0（未设置）处理，与上游 Parse 同口径。
 
-    不做上下限钳制：钳制只在选号时发生（上游 `auth.PickWeight`），而列表要按
+    不做上下限钳制：钳制只在选号时发生（账号池服务 `auth.PickWeight`），而列表要按
     文件里的真实值回显，否则用户会看到「我填了 0.01，界面显示 0.1」。
     """
     try:
@@ -169,7 +169,7 @@ def token_ttl_seconds(access_token: str) -> int | None:
     而 JWT 载荷里同时有 iat 与 exp，且只是本地解码、不发网络请求。
 
     为什么不另存一份 expiresIn：JWT 的 exp - iat 就是该令牌自身的真实寿命，
-    且随令牌一起走——刷新换发新令牌时它自动更新，也不会被上游写回时丢掉。
+    且随令牌一起走——刷新换发新令牌时它自动更新，也不会被账号池服务写回时丢掉。
     另存字段反而可能与令牌不一致或过期。
 
     纯展示用途：解不出来就返回 None，调用方回退到保守的默认窗口，
@@ -197,7 +197,7 @@ def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
     auth_dir 非空时读该**分组**的账号目录（多分组 / 账号池，见 upstreamsvc）；
     缺省读 config.AUTH_DIR —— 存量行为不变。
 
-    同时收上游**加载不到**的两类文件，否则它们会在面板上「凭空消失」：
+    同时收账号池服务**加载不到**的两类文件，否则它们会在面板上「凭空消失」：
       · `workbuddy*.json.disabled` —— 本面板「临时禁用」改名的产物（见
         `set_account_disabled`）。用户禁用的账号必须仍然看得见、并且能再启用，
         否则「禁用」在使用体验上等同于「删除」。
@@ -298,19 +298,19 @@ def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
 def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
     """把 /status 的运行时状态合并进账号列表（含积分余额）。
 
-    credits：账号当前可花费积分余额，由上游聚合所有套餐的
+    credits：账号当前可花费积分余额，由账号池服务聚合所有套餐的
     CycleCapacityRemain 得出（见 upstream.UserResource）。
 
-    **in_pool 标记**：该账号是否出现在上游的账号池（`/status.accounts`）里。
+    **in_pool 标记**：该账号是否出现在账号池（`/status.accounts`）里。
 
-    为什么要这个标记：我们读的是 auths/ 目录下的**文件**，上游读的才是**池**。
-    两者并不总是一致——上游 `LoadDir` 对解析失败的 auth 文件**静默跳过**
+    为什么要这个标记：我们读的是 auths/ 目录下的**文件**，账号池服务读的才是**池**。
+    两者并不总是一致——账号池服务 `LoadDir` 对解析失败的 auth 文件**静默跳过**
     （`Parse` 在 accessToken 为空时直接报错），那个文件因此不在池里、永远选不中。
     而我们此前照样把它列出来，且因为 `/status` 里没有它，cooling / disabled
     等字段全是 None，前端兜底分支就显示成「● 在线」——**面板全绿、调用却报
     「没有健康账号」**，用户完全无从下手（这正是用户报的现象）。
 
-    `invalid_reason` 用于我们已经能确定「上游不会加载它」的情形，把原因写出来，
+    `invalid_reason` 用于我们已经能确定「账号池服务不会加载它」的情形，把原因写出来，
     而不是让用户自己去猜文件哪里不对。
     """
     pool: dict[str, dict] = {}
@@ -330,7 +330,7 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
             # 报成「账号文件可能有问题」，用户看到自己刚禁用的账号被标成疑似损坏，
             # 反而要去查文件（实测会在界面上产生这种误导）。
             if a.get('disabled_by_panel') and not a.get('invalid_reason'):
-                a['invalid_reason'] = '已在本面板临时禁用（不会被上游加载）'
+                a['invalid_reason'] = '已在本面板临时禁用（不会被账号池服务加载）'
             continue
         credits = p.get('credits')
         a['credits'] = int(credits) if isinstance(credits, (int, float)) else None
@@ -411,7 +411,7 @@ def read_account_file_any(filename: str, auth_dir: Path | None = None) -> dict:
     为什么需要：调用方手里的文件名可能与磁盘上的形态不一致——界面在「停用」
     之后仍然持有旧名字（心跳刷新前），或反过来用户刚停用就点了启用。只按
     传进来的名字读会 FileNotFoundError，于是 uid 解析不出来，依赖 uid 的
-    路径（上游状态位）就被静默跳过，功能看着「没生效」。
+    路径（账号池服务状态位）就被静默跳过，功能看着「没生效」。
 
     两种形态都不存在时抛最后一个异常（FileNotFoundError），语义与
     `read_account_file` 一致。
@@ -437,22 +437,22 @@ def set_account_disabled(filename: str, disabled: bool,
 
     实现原理
     --------
-    上游 `auth.LoadAuthFiles` 用 glob `workbuddy*.json` 收集账号文件，所以把文件
+    账号池服务 `auth.LoadAuthFiles` 用 glob `workbuddy*.json` 收集账号文件，所以把文件
     改名成 `workbuddy-xxx.json.disabled` 之后它就不再被加载——账号随即从池里消失、
-    不会被选中。启用就是改回原名。上游**没有**任何禁用/启用的 HTTP 接口
+    不会被选中。启用就是改回原名。账号池服务**没有**任何禁用/启用的 HTTP 接口
     （它内部有 `Disable`/`ReviveDisabled`，但只被自身的错误处理调用，未对外暴露），
     而且 `state.json` 每 5 秒被上位机覆盖、改它没有意义，所以改名是唯一可行路径。
 
-    生效方式（新旧上游不同）
+    生效方式（新旧账号池服务不同）
     ------------------------
     改名后调用方仍会触发一次重载（`reload.request_restart()`）——这里只做文件操作，
-    保持本函数纯粹、可测。两种上游的差别：
+    保持本函数纯粹、可测。两种账号池服务的差别：
 
-      · **新上游**（2026-09-18 起）有 auths 目录热加载：每 5 秒轮询目录指纹，
+      · **新账号池服务**（2026-09-18 起）有 auths 目录热加载：每 5 秒轮询目录指纹，
         改名本身就会让它自动重扫，我们不触发也会生效（触发只是为了不等那 5 秒）。
-      · **旧上游**只在启动时扫描一次，必须重启容器才生效——重载就是唯一途径。
+      · **旧账号池服务**只在启动时扫描一次，必须重启容器才生效——重载就是唯一途径。
 
-    所以「总是触发一次重载」对两种形态都正确，不需要探测上游版本（上游没暴露
+    所以「总是触发一次重载」对两种形态都正确，不需要探测账号池服务版本（账号池服务没暴露
     版本号，也探测不了）。
 
     为什么不用「删掉文件再恢复」
@@ -514,7 +514,7 @@ async def get_status(*, base_url: str | None = None, api_key: str | None = None)
         async with config.http_client(10, connect=3) as client:
             resp = await client.get(f'{base}/status', headers=_auth_headers(api_key))
         if resp.status_code >= 400:
-            return {'connected': False, 'error': f'上游返回 {resp.status_code}'}
+            return {'connected': False, 'error': f'账号池服务返回 {resp.status_code}'}
         data = resp.json()
         data['connected'] = True
         return data
@@ -526,7 +526,7 @@ def _admin_route_missing(resp: object) -> bool:
     """判断这次 404 是「接口没注册」还是「账号不在池里」。
 
     两者都是 404，但含义完全相反，处理方式也相反——前者要回退到改名，
-    后者是真错误（改名同样救不了）。上游对这两种 404 的响应体不同：
+    后者是真错误（改名同样救不了）。账号池服务对这两种 404 的响应体不同：
 
       · **接口没注册**（`admin.enabled=false` 或旧版本未实现）：net/http 的
         默认路由兜底，响应体是纯文本 `404 page not found`；
@@ -559,19 +559,19 @@ async def _admin_account_call(uid: str, action: str, *, reason: str = '',
     结果码：
 
       · `ok`        —— 调用成功（注意：成功 ≠ 账号已回到选号池，见 revive_account）；
-      · `no_route`  —— 上游没注册这组接口（旧版本、或 `admin.enabled=false`）；
+      · `no_route`  —— 账号池服务没注册这组接口（旧版本、或 `admin.enabled=false`）；
       · `not_found` —— 接口在，但该 uid 不在池里（文件还没被加载等）；
       · `error`     —— 其它失败（网络、5xx、鉴权）。
 
     ## 关于 `admin.enabled` 默认关闭
 
-    上游这组接口**默认不注册**（`admin.enabled` 默认 false，关闭时一律 404，
+    账号池服务这组接口**默认不注册**（`admin.enabled` 默认 false，关闭时一律 404，
     其注释写明是「不向外暴露管理面」的有意设计）。所以能拿到 `no_route` 是
     **常见且正常**的，不是故障——调用方据此回退改名即可，并把开启方式告诉用户。
 
     ## 鉴权
 
-    与 `/status` 同源（`api_key`）。`_auth_headers()` 已带上；上游未配 api_key 时
+    与 `/status` 同源（`api_key`）。`_auth_headers()` 已带上；账号池服务未配 api_key 时
     它自己的启动校验会拒绝 `admin.enabled=true`，所以这里不需要额外分支。
     """
     if not uid:
@@ -586,12 +586,12 @@ async def _admin_account_call(uid: str, action: str, *, reason: str = '',
         return False, _err_text(exc), 'error', {}
     if resp.status_code == 404:
         if _admin_route_missing(resp):
-            return False, '上游未启用管理接口（admin.enabled=false 或版本较旧）', 'no_route', {}
-        return False, '该账号不在上游账号池里', 'not_found', {}
+            return False, '账号池服务未启用管理接口（admin.enabled=false 或版本较旧）', 'no_route', {}
+        return False, '该账号不在账号池里', 'not_found', {}
     if resp.status_code == 401:
-        return False, '上游拒绝了鉴权（api_key 不一致）', 'error', {}
+        return False, '账号池服务拒绝了鉴权（api_key 不一致）', 'error', {}
     if resp.status_code >= 400:
-        return False, f'上游返回 {resp.status_code}', 'error', {}
+        return False, f'账号池服务返回 {resp.status_code}', 'error', {}
     try:
         payload = resp.json()
     except Exception:  # noqa: BLE001 —— 回显只是锦上添花，解析不了不算失败
@@ -603,7 +603,7 @@ async def clear_model_block(uid: str, model: str, *, base_url: str | None = None
                             api_key: str | None = None) -> tuple[bool, str, str]:
     """成功探测同步到运行中的网关；只清 11102，不清真实模型配额或账号状态。
 
-    第三项是 `_admin_account_call` 的结果码：`no_route` 表示上游没注册管理接口
+    第三项是 `_admin_account_call` 的结果码：`no_route` 表示账号池服务没注册管理接口
     （`admin.enabled` 默认 false）。那不是同步失败，只是没有这条同步通道 ——
     调用方据此按「不可用」处理，别把它报成错误、也别反复重试。
     """
@@ -628,7 +628,7 @@ async def set_manual_disabled(uid: str, disabled: bool, reason: str = '',
 
     ## 为什么优先用它，而不是改文件名（issue #45）
 
-    上游 2026-09-19 暴露了 `POST /admin/accounts/{uid}/disable|enable`，
+    账号池服务 2026-09-19 暴露了 `POST /admin/accounts/{uid}/disable|enable`，
     语义是**「对话流量摘除」而非「账号冻结」**（其 admin.go 原话）：
 
       · 停用期间**不参与选号**（`pick.go` 把 `e.disabled || e.manualDisabled`
@@ -650,8 +650,8 @@ async def set_manual_disabled(uid: str, disabled: bool, reason: str = '',
         base_url=base_url, api_key=api_key)
     if not ok:
         return False, msg, code
-    return True, ('已通过上游状态位停用（签到与保活照常执行）' if disabled
-                  else '已通过上游状态位启用'), 'ok'
+    return True, ('已通过账号池服务状态位停用（签到与保活照常执行）' if disabled
+                  else '已通过账号池服务状态位启用'), 'ok'
 
 
 def is_account_banned(account: dict) -> bool:
@@ -669,7 +669,7 @@ async def revive_account(uid: str, *, base_url: str | None = None,
 
     ## 为什么必须有它（用户反馈：国际版重新登录后账号池调不动）
 
-    上游 admin.go 的注释写得很明确：
+    账号池服务 admin.go 的注释写得很明确：
 
     > `adminAccountEnable` 解除手动停用。若账号仍被系统自动禁用（disabled），
     > 它**不会**因此回到选号池——那需要 revive。
@@ -677,7 +677,7 @@ async def revive_account(uid: str, *, base_url: str | None = None,
     而面板此前**只调 disable/enable、从不调 revive**，于是被自动禁用的账号在
     面板里没有任何操作能救回来，四条自救路径全被堵死：
 
-      · 重新登录 → 上游 `upsertLocked` 只换凭证，**disabled 原样保留**；
+      · 重新登录 → 账号池服务 `upsertLocked` 只换凭证，**disabled 原样保留**；
       · 签到解冻 → `ReenableIfCredits` 里 `if remain > 0 && !e.disabled` 直接跳过；
       · 一次成功 → `NoteSuccess` 要求账号先被选中，而 disabled 的号永不被选中（自锁）；
       · 等时间 → `healthy()` 里 `if e.disabled` 没有任何时间判据，**永不过期**；
@@ -697,7 +697,7 @@ async def revive_account(uid: str, *, base_url: str | None = None,
     if not status.get('connected') or account is None:
         return False, '无法确认账号封禁状态，未解除系统禁用，请稍后重试', 'error'
     if is_account_banned(account):
-        return False, '账号被封禁：上游限制使用，重新登录不能解除限制；如需申诉请向腾讯提交反馈', 'banned'
+        return False, '账号被封禁：腾讯官方限制使用，重新登录不能解除限制；如需申诉请向腾讯提交反馈', 'banned'
     ok, msg, code, payload = await _admin_account_call(
         uid, 'revive', base_url=base_url, api_key=api_key)
     if not ok:
@@ -705,7 +705,7 @@ async def revive_account(uid: str, *, base_url: str | None = None,
     if payload.get('disabled') is True:
         # 上游回了 200 但禁用位还在：这不该发生（除非它改了语义），如实报出来，
         # 不能像以前那样无条件回一句「已启用」——那正是用户被误导的来源。
-        return False, '上游已接受请求，但账号仍处于禁用状态', 'error'
+        return False, '账号池服务已接受请求，但账号仍处于禁用状态', 'error'
     return True, ('已解除系统禁用' if payload.get('changed') else '该账号未被系统禁用'), 'ok'
 
 
@@ -713,7 +713,7 @@ async def account_disabled(uid: str, *, base_url: str | None = None,
                            api_key: str | None = None) -> bool | None:
     """从 `/status` 读某账号当前的**系统自动禁用**位。
 
-    返回 True/False；读不到（上游不可达、uid 不在池里）返回 None。
+    返回 True/False；读不到（账号池服务不可达、uid 不在池里）返回 None。
     用它做「enable 之后到底有没有真的回到池子」的最终判据：admin 端点的回显
     在旧版本上可能没有 `disabled` 字段，而 `/status` 一直是有的。
     """
@@ -733,8 +733,8 @@ async def account_disabled(uid: str, *, base_url: str | None = None,
 def upstream_state_file() -> Path:
     """读取上游 config.json 并解析 state_file 的真实路径。
 
-    上游允许 `state_file` 使用相对路径，且相对的是上游进程的工作目录。
-    管理端与上游共享同一个上游仓库目录，因此这里按 `WB_UPSTREAM_DIR`
+    账号池服务允许 `state_file` 使用相对路径，且相对的是账号池服务进程的工作目录。
+    管理端与账号池服务共享同一个账号池服务仓库目录，因此这里按 `WB_UPSTREAM_DIR`
     解析；配置缺失或非法时拒绝操作，避免猜错路径后改到别的文件。
     """
     try:
@@ -823,7 +823,7 @@ def clear_account_cooling_state(uid: str) -> dict:
     """清除一个账号在 state.json 中的冷却、熔断、降权与模型级限流。
 
     只修改 target uid 对应条目，`disabled` / `manual_disabled` / 凭证 / 积分
-    等正交状态保持不变。调用方必须先停止上游，否则周期 Flush 会覆盖本改动。
+    等正交状态保持不变。调用方必须先停止账号池服务，否则周期 Flush 会覆盖本改动。
     """
     uid = str(uid or '').strip()
     if not uid:
@@ -890,7 +890,7 @@ def set_account_cooling_state(
     """设定一个账号在 state.json 中的冷却截止时间与原因。
 
     只修改 target uid 对应条目，`disabled` / `manual_disabled` / 凭证 / 积分
-    等正交状态保持不变。调用方必须先停止上游，否则周期 Flush 会覆盖本改动。
+    等正交状态保持不变。调用方必须先停止账号池服务，否则周期 Flush 会覆盖本改动。
     """
     uid = str(uid or '').strip()
     if not uid:
@@ -961,7 +961,7 @@ async def _set_upstream_running(running: bool) -> tuple[bool, str]:
     if config.WB2API_MODE == 'native':
         script = config.WB2API_START_SCRIPT if running else config.WB2API_STOP_SCRIPT
         if not script.is_file():
-            return False, f'未找到原生上游脚本：{script}'
+            return False, f'未找到原生账号池服务脚本：{script}'
         cmd = (('cmd.exe', '/d', '/c', str(script)) if os.name == 'nt' else (str(script),))
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -1008,8 +1008,8 @@ async def _set_upstream_running(running: bool) -> tuple[bool, str]:
 # 默认 WB2API_MODE=docker 却找不到 docker：多半是宿主机直跑上游（issue #329）。
 # 光说「未找到 docker 命令」用户不知道怎么办，把出路一并说清。
 _NO_DOCKER_HINT = (
-    '未找到 docker 命令。若上游不是 docker 容器：由 systemd 托管的请在 .env 设 '
-    'WB2API_MODE=systemd 与 WB2API_SERVICE=<上游 unit 名>；其它原生进程设 '
+    '未找到 docker 命令。若账号池服务不是 docker 容器：由 systemd 托管的请在 .env 设 '
+    'WB2API_MODE=systemd 与 WB2API_SERVICE=<账号池服务 unit 名>；其它原生进程设 '
     'WB2API_MODE=native 并配置 WB2API_START_SCRIPT / WB2API_STOP_SCRIPT'
 )
 
@@ -1043,7 +1043,7 @@ async def _systemctl(action: str) -> tuple[bool, str]:
         return False, f'执行 systemctl 失败：{exc}'
     if proc.returncode == 0:
         verb = {'start': '启动', 'stop': '停止', 'restart': '重启'}.get(action, action)
-        return True, f'上游服务 {unit} 已{verb}'
+        return True, f'账号池服务 {unit} 已{verb}'
     detail = (err or b'').decode(errors='ignore').strip()
     if 'authentication' in detail.lower() or 'access denied' in detail.lower() \
             or 'interactive' in detail.lower():
@@ -1053,7 +1053,7 @@ async def _systemctl(action: str) -> tuple[bool, str]:
 
 async def _wait_for_upstream(timeout: float = 35.0) -> dict:
     deadline = time.monotonic() + timeout
-    last: dict = {'connected': False, 'error': '等待上游重启超时'}
+    last: dict = {'connected': False, 'error': '等待账号池服务重启超时'}
     while time.monotonic() < deadline:
         last = await get_status()
         if last.get('connected'):
@@ -1081,7 +1081,7 @@ async def _clear_cooling_online(uid: str, account: dict,
       · 本模块写入的强制冷却（manual_disabled + 冷却标记）→ `enable`。
 
     账号级冷却 / 熔断 / 降权、真实 6004 等其它模型限流没有在线接口，返回
-    None 交给原来的「停上游 → 改 state.json → 启上游」。上游没开 admin
+    None 交给原来的「停账号池服务 → 改 state.json → 启账号池服务」。账号池服务没开 admin
     接口（`no_route`）或在线调用失败时同样返回 None 回退，**不会**因为在线
     这一步而让原本能成功的离线路径失败。
     """
@@ -1113,7 +1113,7 @@ async def _clear_cooling_online(uid: str, account: dict,
                   if str(x.get('uid') or '') == uid), None)
     if not status.get('connected') or not _account_blocks_cleared(after):
         return None
-    return True, '已通过上游管理接口在线清除（无需重启上游）', {
+    return True, '已通过账号池服务管理接口在线清除（无需重启账号池服务）', {
         'uid': uid, 'online': True, 'models': names, 'unfrozen': has_freeze}
 
 
@@ -1130,7 +1130,7 @@ async def force_clear_account_cooling(uid: str) -> tuple[bool, str, dict]:
             None,
         )
         if account is None:
-            return False, '该账号不在上游账号池里', {}
+            return False, '该账号不在账号池里', {}
         has_freeze = bool(
             account.get('manual_disabled')
             and _is_manual_cooling_reason(account.get('manual_reason'))
@@ -1143,7 +1143,7 @@ async def force_clear_account_cooling(uid: str) -> tuple[bool, str, dict]:
 
     stopped, stop_message = await _set_upstream_running(False)
     if not stopped:
-        return False, f'停止上游失败：{stop_message}', {}
+        return False, f'停止账号池服务失败：{stop_message}', {}
 
     try:
         changed = clear_account_cooling_state(uid)
@@ -1154,25 +1154,25 @@ async def force_clear_account_cooling(uid: str) -> tuple[bool, str, dict]:
 
     started, start_message = await _set_upstream_running(True)
     if not started:
-        return False, f'状态已清除，但启动上游失败：{start_message}', changed
+        return False, f'状态已清除，但启动账号池服务失败：{start_message}', changed
 
     status = await _wait_for_upstream()
     if not status.get('connected'):
-        return False, f'上游重启后未就绪：{status.get("error") or "未知错误"}', changed
+        return False, f'账号池服务重启后未就绪：{status.get("error") or "未知错误"}', changed
     account = next(
         (x for x in status.get('accounts') or [] if str(x.get('uid') or '') == uid),
         None,
     )
     if account is None:
-        return False, '状态已清除且上游已启动，但账号尚未进入账号池', changed
+        return False, '状态已清除且账号池服务已启动，但账号尚未进入账号池', changed
     has_freeze_after = bool(
         account.get('manual_disabled')
         and _is_manual_cooling_reason(account.get('manual_reason'))
     )
     if account.get('cooling') or account.get('rate_limited_models') or has_freeze_after:
-        return False, '上游已重启，但冷却或模型限流状态仍然存在', changed
+        return False, '账号池服务已重启，但冷却或模型限流状态仍然存在', changed
 
-    return True, '已强制清除冷却与模型限流状态，上游已重启生效', changed
+    return True, '已强制清除冷却与模型限流状态，账号池服务已重启生效', changed
 
 
 async def force_set_account_cooling(
@@ -1187,7 +1187,7 @@ async def force_set_account_cooling(
 
     stopped, stop_message = await _set_upstream_running(False)
     if not stopped:
-        return False, f'停止上游失败：{stop_message}', {}
+        return False, f'停止账号池服务失败：{stop_message}', {}
 
     try:
         changed = set_account_cooling_state(uid, until, reason)
@@ -1198,21 +1198,21 @@ async def force_set_account_cooling(
 
     started, start_message = await _set_upstream_running(True)
     if not started:
-        return False, f'状态已设定，但启动上游失败：{start_message}', changed
+        return False, f'状态已设定，但启动账号池服务失败：{start_message}', changed
 
     status = await _wait_for_upstream()
     if not status.get('connected'):
-        return False, f'上游重启后未就绪：{status.get("error") or "未知错误"}', changed
+        return False, f'账号池服务重启后未就绪：{status.get("error") or "未知错误"}', changed
     account = next(
         (x for x in status.get('accounts') or [] if str(x.get('uid') or '') == uid),
         None,
     )
     if account is None:
-        return False, '状态已设定且上游已启动，但账号尚未进入账号池', changed
+        return False, '状态已设定且账号池服务已启动，但账号尚未进入账号池', changed
     if not account.get('cooling') and not account.get('manual_disabled'):
-        return False, '上游已重启，但冷却状态未生效（可能已过截止时间）', changed
+        return False, '账号池服务已重启，但冷却状态未生效（可能已过截止时间）', changed
 
-    return True, '已强制设定冷却状态，上游已重启生效', changed
+    return True, '已强制设定冷却状态，账号池服务已重启生效', changed
 
 
 def expired_manual_cooling_uids(
@@ -1222,7 +1222,7 @@ def expired_manual_cooling_uids(
 
     只认 `manual_reason` 里带 `_MANUAL_COOLING_PREFIX` 标记、且**标记中的
     到期时间**已过的条目；用户自己摘流量的 manual_disabled（reason 是别的
-    文案）不在范围内。到期时间必须取自 reason，不能取 `until` —— 上游签到
+    文案）不在范围内。到期时间必须取自 reason，不能取 `until` —— 账号池服务签到
     会把 until 重置成零值，拿它判断会在签到后立刻清掉冷却。
     读不到/解析不了 state.json 时返回空列表，让调用方下一轮再试。
     """
@@ -1254,9 +1254,9 @@ def expired_manual_cooling_uids(
 async def clear_expired_manual_cooling() -> int:
     """恢复已到期的强制冷却账号，返回实际清除的数量。
 
-    上游签到只会重置 until，不会清 manual_disabled；不主动清理的话，定时冷却
+    账号池服务签到只会重置 until，不会清 manual_disabled；不主动清理的话，定时冷却
     到期后会一直停在「已停用」，与界面上「到期后自动恢复」的承诺不符。
-    只在真的有过期条目时才停上游（写 state.json 必须离线，否则周期 Flush
+    只在真的有过期条目时才停账号池服务（写 state.json 必须离线，否则周期 Flush
     会覆盖），清完立刻启动。
     """
     uids = expired_manual_cooling_uids()
@@ -1264,7 +1264,7 @@ async def clear_expired_manual_cooling() -> int:
         return 0
     stopped, stop_message = await _set_upstream_running(False)
     if not stopped:
-        logger.warning('强制冷却到期清理：停止上游失败（%s），下轮重试', stop_message)
+        logger.warning('强制冷却到期清理：停止账号池服务失败（%s），下轮重试', stop_message)
         return 0
     cleared = 0
     try:
@@ -1277,7 +1277,7 @@ async def clear_expired_manual_cooling() -> int:
     finally:
         started, start_message = await _set_upstream_running(True)
         if not started:
-            logger.warning('强制冷却到期清理后启动上游失败：%s', start_message)
+            logger.warning('强制冷却到期清理后启动账号池服务失败：%s', start_message)
     if cleared:
         logger.info('已恢复 %d 个到期的强制冷却账号', cleared)
     return cleared
@@ -1292,8 +1292,8 @@ def admin_enabled_in_config() -> tuple[bool | None, str]:
     处理方式完全相反，而用户从界面上看不出是哪一种：
 
       · 配置里**没开** → 去「设置 → 账号管理接口」打开；
-      · 配置里**已开** → 说明**运行中的上游没加载到它**。上游只在启动时读这个
-        开关，改完配置必须重启容器；若已重启仍如此，说明上游镜像早于
+      · 配置里**已开** → 说明**运行中的账号池服务没加载到它**。账号池服务只在启动时读这个
+        开关，改完配置必须重启容器；若已重启仍如此，说明账号池服务镜像早于
         2026-09-19（那版还没有这组接口）。实测有用户手改了配置文件里的一处，
         面板读到的却是另一处，于是「明明开了却还是不行」——所以这条文案里
         必须带上**面板实际读的那个路径**，用户一对就知道是不是同一个文件。
@@ -1341,13 +1341,13 @@ async def get_upstream_stats() -> dict:
 
       · 面板的用量统计（`/api/stats/*`）统计的是**经过本网关**的调用，
         按密钥归属、可按时段筛选；
-      · 上游这份是「上游进程自己看到的全部调用」——**直连 7863 的调用只在这里**，
-        而且它是**自上游进程启动以来**的累计，没有时段概念。
+      · 账号池服务这份是「账号池服务进程自己看到的全部调用」——**直连 7863 的调用只在这里**，
+        而且它是**自账号池服务进程启动以来**的累计，没有时段概念。
 
-    用户要的「原有密钥的用量」只能在后者里看到（那把密钥直连上游，面板看不见它），
+    用户要的「原有密钥的用量」只能在后者里看到（那把密钥直连账号池服务，面板看不见它），
     所以如实说明口径比数字本身更重要。
 
-    返回 `{'available': False, 'error': ...}` 表示取不到（上游没起来、版本太旧没有
+    返回 `{'available': False, 'error': ...}` 表示取不到（账号池服务没起来、版本太旧没有
     这个端点、或 api_key 不一致）——界面据此说明情况，而不是显示一片空白。
     """
     try:
@@ -1357,18 +1357,18 @@ async def get_upstream_stats() -> dict:
     except Exception as exc:  # noqa: BLE001
         return {'available': False, 'error': _err_text(exc)}
     if resp.status_code == 401:
-        return {'available': False, 'error': '上游拒绝了鉴权（api_key 不一致）'}
+        return {'available': False, 'error': '账号池服务拒绝了鉴权（api_key 不一致）'}
     if resp.status_code == 404:
         return {'available': False,
-                'error': '该上游版本没有这个端点（需要较新的上游镜像）'}
+                'error': '该账号池服务版本没有这个端点（需要较新的账号池服务镜像）'}
     if resp.status_code >= 400:
-        return {'available': False, 'error': f'上游返回 {resp.status_code}'}
+        return {'available': False, 'error': f'账号池服务返回 {resp.status_code}'}
     try:
         data = resp.json()
     except Exception as exc:  # noqa: BLE001
-        return {'available': False, 'error': f'上游返回的不是 JSON：{_err_text(exc)}'}
+        return {'available': False, 'error': f'账号池服务返回的不是 JSON：{_err_text(exc)}'}
     if not isinstance(data, dict):
-        return {'available': False, 'error': '上游返回的结构无法识别'}
+        return {'available': False, 'error': '账号池服务返回的结构无法识别'}
     # 只挑白名单字段下发（见 _STATS_ROW_FIELDS 的说明）
     out: dict = {
         'available': True,
@@ -1392,7 +1392,7 @@ async def get_models() -> tuple[bool, list | dict]:
         async with config.http_client(15, connect=3) as client:
             resp = await client.get(f'{config.WB2API_BASE}/v1/models', headers=_auth_headers())
         if resp.status_code >= 400:
-            return False, {'error': f'上游返回 {resp.status_code}'}
+            return False, {'error': f'账号池服务返回 {resp.status_code}'}
         body = resp.json()
         return True, body.get('data', body)
     except Exception as exc:  # noqa: BLE001
@@ -1402,20 +1402,20 @@ async def get_models() -> tuple[bool, list | dict]:
 def models_source(items: list) -> str:
     """判断这份模型列表来自上游「动态拉取」还是「静态回退」。
 
-    注意（上游 2026-09-15 起，commit 1b7ce4a）：上游已**删除** CN/global 的静态
+    注意（账号池服务 2026-09-15 起，commit 1b7ce4a）：账号池服务已**删除** CN/global 的静态
     兜底表，改为纯动态——动态拉取失败或池中无对应账号时返回**空列表**，不再回退
-    到编译进二进制的固定名单。因此下面的 `static` 只可能来自仍在跑老版本上游的
+    到编译进二进制的固定名单。因此下面的 `static` 只可能来自仍在跑老版本账号池服务的
     部署（那种情况下如实标「非实时」依然有用）。
 
-    判据（取上游内部实现细节）：
-      * 动态条目经 `applyModelInfoFields` 写出 `name`（上游模型对象带 Name 时必写）
+    判据（取账号池服务内部实现细节）：
+      * 动态条目经 `applyModelInfoFields` 写出 `name`（账号池服务模型对象带 Name 时必写）
         与 `max_output_tokens`（四级查找命中时写）；
-      * 老版本上游的静态表**只覆盖 CN**，条目为裸名或 `cn:` 前缀；
+      * 老版本账号池服务的静态表**只覆盖 CN**，条目为裸名或 `cn:` 前缀；
       * 故「没有动态特征键 + 没有 global 条目」才判 static——国际版的探测结果在窄表
         形态下同样不带这些键，若不加前缀约束会被误报成静态回退。
 
     为什么同时看 `name` 和 `max_output_tokens`：后者是**四级查找全不命中就省略**
-    （上游 handler.go 的 `MaxOutputTokensListingV4`，兜底是「省略字段」而非填默认值），
+    （账号池服务 handler.go 的 `MaxOutputTokensListingV4`，兜底是「省略字段」而非填默认值），
     理论上存在整张表都没这个键的情况；`name` 的写出条件宽得多（模型对象自带 Name 即可）。
     两个信号任一命中即判动态，比只认一个稳。
 
@@ -1492,7 +1492,7 @@ async def restart_container(container: str | None = None) -> tuple[bool, str]:
                 _kill_quietly(proc)
                 return False, (
                     f'{script.name} 执行超过 {_NATIVE_RESTART_TIMEOUT} 秒未结束，已终止。'
-                    f'请手动确认上游状态，或把 WB2API_START_SCRIPT / WB2API_STOP_SCRIPT '
+                    f'请手动确认账号池服务状态，或把 WB2API_START_SCRIPT / WB2API_STOP_SCRIPT '
                     f'指向不会挂住的脚本'
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1531,18 +1531,18 @@ def read_container_logs(limit: int = 200, timestamps: bool = True,
                         container: str | None = None) -> list[str] | tuple[list[str], float | None]:
     """读取上游日志（原生日志文件或 Docker，失败返回空列表）。
 
-    `container` 指定要读的容器名（issue #389：多分组部署里每组一个上游容器）。
+    `container` 指定要读的容器名（issue #389：多分组部署里每组一个账号池服务容器）。
     显式传入时**总是走 `docker logs`**，即使面板自身是 native/systemd 模式——
     分组容器是独立的 Docker 实例，日志不在本机文件里。
 
     默认带 `--timestamps`：docker 会在每行前面加上精确到纳秒的 RFC3339 时间，
-    自动任务日志据此获得准确时间并据此去重（上游自己的 log 前缀精度只到秒）。
+    自动任务日志据此获得准确时间并据此去重（账号池服务自己的 log 前缀精度只到秒）。
 
     `with_mtime=True` 额外返回原生日志文件的 mtime；Docker 模式返回 None。
     账号回填需要它：原生日志行只有 `HH:MM:SS`，没有日期，不能单独还原 epoch。
 
     `path` 指定原生模式读哪个文件，缺省仍是 `WB2API_LOG_FILE`。账号回填必须传
-    `WB2API_CHAT_LOG_FILE`：上游把对话行写 stdout、业务行写 stderr，原生模式两者
+    `WB2API_CHAT_LOG_FILE`：账号池服务把对话行写 stdout、业务行写 stderr，原生模式两者
     是两个文件。Docker 模式忽略它 —— `docker logs` 本来就把两路合并在一起。
     """
     if container is None and config.WB2API_MODE == 'native':
@@ -1639,7 +1639,7 @@ def load_upstream_config() -> dict:
     读不到时返回 available=False 并附带原因，供前端明确提示并禁止保存，
     避免把空配置写回真实文件。
 
-    注意：不返回原始配置对象。原始配置含上游 API Key、Upstash token 与
+    注意：不返回原始配置对象。原始配置含账号池服务 API Key、Upstash token 与
     设备风控 token 的明文，前端并不需要它们，不应通过接口下发。
     """
     path = config.UPSTREAM_CONFIG
@@ -1808,7 +1808,7 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
     """校验并归一化要写入的字段，挡住会把配置写坏的非法值。
 
     前端已经做了校验，这里再做一层兜底：错的数据宁可拒绝（抛错），
-    也不要写进上游配置触发容器启动失败。
+    也不要写进账号池服务配置触发容器启动失败。
     """
     out = dict(incoming)
     for key, raw in incoming.items():
@@ -1850,7 +1850,7 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             if any(ch in val for ch in ('\n', '\r', '\x00')):
                 raise ValueError(
                     '这一栏要填文件路径，不是提示词正文。正文请先写进一个文件，'
-                    '再填该文件在上游容器内的路径，例如 /app/data/prompt-custom.txt'
+                    '再填该文件在账号池服务容器内的路径，例如 /app/data/prompt-custom.txt'
                 )
             if len(val.encode('utf-8')) > 255:
                 raise ValueError(
@@ -1953,8 +1953,8 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             # 这里永远读现有配置来判，而不是假定它为空。
             if raw is True and not config.upstream_api_key().strip():
                 raise ValueError(
-                    '开启账号管理接口需要上游已设置 api_key（上游要求管理端点必须鉴权，'
-                    '否则拒绝启动）。请先在上游 config.json 里设置 api_key')
+                    '开启账号管理接口需要账号池服务已设置 api_key（账号池服务要求管理端点必须鉴权，'
+                    '否则拒绝启动）。请先在账号池服务 config.json 里设置 api_key')
             out[key] = bool(raw)
         elif section == 'upstream' and key in _UPSTREAM_TEXT_KEYS:
             # 单行文本：UA、客户端版本、用量归知名度、设备 token 文件路径
@@ -2284,7 +2284,7 @@ async def _redis_ping(url: str, timeout: float = 5.0) -> tuple[bool, str]:
 
     为什么**不套用** REST 那套「只放行公网」的判定：自建 Redis 在私网、甚至回环
     （宿主机原生部署就是 127.0.0.1:6379）都是正常形态，而这条路上探测的地址本就
-    是用户自己填给上游用的存储地址；拦掉的话按钮就变成必现误报 —— 明明上游连得
+    是用户自己填给账号池服务用的存储地址；拦掉的话按钮就变成必现误报 —— 明明账号池服务连得
     上，面板却说地址不允许（issue #125）。元数据主机名仍然拒绝（见 `_BLOCKED_HOSTNAMES`），
     那是最小的一块高风险面，且不影响任何正常部署。
     """

@@ -191,7 +191,7 @@ class ErrorCodeHintTest(unittest.TestCase):
         """未知码（含带横线的）不能抛异常 —— 之前 int() 会在这里炸。"""
         for code in ('99-1', 999999, 'weird', None):
             out = tencent._explain_code(code)
-            self.assertIn('上游返回 code=', out)
+            self.assertIn('腾讯官方返回 code=', out)
 
     def test_message_is_preserved(self) -> None:
         out = tencent._explain_code('11-128', 'first message is not system prompt')

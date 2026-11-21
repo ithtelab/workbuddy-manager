@@ -1,4 +1,4 @@
-"""账号管理：列表、扫码添加、签到、测试、刷新、删除、重启上游。"""
+"""账号管理：列表、扫码添加、签到、测试、刷新、删除、重启账号池服务。"""
 from __future__ import annotations
 
 import asyncio
@@ -141,7 +141,7 @@ def export_accounts(
                 # `.json` 与 `.json.disabled` 同时存在（手工拷贝或异常状态）时，
                 # 两者会折成同一个导出名（`.disabled` 被剥掉才能重新导入）——
                 # zip 里出现**重复条目**，解压方行为依工具而异（Python 打包时
-                # 自己都会告警）。保留先扫到的 enabled 那一份（上游实际加载的
+                # 自己都会告警）。保留先扫到的 enabled 那一份（账号池服务实际加载的
                 # 就是它），后续同名跳过。
                 logger.warning('同名账号文件重复，跳过 file=%s', path.name)
                 continue
@@ -407,10 +407,10 @@ def _today_start() -> int:
 
 
 def _group(upstream_id: int | None) -> dict:
-    """解析这次操作作用于哪个**分组**：None / 0 = 默认分组，否则查上游记录。
+    """解析这次操作作用于哪个**分组**：None / 0 = 默认分组，否则查账号池服务记录。
 
     账号相关接口有十几个，每一个都要回答同一个问题——「这次操作读哪个目录、
-    问哪个上游实例」。集中在一处：默认分组的定义、未知分组的报错、空目录的
+    问哪个账号池服务实例」。集中在一处：默认分组的定义、未知分组的报错、空目录的
     判定只有一份；多分组特性最容易错的地方就是某条路径忘了带分组、静默落到
     默认分组上（那会让「B 组的账号」显示成 A 组的，判断全错）。
     """
@@ -441,7 +441,7 @@ def _require_dir(group: dict) -> Path:
         raise HTTPException(
             status_code=409,
             detail=(f"分组「{group['name']}」没有配置本地账号目录，无法在面板里管理"
-                    "它的账号；请到「设置 → 上游」为它填写账号目录（与那套上游实例"
+                    "它的账号；请到「设置 → 上游」为它填写账号目录（与那套账号池服务实例"
                     "的 auths 目录一致）"),
         )
     return d
@@ -450,7 +450,7 @@ def _require_dir(group: dict) -> Path:
 def _reload_target(group: dict) -> dict | None:
     """转给 reload 模块的分组参数：默认分组传 None（既有行为逐字不变）。
 
-    默认上游的启停走 WB2API_MODE / 启停脚本那套（native 部署依赖它），
+    默认账号池服务的启停走 WB2API_MODE / 启停脚本那套（native 部署依赖它），
     只有非默认分组才按「容器名」重启。
     """
     return None if group.get('is_default') else group
@@ -492,7 +492,7 @@ async def account_set_weight(
 ) -> dict:
     """设置 / 清除账号手写权重（issue #187）。
 
-    权重是**乘数**不是优先级：上游本来就按「余额 + 快过期占比 + 闲置时长」加权
+    权重是**乘数**不是优先级：账号池服务本来就按「余额 + 快过期占比 + 闲置时长」加权
     随机选号（见 pool.weightOf），这里把结果再乘该值 —— 2 表示同等条件下被抽中的
     机会约为默认的两倍。它不改变可用性（冷却 / 禁用 / 在途占满照旧拦截），也不会
     让低权重的号彻底饿死（固定优先会让闲置号的积分白过期，这正是 #187 另一半
@@ -500,7 +500,7 @@ async def account_set_weight(
 
     `weight` 传 0 = 恢复默认（等价 1.0，并从文件里删掉该键）。
 
-    为什么改完要重载上游：权重在上游是**加载时**解析进内存的（auth.Parse），
+    为什么改完要重载账号池服务：权重在账号池服务是**加载时**解析进内存的（auth.Parse），
     磁盘改完不重载不生效 —— 与「出口线路」同一套机制。
     """
     group = _group(upstream_id)
@@ -519,13 +519,13 @@ async def account_set_weight(
 @router.get('/accounts')
 async def list_accounts(upstream_id: int | None = Query(None),
                         user: dict = Depends(security.current_user)) -> dict:
-    """账号列表：本地授权信息 + 上游运行时状态（含积分余额）。
+    """账号列表：本地授权信息 + 账号池服务运行时状态（含积分余额）。
 
-    积分（credits）优先使用上游 /status 的值：它是上游调度时写入的快照，
+    积分（credits）优先使用账号池服务 /status 的值：它是账号池服务调度时写入的快照，
     与账号可用性判定一致，开销也小。前端可用「刷新积分」触发实时查询。
 
     upstream_id 指定**分组**（缺省 = 默认分组）：账号文件读该分组的目录，
-    积分与运行状态问该分组的上游实例。两者必须一致——读 A 组的文件、问 B 组
+    积分与运行状态问该分组的账号池服务实例。两者必须一致——读 A 组的文件、问 B 组
     的状态，界面会把「别的组的账号」标成在线/离线，判断全错。
     """
     group = _group(upstream_id)
@@ -543,7 +543,7 @@ async def list_accounts(upstream_id: int | None = Query(None),
     added_times = db.account_added_times(base_dir) if base_dir else {}
     # 今日签到状态随列表一次带回（和备注同一个理由：两处视图都直接读它）。
     # 数据源是本端签到记录 —— 腾讯对「今天已签过」回 10001 且我们照记，
-    # 所以「本端签过」与「今天已签到」在这里是同一件事。上游自动签到不产
+    # 所以「本端签过」与「今天已签到」在这里是同一件事。账号池服务自动签到不产
     # 逐账号记录（它只打一行汇总），所以首次进入面板时可能显示未签到，
     # 手动点一次拿到 10001 后就归位了 —— 这一点在界面上如实说明。
     done_today = db.checkin_done_since(_today_start())
@@ -603,7 +603,7 @@ def save_account_order(body: dict,
 @router.get('/upstream/status')
 async def upstream_status(upstream_id: int | None = Query(None),
                           user: dict = Depends(security.current_user)) -> dict:
-    """上游运行状态。
+    """账号池服务运行状态。
 
     路径从 `/api/status` 迁到这里：那个地址要让给客户端余额协议的公开元数据
     端点（见 routers/balance），而它必须无鉴权可达。本接口要登录，改用与
@@ -637,13 +637,13 @@ async def models(
     realm: str | None = None,
     user: dict = Depends(security.current_user),
 ) -> dict:
-    """上游可用模型列表。
+    """账号池服务可用模型列表。
 
-    返回结构化对象而非裸数组，是为了带上 source：上游在动态拉取失败时会
+    返回结构化对象而非裸数组，是为了带上 source：账号池服务在动态拉取失败时会
     回退到**内置静态表**（老版本写死的，数量少得多），两者外观一样。前端
     据此如实标注来源，避免让人误以为是自己账号/配置有问题。
 
-    realm 非空时只返回该版本的条目：上游清单里带 `cn:` / `global:` 前缀，
+    realm 非空时只返回该版本的条目：账号池服务清单里带 `cn:` / `global:` 前缀，
     不过滤会把两个版本的模型混在一起显示。
     """
     ok, data = await wb2api.get_models()
@@ -659,18 +659,18 @@ async def models(
     if realm:
         r = 'global' if str(realm).strip().lower() == 'global' else 'cn'
         items = [m for m in items if modelcatalog._belongs(m, r)]
-    # 去掉 `cn:` 前缀：那是**上游的路由约定**，不是模型本身的名字。
+    # 去掉 `cn:` 前缀：那是**账号池服务的路由约定**，不是模型本身的名字。
     # 界面要显示的是「腾讯自带的模型名」（glm-5.2 / deepseek-v4.1-flash），
     # 前面挂个 cn: 既难看又让人以为得照着写。
     #
-    # ⚠️ 只去 `cn:`，**绝不能动 `global:`**：上游 resolveModel 只认 `[realm:]model`
+    # ⚠️ 只去 `cn:`，**绝不能动 `global:`**：账号池服务 resolveModel 只认 `[realm:]model`
     # 协议——取第一个 `:` 前段恰为 cn/global 才剥离，**其余一律当裸名（= 国内版）**。
     # 所以裸名走国内版本来就成立（存量客户端一直如此），但**国际版一旦失去
     # `global:` 前缀就会被路由到国内账号池**（模型名对不上，必然报错）。
     # 曾用过 modelcatalog._strip_realm_prefix()，它把两种前缀都去掉了——那会让
     # 界面上的国际版模型名变成「不可用」，实测发现后改为只去 cn:。
     items = [_strip_cn_prefix(m) for m in items]
-    # 按模型中心目录裁掉已下架模型（issue #407）：上游 /v1/models 的静态表里
+    # 按模型中心目录裁掉已下架模型（issue #407）：账号池服务 /v1/models 的静态表里
     # 还留着 lkeap / v3-0324 这类早就不能用的名字，界面和客户端都会当成可选。
     # 两个版本都取到腾讯直连目录时才裁；任一版本取不到就原样返回，不清空列表。
     catalog_realms = ['global' if str(realm).strip().lower() == 'global' else 'cn'] if realm else ['cn', 'global']
@@ -725,7 +725,7 @@ async def auth_start(
 
       1. **版本跟随账号**，不跟随界面上的全局切换。国际版账号在界面停在国内版
          时点重登，此前拿到的是国内版二维码，落盘时 `auth.realm` 还被改写成 cn
-         —— 这个账号随后拿一张国内版令牌去请求，聊天 401、被上游系统禁用，
+         —— 这个账号随后拿一张国内版令牌去请求，聊天 401、被系统禁用，
          重登一百次也不会离开队列（每次都在重复同一个错误）。目标账号已知，
          版本就该由它决定，`realm` 参数在这种情况下被忽略。
       2. **扫到的必须是它**（见 `auth_poll` 的 `account_mismatch`）。
@@ -816,7 +816,7 @@ async def auth_poll(
     upstream_id: int | None = Query(None),
     user: dict = Depends(security.require_admin),
 ) -> dict:
-    """轮询扫码结果；成功则落盘并触发上游重载。
+    """轮询扫码结果；成功则落盘并触发账号池服务重载。
 
     region：国际版账号的地区代码（如 HK）。国际版新号必须先完成地区注册，
     否则聊天会报 14017；地区由用户在弹窗里选，这里只负责提交，不替他决定。
@@ -970,23 +970,23 @@ async def _poll_login_background(state: str, realm: str, region: str | None,
 
 # ── 系统自动禁用（disabled）的解除 ────────────────────────────────
 #
-# 上游把「账号不可用」拆成**两位独立的开关**：
+# 账号池服务把「账号不可用」拆成**两位独立的开关**：
 #
 #   · `manual_disabled` —— 运维主动摘的（面板的「临时停用」）；
 #   · `disabled`        —— 系统自动禁的（12153 连败 3 次、或 11140 被封）。
 #
-# 两者由不同的端点解除：`enable` 只清前者，`revive` 只清后者（上游 admin.go
+# 两者由不同的端点解除：`enable` 只清前者，`revive` 只清后者（账号池服务 admin.go
 # 原话：「若账号仍被系统自动禁用，它不会因此回到选号池——那需要 revive」）。
 #
 # 面板此前**只调 disable/enable、从不调 revive**，于是被自动禁用的账号在面板里
-# 没有任何操作能救回来 —— 重新登录只换凭证（上游 upsert 保留 disabled）、签到被
+# 没有任何操作能救回来 —— 重新登录只换凭证（账号池服务 upsert 保留 disabled）、签到被
 # `!e.disabled` 挡掉、一次成功又要求先被选中（自锁）、时间也不会让它过期。
 # 用户报的「国际版重新登录后连通性测试通过、账号池就是调不动」就是这条。
 
 
 async def _revive_if_disabled(uid: str, *, base_url: str | None = None,
                               api_key: str | None = None) -> tuple[bool, str, bool | None]:
-    """账号若被上游**系统自动禁用**，解除它。
+    """账号若被账号池服务**系统自动禁用**，解除它。
 
     返回 `(是否真的解除了, 说明文案, 之后是否仍被禁用)` —— 第三位是**三态**：
     `True` 仍禁用 / `False` 确认已回到池子 / `None` 读不到状态（不知道）。
@@ -1003,13 +1003,13 @@ async def _revive_if_disabled(uid: str, *, base_url: str | None = None,
     """
     still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
     if still is None:
-        return False, '读不到该账号在上游的状态（上游不可达，或它还没进入账号池）', None
+        return False, '读不到该账号在账号池服务的状态（账号池服务不可达，或它还没进入账号池）', None
     if not still:
         return False, '', False
     ok, msg, code = await wb2api.revive_account(uid, base_url=base_url, api_key=api_key)
     if not ok:
         if code == 'no_route':
-            return False, ('上游未启用管理接口，无法解除系统禁用 —— 请到'
+            return False, ('账号池服务未启用管理接口，无法解除系统禁用 —— 请到'
                            '「设置 → 账号管理接口」开启后重试'), True
         return False, f'解除系统禁用失败：{msg}', True
     # 再确认一次：接口回 200 ≠ 真的回到池子（见 revive_account 的说明）。
@@ -1019,7 +1019,7 @@ async def _revive_if_disabled(uid: str, *, base_url: str | None = None,
 
 
 # 重新登录后的自动恢复。等待上限比热加载窗口（约 5 秒）宽一档：账号文件刚落盘时
-# 上游可能还没扫到，这时 `/status` 里读不到它（返回 None），要再等一轮。
+# 账号池服务可能还没扫到，这时 `/status` 里读不到它（返回 None），要再等一轮。
 _REVIVE_WAIT_SECONDS = 20.0
 _REVIVE_POLL_SECONDS = 2.0
 
@@ -1041,7 +1041,7 @@ async def _revive_after_login(uid: str, group: dict) -> None:
     while time.monotonic() < deadline:
         still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
         if still is None:
-            await asyncio.sleep(_REVIVE_POLL_SECONDS)   # 还没被上游收录，再等等
+            await asyncio.sleep(_REVIVE_POLL_SECONDS)   # 还没被账号池服务收录，再等等
             continue
         if not still:
             return                                      # 没被禁用，无需处理
@@ -1137,7 +1137,7 @@ async def _finish_and_revive(result: dict, realm_of_result: str, region_msg: str
 
 # 重登（针对某个账号）时**当场**尝试解除系统禁用的窗口。
 #
-# 取 6s：账号文件刚落盘时上游热加载约 5 秒，等一轮就够；而用户此刻正盯着弹窗，
+# 取 6s：账号文件刚落盘时账号池服务热加载约 5 秒，等一轮就够；而用户此刻正盯着弹窗，
 # 超过几秒的等待比「先说成功、队列里却还挂着」更难接受。等不到就交回后台那套
 # 更长窗口的任务，并在响应里如实写「还在处理」。
 _REVIVE_INLINE_WAIT_SECONDS = 6.0
@@ -1150,7 +1150,7 @@ async def _revive_inline(uid: str, group: dict) -> dict:
     为什么不能只靠后台的 `_revive_after_login`：它是 fire-and-forget，失败只写
     一行日志。而重登是用户为解决「这个号已停用」按的按钮 —— 结果必须回到他眼前，
     否则「凭证已更新、徽章还红着、队列里还排着」就是死结：用户没有任何线索知道
-    是上游管理接口没开、还是 api_key 不对、还是账号被封禁了。
+    是账号池服务管理接口没开、还是 api_key 不对、还是账号被封禁了。
 
     返回字段：
       · `ok`            真的解除了（或本来就没被禁用）；
@@ -1175,7 +1175,7 @@ async def _revive_inline(uid: str, group: dict) -> dict:
                         'message': msg}
             return {'attempted': True, 'ok': False, 'still_disabled': after,
                     'message': msg or '解除系统禁用失败'}
-        # None = 上游读不到它（还没收录 / 上游不可达），等下一轮
+        # None = 账号池服务读不到它（还没收录 / 账号池服务不可达），等下一轮
         if time.monotonic() >= deadline:
             break
         await asyncio.sleep(_REVIVE_INLINE_POLL_SECONDS)
@@ -1185,13 +1185,13 @@ async def _revive_inline(uid: str, group: dict) -> dict:
     _schedule_revive_after_login(uid, group)
     return {
         'attempted': True, 'ok': False, 'pending': True, 'still_disabled': None,
-        'message': '上游还没收录这个账号（或暂时读不到状态），已在后台继续尝试解除停用',
+        'message': '账号池服务还没收录这个账号（或暂时读不到状态），已在后台继续尝试解除停用',
     }
 
 
 def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
                      state: str, group: dict | None = None) -> dict:
-    """落盘 + 收尾（重载上游、丢弃 state）。落盘失败时抛出**可执行**的提示。
+    """落盘 + 收尾（重载账号池服务、丢弃 state）。落盘失败时抛出**可执行**的提示。
 
     单独抽出来是因为它有两条进入路径：首次供给后、以及「上次就是败在落盘」
     的重试。两条路径都必须给出同样的引导，且都**不丢 state**（issue #26）。
@@ -1206,12 +1206,12 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
         filename, existed = tencent.write_auth_file(result, auth_dir)
     except ValueError as exc:
         # uid 形态异常（`write_auth_file` 会校验后才拼文件名）。这不是权限问题，
-        # 给「去 chown」的提示会把用户引到错方向 —— 如实说明是上游返回的数据异常。
+        # 给「去 chown」的提示会把用户引到错方向 —— 如实说明是账号池服务返回的数据异常。
         raise HTTPException(
             status_code=500,
             detail=(
                 f'账号已授权成功，但返回的账号标识形态异常，已拒绝写入：{exc}。'
-                f'这通常是上游接口返回了非预期的数据；请重试一次，'
+                f'这通常是账号池服务接口返回了非预期的数据；请重试一次，'
                 f'若持续出现请把本条信息反馈给我们。'
             ),
         ) from exc
@@ -1240,13 +1240,13 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
     _provisioned_states.pop(state, None)
     _login_targets.pop(state, None)
 
-    # 让上游加载新账号：**先等它的 auths 热加载，超时才重启**（后台执行，
-    # 不阻塞本次响应）。此前无脑重启，而重启期间上游 /status 不可用 —— 前端
+    # 让账号池服务加载新账号：**先等它的 auths 热加载，超时才重启**（后台执行，
+    # 不阻塞本次响应）。此前无脑重启，而重启期间账号池服务 /status 不可用 —— 前端
     # 收到成功立刻刷新账号列表，那一刷会一直挂到容器起来，用户看到的是
     # 「登录成功却要等 20-30 秒」。详见 reload.request_reload_or_restart。
     reload.request_reload_or_restart(str(result.get('uid') or ''),
                                      upstream=_reload_target(group))
-    # 登录后尝试恢复会话失效导致的系统禁用；revive_account 会拒绝上游封禁账号。
+    # 登录后尝试恢复会话失效导致的系统禁用；revive_account 会拒绝账号池服务封禁账号。
     # 重登（`targeted`）不走这里：那条路要**当场**把结果回给界面，由 auth_poll
     # 调 `_revive_inline` 完成；两条同时跑会对着同一个账号重复 revive。
     if not targeted:
@@ -1268,7 +1268,7 @@ def _auth_dict(raw: dict, directory: Path | None = None) -> dict:
 
     device_token 是**每号**的设备风控 token（auth 文件顶层 device_token 键，
     与 workbuddy2api 的解析位置一致）；缺省留空，由 realm.device_token_for
-    回退到上游 config 的全局值或文件。
+    回退到账号池服务 config 的全局值或文件。
 
     `nickname` / `proxy_session` 只为**旧版线路地址里的 `{account}` 会话模板**带上
     （`config.route_session_name` 要拿它算会话名）：会话名决定住宅代理的出口 IP，
@@ -1314,7 +1314,7 @@ async def account_checkin(filename: str, upstream_id: int | None = Query(None),
         db.add_checkin_log(uid, nickname, 'manual', False, None, '该账号无有效 accessToken')
         return {'code': -1, 'message': '该账号无有效 accessToken'}
 
-    # 今天已经签过就不再打上游：腾讯对重复签到回 10001（幂等成功，不是错误），
+    # 今天已经签过就不再打账号池服务：腾讯对重复签到回 10001（幂等成功，不是错误），
     # 但每点一次都是一次真实 RPC，而且会在签到记录里堆出一串「今日已签到」，
     # 把真正的失败记录挤出视线（线上实测：同一个账号一天被记了 11 条）。
     # 这里就地返回、不写日志，让「签到记录」保持「每次实际动作一条」。
@@ -1329,7 +1329,7 @@ async def account_checkin(filename: str, upstream_id: int | None = Query(None),
             'expiries': [],
         }
 
-    # 传完整 auth dict：billing 域要带 X-User-Id 等身份头（对齐上游 BillingHeaders）
+    # 传完整 auth dict：billing 域要带 X-User-Id 等身份头（对齐账号池服务 BillingHeaders）
     code, message = await tencent.checkin({
         '_risk_auth_dir': str(base_dir),
         'access_token': token,
@@ -1345,7 +1345,7 @@ async def account_checkin(filename: str, upstream_id: int | None = Query(None),
     ok = code in (0, 10001)
     db.add_checkin_log(uid, nickname, 'manual', ok, code, message)
 
-    # 签到后顺带查实时积分：上游只在它自己的定时任务里刷新 credits，
+    # 签到后顺带查实时积分：账号池服务只在它自己的定时任务里刷新 credits，
     # 手动签到不会带动它更新，所以这里主动查一次返回给前端。
     credits: int | float | None = None
     expiries: list[dict] = []
@@ -1396,11 +1396,11 @@ async def account_credits(
 
 
 def _local_accounts() -> dict[str, dict]:
-    """本机**所有分组**当前存在的账号 uid 及其调度状态（不查上游）。
+    """本机**所有分组**当前存在的账号 uid 及其调度状态（不查账号池服务）。
 
     快照按 uid 登记、不分分组，所以判断「这个 uid 还在不在」也要跨分组找。
     `active` 只依赖本地就能判的信号：账号文件存在、没有 `.disabled` 后缀、
-    令牌没有过期。上游的 `disabled`/`manual_disabled` 要问 /status，这个只读
+    令牌没有过期。账号池服务的 `disabled`/`manual_disabled` 要问 /status，这个只读
     接口刻意不发请求；跨分组同名 uid 只要有一组可用就算可用。
     """
     found: dict[str, dict] = {}
@@ -1422,14 +1422,14 @@ def _local_accounts() -> dict[str, dict]:
 @router.get('/accounts/admin-api-status')
 def account_admin_api_status(upstream_id: int | None = Query(None),
                              user: dict = Depends(security.require_admin)) -> dict:
-    """上游「账号管理接口」（admin.enabled）开关状态，供解禁队列提示用。
+    """账号池服务「账号管理接口」（admin.enabled）开关状态，供解禁队列提示用。
 
-    revive / enable / disable 这组解封操作都依赖上游这组接口：开关没开时，
+    revive / enable / disable 这组解封操作都依赖账号池服务这组接口：开关没开时，
     重新登录只换令牌、清不掉「禁用」位。前端据此把「可通过解禁队列重新登录
     解封」换成「需先在设置开启管理接口」，避免误导用户白重登。
 
     这里只读**本地配置文件**、不做运行时探测：运行时是否生效由「保存设置自动
-    重启」保证；若要更精确（配置已开但运行中的上游没加载到它），应参照
+    重启」保证；若要更精确（配置已开但运行中的账号池服务没加载到它），应参照
     `_disable_hint` 的运行时诊断逻辑，本接口刻意保持轻量。
 
     非默认分组通常跑在另一套容器/主机上，面板读不到它的 config.json——
@@ -1447,7 +1447,7 @@ def account_admin_api_status(upstream_id: int | None = Query(None),
 @router.get('/accounts/credits-snapshot')
 def credits_snapshot(include_inactive: bool = Query(False),
                      user: dict = Depends(security.current_user)) -> dict:
-    """已登记的积分快照（只读，**不触发任何上游查询**）。
+    """已登记的积分快照（只读，**不触发任何账号池服务查询**）。
 
     给外部工具/对账用：默认只返回**当前还在、且还能被调度**的账号的登记值，
     这样按 uid / 按域汇总出来的余额就是实际可花的量（issue #404）。已删除账号
@@ -1490,7 +1490,7 @@ async def refresh_all_credits(
 ) -> dict:
     """并发查询所有账号的积分，返回 {uid: credits} 与每条是否来自缓存。
 
-    上游 /status 的 credits 只在它定时任务时更新，可能滞后数小时；
+    账号池服务 /status 的 credits 只在它定时任务时更新，可能滞后数小时；
     本接口直接向腾讯查询。force=true（默认）用于「刷新积分」按钮，
     强制绕过 60 秒缓存；force=false 用于页面加载，命中缓存时不重复请求腾讯。
     无论哪种，都回传 cached / cache_age，前端据此标注「实时 / 缓存」。
@@ -1500,7 +1500,7 @@ async def refresh_all_credits(
     `force=false`（页面加载那条路）**任何已登录用户都能调**：它读取的是
     账号余额，属于只读信息，只读账号同样应当看到**同一份**数字。
     此前整个接口都是 admin-only，于是只读账号的页面加载静默 403，界面
-    回退到上游 `/status` 的快照值——那是「上游上次调度这个账号时记下的」，
+    回退到账号池服务 `/status` 的快照值——那是「账号池服务上次调度这个账号时记下的」，
     可能滞后数小时、也可能还是 0，用户看到的就是「积分不对 / 有两个显示 0」。
 
     `force=true`（显式点「刷新积分」）仍然只有管理员能调：它会**强制**绕过
@@ -1516,7 +1516,7 @@ async def refresh_all_credits(
     # 非字符串一律当「没传」，否则会把哨兵当成文件名去匹配（必然 404）。
     if isinstance(file, str) and file.strip():
         # 单账号刷新（issue #432）：账号多时只想更新某一个号的积分，
-        # 不必为它把整池都打一遍上游。文件名不在本组时按 404 处理，
+        # 不必为它把整池都打一遍账号池服务。文件名不在本组时按 404 处理，
         # 不静默退化成「刷了全部」——那会让用户以为只刷新了一个。
         wanted = str(file).strip()
         picked = [a for a in accounts
@@ -1578,13 +1578,13 @@ def _checkin_semaphore() -> asyncio.Semaphore:
     return asyncio.Semaphore(config.CHECKIN_CONCURRENCY)
 
 
-# 批量签到的退避序列（issue #256）：上游偶发 `10001 签到失败，请稍后重试`，
+# 批量签到的退避序列（issue #256）：账号池服务偶发 `10001 签到失败，请稍后重试`，
 # 隔几秒单号重试即可成功。5s + 15s 总等待 20s，仍在面板 60s 超时内。
 _CHECKIN_RETRY_DELAYS = (5.0, 15.0)
 
 
 async def _checkin_with_retry(payload: dict, realm) -> tuple[int, str]:
-    """执行签到；仅对 -3（上游瞬时拒绝）按 5s/15s 退避重试。"""
+    """执行签到；仅对 -3（账号池服务瞬时拒绝）按 5s/15s 退避重试。"""
     code, message = await tencent.checkin(payload, realm)
     for delay in _CHECKIN_RETRY_DELAYS:
         if code != -3:
@@ -1599,7 +1599,7 @@ async def checkin_all(upstream_id: int | None = Query(None),
                       user: dict = Depends(security.require_admin)) -> dict:
     """对所有账号执行一次签到，并逐条记录结果。
 
-    上游的自动签到只在失败时打日志、成功静默，且没有可触发的 HTTP 接口；
+    账号池服务的自动签到只在失败时打日志、成功静默，且没有可触发的 HTTP 接口；
     这里用管理端自己的签到实现补齐「可手动触发 + 可追溯」。
 
     并发执行（上限见 WB_CHECKIN_CONCURRENCY）：逐个 await 时，
@@ -1629,7 +1629,7 @@ async def checkin_all(upstream_id: int | None = Query(None),
             db.add_checkin_log(uid, nickname, 'manual-batch', False, None, msg)
             return {'nickname': nickname, 'ok': False, 'message': msg}
 
-        # 国际版没有签到体系：直接跳过（不记失败，也不打上游请求）
+        # 国际版没有签到体系：直接跳过（不记失败，也不打账号池服务请求）
         if not supports_checkin(realm_of(auth)):
             msg = '国际版无签到体系，已跳过'
             db.add_checkin_log(uid, nickname, 'manual-batch', False, -2, msg)
@@ -1645,7 +1645,7 @@ async def checkin_all(upstream_id: int | None = Query(None),
 
         async with sem:
             # 传完整 auth dict：billing 域要带 X-User-Id 等身份头
-            # 瞬时 10001（上游短时限流）在 sem 内退避重试：放掉信号量再睡会让
+            # 瞬时 10001（账号池服务短时限流）在 sem 内退避重试：放掉信号量再睡会让
             # 其他账号涌入，重新制造并发峰值（issue #256）。
             code, message = await _checkin_with_retry({
                 '_risk_auth_dir': str(base_dir),
@@ -1670,7 +1670,7 @@ async def checkin_all(upstream_id: int | None = Query(None),
     # 两类账号都不进 `total` 分母，各自单独报数：
     #   · skipped：国际版没有签到体系，既不会成功也不是失败。算进 total 会显示成
     #     「5/6 成功」，用户以为漏签了一个号、反复去点——而它永远是「已跳过」。
-    #   · already：今日已签到，本次压根没打上游。算进 total 会把「无需重复」说成
+    #   · already：今日已签到，本次压根没打账号池服务。算进 total 会把「无需重复」说成
     #     「刚签成功」，用户会以为这次点击真的又签了一次。
     # 于是 total 的含义收敛成「本次真正发起并需要结果的账号数」，
     # succeeded 自然就是「这次真签上了几个」。
@@ -1696,13 +1696,13 @@ def checkin_logs(
     realm: str | None = None,
     user: dict = Depends(security.current_user),
 ) -> dict:
-    """签到记录（分页）：**本端触发的 + 上游自动签到的**统一视图。
+    """签到记录（分页）：**本端触发的 + 账号池服务自动签到的**统一视图。
 
-    为什么要合并：签到记录原先只写本端触发的（手动 / 批量 / 添加账号），而上游
+    为什么要合并：签到记录原先只写本端触发的（手动 / 批量 / 添加账号），而账号池服务
     定时签到的结果由日志采集器写进 task_logs。于是「自动签到」在签到记录里
     永远看不到——用户反馈的「自动签到不显示」就是这个。
 
-    上游对签到成功是静默的（只打一行 `checkin done: total=.. ok=..` 汇总 + 失败明细），
+    账号池服务对签到成功是静默的（只打一行 `checkin done: total=.. ok=..` 汇总 + 失败明细），
     所以自动签到侧提供的是**每轮汇总/异常行**，不是逐账号成功明细；这一点在
     界面上如实标注，不假装有更细的数据。
 
@@ -1731,7 +1731,7 @@ def checkin_logs(
     local_total = db.count_checkin_logs(uid=uid, days=days)
     local_items = [{**r, 'auto': False} for r in local]
 
-    # 上游自动签到（采集器落库的 kind='checkin'）
+    # 账号池服务自动签到（采集器落库的 kind='checkin'）
     auto_rows = db.list_task_logs(limit=want, uid=uid, kind='checkin', offset=0, days=days)
     auto_total = db.count_task_logs(uid=uid, kind='checkin', days=days)
     auto_items = [
@@ -1764,7 +1764,7 @@ def checkin_logs(
     total = len(merged) if realm_map is not None else local_total + auto_total
     unfiltered_total = local_total + auto_total
 
-    # 自动侧的行也要解析昵称（上游只带 uid 前 8 位）；本端的已有昵称
+    # 自动侧的行也要解析昵称（账号池服务只带 uid 前 8 位）；本端的已有昵称
     resolve_nick = _nickname_resolver()
     for it in merged:
         if not it.get('nickname'):
@@ -1796,7 +1796,7 @@ def clear_checkin_logs(user: dict = Depends(security.require_session_admin)) -> 
 def _nickname_resolver() -> object:
     """构造 uid → 昵称的解析函数。
 
-    上游 2026-09-12 起把日志里的 uid 截成前 8 位，而账号表里是完整 uuid，
+    账号池服务 2026-09-12 起把日志里的 uid 截成前 8 位，而账号表里是完整 uuid，
     无法直接相等匹配，因此按前缀解析；前缀命中多个账号（理论可能）时不猜，
     保留 uid 原文。签到记录与任务记录都用它，避免两处口径不一致。
     """
@@ -1841,7 +1841,7 @@ def _realm_uid_filter(realm: str | None) -> dict[str, str] | None:
     """构造「哪些 uid 属于该版本」的映射；realm 为空返回 None（不过滤）。
 
     日志表里只有 uid，没有 realm 列（本方案选择不改数据库），所以按
-    账号表把 uid 映射到版本再筛。上游日志里的 uid 是前 8 位，这里同时
+    账号表把 uid 映射到版本再筛。账号池服务日志里的 uid 是前 8 位，这里同时
     支持完整 uid 与前缀两种匹配。
 
     注意：账号已被删除时其历史日志无从判断版本，一律按「不属于任何版本」
@@ -1881,7 +1881,7 @@ def _uid_matches_realm(uid: str, realm_map: dict[str, str] | None, realm: str) -
     full = realm_map.get(u)
     if full is not None:
         return full == want
-    # 上游只给前 8 位：前缀唯一命中才算，命中多个视为不确定、不展示
+    # 账号池服务只给前 8 位：前缀唯一命中才算，命中多个视为不确定、不展示
     hits = {v for k, v in realm_map.items() if k[:8] == u[:8]}
     return len(hits) == 1 and hits.pop() == want
 
@@ -1896,9 +1896,9 @@ def task_logs(
     realm: str | None = None,
     user: dict = Depends(security.current_user),
 ) -> dict:
-    """上游自动任务留痕（猫猫旅行 / 活跃上报 / 自动签到 / 保活）。
+    """账号池服务自动任务留痕（猫猫旅行 / 活跃上报 / 自动签到 / 保活）。
 
-    上游把这些结果打在容器日志里，容器重建即丢失；本接口读取的是
+    账号池服务把这些结果打在容器日志里，容器重建即丢失；本接口读取的是
     后台采集器解析后落库的记录，因此能长期保留并统计积分收益。
 
     分页返回：列表只取当前页，`total` 为**当前筛选下**的总数，
@@ -1916,7 +1916,7 @@ def task_logs(
 
     resolve_nick = _nickname_resolver()
     for row in logs:
-        # 结果文案中文化：数据库留英文原文（排查要看上游原话），
+        # 结果文案中文化：数据库留英文原文（排查要看账号池服务原话），
         # 接口额外给出 message_cn 供界面展示
         row['message_cn'] = tasklog.translate_message(row.get('message', ''))
         row['nickname'] = resolve_nick(str(row.get('uid') or ''))
@@ -1987,7 +1987,7 @@ _provisioned_states: dict[str, float] = {}
 
 
 # ── 成长任务一键执行（issue #19）─────────────────────────────
-# 调用上游自带的 scripts/task_runner.py。三种模式按风险分级，见 taskrun 模块注释：
+# 调用账号池服务自带的 scripts/task_runner.py。三种模式按风险分级，见 taskrun 模块注释：
 # preview 只读 / claim 幂等领奖 / full 点亮+领奖（会伪造上报）。
 # 全部仅管理员可用 —— 这些操作会对账号发起真实写请求。
 
@@ -2072,16 +2072,16 @@ def task_claim_schedule_put(
 
 @router.get('/upstream/logs')
 def upstream_logs(limit: int = 200, user: dict = Depends(security.current_user)) -> dict:
-    """上游容器日志中与自动任务相关的行（原始日志）。
+    """账号池服务容器日志中与自动任务相关的行（原始日志）。
 
-    上游只在失败时打日志、成功大多静默（旅行与活跃上报除外，它们会记录
+    账号池服务只在失败时打日志、成功大多静默（旅行与活跃上报除外，它们会记录
     积分与服务端判据）。结构化、可长期保留的记录见 /api/task-logs。
     """
     limit = max(1, min(int(limit), 2000))
     lines = wb2api.read_container_logs(limit=limit)
     keywords = ('checkin', 'keepalive', 'user-resource', 'travel', 'activity')
     interesting = [
-        # 去掉 docker --timestamps 前缀（上游自己已带秒级时间，重复显示反而难读）
+        # 去掉 docker --timestamps 前缀（账号池服务自己已带秒级时间，重复显示反而难读）
         tasklog.strip_docker_ts(ln)
         for ln in lines
         if any(k in ln.lower() for k in keywords)
@@ -2096,8 +2096,8 @@ async def account_test(filename: str, upstream_id: int | None = Query(None),
     raw = _load(filename, base_dir)
     acct = raw.get('account') or {}
     auth = raw.get('auth') or {}
-    # 探测需要 uid / enterpriseId / domain 以复刻上游请求头，
-    # device_token 用于 X-Device-Token（上游 chat 域同样注入）
+    # 探测需要 uid / enterpriseId / domain 以复刻账号池服务请求头，
+    # device_token 用于 X-Device-Token（账号池服务 chat 域同样注入）
     ok, message = await tencent.probe_account({
         '_risk_auth_dir': str(base_dir),
         'access_token': auth.get('accessToken', ''),
@@ -2112,7 +2112,7 @@ async def account_test(filename: str, upstream_id: int | None = Query(None),
 
 
 # 主动探测一次最多的账号 × 模型组合数与规模上限（issue #270）。
-# 每条组合都是一次真实对话请求（max_tokens=1），上限既保护上游配额，也保证
+# 每条组合都是一次真实对话请求（max_tokens=1），上限既保护账号池服务配额，也保证
 # 这个同步接口能在浏览器超时前跑完（每账号内串行 + 600ms 间隔）。
 _PROBE_COMBOS_MAX = 60
 _PROBE_ACCOUNTS_MAX = 20
@@ -2139,7 +2139,7 @@ async def probe_models(body: dict = Body(...),
                        user: dict = Depends(security.require_admin)) -> dict:
     """账号 × 模型主动探测：一次性回答「这个号能不能用这个模型」（issue #270）。
 
-    结果分类与上游错误口径一致：ok / rate（6004 模型限流）/ credit（402 或
+    结果分类与账号池服务错误口径一致：ok / rate（6004 模型限流）/ credit（402 或
     积分文案）/ auth（401 / 12153）/ no_model（11102，**不算错误**）/ error。
 
     限流保护：同一账号内串行、每条之间 600ms；不同账号最多 4 路并发；
@@ -2255,7 +2255,7 @@ async def probe_models(body: dict = Body(...),
 
 
 async def _refresh_one_token(filename: str, base_dir: Path) -> dict:
-    """刷新单个账号的 accessToken 并原子写回（**不含上游重载**）。
+    """刷新单个账号的 accessToken 并原子写回（**不含账号池服务重载**）。
 
     单账号端点与「一键刷新令牌」批量端点共用这一份实现——协议本身、错误文案、
     原子写回的口径只有一处，两个入口对同一个失败不会给出不同说法。
@@ -2311,11 +2311,11 @@ async def _refresh_one_token(filename: str, base_dir: Path) -> dict:
 def _refresh_reload_tail(group: dict, reloaded: bool, reload_error: str) -> str:
     """重载结果 → 追在成功文案后面的那句话（单账号 / 批量共用）。"""
     if reloaded:
-        return '，上游已重载生效'
+        return '，账号池服务已重载生效'
     if group['is_default'] or str(group.get('container') or '').strip():
-        return f'；上游重载失败：{reload_error}，请在宿主机重启上游容器'
-    # 分组没登记容器名：不猜也不冒报错——上游的 auths 热加载会自己收录
-    return f'；{reload_error}；新凭证将由该分组的上游热加载（约 5 秒）自动收录'
+        return f'；账号池服务重载失败：{reload_error}，请在宿主机重启账号池服务容器'
+    # 分组没登记容器名：不猜也不冒报错——账号池服务的 auths 热加载会自己收录
+    return f'；{reload_error}；新凭证将由该分组的账号池服务热加载（约 5 秒）自动收录'
 
 
 @router.post('/accounts/{filename}/refresh')
@@ -2324,15 +2324,15 @@ async def account_refresh(filename: str, upstream_id: int | None = Query(None),
     """刷新该账号的 accessToken（issue #40）。
 
     **这里真的去续期了**。此前这个端点只是 `reload.restart_now()`——触发一次
-    上游容器重载，而重载既不会刷新 token、也不会改变任何凭证。用户以为按钮会
+    账号池服务容器重载，而重载既不会刷新 token、也不会改变任何凭证。用户以为按钮会
     续期、实际什么也没发生（issue #40 报的正是这个），属于**承诺与行为不符**。
 
-    上游没有对外暴露刷新接口（其路由表见 `tencent.refresh_token` 的说明），
+    账号池服务没有对外暴露刷新接口（其路由表见 `tencent.refresh_token` 的说明），
     刷新只发生在它自己的保活排程与选号路径里。所以这里直接实现协议本身。
 
     流程：读账号 → 调腾讯刷新接口 → **原子写回**新 token（保留 device_token
-    等未知字段）→ 触发一次上游重载让新凭证立刻生效（不重载的话上游要等
-    auths 热加载轮询，旧上游甚至要等重启）。批量版见 `refresh_all_tokens`。
+    等未知字段）→ 触发一次账号池服务重载让新凭证立刻生效（不重载的话账号池服务要等
+    auths 热加载轮询，旧账号池服务甚至要等重启）。批量版见 `refresh_all_tokens`。
     """
     group = _group(upstream_id)
     base_dir = _require_dir(group)
@@ -2363,8 +2363,8 @@ async def refresh_all_tokens(upstream_id: int | None = Query(None),
     """一键刷新**所有**账号的 accessToken（issue #40 的批量版）。
 
     单个账号的「刷新 Token」已经在真续期（见 `account_refresh`），但账号一多就得
-    逐个点。这里用同一份实现并发跑一遍，最后**只重载一次上游**——若照着单账号
-    端点每个号各重载一次，14 个号会把上游重启 14 遍，既慢又会打断在途请求。
+    逐个点。这里用同一份实现并发跑一遍，最后**只重载一次账号池服务**——若照着单账号
+    端点每个号各重载一次，14 个号会把账号池服务重启 14 遍，既慢又会打断在途请求。
 
     并发上限见 `WB_REFRESH_CONCURRENCY`（默认 3，与签到同口径）：刷新要过腾讯的
     风控接口，并发太高可能被当成异常来源。返回逐条结果，好让界面说清是「全部
@@ -2443,8 +2443,8 @@ def save_refresh_plan(body: dict,
 async def run_refresh_plan_now(user: dict = Depends(security.require_admin)) -> dict:
     """立即执行一次全量刷新（不等下一个整点），并把它算作本轮。
 
-    与上面「一键刷新令牌」的共同点：都真续期。区别：那个并发、末尾重载一次上游；
-    这里串行（与后台巡检同一套，防腾讯风控），**不重载上游**——写回的凭证由上游
+    与上面「一键刷新令牌」的共同点：都真续期。区别：那个并发、末尾重载一次账号池服务；
+    这里串行（与后台巡检同一套，防腾讯风控），**不重载账号池服务**——写回的凭证由账号池服务
     的 auths 热加载自行收录。执行后重置计划计时，避免刚手动跑完到点又跑一次。
     """
     stats = await renew.refresh_all(force=True)
@@ -2465,10 +2465,10 @@ async def claim_compensation_all(upstream_id: int | None = Query(None),
                                  user: dict = Depends(security.require_admin)) -> dict:
     """对所有账号领一次「活动补偿」（有则领，没有就跳过）。
 
-    **为什么管理端要自己再做一遍**：上游调度器的活跃上报里本来就会调同一个接口
+    **为什么管理端要自己再做一遍**：账号池服务调度器的活跃上报里本来就会调同一个接口
     （`ClaimCompensation`），但它挂在「活跃上报」这个开关下 —— 关掉活跃上报、或
-    上游版本较旧，就领不到了。而这类补偿是**有时限**的（公告写着截止日期），
-    漏了就真的没了，所以管理端自己也要有一条不依赖上游开关的路。
+    账号池服务版本较旧，就领不到了。而这类补偿是**有时限**的（公告写着截止日期），
+    漏了就真的没了，所以管理端自己也要有一条不依赖账号池服务开关的路。
 
     每号先查一次状态（`compensation-status`）再决定要不要领：状态里能看出「已经
     领过」时直接跳过，省掉一次注定失败的写请求；状态接口认不出来（结构变了）时
@@ -2558,7 +2558,7 @@ def save_daily_plan(body: dict,
 
 
 def _task_scheduler_status() -> dict:
-    """上游调度器与面板每日计划的重叠状态（issue #375）。"""
+    """账号池服务调度器与面板每日计划的重叠状态（issue #375）。"""
     plan = dailyplan.get_plan()
     try:
         cfg = wb2api.load_upstream_config()
@@ -2581,7 +2581,7 @@ def _task_scheduler_status() -> dict:
 
 
 def _set_upstream_overlap(enabled: bool) -> bool:
-    """把上游 checkin/activity 设成指定状态；返回是否真的改了配置。
+    """把账号池服务 checkin/activity 设成指定状态；返回是否真的改了配置。
 
     只在状态不一致时写文件 + 触发重载：点「只留反代调度」时反代调度通常本来就开着，
     没必要为一次无变化的保存重启容器（会打断正在跑的请求）。
@@ -2607,16 +2607,16 @@ def get_task_scheduler(user: dict = Depends(security.current_user)) -> dict:
 async def keep_task_scheduler(body: dict, user: dict = Depends(security.require_admin)) -> dict:
     """只保留一套调度（issue #375）。
 
-    - `upstream`：关闭面板的签到 / 领取补偿；领奖与做任务仍留在面板（上游没有）。
-    - `panel`：开启面板的签到 / 领取补偿，并关闭上游的 checkin / activity，
-      避免两套同时跑。会写上游 config 并触发热重载；改完需等容器重启生效。
+    - `upstream`：关闭面板的签到 / 领取补偿；领奖与做任务仍留在面板（账号池服务没有）。
+    - `panel`：开启面板的签到 / 领取补偿，并关闭账号池服务的 checkin / activity，
+      避免两套同时跑。会写账号池服务 config 并触发热重载；改完需等容器重启生效。
     """
     keep = str((body or {}).get('keep') or '').strip()
     if keep not in ('upstream', 'panel'):
         raise HTTPException(status_code=400, detail="keep 只能是 upstream 或 panel")
     if keep == 'upstream':
         # 对称：若之前选过「只留面板计划」，反代的 checkin/activity 已被关掉；
-        # 现在切回上游必须把它们重新打开，否则会变成「两边都没跑」。
+        # 现在切回账号池服务必须把它们重新打开，否则会变成「两边都没跑」。
         try:
             changed = _set_upstream_overlap(True)
         except FileNotFoundError as exc:
@@ -2626,15 +2626,15 @@ async def keep_task_scheduler(body: dict, user: dict = Depends(security.require_
         plan = dailyplan.set_overlap_enabled(False)
         reloaded = reload.request_restart() if changed else None
         security.audit(user, 'keep_task_scheduler', 'upstream',
-                       '关闭面板签到/领取补偿，恢复上游 checkin/activity')
+                       '关闭面板签到/领取补偿，恢复账号池服务 checkin/activity')
         result = {'plan': plan, 'scheduler': _task_scheduler_status(),
                   'reload_scheduled': None if not changed else bool(reloaded)}
         if changed and not reloaded:
-            result['reload_hint'] = ('配置已写入，但当前环境无法自动重启上游容器；'
+            result['reload_hint'] = ('配置已写入，但当前环境无法自动重启账号池服务容器；'
                                      '请手动重启后生效')
         return result
 
-    # panel：先确认上游配置可写，避免「面板开了、上游没关」的半套状态。
+    # panel：先确认账号池服务配置可写，避免「面板开了、账号池服务没关」的半套状态。
     try:
         changed = _set_upstream_overlap(False)
     except FileNotFoundError as exc:
@@ -2644,11 +2644,11 @@ async def keep_task_scheduler(body: dict, user: dict = Depends(security.require_
     plan = dailyplan.set_overlap_enabled(True)
     reloaded = reload.request_restart() if changed else None
     security.audit(user, 'keep_task_scheduler', 'panel',
-                   '关闭上游 checkin/activity，改由面板签到/领取补偿')
+                   '关闭账号池服务 checkin/activity，改由面板签到/领取补偿')
     result = {'plan': plan, 'scheduler': _task_scheduler_status(),
               'reload_scheduled': None if not changed else bool(reloaded)}
     if changed and not reloaded:
-        result['reload_hint'] = ('配置已写入，但当前环境无法自动重启上游容器；'
+        result['reload_hint'] = ('配置已写入，但当前环境无法自动重启账号池服务容器；'
                                  '请手动重启后生效')
     return result
 
@@ -2684,19 +2684,19 @@ async def account_clear_cooling(
 ) -> dict:
     """强制退出账号级冷却、熔断/降权和模型级限流状态。
 
-    上游没有提供清除运行态冷却的管理接口，而 state.json 每 5 秒会被内存
-    Flush 覆盖。因此这个动作必须：停上游 → 原子修改目标账号 → 启上游 →
+    账号池服务没有提供清除运行态冷却的管理接口，而 state.json 每 5 秒会被内存
+    Flush 覆盖。因此这个动作必须：停账号池服务 → 原子修改目标账号 → 启账号池服务 →
     验证实时状态。只改目标 uid，不碰凭证、积分、禁用位或其它账号。
     """
     group = _group(upstream_id)
     if not group['is_default']:
-        # 清冷却要「停上游 → 改 state.json → 启上游」。分组的登记信息里没有
+        # 清冷却要「停账号池服务 → 改 state.json → 启账号池服务」。分组的登记信息里没有
         # state.json 的路径（只有地址 / 密钥 / 账号目录），去改默认实例的
         # state.json 是**改错对象**——那种「成功」比失败更危险。明确拒绝。
         raise HTTPException(
             status_code=409,
             detail=('该分组暂不支持从面板清除冷却（需要该实例的 state.json 路径）；'
-                    '可等它自然冷却，或在宿主机上重启该分组的上游实例'),
+                    '可等它自然冷却，或在宿主机上重启该分组的账号池服务实例'),
         )
     try:
         raw = wb2api.read_account_file_any(filename)
@@ -2704,7 +2704,7 @@ async def account_clear_cooling(
         raise HTTPException(status_code=404, detail='账号文件不存在') from exc
     uid = str((raw.get('account') or {}).get('uid') or '').strip()
     if not uid:
-        raise HTTPException(status_code=400, detail='该账号文件缺少 uid，无法定位上游状态')
+        raise HTTPException(status_code=400, detail='该账号文件缺少 uid，无法定位账号池服务状态')
 
     ok, message, detail = await wb2api.force_clear_account_cooling(uid)
     return {'ok': ok, 'message': message, **(detail or {})}
@@ -2737,7 +2737,7 @@ async def account_force_cooling(
         raise HTTPException(status_code=404, detail='账号文件不存在') from exc
     uid = str((raw.get('account') or {}).get('uid') or '').strip()
     if not uid:
-        raise HTTPException(status_code=400, detail='该账号文件缺少 uid，无法定位上游状态')
+        raise HTTPException(status_code=400, detail='该账号文件缺少 uid，无法定位账号池服务状态')
 
     duration_seconds = body.get('duration_seconds') if isinstance(body, dict) else None
     until_str = str(body.get('until') or '').strip() if isinstance(body, dict) else ''
@@ -2795,8 +2795,8 @@ async def account_set_note(
 
     为什么需要：用手机号邀请注册的账号，昵称往往认不出是谁，删号时不知道该删哪个。
 
-    存法见 `db.account_notes` 的注释：**按 uid** 存在本端库里（不写进上游的账号
-    文件——那是上游按自己 schema 读写的文件，塞自定义字段会被它覆盖或超出 schema）。
+    存法见 `db.account_notes` 的注释：**按 uid** 存在本端库里（不写进账号池服务的账号
+    文件——那是账号池服务按自己 schema 读写的文件，塞自定义字段会被它覆盖或超出 schema）。
     uid 是账号的稳定标识，所以临时停用（改文件名）不会让备注丢。
 
     空串 = 删除备注（不留空行）。
@@ -2862,8 +2862,8 @@ async def account_move(
       · 移动的是**账号文件本身**（含 `.json.disabled` 形态），凭证一个字节不改；
       · 目标已有同名文件时拒绝（409）——覆盖等于丢掉目标那份凭据；
       · 两侧都必须是登记过本地账号目录的分组（否则明确 409，绝不猜路径）。
-    生效方式：文件落到目标目录后，目标上游的 auths 热加载（约 5 秒）会收录
-    它；这里走 request_reload_or_restart——新上游不必等，旧版本回退重启。
+    生效方式：文件落到目标目录后，目标账号池服务的 auths 热加载（约 5 秒）会收录
+    它；这里走 request_reload_or_restart——新账号池服务不必等，旧版本回退重启。
     """
     src = _group(upstream_id)
     to_raw = body.get('to_upstream_id')
@@ -2943,10 +2943,10 @@ def _fallback_why(bit_code: str, disabled: bool, group: dict | None = None) -> s
     `no_route` 有两种成因，界面上必须分得开：
 
       · 配置里**没开** → 给出开关位置；
-      · 配置里**已开** → 说明运行中的上游没加载到它：上游只在启动时读这个开关，
+      · 配置里**已开** → 说明运行中的账号池服务没加载到它：账号池服务只在启动时读这个开关，
         改完必须**重启容器**；若已重启仍如此，就是镜像太旧（早于 2026-09-19）。
         这条文案里带上**面板实际读的配置路径**——用户手改的常常是另一个文件
-        （实测反馈：「明明上游已经打开了 admin.enabled 还是不行」）。
+        （实测反馈：「明明账号池服务已经打开了 admin.enabled 还是不行」）。
 
     `disabled` 决定文案的落点：**停用**要说清代价并给出「重新停用」的下一步；
     **启用**时账号已经恢复，再说「再重新停用」是说不通的（用户点的是启用），
@@ -2957,25 +2957,25 @@ def _fallback_why(bit_code: str, disabled: bool, group: dict | None = None) -> s
     if disabled:
         tail = '已改用改名方式：账号将完全退出账号池，签到与保活也会一并停止。'
         next_step = ('若要保留签到与保活，请到「设置 → 账号管理接口」开启后'
-                     '重启上游容器，再重新停用')
+                     '重启账号池服务容器，再重新停用')
     else:
         tail = '已改用改名方式启用（该方式下账号退出账号池，任务也不执行）。'
         next_step = ('若希望以后停用时保留签到与保活，请到「设置 → 账号管理接口」'
-                     '开启后重启上游容器')
+                     '开启后重启账号池服务容器')
     if group is not None and not group.get('is_default'):
-        # 分组的上游配置文件路径不在登记信息里：这里**不能**引用默认实例的
+        # 分组的账号池服务配置文件路径不在登记信息里：这里**不能**引用默认实例的
         # 配置路径（用户照着改的是另一个文件，改完仍无效）。
-        return (f'（该分组「{group["name"]}」的上游未提供管理接口：' + tail
-                + '；如需「只摘流量、任务照常」的语义，请在这个分组自己的上游'
+        return (f'（该分组「{group["name"]}」的账号池服务未提供管理接口：' + tail
+                + '；如需「只摘流量、任务照常」的语义，请在这个分组自己的账号池服务'
                 '实例里开启 admin 后重启它）')
     enabled, where = wb2api.admin_enabled_in_config()
     if enabled:
-        return (f'（上游配置里已开启管理接口（{where}），但运行中的上游没有提供它：'
-                '上游只在启动时读这个开关，改完配置需要重启上游容器才生效；'
-                '若已重启仍如此，说明上游镜像早于 2026-09-19。' + tail + '）')
+        return (f'（账号池服务配置里已开启管理接口（{where}），但运行中的账号池服务没有提供它：'
+                '账号池服务只在启动时读这个开关，改完配置需要重启账号池服务容器才生效；'
+                '若已重启仍如此，说明账号池服务镜像早于 2026-09-19。' + tail + '）')
     if enabled is None:
         return f'（{where}。' + tail + next_step + '）'
-    return '（该上游未启用管理接口，' + tail + next_step + '）'
+    return '（该账号池服务未启用管理接口，' + tail + next_step + '）'
 
 
 @router.post('/accounts/{filename}/disabled')
@@ -2987,23 +2987,23 @@ async def account_set_disabled(
 ) -> dict:
     """临时停用 / 启用一个账号（issue #21、#45）。
 
-    两种机制，**优先用上游状态位**：
+    两种机制，**优先用账号池服务状态位**：
 
-      · `manual_disabled`（上游 2026-09-19 起的新接口）——语义是「对话流量摘除」
+      · `manual_disabled`（账号池服务 2026-09-19 起的新接口）——语义是「对话流量摘除」
         而非「账号冻结」：不被选中转发，但**签到 / token 保活 / 猫猫旅行照常执行**，
         凭证与积分都是活的。这才是「先停一会儿」想要的语义。
       · **改文件名**（加 `.disabled` 后缀，本面板旧实现）——账号完全退出账号池，
         连排程任务都不再跑。副作用过大：积分不再增长、token 不再续期，回来时
         可能已经过期。仅作为回退。
 
-    为什么必须保留回退：上游那组接口**默认不注册**（`admin.enabled` 默认 false，
+    为什么必须保留回退：账号池服务那组接口**默认不注册**（`admin.enabled` 默认 false，
     关闭时一律 404——其注释写明是「不向外暴露管理面」的有意设计），旧版本更是
     根本没有。没有回退的话，这些部署上「停用」按钮会直接失效。
 
     body: {disabled: bool, reload: bool, reason: str}。
-    `reload` 默认 true，**只对回退的改名路径有意义**（旧上游不监听文件变化，
-    不重载就不生效；新上游有 5 秒热加载，重载只是为了不等那 5 秒）。
-    状态位路径不需要重载——它走的是上游自己的接口。要批量操作时可先传 false。
+    `reload` 默认 true，**只对回退的改名路径有意义**（旧账号池服务不监听文件变化，
+    不重载就不生效；新账号池服务有 5 秒热加载，重载只是为了不等那 5 秒）。
+    状态位路径不需要重载——它走的是账号池服务自己的接口。要批量操作时可先传 false。
     """
     if not isinstance(body.get('disabled'), bool):
         raise HTTPException(status_code=400, detail='disabled 必须是布尔值')
@@ -3012,7 +3012,7 @@ async def account_set_disabled(
     group = _group(upstream_id)
     base_dir = _require_dir(group)
 
-    # uid 用于调上游的状态位接口。用 any 版本读：用户手里的文件名可能与磁盘
+    # uid 用于调账号池服务的状态位接口。用 any 版本读：用户手里的文件名可能与磁盘
     # 形态不一致（刚停用/刚启用时界面仍持旧名），只按一个名字读会解析不出 uid，
     # 于是状态位那条路被静默跳过——「点了启用但没恢复」正是这么来的。
     uid = ''
@@ -3038,7 +3038,7 @@ async def account_set_disabled(
                     'disabled': True,
                     'changed': True,
                     'via': 'manual_disabled',
-                    'reload_triggered': False,  # 状态位由上游自己管，无需重载
+                    'reload_triggered': False,  # 状态位由账号池服务自己管，无需重载
                     'message': f'已停用该账号（{bit_msg}）',
                 }
         try:
@@ -3065,7 +3065,7 @@ async def account_set_disabled(
                 uid, False, base_url=base_url, api_key=api_key)
             if ok:
                 # 「启用」要清的是**两位**，上面那步只清了 manual_disabled。
-                # 上游的 enable **不管系统自动禁用**（其 admin.go 原话：「若账号仍被
+                # 账号池服务的 enable **不管系统自动禁用**（其 admin.go 原话：「若账号仍被
                 # 系统自动禁用（disabled），它不会因此回到选号池——那需要 revive」）。
                 # 面板此前从不调 revive，于是被自动禁用的账号（12153 连败 3 次、
                 # 或 11140 被封）点「启用」看着成功、实际还在池外 —— 这正是用户报的
@@ -3084,7 +3084,7 @@ async def account_set_disabled(
                         'reload_triggered': reloaded,
                         'bit_code': bit_code,
                         # 文案走 toast（纯文本），别用 markdown 记号
-                        'message': (f'已解除面板停用，但该账号仍被上游系统禁用，'
+                        'message': (f'已解除面板停用，但该账号仍被系统禁用，'
                                     f'现在仍不会被调用。{revive_msg}'),
                     }
                 return {
@@ -3096,17 +3096,17 @@ async def account_set_disabled(
                     'reload_triggered': reloaded,
                     'revived': revived,
                     # 两位都清了才算真的回到池子：`still_disabled is None` 表示这一趟
-                    # **没读到**上游状态，那就别把话说满（上面 True 的分支已如实报失败）。
+                    # **没读到**账号池服务状态，那就别把话说满（上面 True 的分支已如实报失败）。
                     'message': (f'已启用该账号（{bit_msg}'
                                 + ('；并已解除系统禁用' if revived else '')
-                                + ('；但读不到上游状态，未能确认它是否仍被系统禁用'
+                                + ('；但读不到账号池服务状态，未能确认它是否仍被系统禁用'
                                    if still_disabled is None else '')
                                 + '）')
-                               + ('，正在重载上游使其生效' if reloaded else ''),
+                               + ('，正在重载账号池服务使其生效' if reloaded else ''),
                 }
-            # 状态位没走通（多半是上游没开管理接口）。这时**必须先看一眼**它是不是
+            # 状态位没走通（多半是账号池服务没开管理接口）。这时**必须先看一眼**它是不是
             # 被系统禁用了：若是，下面的改名回退救不了它 —— 改名只管「文件在不在
-            # 池里」，管不了上游的 disabled 位；而 revive 与 enable 同属那组没注册
+            # 池里」，管不了账号池服务的 disabled 位；而 revive 与 enable 同属那组没注册
             # 的接口，所以此刻确实无解。如实说清，别跟着兜底文案一起报「已启用」。
             still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
             if still:
@@ -3118,30 +3118,30 @@ async def account_set_disabled(
                     'via': 'rename',
                     'reload_triggered': reloaded,
                     'bit_code': bit_code,
-                    'message': ('该账号被上游系统禁用，而解除它需要上游的「账号管理接口」；'
-                                '当前上游没有提供这组接口，面板无法把它放回账号池。'
+                    'message': ('该账号被系统禁用，而解除它需要账号池服务的「账号管理接口」；'
+                                '当前账号池服务没有提供这组接口，面板无法把它放回账号池。'
                                 + _fallback_why(bit_code, False, group)),
                 }
 
     return {
         'ok': True,
         **result,
-        # 生效方式：manual_disabled = 上游状态位（任务照常）；rename = 改名（回退）
+        # 生效方式：manual_disabled = 账号池服务状态位（任务照常）；rename = 改名（回退）
         'via': 'rename',
         # 状态位没走通的原因码（no_route / not_found / error / skipped），
-        # 前端据此区分「上游没开管理接口」（给开启提示）与真失败。
+        # 前端据此区分「账号池服务没开管理接口」（给开启提示）与真失败。
         'bit_code': bit_code,
         'bit_message': bit_msg,
-        # 是否已触发上游重载。未触发时调用方要自己重启，否则改名不生效。
+        # 是否已触发账号池服务重载。未触发时调用方要自己重启，否则改名不生效。
         'reload_triggered': reloaded,
         'message': (
             f"已{'停用' if disabled else '启用'}该账号"
             # 回退路径要如实说清代价：这条路会让账号退出账号池，任务也停。
-            # 回退路径要如实说清代价，并给出**可操作的下一步**：「该上游未启用管理
+            # 回退路径要如实说清代价，并给出**可操作的下一步**：「该账号池服务未启用管理
             # 接口」只说了现状，用户不知道去哪儿开（实测反馈正是这个——看到提示后
             # 只能来问）。所以带上开关位置与生效条件。
             + _fallback_why(bit_code, disabled, group)
-            + ('，正在重载上游使其生效' if reloaded
-               else ('；请手动重启上游以生效' if result.get('changed') else ''))
+            + ('，正在重载账号池服务使其生效' if reloaded
+               else ('；请手动重启账号池服务以生效' if result.get('changed') else ''))
         ),
     }
