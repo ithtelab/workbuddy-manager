@@ -644,6 +644,22 @@ docker restart workbuddy-manager
 首次启动就失败时 `./data` 是空的，直接切即可；若里面已有数据，先用
 `cp -a ./data/ ./data.bak/` 留一份再操作。
 
+**Q：容器日志太多 / 启动失败看不到原因**
+
+逐请求的 access log 默认关掉了 —— 健康检查每 30 秒一次、前端不断轮询，全打出来
+只会把有用的信息淹掉。请求记录没丢：界面「请求日志」记谁、何时、哪个账号、多少
+token，「IP 访问日志」记谁被拦、为什么，都能按条件过滤。要临时看原始请求行，
+在 `.env` 里设 `WB_ACCESS_LOG=1` 再重启。
+
+启动失败时现在只打印一段精简说明：醒目的失败标题、根因与修法（逐字保留）、以及
+出错位置。框架内部那些重复几十层的调用栈不会再出现。需要连项目自身的栈帧一起
+看时保持 `WB_STARTUP_FAILURE_STACK=1`（默认），日志空间特别紧才设 0。
+
+```bash
+docker compose logs workbuddy-manager --tail=80     # 看最近的日志
+docker compose logs data-perms                      # 看权限修复结果
+```
+
 **Q：首次构建上游很慢**
 上游是 Go 项目，首次 `docker compose up --build` 需拉取基础镜像并编译，
 视网络情况可能需要几分钟，属正常现象。不想本地编译就把 compose 的 `build: .`
