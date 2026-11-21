@@ -88,6 +88,10 @@ services:
       WB_GITHUB_MIRROR: ${WB_GITHUB_MIRROR:-}
       # 新账号默认绑定的命名线路（名字要在上游 config.json 的 proxies 里）
       WB_DEFAULT_ACCOUNT_PROXY: ${WB_DEFAULT_ACCOUNT_PROXY:-}
+      # 容器日志：默认不打印逐请求 access log（避免健康检查/轮询刷屏）；
+      # 启动失败时只打精简说明 + 项目栈帧。临时抓请求时设 WB_ACCESS_LOG=1。
+      WB_ACCESS_LOG: ${WB_ACCESS_LOG:-0}
+      WB_STARTUP_FAILURE_STACK: ${WB_STARTUP_FAILURE_STACK:-1}
     ports:
       # **只监听本机**：管理端必须藏在反向代理之后。
       # 若确需直接从别的机器访问，改成 "7864:7864"，但请先确保有 HTTPS 与访问控制——
