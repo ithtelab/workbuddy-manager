@@ -726,18 +726,24 @@ class DockerAssetsTest(unittest.TestCase):
         self.assertTrue(any('/app/data' in str(v) for v in vols),
                         '未持久化 data 卷 —— 重建容器会丢失统计与审计记录')
 
-    def test_upstream_dir_mounted(self) -> None:
-        """必须挂载上游仓库目录。
+    def test_upstream_dir_not_mounted(self) -> None:
+        """compose 默认不挂上游仓库目录。
 
-        没挂的话容器内既拿不到上游的 docker-compose.yml（端口收敛无从下手），
-        也无法在容器内 git pull —— 「更新上游」直接做不到。
-        （这正是初版的问题：只挂了 auths 与 config.json 两条子路径。）
+        这条挂载曾导致 NAS 上 `Bind mount failed: ... does not exist` 起不来
+        （宿主机没那个目录时 daemon 直接拒绝）；而镜像来源（WB_MANAGER_IMAGE）
+        与它无关，不需要靠它切换。依赖直读上游文件的功能（账号管理 / 读配置 /
+        日志回填）在没有目录时会降级提示，不影响面板启动。
         """
         import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        text = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
+        dc = yaml.safe_load(text)
         vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
-        self.assertTrue(any('/opt/workbuddy2api' in v for v in vols),
-                        '未挂载上游目录 —— 容器版将无法更新上游')
+        self.assertFalse(any('/opt/workbuddy2api' in v for v in vols),
+                        '上游目录不应默认挂载 —— 宿主机没该目录会 Bind mount failed')
+        self.assertNotIn('WB_UPSTREAM_DIR', text,
+                         'WB_UPSTREAM_DIR 已移除，compose 不该再引用它')
+        self.assertNotIn('workbuddy2api-upstream', (dc.get('volumes') or {}),
+                         '顶层不该再声明已废弃的 workbuddy2api-upstream 卷')
 
     def test_docker_socket_is_opt_in(self) -> None:
         """docker.sock **默认不挂**，以注释形式保留显式开启的路径（2026-10-21

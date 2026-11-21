@@ -5,7 +5,7 @@
 #   浏览器打开 http://<服务器IP>:7864
 #   首启密码：docker compose logs workbuddy-manager | grep -A2 密码
 #
-# 镜像来源、数据卷与可选挂载见同目录 .env.example。
+# 镜像来源与数据卷见同目录 .env.example。
 
 services:
   workbuddy-manager:
@@ -32,9 +32,6 @@ services:
       # 写不进去会报「无法打开数据库文件」：宿主执行 chown -R 10001:10001 ./data，
       # 或 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷（首次创建自动继承属主）。
       - ${WB_DATA_VOLUME:-./data}:/app/data
-      # 上游仓库目录。默认挂空卷（相关功能自动降级）；在 .env 设 WB_UPSTREAM_DIR
-      # 为宿主机实际路径（如 /volume1/docker/workbuddy2api）即可启用。
-      - ${WB_UPSTREAM_DIR:-workbuddy2api-upstream}:/opt/workbuddy2api
       # 需要在容器内更新上游/读日志时挂 docker.sock 并放开 group_add，见 deploy/README.md。
       # - /var/run/docker.sock:/var/run/docker.sock
     # group_add:
@@ -45,4 +42,3 @@ services:
 
 volumes:
   wb-manager-data:
-  workbuddy2api-upstream:
