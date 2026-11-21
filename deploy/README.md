@@ -461,7 +461,7 @@ docker compose exec workbuddy-manager python /app/deploy/update.py --target both
 |---|---|---|---|
 | 管理端代码 | 容器可写层 `/app/server`、`/app/web/out` | 保留 | **退回镜像里的版本** |
 | 更新时新装的依赖 | `/app/.local`（`PYTHONUSERBASE`） | 保留 | **丢失** |
-| 数据库 / 日志 / 配置 | 宿主 `./data`（bind mount） | 保留 | 保留 |
+| 数据库 / 日志 / 配置 | 宿主 `./data/manager`（bind mount） | 保留 | 保留 |
 
 所以**更新之后不要对管理端执行 `docker compose up -d`** —— 那会用镜像里的旧代码
 重建容器。要重启用 `docker restart workbuddy-manager`；要升级镜像本身，走下面这步。
@@ -482,8 +482,9 @@ docker compose up -d --build workbuddy-manager
 ```
 
 发布包里带 `Dockerfile`、`docker-compose.yml`、`server/`、`web/out/` 与 `upstream/`，
-所以这一步既能救砖、也能把镜像升到最新。`./data` 与 `../workbuddy2api` 都是挂载卷，
-不会被覆盖。
+所以这一步既能救砖、也能把镜像升到最新。整个 `./data/` 都是挂载卷
+（`data/manager/` 放管理端数据，`data/workbuddy2api/` 放账号池数据），不会被覆盖；
+包内的 `upstream/` 放到 `data/workbuddy2api/` 即可。
 
 #### 容器内操作 docker（更新账号池服务 / 重载配置）
 
@@ -590,21 +591,21 @@ chmod g+s /opt/workbuddy2api/auths
 **Q：容器反复重启，日志报 `unable to open database file` / 「目录不可写：/app/data」**
 
 这是**权限**问题，不是数据库坏了，也不是路径配错。管理端容器以 uid 10001 运行
-（Dockerfile 里的 `USER app`），而 compose 默认把宿主 `./data` bind mount 到
-`/app/data` —— 这个目录的属主由宿主机决定，Docker 首次自动创建时归 `root`，
-容器内的 10001 写不进去，SQLite 连库文件都建不了，启动即失败；配合
+（Dockerfile 里的 `USER app`），而 compose 默认把宿主 `./data/manager`
+bind mount 到 `/app/data` —— 这个目录的属主由宿主机决定，Docker 首次自动创建时归
+`root`，容器内的 10001 写不进去，SQLite 连库文件都建不了，启动即失败；配合
 `restart: unless-stopped` 就表现为一直重启、页面打不开。
 
 在 docker-compose.yml 所在目录确认一下：
 
 ```bash
-ls -ld ./data     # drwxr-xr-x root root → 中招
+ls -ld ./data/manager     # drwxr-xr-x root root → 中招
 ```
 
 **修法一（能 SSH、能改属主，推荐）**：只改权限，不动配置，也不用重建容器：
 
 ```bash
-sudo chown -R 10001:10001 ./data
+sudo chown -R 10001:10001 ./data/manager
 docker restart workbuddy-manager
 ```
 
@@ -614,8 +615,8 @@ docker restart workbuddy-manager
 **修法二（NAS / 群晖 / SMB / 没开 SSH，改不了属主）**：换成命名卷。命名卷首次
 创建时会继承镜像内 `/app/data` 的属主（10001），不需要 chown。
 
-- 新版 compose（挂载行是 `${WB_DATA_VOLUME:-./data}:/app/data`）：在 compose
-  同目录的 `.env` 里加一行 `WB_DATA_VOLUME=wb-manager-data`，再
+- 新版 compose（挂载行是 `${WB_DATA_VOLUME:-./data/manager}:/app/data`）：
+  在 compose 同目录的 `.env` 里加一行 `WB_DATA_VOLUME=wb-manager-data`，再
   `docker compose up -d`。
 - 旧版 compose（挂载行是 `- ./data:/app/data`）：把整行改成
   `- wb-manager-data:/app/data`，并在文件末尾加：
@@ -627,10 +628,10 @@ docker restart workbuddy-manager
 
   然后 `docker compose up -d --force-recreate workbuddy-manager`。
 
-切过去之后数据库不再落在宿主 `./data`，取备份用
+切过去之后数据库不再落在宿主 `./data/manager`，取备份用
 `docker compose cp workbuddy-manager:/app/data/manager.db ./manager.db`。
-首次启动就失败时 `./data` 是空的，直接切即可；若里面已有数据，先用
-`cp -a ./data/ ./data.bak/` 留一份再操作。
+首次启动就失败时该目录是空的，直接切即可；若里面已有数据，先用
+`cp -a ./data/manager/ ./data/manager.bak/` 留一份再操作。
 
 **Q：容器日志太多 / 启动失败看不到原因**
 

@@ -579,11 +579,9 @@ def _explain_db_open_failure(exc: Exception) -> str:
 
     这个报错的原始信息**完全无法定位**（issue #30）：它既不说哪个路径，
     也不说为什么。实测最常见的原因是**目录/文件的属主不对** ——
-    容器以 uid 10001 运行，而 bind mount（`./data:/app/data`）的属主由宿主机
-    决定：docker 首次自动创建 `./data` 时归 root，容器内的 10001 就写不进去。
-
-    上游自己的 compose 对 `./data` 写了 chown 提示，我们的漏了 —— 于是同样的坑
-    在管理端这边表现为一条 sqlite 报错，用户完全猜不到是权限。
+    容器以 uid 10001 运行，而 bind mount（`./data/manager:/app/data`）
+    的属主由宿主机决定：docker 首次自动创建该目录时归 root，容器内的 10001 就
+    写不进去 —— 于是同样的坑在管理端表现为一条 sqlite 报错，用户完全猜不到是权限。
 
     光给 chown 还不够：NAS / 群晖这类环境的目录属主根本改不了（或没开 SSH），
     所以说明里同时给出「切到命名卷」这条不需要动宿主权限的路（见 compose 的
@@ -611,13 +609,12 @@ def _explain_db_open_failure(exc: Exception) -> str:
     lines.append(f'  原始错误：{exc}')
     lines.append(
         '  最常见的成因是**目录属主不对**：容器以 uid 10001 运行，而 bind mount\n'
-        '  （compose 里的 `./data:/app/data`）属主由宿主机决定 —— docker 首次自动\n'
-        '  创建该目录时归 root，容器内的 10001 写不进去。新版 compose 已内置\n'
-        '  data-perms sidecar 自动修正属主；看到这条说明 sidecar 也改不动\n'
-        '  （NFS/SMB 根用户被压扁等），请直接走下面的命名卷方案。\n'
+        '  （compose 里的 `./data/manager:/app/data`）属主由宿主机\n'
+        '  决定 —— docker 首次自动创建该目录时归 root，容器内的 10001 写不进去。\n'
+        '  改不了属主（NFS/SMB 根用户被压扁等）就直接走下面的命名卷方案。\n'
         '  两种修法任选其一：\n'
         '  ① 能改属主：在 docker-compose.yml 所在目录执行\n'
-        '       sudo chown -R 10001:10001 ./data\n'
+        '       sudo chown -R 10001:10001 ./data/manager\n'
         '       docker restart workbuddy-manager\n'
         '     （10001 是镜像内 app 用户的 uid；只重启、别重建，\n'
         '       否则面板更新过的代码会退回镜像里的版本）\n'

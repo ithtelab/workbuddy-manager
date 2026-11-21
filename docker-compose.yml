@@ -30,17 +30,17 @@ services:
       # 只监听本机：请置于 HTTPS 反向代理之后（管理端持有全部账号凭据）。
       - "127.0.0.1:7864:7864"
     volumes:
-      # 数据持久化。群晖/NAS 的 bind mount 属主常是 root（容器用 uid 10001），
-      # 写不进去会报「无法打开数据库文件」：宿主执行 chown -R 10001:10001 ./data，
-      # 或 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷（首次创建自动继承属主）。
-      - ${WB_DATA_VOLUME:-./data}:/app/data
-      # 账号池数据目录：账号池服务配置 config.json、auths/、scripts/task_runner.py 都在这里。
-      # 沿用原作者布局：与部署目录同级（安装脚本默认装在 /opt/workbuddy-manager
-      # 与 /opt/workbuddy2api，账号池源码随发布包分发后落到后者）。
+      # 宿主机只需一个目录 ./data/，两个组件各占一个子目录（互为兄弟，不嵌套）：
+      #   data/manager/         管理网关数据（数据库、管理员账号、日志）→ /app/data
+      #   data/workbuddy2api/   账号池服务数据（config.json、auths、scripts）→ /opt/workbuddy2api
+      # 首次部署先把目录交给容器 uid，否则 SQLite 会报「无法打开数据库文件」：
+      #   mkdir -p data/manager && sudo chown -R 10001:10001 data/manager
+      # 改不了属主（NFS/SMB）就 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷。
+      - ${WB_DATA_VOLUME:-./data/manager}:/app/data
+      # 账号池数据目录：config.json、auths/、scripts/task_runner.py 都在这里。
       # 该目录不存在时容器会直接报「Bind mount failed: ... does not exist」起不来：
-      # 先按部署文档把账号池源码装到该位置，或只改冒号左边（宿主机路径），
-      # 右边 /opt/workbuddy2api 不要动。
-      - ../workbuddy2api:/opt/workbuddy2api
+      # 先把账号池源码放进去，或只改冒号左边（宿主机路径），右边 /opt/workbuddy2api 不要动。
+      - ./data/workbuddy2api:/opt/workbuddy2api
       # 需要在容器内更新账号池服务/读日志时挂 docker.sock 并放开 group_add，见 deploy/README.md。
       # - /var/run/docker.sock:/var/run/docker.sock
     # group_add:
