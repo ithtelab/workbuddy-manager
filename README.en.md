@@ -4,7 +4,7 @@
 
 **Management console for Tencent CodeBuddy account pools · OpenAI-compatible gateway**
 
-A web console for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api): QR onboarding, scheduled check-in and keep-alive, per-group key distribution, IP and model allowlists, request logs and usage stats; the upstream source ships inside the release package (MIT) — see the [deployment guide](deploy/README.md#〇上游源码从哪来随发布包分发) for migration.
+A web console for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api): QR onboarding, scheduled check-in and keep-alive, per-group key distribution, IP and model allowlists, request logs and usage stats; the account pool service source ships inside the release package (MIT) — see the [deployment guide](deploy/README.md#〇账号池服务源码从哪来随发布包分发) for migration.
 
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)

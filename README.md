@@ -259,7 +259,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 ## 已知限制
 
 - **账号出口线路**：管理端支持按账号绑定命名 HTTP/HTTPS 代理。聊天和账号池服务后台任务还需 workbuddy2api 配套支持，配置与兼容条件见 [账号出口线路](docs/account-proxy-routes.md)。
-- **不支持图片生成**：网关只桥接对话 / Responses / Messages 接口，不提供 `/v1/images/generations`；模型目录里的 `supports_images` 表示「可以看图」（图片输入），不是「可以生图」。官方 App 的画布 / 生图走独立链路，反代没有对应入口。
+- **不支持图片生成**：网关只桥接对话 / Responses / Messages 接口，不提供 `/v1/images/generations`；模型目录里的 `supports_images` 表示「可以看图」（图片输入），不是「可以生图」。官方 App 的画布 / 生图走独立链路，管理网关没有对应入口。
 - 请求的**请求体 / 响应体内容默认不留存**，仅记录元数据（模型、状态、Token、延迟、来源），以保护隐私。需要排查「模型为什么这么答」时，可在底栏「轨迹」里显式打开抓包：内容只写本机、密钥类字段先脱敏、按保留期自动清理（见 [调用抓包](docs/api-traffic-tap.md)）。
 - 用量统计按「天 × 密钥 × 模型」聚合；如需小时粒度可扩展 `usage_daily` 表。
 

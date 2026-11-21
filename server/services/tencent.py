@@ -581,7 +581,7 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     """用 refreshToken 换新的 accessToken（issue #40）。
 
     返回 `(是否成功, 说明, 新字段)`；成功时 `新字段` 含
-    `access_token` / `refresh_token` / `expires_at`（后两者可能缺省 = 上游没返回、
+    `access_token` / `refresh_token` / `expires_at`（后两者可能缺省 = 腾讯官方没返回、
     保持旧值）。
 
     ## 为什么管理端要自己实现这一步
@@ -655,7 +655,7 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     except Exception:  # noqa: BLE001
         return False, '刷新响应不是 JSON', {}
 
-    # 上游可能把结果包在 data 里（与登录接口同风格），两种形态都认
+    # 腾讯官方可能把结果包在 data 里（与登录接口同风格），两种形态都认
     body = (data.get('data') if isinstance(data, dict)
             and isinstance(data.get('data'), dict) else data)
     if not isinstance(body, dict):
@@ -685,7 +685,7 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     if when:
         left = max(0, when - int(time.time()))
         return True, f'刷新成功，新令牌有效期 {left // 86400} 天', out
-    return True, '刷新成功（上游未返回有效期，沿用原值）', out
+    return True, '刷新成功（腾讯官方未返回有效期，沿用原值）', out
 
 
 # 10001 的两层语义（issue #256）：上游既用它表示「今天已签到」（幂等成功），

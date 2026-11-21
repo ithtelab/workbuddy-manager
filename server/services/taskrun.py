@@ -1,18 +1,18 @@
-"""成长任务一键执行（调用上游自带的 `task_runner.py`）。
+"""成长任务一键执行（调用账号池服务自带的 `task_runner.py`）。
 
 为什么要做这个
 --------------
-上游 `workbuddy2api` 自带 `scripts/task_runner.py`，能覆盖约 20 种成长中心任务
+账号池服务 `workbuddy2api` 自带 `scripts/task_runner.py`，能覆盖约 20 种成长中心任务
 （模板 / 专家 / 技能 / 自动化 / Buddy / 画布 / 各类对话…），但：
 
-  · 它被上游定性为**辅助工具**（README「辅助工具」一节），不是定时任务；
-  · 上游调度器只自动跑其中 **6 类**（签到 / 活跃地图 / 猫猫旅行 / 保活 /
+  · 它被账号池服务定性为**辅助工具**（README「辅助工具」一节），不是定时任务；
+  · 账号池服务调度器只自动跑其中 **6 类**（签到 / 活跃地图 / 猫猫旅行 / 保活 /
     开学季 / 夜猫），成长中心那批**没有任何自动入口**；
-  · 本面板此前是纯只读的（只采集展示日志），点不了任何任务。
+  · 本管理网关此前是纯只读的（只采集展示日志），点不了任何任务。
 
 于是这些任务只能上服务器手敲命令，这就是 issue #19 的诉求。
 
-本模块只负责**调用上游那个脚本**，不自己实现上报协议 —— 脚本是「与官方客户端
+本模块只负责**调用账号池服务那个脚本**，不自己实现上报协议 —— 脚本是「与官方客户端
 逐字对齐」的那份参照实现，自己重写一份必然漂移。
 
 三种模式（按风险分级，不允许任意参数）
@@ -22,7 +22,7 @@
   · `claim`   —— `--yes --only-claim`：**只把已完成任务的奖励领回来**，
     是幂等的（已领过服务端返回业务错误，视为正常）。不伪造任何行为。
   · `full`    —— `--yes`：点亮 + 领奖。**会伪造活跃上报**（造画布、连发对话、
-    批量使用专家等），这是风控最容易识别的模式，上游自己都标注「写操作慎用，
+    批量使用专家等），这是风控最容易识别的模式，账号池服务自己都标注「写操作慎用，
     请确认决策后再跑」。因此**只允许手动触发，且必须显式确认**，不参与定时。
 
 定时只跑 `claim`：它是幂等的领奖，不产生任何伪造行为，风险最低。
@@ -33,10 +33,10 @@
     既放大风控信号，也让输出交错难读。
   · 模式走**白名单**，账号标识做字符校验后作为独立 argv 传入（不拼 shell），
     因此不存在命令注入面。
-  · 执行前先确认上游目录与脚本存在，**前置拒绝并给出替代做法**，
+  · 执行前先确认账号池服务目录与脚本存在，**前置拒绝并给出替代做法**，
     而不是跑到一半才失败。
-  · 账号目录通过 `WB2A_AUTHS` 显式传给脚本，保证它读的就是本面板管的那批
-    auth 文件（脚本自身的回落顺序与本面板的 AUTH_DIR 可能不一致）。
+  · 账号目录通过 `WB2A_AUTHS` 显式传给脚本，保证它读的就是本管理网关管的那批
+    auth 文件（脚本自身的回落顺序与本管理网关的 AUTH_DIR 可能不一致）。
 """
 from __future__ import annotations
 
@@ -102,18 +102,18 @@ _task: asyncio.Task | None = None
 
 
 def _host_script() -> Path | None:
-    """宿主机挂载目录里的脚本（`<上游目录>/scripts/task_runner.py`），没有则 None。
+    """宿主机挂载目录里的脚本（`<账号池服务目录>/scripts/task_runner.py`），没有则 None。
 
-    这条路径适用于**源码部署 / 完整挂载**的形态：上游目录是宿主机上的 git 仓库，
+    这条路径适用于**源码部署 / 完整挂载**的形态：账号池服务目录是宿主机上的 git 仓库，
     scripts/ 就在那里。
     """
-    from . import updater  # 复用既有的上游目录推断，避免两处口径不一
+    from . import updater  # 复用既有的账号池服务目录推断，避免两处口径不一
     p = updater._upstream_dir() / 'scripts' / 'task_runner.py'
     return p if p.is_file() else None
 
 
 def _extract_dir() -> Path:
-    """从上游容器镜像提取出的脚本的存放目录。"""
+    """从账号池服务容器镜像提取出的脚本的存放目录。"""
     return config.DATA_DIR / 'upstream-scripts'
 
 
@@ -132,17 +132,17 @@ _last_extract_failure: dict = {'at': 0.0, 'reason': ''}
 # fork 一次 `docker inspect`。
 #
 # TTL 取 5 秒：远小于轮询间隔（不会变成轮询放大器），又远大于一次检查的耗时，
-# 于是「上游刚更新完」最多 5 秒后就被发现，用户感知不到延迟。
+# 于是「账号池服务刚更新完」最多 5 秒后就被发现，用户感知不到延迟。
 _IMAGE_ID_TTL_SECONDS = 5
 _image_id_cache: dict = {'at': 0.0, 'id': ''}
 
 
 def _cache_is_fresh() -> bool:
-    """提取出来的脚本是否还对应**当前**上游容器镜像。
+    """提取出来的脚本是否还对应**当前**账号池服务容器镜像。
 
-    用镜像 ID 作指纹：上游更新（`docker compose up -d --build` 重建镜像）后 ID
-    会变，我们就重新提取。这也顺带保证了版本一致 —— 脚本与容器里的上游二进制
-    始终来自同一份代码，不会出现「脚本比上游新/旧」的漂移。
+    用镜像 ID 作指纹：账号池服务更新（`docker compose up -d --build` 重建镜像）后 ID
+    会变，我们就重新提取。这也顺带保证了版本一致 —— 脚本与容器里的账号池服务二进制
+    始终来自同一份代码，不会出现「脚本比账号池服务新/旧」的漂移。
     """
     stamp = _extract_dir() / '.image-id'
     try:
@@ -152,7 +152,7 @@ def _cache_is_fresh() -> bool:
 
 
 def _upstream_image_id() -> str:
-    """上游容器的镜像 ID；取不到返回空串（视为「无法比较」，走重取）。
+    """账号池服务容器的镜像 ID；取不到返回空串（视为「无法比较」，走重取）。
 
     这是**阻塞**调用（`docker inspect`，最多 15 秒），且被 `available()` 间接
     调用 —— 而 `available()` 的调用方里有事件循环内的路径（定时领奖循环、
@@ -184,14 +184,14 @@ def _upstream_image_id() -> str:
 
 
 def extract_scripts(rep: logging.Logger | None = None) -> tuple[bool, str]:
-    """把上游容器里的 `scripts/` 提取到本地，供本面板调用。
+    """把账号池服务容器里的 `scripts/` 提取到本地，供本管理网关调用。
 
     为什么要提取而不是 `docker exec` 每次跑：
       · 脚本会 glob `auths/` 并读写文件、还会访问网络；在容器里跑要处理它的
         工作目录、uid、以及把 auths 暴露进去 —— 每个环节都是新的失败面；
       · 提取一次后就是普通文件，与宿主机部署完全同一条执行路径，调试、日志、
         超时控制都复用同一套；
-      · 用**镜像 ID** 作指纹，上游更新后自动重取，不存在版本漂移。
+      · 用**镜像 ID** 作指纹，账号池服务更新后自动重取，不存在版本漂移。
 
     提取的是**整组**脚本而不是单个 task_runner.py：它 `import task_common` 与
     `school_open_day_2026`（后者又 import task_common），少一个就会在运行时
@@ -220,13 +220,13 @@ def extract_scripts(rep: logging.Logger | None = None) -> tuple[bool, str]:
             capture_output=True, text=True, timeout=60,
         )
     except FileNotFoundError:
-        return _fail('未找到 docker 命令，无法从上游容器提取脚本')
+        return _fail('未找到 docker 命令，无法从账号池服务容器提取脚本')
     except Exception as exc:  # noqa: BLE001
-        return _fail(f'从上游容器提取脚本失败：{err_text(exc)}')
+        return _fail(f'从账号池服务容器提取脚本失败：{err_text(exc)}')
 
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or '').strip()
-        return _fail(f'从上游容器提取脚本失败（{container}）：{err}')
+        return _fail(f'从账号池服务容器提取脚本失败（{container}）：{err}')
 
     if not (dest / 'task_runner.py').is_file():
         return _fail('提取后仍未找到 task_runner.py（容器内 /app/scripts/ 是否存在？）')
@@ -238,7 +238,7 @@ def extract_scripts(rep: logging.Logger | None = None) -> tuple[bool, str]:
         pass
     _last_extract_failure.update({'at': 0.0, 'reason': ''})
     if rep:
-        rep.info('已从上游容器提取任务脚本到 %s', dest)
+        rep.info('已从账号池服务容器提取任务脚本到 %s', dest)
     return True, str(dest / 'task_runner.py')
 
 
@@ -252,7 +252,7 @@ def _script_path() -> Path:
         宿主机那个目录里**根本没有 scripts/**（你只挂了 config.json 与 auths），
         所以回落去容器里提取。
 
-    注意不要为了「让第一条路径有东西」而让用户手动拷贝脚本：那样每次上游更新
+    注意不要为了「让第一条路径有东西」而让用户手动拷贝脚本：那样每次账号池服务更新
     都要重来一次，迟早版本对不上（issue 里正是这么抱怨的）。
     """
     host = _host_script()
@@ -283,7 +283,7 @@ def _auth_dir(value: Path | str | None) -> Path:
 
 
 def available(auth_dir: Path | str | None = None) -> tuple[bool, str]:
-    """能否执行（上游目录与脚本是否到位）。返回 (可用, 说明)。
+    """能否执行（账号池服务目录与脚本是否到位）。返回 (可用, 说明)。
 
     单独抽出来是为了让接口能在**动手前**就拒绝，并把原因说清楚 ——
     用户看到「跑不了」时最想知道的是「为什么、我该怎么办」。
@@ -294,14 +294,14 @@ def available(auth_dir: Path | str | None = None) -> tuple[bool, str]:
     script = _script_path()
     if not script.is_file():
         return False, (
-            f'未找到上游任务脚本（{script}）。'
-            '该功能调用的是上游 workbuddy2api 自带的 scripts/task_runner.py。\n'
+            f'未找到账号池服务任务脚本（{script}）。'
+            '该功能调用的是账号池服务 workbuddy2api 自带的 scripts/task_runner.py。\n'
             '两种部署形态各有一种修法：\n'
-            '  · 官方镜像部署：本面板会尝试用 `docker cp` 从上游容器里提取脚本，'
+            '  · 官方镜像部署：本管理网关会尝试用 `docker cp` 从账号池服务容器里提取脚本，'
             '但它需要能访问 docker（挂载 /var/run/docker.sock，且容器名与 '
             'WB2API_CONTAINER 一致）。请检查这两项，然后点「预览」重试。\n'
-            '  · 源码部署：请确认上游目录（WB_UPSTREAM_DIR）已挂载且版本较新，'
-            '可到「设置 → 系统更新」更新上游。'
+            '  · 源码部署：请确认账号池服务目录（WB_UPSTREAM_DIR）已挂载且版本较新，'
+            '可到「设置 → 系统更新」更新账号池服务。'
         )
     auths = _auth_dir(auth_dir)
     if not auths.is_dir():
@@ -484,7 +484,7 @@ async def _run(argv: list[str], mode: str, target: str,
     # PYTHONIOENCODING 作为双保险（即使环境里已被设置了别的值也覆盖掉）。
     env['PYTHONUTF8'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8:replace'
-    # 上游目录作为 cwd：脚本以 __file__ 自定位，但仍按上游惯例从仓库根运行。
+    # 账号池服务目录作为 cwd：脚本以 __file__ 自定位，但仍按账号池服务惯例从仓库根运行。
     # 丢进线程池：`_script_path()` 在脚本缺失时会触发 docker 提取（阻塞），
     # 而本函数跑在事件循环里。
     script_path = await asyncio.to_thread(_script_path)
@@ -576,7 +576,7 @@ def _record_history(mode: str, target: str, group: str = '') -> None:
     """把这次执行的结果写进「任务记录」，让它在历史里能查到。
 
     只在**真正可能产生写入**的模式下记录（claim / full），且只记一行结果 ——
-    逐行上报日志交给采集器读容器日志，这里记的是「面板发起的这次操作」。
+    逐行上报日志交给采集器读容器日志，这里记的是「管理网关发起的这次操作」。
     """
     if mode not in ('claim', 'full'):
         return
@@ -683,8 +683,8 @@ def get_schedule() -> dict:
     ⚠️ **这套配置有意不做前端入口**，别把它当「漏接线的功能」补上：
 
       · 它跑的是**无人值守**的写操作。虽然只做幂等认领（不伪造行为），但用户
-        设完就忘了，上游限流 / 账号失效时没有任何人在场看到。
-      · 设置页的「定时任务」区块走的是**上游 config.json**（`SCHEDULE_FIELDS`），
+        设完就忘了，账号池服务限流 / 账号失效时没有任何人在场看到。
+      · 设置页的「定时任务」区块走的是**账号池服务 config.json**（`SCHEDULE_FIELDS`），
         与本模块（管理端自己的调度器）是**两套独立机制**。现在界面只暴露前者，
         用户不会困惑；补了入口就会出现两个都叫「定时」的东西。
 

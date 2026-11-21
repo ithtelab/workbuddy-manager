@@ -8,7 +8,7 @@
      是账号风控。接口层不加确认就等同把风险最高的操作变成一键。
   3. 定时只跑 `claim`：领奖是幂等的、不伪造行为；点亮绝不能进定时。
   4. 并发保护：一次只跑一个（叠着跑会放大风控信号，输出也会交错）。
-  5. 上游脚本不存在时**前置拒绝**并说清怎么办，而不是跑到一半失败。
+  5. 账号池服务脚本不存在时**前置拒绝**并说清怎么办，而不是跑到一半失败。
 """
 from __future__ import annotations
 
@@ -122,7 +122,7 @@ class AvailabilityTest(unittest.TestCase):
             ok, why = taskrun.available()
         self.assertFalse(ok)
         self.assertIn('task_runner.py', why)
-        self.assertIn('workbuddy2api', why, '要说清这是上游的脚本')
+        self.assertIn('workbuddy2api', why, '要说清这是账号池服务自带的脚本')
 
     def test_refuses_to_start_when_unavailable(self) -> None:
         # _prepare 会把分组的账号目录传进来（issue #274），lambda 必须收下它
@@ -162,16 +162,16 @@ class AvailabilityTest(unittest.TestCase):
 
 
 class ScriptExtractionTest(unittest.TestCase):
-    """从上游容器提取脚本（issue #29）。
+    """从账号池服务容器提取脚本（issue #29）。
 
-    报障现象：官方**镜像**部署上游时，面板说
-    「未找到上游任务脚本（/opt/workbuddy2api/scripts/task_runner.py）」。
-    原因是上游镜像把脚本 COPY 进容器内的 `/app/scripts/`，而宿主机挂载目录里
+    报障现象：官方**镜像**部署账号池服务时，管理网关说
+    「未找到账号池服务任务脚本（/opt/workbuddy2api/scripts/task_runner.py）」。
+    原因是账号池服务镜像把脚本 COPY 进容器内的 `/app/scripts/`，而宿主机挂载目录里
     根本没有 `scripts/`（用户只挂了 config.json 与 auths）—— 于是无论怎么配
-    都找不到，除非手动从镜像里扒脚本出来（那就每次上游更新都要重来一遍）。
+    都找不到，除非手动从镜像里扒脚本出来（那就每次账号池服务更新都要重来一遍）。
 
     修法：找不到就 `docker cp` 从容器里提取到本地缓存，并以**镜像 ID** 为指纹
-    —— 上游重建镜像后自动重取，脚本与上游二进制始终同版本。
+    —— 账号池服务重建镜像后自动重取，脚本与账号池服务二进制始终同版本。
     """
 
     def setUp(self) -> None:
@@ -221,7 +221,7 @@ class ScriptExtractionTest(unittest.TestCase):
             self.assertTrue((dest / name).is_file(), f'缺少 {name}')
 
     def test_cp_uses_container_and_app_scripts(self) -> None:
-        """docker cp 的来源必须是 `<容器>:/app/scripts/.`（上游镜像里的位置）。"""
+        """docker cp 的来源必须是 `<容器>:/app/scripts/.`（账号池服务镜像里的位置）。"""
         seen: list[list[str]] = []
 
         def _run(cmd, **kw):
@@ -258,7 +258,7 @@ class ScriptExtractionTest(unittest.TestCase):
         sl.assert_not_called()
 
     def test_cache_invalidated_when_image_changes(self) -> None:
-        """上游重建镜像后必须重新提取 —— 否则脚本与上游版本漂移。"""
+        """账号池服务重建镜像后必须重新提取 —— 否则脚本与账号池服务版本漂移。"""
         with mock.patch('subprocess.run', side_effect=self._fake_cp()), \
              mock.patch.object(taskrun, '_upstream_image_id', return_value='img-old'):
             taskrun.extract_scripts()
@@ -847,7 +847,7 @@ class ChildStdioEncodingTest(unittest.TestCase):
     报障：Windows 中文区域原生部署下，账号昵称里带 emoji（🏅）时任务一个账号都没跑
     就退出——脚本 `print(f"== {uid8} ({auth['nick']}) ==")` 那一行，Python 默认按
     ANSI 代码页（cp936）编码 stdout，emoji 编不出去 → `UnicodeEncodeError`。
-    面板这侧读回来时用的是 UTF-8，两端本来就该是同一个编码。
+    管理网关这侧读回来时用的是 UTF-8，两端本来就该是同一个编码。
 
     这里分两层验：
       · 环境形状：子进程环境里必须有 PYTHONUTF8 / PYTHONIOENCODING；
@@ -902,7 +902,7 @@ class ChildStdioEncodingTest(unittest.TestCase):
                         f'PYTHONIOENCODING={env.get("PYTHONIOENCODING")!r}，应为 utf-8')
 
     def test_emoji_nickname_survives_a_cp936_inherited_env(self) -> None:
-        """继承环境故意说自己用 cp936：面板传下去的 UTF-8 必须压过它。"""
+        """继承环境故意说自己用 cp936：管理网关传下去的 UTF-8 必须压过它。"""
         self.script.write_text(
             'print("\U0001f3c5 昵称带奖牌的任务开始")\n'
             'print("task_runner done: ok=1")\n',
@@ -920,7 +920,7 @@ class ChildStdioEncodingTest(unittest.TestCase):
 
 
 class ForceUtf8StdioTest(unittest.TestCase):
-    """面板自身的标准输出也要钉成 UTF-8（同族故障：日志里带 emoji）。"""
+    """管理网关自身的标准输出也要钉成 UTF-8（同族故障：日志里带 emoji）。"""
 
     def test_reconfigures_with_utf8_and_replace(self) -> None:
         from server.stdio_utf8 import force_utf8_stdio

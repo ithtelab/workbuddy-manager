@@ -1,7 +1,7 @@
 {
   "name": "WorkBuddy Manager",
   "short_name": "WorkBuddy",
-  "description": "腾讯 CodeBuddy 账号池管理控制台与 OpenAI 兼容反代网关",
+  "description": "腾讯 CodeBuddy 账号池管理控制台与 OpenAI 兼容管理网关",
   "icons": [
     {
       "src": "android-chrome-192x192.png",

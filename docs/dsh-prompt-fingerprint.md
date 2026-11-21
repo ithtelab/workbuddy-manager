@@ -7,7 +7,7 @@ You are an AI agent powered by DeepSeek Harness.
 You are a coding agent powered by the deepseek-v4.1-flash model.
 ```
 
-上游对这两句**逐字匹配**，命中即回 400 `{"code":11-128,"msg":"Illegal API invocation
+腾讯官方对这两句**逐字匹配**，命中即回 400 `{"code":11-128,"msg":"Illegal API invocation
 from an unapproved channel"}`（与请求规模、tools、stream、max_tokens 全无关，issue #246
 逐项实测排除）。`sanitize.go` 原先没有任何 DSH 指纹，于是这两句原样出站。
 
@@ -58,7 +58,7 @@ You are a helpful AI assistant.
   幂等、反例（普通自我介绍不得改写）、`PrepareBody` 出站边界。
 - 补丁在 `upstream-src` 资产基线上 `apply_upstream_patches.py` 报 `applied`，
   重跑报 `already applied`；打完后重新打包的资产再验一遍，16 条补丁全部 `already applied`。
-- **对上游真实接口的 200 无法在本仓复现**（没有可用账号与出网条件）。句式与改写目标
+- **对腾讯官方真实接口的 200 无法在本仓复现**（没有可用账号与出网条件）。句式与改写目标
   来自 issue #246 与 workbuddy2api-hub#533 的实测结论（后者以「整句换成通用自我介绍」
   在生产环境验证过）。
 

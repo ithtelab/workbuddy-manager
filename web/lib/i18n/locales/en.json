@@ -2020,7 +2020,7 @@
     "custom（替换为网关提示词）": "custom (replace with the gateway prompt)",
     "自定义提示词文件": "Custom prompt file",
     "在 custom 与 append 模式下生效。留空使用内置默认提示词": "Applies in both custom and append modes. Empty uses the built-in default prompt",
-    "路径必须存在于上游容器内且可读；写错会导致上游启动失败、反代不可用。不确定就留空。": "The path must exist and be readable inside the account pool service container; a wrong value makes account pool service fail to start and the gateway unavailable. Leave it empty if unsure.",
+    "路径必须存在于账号池服务容器内且可读；写错会导致账号池服务启动失败、管理网关不可用。不确定就留空。": "The path must exist and be readable inside the account pool service container; a wrong value makes account pool service fail to start and the gateway unavailable. Leave it empty if unsure.",
     "留空 = 使用内置默认": "empty = use the built-in default",
     "请求体上限": "Max request body",
     "单个请求体最大体积，超过返回 413。反代网关也按此值限制入站请求，调大可容纳更长的上下文": "Largest single request body; anything above returns 413. The gateway applies the same limit to inbound requests, so raising it allows longer contexts",
