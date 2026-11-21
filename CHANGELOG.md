@@ -25,7 +25,7 @@
 ### 变更
 
 - **Docker Compose 默认拉取上游官方镜像，不再在部署时本地构建**：`docker compose up -d` 现在直接用 `ghcr.io/ithtelab/workbuddy-manager:latest`，不再需要本机装 Docker 构建环境或下载源码编译前端。如果你 fork 了本项目、按 `deploy/fork-image/README.md` 构建了自己的镜像，只需在 `.env` 里设 `WB_MANAGER_IMAGE=ghcr.io/<你的用户名>/workbuddy-manager:latest` 即可切到自己仓库，compose 文件无需改动。
-- **Docker Compose 精简为标准最小化写法，修正账号池数据目录挂载**：旧版默认挂载 `../workbuddy2api`（部署目录的上级），群晖/NAS 上没这个目录时容器会直接报「Bind mount failed: ... does not exist」起不来。现在改为挂载发布包内自带的 `./upstream` 目录到 `/opt/workbuddy2api`——程序在 Windows / Linux / Docker 三种运行方式下都从该固定路径读取 config.json、auths 与任务脚本，代码本身不做区分；这份数据随发布包更新，面板里「未找到账号池服务配置文件」「未找到 task_runner.py」的报错随之消失。若你的目录不叫 `upstream`，只需改挂载的宿主机侧路径。同时移除了额外的权限修复辅助容器与健康检查，compose 只保留一个服务。
+- **Docker Compose 精简为标准最小化写法，账号池数据目录沿用原作者布局**：挂载保持 `../workbuddy2api`（部署目录的上一级；安装脚本默认装在 `/opt/workbuddy-manager` 与 `/opt/workbuddy2api`），不自建 `./upstream`。程序在 Windows / Linux / Docker 三种运行方式下都从容器内 `/opt/workbuddy2api` 读取 config.json、auths 与任务脚本，代码本身不做区分。若该目录不存在（例如直接把发布包解压到任意目录，或群晖/NAS 上没有这个路径），容器会报「Bind mount failed: ... does not exist」起不来 —— 先按部署文档把账号池源码装到该位置，或只改挂载的宿主机侧路径。同时移除了额外的权限修复辅助容器与健康检查，compose 只保留一个服务。
 - **四大组件术语统一，彻底和「仓库上游」脱钩**：链路上的四个角色现在各有专属名称——`workbuddy2api`（7863）叫**账号池服务**，本面板叫**管理网关**，腾讯 CodeBuddy 叫**腾讯官方**（它在链路里的角色是能力源），调用方（拿密钥调 `/v1` 的一方）叫**调用方**。此前「反代」一词同时指面板和 workbuddy2api，容易混；现在「反代」不再用于指代组件。`config.json` 称「账号池服务配置」，`/opt/workbuddy2api` 称「账号池数据目录」。「多上游」是管理网关的产品功能名（配置多个账号池服务实例做账号池隔离），含义不变；git 语境的「仓库上游 / fork 源」指代码来源，与运行时链路无关。面板报错与日志里的相关文案已同步，例如「未找到账号池服务配置文件」。
 
 ### 修复

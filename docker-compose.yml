@@ -35,9 +35,12 @@ services:
       # 或 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷（首次创建自动继承属主）。
       - ${WB_DATA_VOLUME:-./data}:/app/data
       # 账号池数据目录：账号池服务配置 config.json、auths/、scripts/task_runner.py 都在这里。
-      # 用官方发布包部署时，包内自带 upstream/，这行直接可用；数据随发布包更新。
-      # 若你的目录不叫这个名字，只改冒号左边（宿主机路径），右边 /opt/workbuddy2api 不要动。
-      - ./upstream:/opt/workbuddy2api
+      # 沿用原作者布局：与部署目录同级（安装脚本默认装在 /opt/workbuddy-manager
+      # 与 /opt/workbuddy2api，账号池源码随发布包分发后落到后者）。
+      # 该目录不存在时容器会直接报「Bind mount failed: ... does not exist」起不来：
+      # 先按部署文档把账号池源码装到该位置，或只改冒号左边（宿主机路径），
+      # 右边 /opt/workbuddy2api 不要动。
+      - ../workbuddy2api:/opt/workbuddy2api
       # 需要在容器内更新账号池服务/读日志时挂 docker.sock 并放开 group_add，见 deploy/README.md。
       # - /var/run/docker.sock:/var/run/docker.sock
     # group_add:

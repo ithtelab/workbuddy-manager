@@ -726,26 +726,26 @@ class DockerAssetsTest(unittest.TestCase):
         self.assertTrue(any('/app/data' in str(v) for v in vols),
                         '未持久化 data 卷 —— 重建容器会丢失统计与审计记录')
 
-    def test_upstream_dir_mounted_from_release_bundle(self) -> None:
-        """compose 必须把发布包内的 upstream/ 挂到 /opt/workbuddy2api。
+    def test_upstream_dir_mounted_next_to_deploy_dir(self) -> None:
+        """compose 必须把账号池数据目录挂到 /opt/workbuddy2api。
 
-        程序三种运行方式（Windows/Linux/Docker）都以这个固定路径读 upstream 的
+        程序三种运行方式（Windows/Linux/Docker）都以这个固定路径读账号池服务的
         config.json / auths / scripts，代码不做区分。所以 Docker 侧必须挂到位，
-        否则面板报「未找到上游配置文件」「未找到 task_runner.py」。
+        否则界面报「未找到账号池服务配置文件」「未找到 task_runner.py」。
 
-        关键是挂载源用**部署目录内的相对路径** `./upstream`：官方发布包自带这个
-        目录、随包更新；旧写法 `../workbuddy2api` 指向部署目录的上级，NAS 上往往
-        不存在，会让 daemon 直接 `Bind mount failed` 拒绝启动。
+        挂载源沿用原作者的写法 `../workbuddy2api`：与部署目录同级（安装脚本默认
+        装在 /opt/workbuddy-manager 与 /opt/workbuddy2api）。该目录不存在时 daemon
+        会直接 `Bind mount failed` 拒绝启动，所以宿主机要先把源码装到该位置。
         """
         import yaml
         text = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
         dc = yaml.safe_load(text)
         vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
         self.assertTrue(
-            any(v.startswith('./upstream:') and '/opt/workbuddy2api' in v for v in vols),
-            '未把发布包内的 ./upstream 挂到 /opt/workbuddy2api —— 面板会报找不到配置')
-        self.assertNotRegex(text, r'\.\./workbuddy2api',
-                            '仍有 ../workbuddy2api 上级目录挂载 —— NAS 上不存在会启动失败')
+            any(v.startswith('../workbuddy2api:') and '/opt/workbuddy2api' in v for v in vols),
+            '未把 ../workbuddy2api 挂到 /opt/workbuddy2api —— 界面会报找不到配置')
+        self.assertNotRegex(text, r'\./upstream:',
+                            '不要自建 ./upstream 挂载 —— 与部署文档的目录布局不一致')
         self.assertNotIn('WB_UPSTREAM_DIR', text,
                          'WB_UPSTREAM_DIR 已移除，compose 不该再引用它')
         self.assertNotIn('workbuddy2api-upstream', (dc.get('volumes') or {}),
