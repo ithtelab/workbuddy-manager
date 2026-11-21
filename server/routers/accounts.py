@@ -2588,7 +2588,7 @@ def _set_upstream_overlap(enabled: bool) -> bool:
     """
     cfg = wb2api.load_upstream_config()
     if cfg.get('available') is False:
-        raise HTTPException(status_code=409, detail=str(cfg.get('error') or '上游配置不可用'))
+        raise HTTPException(status_code=409, detail=str(cfg.get('error') or '反代服务配置不可用'))
     sched = cfg.get('schedule') if isinstance(cfg.get('schedule'), dict) else {}
     keys = ('checkin_enabled', 'activity_enabled')
     if all(bool(sched.get(k, True)) == enabled for k in keys):

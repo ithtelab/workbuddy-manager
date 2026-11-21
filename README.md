@@ -223,12 +223,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 | `GET` | `/v1/usage` | 网关密钥 | 密钥自查：已用 / 剩余额度、有效期与模型范围（只读面板记录，不产生调用） |
 | `GET` | `/api/usage/token/` | 网关密钥 | 余额协议：当前密钥的剩余额度（供 new-api 客户端余额面板） |
 | `GET` | `/api/status` | 无 | 余额协议公开元数据：只声明数值单位，不含额度 |
-| `GET` | `/api/upstream/status` | 会话 | 上游运行状态（由原 `/api/status` 迁来；旧路径已让给余额协议） |
-| `GET` | `/healthz` | 无 | 存活探测（含上游连通性） |
+| `GET` | `/api/upstream/status` | 会话 | 反代服务运行状态（由原 `/api/status` 迁来；旧路径已让给余额协议） |
+| `GET` | `/healthz` | 无 | 存活探测（含反代服务连通性） |
 | `GET` | `/api/me` | 会话 | 当前登录用户 |
 | `POST` | `/api/login` `/api/logout` | 无 | 登录 / 登出 |
 | `GET` | `/api/accounts` | 会话 | 账号列表 |
-| `GET` | `/api/accounts/credits-snapshot` | 会话 / 只读令牌 | 已登记积分的只读快照（给看板 / 对账脚本，不查上游） |
+| `GET` | `/api/accounts/credits-snapshot` | 会话 / 只读令牌 | 已登记积分的只读快照（给看板 / 对账脚本，不查反代服务） |
 | `POST` | `/api/auth/start` `/api/auth/poll` | 管理员 | 扫码授权流程 |
 | `POST` | `/api/accounts/{file}/checkin` `/test` `/refresh` | 管理员 | 签到 / 测活 / 刷新 |
 | `DELETE` | `/api/accounts/{file}` | 管理员 | 删除账号 |
@@ -237,7 +237,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 | `GET/POST/PATCH/DELETE` | `/api/tokens[/{id}]` | 会话（管理员） | 管理面 API Token（给脚本 / CI，见 [docs/api-tokens.md](docs/api-tokens.md)） |
 | `GET` | `/api/logs` `/api/stats/*` | 会话 | 日志与用量 |
 | `GET/POST/DELETE` | `/api/security/*` | 会话 / 管理员 | IP 规则与审计 |
-| `GET/POST` | `/api/settings/*` | 会话 / 管理员 | 上游配置、模型映射 |
+| `GET/POST` | `/api/settings/*` | 会话 / 管理员 | 反代服务配置、模型映射 |
 | `GET/POST` | `/api/settings/pg-sync*` | 会话（管理员） | PostgreSQL 异地备份：配置 / 测试连接 / 迁移 / 恢复 |
 
 管理端接口细节可在服务启动后访问 `/docs` 查看（Swagger UI）。

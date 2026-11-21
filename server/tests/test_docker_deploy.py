@@ -795,6 +795,20 @@ class DockerAssetsTest(unittest.TestCase):
         self.assertIn('EnvironmentFile=-/opt/workbuddy-manager/.env', unit,
                       'systemd 单元没读 .env —— 那里面配的代理/线路不会生效')
 
+    def test_compose_passes_admin_password(self) -> None:
+        """初始管理员密码也必须能从 .env 透传到容器（首启 bootstrap 用）。
+
+        与出口代理同理：compose 只认 environment: 列表，不自动读 .env。漏了这一行
+        时用户在 .env 里设了 WB_ADMIN_PASSWORD 也不生效，首启仍随机生成密码。
+        """
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        env = dc['services']['workbuddy-manager']['environment']
+        self.assertIn('WB_ADMIN_PASSWORD', env,
+                      'compose 没透传 WB_ADMIN_PASSWORD —— .env 里设了也无效')
+        self.assertIn('${WB_ADMIN_PASSWORD', str(env['WB_ADMIN_PASSWORD']),
+                      'WB_ADMIN_PASSWORD 没从 .env 取值（compose 用 ${VAR:-} 取）')
+
     def test_dockerfile_deps_go_to_writable_user_site(self) -> None:
         """容器内更新要把新依赖装到**可写**的位置（issue #157 的另一半）。
 

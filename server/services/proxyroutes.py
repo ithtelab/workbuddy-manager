@@ -58,12 +58,12 @@ def _load() -> dict:
         raw = json.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError as exc:
         raise RouteError(
-            f'未找到上游配置文件 {path}。多分组部署请确认该分组的配置文件已配置，'
+            f'未找到反代服务配置文件 {path}。多分组部署请确认该分组的配置文件已配置，'
             f'容器部署请确认它已挂载。', 409) from exc
     except (OSError, ValueError) as exc:
-        raise RouteError(f'上游配置文件无法读取：{exc}') from exc
+        raise RouteError(f'反代服务配置文件无法读取：{exc}') from exc
     if not isinstance(raw, dict):
-        raise RouteError('上游配置文件格式异常（顶层不是对象）')
+        raise RouteError('反代服务配置文件格式异常（顶层不是对象）')
     return raw
 
 
@@ -79,11 +79,11 @@ def _save(cfg: dict) -> None:
         # 权限 —— 只读挂载、root 属主、或 SELinux 标签）。读得到、写不了是最
         # 迷惑的一种：页面能把线路全列出来，一保存就 500。
         raise RouteError(
-            f'上游配置文件写不进去：{path}（{exc}）。'
+            f'反代服务配置文件写不进去：{path}（{exc}）。'
             '请确认面板进程对该文件所在目录有写权限（容器部署注意不要以 :ro 挂载），'
             '宿主机部署可执行 chown 让面板用户可写。', 409) from exc
     except ValueError as exc:
-        raise RouteError(f'上游配置文件写入失败：{exc}', 409) from exc
+        raise RouteError(f'反代服务配置文件写入失败：{exc}', 409) from exc
 
 
 def routes() -> dict[str, str]:

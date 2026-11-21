@@ -25,7 +25,8 @@
 ### 变更
 
 - **Docker Compose 默认拉取上游官方镜像，不再在部署时本地构建**：`docker compose up -d` 现在直接用 `ghcr.io/ithtelab/workbuddy-manager:latest`，不再需要本机装 Docker 构建环境或下载源码编译前端。如果你 fork 了本项目、按 `deploy/fork-image/README.md` 构建了自己的镜像，只需在 `.env` 里设 `WB_MANAGER_IMAGE=ghcr.io/<你的用户名>/workbuddy-manager:latest` 即可切到自己仓库，compose 文件无需改动。
-- **Docker Compose 精简为标准最小化写法，修正上游目录挂载**：旧版默认挂载 `../workbuddy2api`（部署目录的上级），群晖/NAS 上没这个目录时容器会直接报「Bind mount failed: ... does not exist」起不来。现在改为挂载发布包内自带的 `./upstream` 目录到 `/opt/workbuddy2api`——程序在 Windows / Linux / Docker 三种运行方式下都从该固定路径读取 config.json、auths 与任务脚本，代码本身不做区分；这份数据随发布包更新，面板里「未找到上游配置文件」「未找到 task_runner.py」的报错随之消失。若你的目录不叫 `upstream`，只需改挂载的宿主机侧路径。同时移除了额外的权限修复辅助容器与健康检查，compose 只保留一个服务。
+- **Docker Compose 精简为标准最小化写法，修正反代数据目录挂载**：旧版默认挂载 `../workbuddy2api`（部署目录的上级），群晖/NAS 上没这个目录时容器会直接报「Bind mount failed: ... does not exist」起不来。现在改为挂载发布包内自带的 `./upstream` 目录到 `/opt/workbuddy2api`——程序在 Windows / Linux / Docker 三种运行方式下都从该固定路径读取 config.json、auths 与任务脚本，代码本身不做区分；这份数据随发布包更新，面板里「未找到反代服务配置文件」「未找到 task_runner.py」的报错随之消失。若你的目录不叫 `upstream`，只需改挂载的宿主机侧路径。同时移除了额外的权限修复辅助容器与健康检查，compose 只保留一个服务。
+- **术语澄清，避免与「仓库上游」混淆**：`/opt/workbuddy2api` 统一称「反代数据目录」，其中的 `config.json` 称「反代服务配置」。面板报错与日志里指代 workbuddy2api 运行时的「上游配置」「未找到上游配置文件」等文案，改为「反代服务配置」「未找到反代服务配置文件」。「多上游」是面板的产品功能名（配置多个反代接入点做账号池隔离），含义不变。
 
 ### 修复
 
