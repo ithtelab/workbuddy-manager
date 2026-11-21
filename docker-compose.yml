@@ -57,15 +57,17 @@ services:
         # 与下面 environment 里的 WB_BASE_PATH 取值必须一致。
         #   docker compose build --build-arg BASE_PATH=/workbuddy-manager
         BASE_PATH: ""
-    image: workbuddy-manager:latest
+    # 镜像名。默认与下面 build 的产物同名；要直接用预构建镜像，
+    # 在 .env 设 WB_MANAGER_IMAGE=<完整引用> 后 `docker compose up -d --no-build`。
+    image: ${WB_MANAGER_IMAGE:-workbuddy-manager:latest}
     container_name: workbuddy-manager
     # 这个 restart 策略是容器版「一键更新」能生效的前提：
     # 更新完成后容器内的进程会退出，靠它用新代码重新拉起。
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
-      # 首启管理员密码；不设则随机生成并打印到日志（推荐首启后立即改）
-      # WB_ADMIN_PASSWORD: "改成你的强密码"
+      # 首启管理员密码；不设（或留空）则随机生成并打印到日志（推荐首启后立即改）
+      WB_ADMIN_PASSWORD: ${WB_ADMIN_PASSWORD:-}
       # 上游地址：若上游与本品在同一 compose 网络，用服务名；否则填宿主机地址
       #   - 同网络（推荐）：http://workbuddy2api:7863
       #   - 用宿主机 Docker 网关：http://host.docker.internal:7863

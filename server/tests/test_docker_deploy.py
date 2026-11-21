@@ -1408,3 +1408,17 @@ class ComposeTimezoneWiringTest(unittest.TestCase):
         self.assertIsNotNone(run_tz, 'environment 缺 TZ')
         self.assertEqual(build_tz.group(1).strip(), run_tz.group(1).strip(),
                          'build 与 runtime 的 TZ 必须一致，否则会按错误时区分天')
+
+    def test_admin_password_is_passed_from_env(self) -> None:
+        """`.env` 里的 WB_ADMIN_PASSWORD 必须真的传进容器。
+
+        `.env.example` 写明「留空则随机生成并打印到日志」；若 compose 里仍是
+        注释掉的固定值，用户按模板填的密码不会生效，只会静默走随机密码。
+        """
+        self.assertIn('WB_ADMIN_PASSWORD: ${WB_ADMIN_PASSWORD', self.src,
+                      'compose 未透传 WB_ADMIN_PASSWORD，.env 里设的初始密码不生效')
+
+    def test_image_name_can_be_overridden(self) -> None:
+        """镜像名可由 WB_MANAGER_IMAGE 覆盖，默认仍是本地构建产物名。"""
+        self.assertIn('${WB_MANAGER_IMAGE:-workbuddy-manager:latest}', self.src,
+                      '镜像名未参数化，无法改用预构建镜像')
