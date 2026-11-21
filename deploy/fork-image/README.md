@@ -1,10 +1,10 @@
 # fork 自建镜像：把镜像推到你自己的 GHCR
 
 > **先看清默认选择：直接用上游官方镜像。**
-> 绝大多数情况不需要自建 —— 上游发版时构建的镜像已经覆盖日常使用，默认拉取地址是
-> `ghcr.io/ithtelab/workbuddy-manager:latest`（`docker-compose.yml` 里照这个填 `image:`
-> 即可）。只有当你**确实要改代码再自己用** —— 换默认配置、加依赖、或不想依赖别人的
-> 镜像仓库 —— 才需要下面这套自建方案。本目录是进阶可选项，不是默认用法。
+> 绝大多数情况不需要自建 —— `docker-compose.yml` 默认就拉上游官方的
+> `ghcr.io/ithtelab/workbuddy-manager:latest`，什么都不用配。只有当你**确实要改代码
+> 再自己用** —— 换默认配置、加依赖、或不想依赖别人的镜像仓库 —— 才需要下面这套
+> 自建方案。本目录是进阶可选项，不是默认用法。
 
 本目录的 `build-image.yml` 就是那份自建工作流，**上游不启用它**，只在 fork 里用。
 
@@ -54,20 +54,19 @@ docker pull ghcr.io/<你的用户名>/workbuddy-manager:latest
 
 默认分支之外的推送会进入工作流但被**跳过**，不会覆盖 `latest`，也不花构建时间。
 
-## 在 compose 里换成镜像
+## 让 compose 用你的镜像
 
-`docker-compose.yml` 默认是本地构建（`build:` 那段）。想直接用拉下来的镜像，
-把 `build:` 整段删掉、把 `image:` 填上。默认用上游官方镜像：
+`docker-compose.yml` 默认拉上游官方镜像，不用改文件。跑完上面的自建工作流后，
+在 compose 同目录的 `.env` 里加一行，就切到你自己的 GHCR：
 
-```yaml
-services:
-  workbuddy-manager:
-    # 默认：上游官方镜像
-    image: ghcr.io/ithtelab/workbuddy-manager:latest
+```bash
+# .env
+WB_MANAGER_IMAGE=ghcr.io/<你的用户名>/workbuddy-manager:latest
 ```
 
-只有跑了下面这套自建工作流、确实要用自己的镜像时，才换成
-`ghcr.io/<你的用户名>/workbuddy-manager:latest`。
+`docker compose up -d` 重建即可。不设这一行时始终用上游
+`ghcr.io/ithtelab/workbuddy-manager:latest`，所以 fork 仓库的 compose 文件不用改动，
+上游更新也能直接合进来。
 
 > 镜像名用的是 `workbuddy-manager`，和你自己的命名空间拼在一起就是
 > `ghcr.io/<你的用户名>/workbuddy-manager`。注意 `<你的用户名>` 这一段不能省 ——

@@ -640,32 +640,18 @@ class DockerAssetsTest(unittest.TestCase):
             self.assertNotIn(bad, lines,
                              f'.dockerignore 里的 {bad!r} 会连带排除前端源码与 out/')
 
-    def test_compose_passes_npm_registry_arg(self) -> None:
-        """compose 要能传 npm 镜像源（国内构建前端时必需），且与 Dockerfile 对齐。"""
-        import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
-        args = (dc['services']['workbuddy-manager'].get('build') or {}).get('args') or {}
-        self.assertIn('NPM_REGISTRY', args, 'compose 没有暴露 NPM_REGISTRY')
-        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
-        self.assertRegex(df, r'(?m)^ARG\s+NPM_REGISTRY',
-                         'Dockerfile 未声明 NPM_REGISTRY —— compose 传了也会被忽略')
+    def test_dockerfile_declares_optional_build_args(self) -> None:
+        """Dockerfile 仍要声明这些可选构建参数。
 
-    def test_compose_passes_mirror_and_base_path_args(self) -> None:
-        """镜像里的两个国外下载源、以及子路径前缀，同样要 compose ↔ Dockerfile 对齐。
-
-        这类「可选开关」最容易出的错法不是写坏，而是**只加了一边**：compose 里
-        列了参数、Dockerfile 却没声明同名 ARG —— docker 对多余的 build-arg 只是
-        忽略，于是用户填了值、构建照样卡在 download.docker.com / GitHub 上，
-        而且没有任何报错。这条与上面的 NPM_REGISTRY 同款。
+        compose 默认从 GHCR 拉镜像、不再本地构建，但 CI 的多架构构建仍需用它们
+        绕开 download.docker.com / GitHub / npm registry 等国外源的抖动。参数名
+        被改掉时 build-arg 会被静默忽略，构建又卡回国外源，所以在这里钉住。
         """
-        import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
-        args = (dc['services']['workbuddy-manager'].get('build') or {}).get('args') or {}
         df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
-        for name in ('DOCKER_CLI_BASE', 'COMPOSE_URL_PREFIX', 'BASE_PATH'):
-            self.assertIn(name, args, f'compose 没有暴露 {name}')
+        for name in ('NPM_REGISTRY', 'DOCKER_CLI_BASE', 'COMPOSE_URL_PREFIX',
+                     'BASE_PATH'):
             self.assertRegex(df, rf'(?m)^ARG\s+{name}',
-                             f'Dockerfile 未声明 {name} —— compose 传了也会被忽略')
+                             f'Dockerfile 未声明 {name} —— CI 传了也会被忽略')
 
     def test_dockerfile_structure_checker_passes(self) -> None:
         """跑一遍 Dockerfile 结构自检（指令拼写 / 阶段引用 / shell 配平）。
@@ -699,6 +685,31 @@ class DockerAssetsTest(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0,
                          '前端阶段分支判定不正确：' + r.stdout + r.stderr)
+
+    def test_compose_defaults_to_upstream_ghcr_image(self) -> None:
+        """compose 默认从上游官方 GHCR 拉镜像，且不保留任何本地构建配置。
+
+        只要 `build:` 还在（哪怕是注释），用户照着取消注释或执行 up --build 时
+        拿到的就不是上游发布的镜像；而这份精简版 compose 的约定是只拉不用建，
+        所以连注释一并去掉，避免两套语义并存。
+        """
+        import yaml
+        text = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
+        svc = yaml.safe_load(text)['services']['workbuddy-manager']
+        image = svc.get('image') or ''
+        # 形如 ${WB_MANAGER_IMAGE:-ghcr.io/ithtelab/workbuddy-manager:latest}
+        m = re.fullmatch(r'\$\{WB_MANAGER_IMAGE:-(.+)\}', image)
+        self.assertIsNotNone(m,
+                             'image 应是带上游默认值的 WB_MANAGER_IMAGE 变量，'
+                             '既默认拉上游、又让 fork 用户在 .env 指向自己仓库')
+        self.assertEqual(m.group(1), 'ghcr.io/ithtelab/workbuddy-manager:latest',
+                         '默认值不是上游官方 GHCR 镜像')
+        self.assertNotIn('build', svc,
+                         'build 键仍在 —— compose up 可能走本地构建而不是拉镜像')
+        self.assertNotRegex(text, r'(?m)^\s*#\s*build:',
+                            'compose 里还留着注释掉的 build 段，应彻底删除')
+        self.assertNotIn('--build', text,
+                         'compose 里还提到 --build，与「只拉镜像」的约定冲突')
 
     def test_compose_has_restart_policy(self) -> None:
         """restart 策略是容器版「一键更新」能生效的前提：
@@ -1411,12 +1422,11 @@ class AlpineTimezoneTest(unittest.TestCase):
                             'useradd 在 Alpine 上不存在（是 Debian 的）')
 
 class ComposeTimezoneWiringTest(unittest.TestCase):
-    """compose 的 TZ 必须在**构建期**与**运行期**两处都给（审计发现的缺口）。
+    """运行期 TZ 必须显式给出，且指向合法时区。
 
-    `environment.TZ` 只影响进程环境；镜像里没有 tzdata、`/etc/localtime` 没指向
-    目标时区的话，musl 的 `localtime()` 会静默退回 UTC。而本项目的按日统计与
-    每日 Token 限额复位都按本地时区 —— 两处不一致的表现是「时区写着 +8、
-    数字按 UTC 分天」，不报任何错。
+    按日统计、每日 Token 限额复位、任务日报分桶都取本地时区。此前 compose 同时
+    负责构建期（build.args.TZ，决定是否装 tzdata）与运行期（environment.TZ）
+    两处；改为从 GHCR 拉官方镜像后，构建期归上游 CI，这份 compose 只管运行期。
     """
 
     COMPOSE = _ROOT / 'docker-compose.yml'
@@ -1424,16 +1434,14 @@ class ComposeTimezoneWiringTest(unittest.TestCase):
     def setUp(self) -> None:
         self.src = self.COMPOSE.read_text(encoding='utf-8')
 
-    def test_build_arg_tz_exists(self) -> None:
-        head = self.src[: self.src.index('environment:')]
-        self.assertIn('TZ:', head, '必须在 build.args 里传 TZ（决定装不装 tzdata）')
-
-    def test_runtime_and_build_tz_agree(self) -> None:
-        head = self.src[: self.src.index('environment:')]
+    def test_runtime_tz_exists(self) -> None:
         tail = self.src[self.src.index('environment:'):]
-        build_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', head, re.M)
-        run_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', tail, re.M)
-        self.assertIsNotNone(build_tz, 'build.args 缺 TZ')
-        self.assertIsNotNone(run_tz, 'environment 缺 TZ')
-        self.assertEqual(build_tz.group(1).strip(), run_tz.group(1).strip(),
-                         'build 与 runtime 的 TZ 必须一致，否则会按错误时区分天')
+        self.assertIsNotNone(re.search(r'^\s+TZ:\s*\S', tail, re.M),
+                             'environment 缺 TZ —— 按日统计会退回 UTC')
+
+    def test_runtime_tz_is_iana_name(self) -> None:
+        tail = self.src[self.src.index('environment:'):]
+        m = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', tail, re.M)
+        self.assertIsNotNone(m, 'environment 缺 TZ')
+        self.assertIn('/', m.group(1).strip(),
+                      'TZ 应为 IANA 时区名（如 Asia/Shanghai），而不是 UTC/GMT')

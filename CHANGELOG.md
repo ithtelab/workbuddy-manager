@@ -22,6 +22,10 @@
 
 ## [未发布]
 
+### 变更
+
+- **Docker Compose 默认拉取上游官方镜像，不再在部署时本地构建**：`docker compose up -d` 现在直接用 `ghcr.io/ithtelab/workbuddy-manager:latest`，不再需要本机装 Docker 构建环境或下载源码编译前端。如果你 fork 了本项目、按 `deploy/fork-image/README.md` 构建了自己的镜像，只需在 `.env` 里设 `WB_MANAGER_IMAGE=ghcr.io/<你的用户名>/workbuddy-manager:latest` 即可切到自己仓库，compose 文件无需改动。
+
 ### 修复
 
 - **Docker 部署不再因 `data` 目录权限起不来**：此前若宿主机上的 `data` 目录属主是 root，容器内的程序写不进去，启动就报「无法打开数据库文件 / 目录不可写：/app/data」。现在启动时会先自动把这目录的属主修正为容器使用的用户，成功后才启动面板；网络文件系统等改不了属主的环境，仍可按日志提示改用命名卷。

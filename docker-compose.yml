@@ -2,7 +2,7 @@
 #
 # 用法：
 #   1) 按需修改下面的环境变量（至少确认上游地址与路径）
-#   2) docker compose up -d --build
+#   2) docker compose up -d
 #   3) 浏览器打开 http://<服务器IP>:7864
 #      首次启动若未设 WB_ADMIN_PASSWORD，会随机生成密码并打印到容器日志：
 #      docker compose logs workbuddy-manager | grep -A2 密码
@@ -48,49 +48,8 @@ services:
     depends_on:
       data-perms:
         condition: service_completed_successfully
-    build:
-      context: .
-      # 可选：Alpine 软件源镜像（镜像基于 python:3.12-alpine）。
-      # 官方源（dl-cdn.alpinelinux.org）国内偶有卡顿，填 mirrors.aliyun.com 可绕开。
-      #   docker compose build --build-arg ALPINE_MIRROR=mirrors.aliyun.com
-      #
-      # DEBIAN_MIRROR 是旧版本的参数名，保留仅为兼容已有 compose（同样填 mirrors.aliyun.com
-      # 即可）；新部署请用 ALPINE_MIRROR。两者都留空 = 官方源。
-      # 可选镜像：mirrors.aliyun.com / mirrors.tuna.tsinghua.edu.cn / mirrors.ustc.edu.cn
-      args:
-        ALPINE_MIRROR: ""
-        DEBIAN_MIRROR: ""
-        # 容器时区。**必须与下面 environment 里的 TZ 一致**：
-        #   · 构建期（这里）决定镜像里装不装 tzdata、/etc/localtime 指向哪；
-        #   · 运行期（environment）只是把 TZ 传进进程环境。
-        # 只设运行期而没装 tzdata 的话，Alpine 会让 localtime 静默退回 UTC ——
-        # 按日统计与每日限额会按 UTC 分天，且不报错。
-        #   docker compose build --build-arg TZ=Asia/Shanghai
-        TZ: "Asia/Shanghai"
-        # 可选：PyPI 镜像（成因同上——官方源走国际 CDN，国内会抖动/失败）。
-        # 留空 = 官方源，失败时 Dockerfile 会自动降级到清华镜像重试。
-        # 可选镜像：https://pypi.tuna.tsinghua.edu.cn/simple / https://mirrors.aliyun.com/pypi/simple
-        PIP_INDEX_URL: ""
-        # 可选：npm 依赖镜像。**只在需要容器内构建前端时用得上**（即工作区
-        # 没有 web/out 的情况，如 git clone 部署）。成因与上面两个相同——
-        # 官方 registry 国内访问慢且会断。
-        #   docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
-        NPM_REGISTRY: ""
-        # 可选：镜像里要装 docker CLI（供容器内「重载上游 / 读上游日志 / 一键更新」用），
-        # 它的静态包固定从 download.docker.com 取——国外 CDN，国内实测很慢，
-        # 构建会长时间停在这一步。填国内镜像基址可绕开。
-        # 可选值：https://mirrors.aliyun.com/docker-ce / https://mirrors.tuna.tsinghua.edu.cn/docker-ce
-        DOCKER_CLI_BASE: ""
-        # 可选：compose 插件从 GitHub Releases 下载（官方地址国内会超时）。
-        # 用法是「加速前缀 + 原始 URL」，例如 https://ghfast.top/
-        COMPOSE_URL_PREFIX: ""
-        # 可选：子路径部署前缀（如 /workbuddy-manager）。留空 = 部署在根路径。
-        #
-        # 容器版的前端是**构建期**编译进镜像的，所以前缀必须在 build 时传进来；
-        # 与下面 environment 里的 WB_BASE_PATH 取值必须一致。
-        #   docker compose build --build-arg BASE_PATH=/workbuddy-manager
-        BASE_PATH: ""
-    image: workbuddy-manager:latest
+    # 默认拉上游官方镜像；fork 自建镜像时在 .env 设 WB_MANAGER_IMAGE 指向自己仓库。
+    image: ${WB_MANAGER_IMAGE:-ghcr.io/ithtelab/workbuddy-manager:latest}
     container_name: workbuddy-manager
     # 这个 restart 策略是容器版「一键更新」能生效的前提：
     # 更新完成后容器内的进程会退出，靠它用新代码重新拉起。
@@ -103,9 +62,8 @@ services:
       #   - 同网络（推荐）：http://workbuddy2api:7863
       #   - 用宿主机 Docker 网关：http://host.docker.internal:7863
       WB2API_BASE: http://host.docker.internal:7863
-      # 可选：子路径部署前缀，必须与上面 build.args.BASE_PATH 完全一致（留空则都不填）。
-      # 服务端用它补回响应里漏掉的站内地址，并在反代保留前缀时把前缀剥掉。
-      # 详见 deploy/README.md 的「子路径部署」。
+      # 子路径部署时补回响应里漏掉的站内地址。官方镜像按根路径构建，
+      # 前端资源路径不随之改变；详见 deploy/README.md 的「子路径部署」。
       # WB_BASE_PATH: /workbuddy-manager
       # 反向代理在后面时，真实 IP 取自它覆盖写入的 X-Real-IP
       WB_TRUST_PROXY: "1"
