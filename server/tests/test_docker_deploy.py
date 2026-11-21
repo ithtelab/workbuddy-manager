@@ -726,20 +726,26 @@ class DockerAssetsTest(unittest.TestCase):
         self.assertTrue(any('/app/data' in str(v) for v in vols),
                         '未持久化 data 卷 —— 重建容器会丢失统计与审计记录')
 
-    def test_upstream_dir_not_mounted(self) -> None:
-        """compose 默认不挂上游仓库目录。
+    def test_upstream_dir_mounted_from_release_bundle(self) -> None:
+        """compose 必须把发布包内的 upstream/ 挂到 /opt/workbuddy2api。
 
-        这条挂载曾导致 NAS 上 `Bind mount failed: ... does not exist` 起不来
-        （宿主机没那个目录时 daemon 直接拒绝）；而镜像来源（WB_MANAGER_IMAGE）
-        与它无关，不需要靠它切换。依赖直读上游文件的功能（账号管理 / 读配置 /
-        日志回填）在没有目录时会降级提示，不影响面板启动。
+        程序三种运行方式（Windows/Linux/Docker）都以这个固定路径读 upstream 的
+        config.json / auths / scripts，代码不做区分。所以 Docker 侧必须挂到位，
+        否则面板报「未找到上游配置文件」「未找到 task_runner.py」。
+
+        关键是挂载源用**部署目录内的相对路径** `./upstream`：官方发布包自带这个
+        目录、随包更新；旧写法 `../workbuddy2api` 指向部署目录的上级，NAS 上往往
+        不存在，会让 daemon 直接 `Bind mount failed` 拒绝启动。
         """
         import yaml
         text = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
         dc = yaml.safe_load(text)
         vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
-        self.assertFalse(any('/opt/workbuddy2api' in v for v in vols),
-                        '上游目录不应默认挂载 —— 宿主机没该目录会 Bind mount failed')
+        self.assertTrue(
+            any(v.startswith('./upstream:') and '/opt/workbuddy2api' in v for v in vols),
+            '未把发布包内的 ./upstream 挂到 /opt/workbuddy2api —— 面板会报找不到配置')
+        self.assertNotRegex(text, r'\.\./workbuddy2api',
+                            '仍有 ../workbuddy2api 上级目录挂载 —— NAS 上不存在会启动失败')
         self.assertNotIn('WB_UPSTREAM_DIR', text,
                          'WB_UPSTREAM_DIR 已移除，compose 不该再引用它')
         self.assertNotIn('workbuddy2api-upstream', (dc.get('volumes') or {}),
