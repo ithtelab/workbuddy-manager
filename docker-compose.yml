@@ -1,172 +1,48 @@
 # WorkBuddy Manager —— Docker Compose 部署
 #
 # 用法：
-#   1) 按需修改下面的环境变量（至少确认上游地址与路径）
-#   2) docker compose up -d
-#   3) 浏览器打开 http://<服务器IP>:7864
-#      首次启动若未设 WB_ADMIN_PASSWORD，会随机生成密码并打印到容器日志：
-#      docker compose logs workbuddy-manager | grep -A2 密码
+#   docker compose up -d
+#   浏览器打开 http://<服务器IP>:7864
+#   首启密码：docker compose logs workbuddy-manager | grep -A2 密码
 #
-# 与宿主机安装（deploy/install.sh + systemd）的区别，见 Dockerfile 顶部说明。
-# 简述：容器版**能**在界面上更新上游 —— 镜像内置了 docker CLI 与 compose 插件，
-# 显式开启 docker.sock 挂载（见下方 volumes 的说明）即可在容器内重建上游容器。
-# 默认**不挂**：把宿主 root 交给一个 Web 应用不该是默认状态。不挂时那几项
-# 会降级为「请到宿主机操作」，界面如实提示。
+# 镜像来源、数据卷与可选挂载见同目录 .env.example。
 
 services:
-  # 一次性权限修复容器（issue #30 复发后的根治）：
-  # bind mount 的 ./data 属主由宿主机决定，首次自动创建时归 root；而管理容器
-  # 以 uid 10001 运行，直接写就会报 `sqlite3.OperationalError: unable to open
-  # database file`。镜像内的 chown 对挂载点无效，宿主机又未必有 SSH 可改属主。
-  # 这个 sidecar 以 root 启动、只做这一件事：把同一个数据卷的属主改成 10001，
-  # 成功退出后管理容器才启动。命名卷场景同样会跑一遍，保证旧卷属主正确。
-  data-perms:
-    image: alpine:3.21
-    container_name: workbuddy-manager-data-perms
-    restart: "no"
-    command:
-      - sh
-      - -c
-      - |
-        set -eu
-        if ! chown -R 10001:10001 /data 2>/tmp/chown.err; then
-          # 不要因为 chown 失败就拦住面板：Windows / Docker Desktop 的 bind mount
-          # 本来就不需要改属主，拦住会把本来能跑的部署搞挂。放行并留警告，
-          # 真的写不进去时 db.py 会给出详细报错与命名卷方案。
-          echo "[data-perms] 警告：无法修正 /data 属主（NFS/SMB 根用户被压扁、Windows 挂载等）。" >&2
-          echo "[data-perms] 若面板随后报数据库无法打开，请在 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷。" >&2
-          cat /tmp/chown.err >&2
-          exit 0
-        fi
-        echo "[data-perms] /data 属主已确保为 10001:10001"
-    volumes:
-      - ${WB_DATA_VOLUME:-./data}:/data
-
   workbuddy-manager:
-    # 等权限修复容器成功退出再启动，避免启动时序竞争：只重启不重建时该容器
-    # 已是 Exited(0)，Compose 会视为依赖已满足，不会重复 chown。
-    depends_on:
-      data-perms:
-        condition: service_completed_successfully
-    # 默认拉上游官方镜像；fork 自建镜像时在 .env 设 WB_MANAGER_IMAGE 指向自己仓库。
+    # 默认拉上游官方镜像；fork 自建时在 .env 设 WB_MANAGER_IMAGE。
     image: ${WB_MANAGER_IMAGE:-ghcr.io/ithtelab/workbuddy-manager:latest}
     container_name: workbuddy-manager
-    # 这个 restart 策略是容器版「一键更新」能生效的前提：
-    # 更新完成后容器内的进程会退出，靠它用新代码重新拉起。
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
-      # 首启管理员密码；不设则随机生成并打印到日志（推荐首启后立即改）
-      # WB_ADMIN_PASSWORD: "改成你的强密码"
-      # 上游地址：若上游与本品在同一 compose 网络，用服务名；否则填宿主机地址
-      #   - 同网络（推荐）：http://workbuddy2api:7863
-      #   - 用宿主机 Docker 网关：http://host.docker.internal:7863
       WB2API_BASE: http://host.docker.internal:7863
-      # 子路径部署时补回响应里漏掉的站内地址。官方镜像按根路径构建，
-      # 前端资源路径不随之改变；详见 deploy/README.md 的「子路径部署」。
-      # WB_BASE_PATH: /workbuddy-manager
-      # 反向代理在后面时，真实 IP 取自它覆盖写入的 X-Real-IP
       WB_TRUST_PROXY: "1"
-      # 生产环境不暴露 /docs 与 /openapi.json
       WB_ENABLE_DOCS: "0"
-      # 出口代理（可选）：写在与本文件同目录的 .env 里即可，compose 用 ${} 取过来。
-      # 支持 http:// / https:// / socks5://；内网与本机目标（含上游那一跳）始终直连。
       WB_HTTP_PROXY: ${WB_HTTP_PROXY:-}
-      # 一键更新的下载代理（可选，只认 http/https）
       WB_UPDATE_PROXY: ${WB_UPDATE_PROXY:-}
-      # GitHub 镜像加速（可选，issue #216）：国内机器直连 GitHub 超时时填基址，
-      # 例如 https://gh-proxy.com/ 。版本检测与发布包下载先走镜像，失败回退直连。
       WB_GITHUB_MIRROR: ${WB_GITHUB_MIRROR:-}
-      # 新账号默认绑定的命名线路（名字要在上游 config.json 的 proxies 里）
       WB_DEFAULT_ACCOUNT_PROXY: ${WB_DEFAULT_ACCOUNT_PROXY:-}
-      # 容器日志：默认不打印逐请求 access log（避免健康检查/轮询刷屏）；
-      # 启动失败时只打精简说明 + 项目栈帧。临时抓请求时设 WB_ACCESS_LOG=1。
       WB_ACCESS_LOG: ${WB_ACCESS_LOG:-0}
       WB_STARTUP_FAILURE_STACK: ${WB_STARTUP_FAILURE_STACK:-1}
     ports:
-      # **只监听本机**：管理端必须藏在反向代理之后。
-      # 若确需直接从别的机器访问，改成 "7864:7864"，但请先确保有 HTTPS 与访问控制——
-      # 管理端持有全部账号凭据，直接暴露到公网是被打穿的常见原因。
+      # 只监听本机：请置于 HTTPS 反向代理之后（管理端持有全部账号凭据）。
       - "127.0.0.1:7864:7864"
     volumes:
-      # 数据库、日志、更新状态、上游版本固定标记都在这里。
-      # 必须持久化，否则重建容器会丢失统计与审计记录。
-      #
-      # **权限提示（issue #30）**：bind mount 的目录属主由宿主机决定，镜像内的
-      # chown 不起作用。docker 首次自动创建 ./data 时归 root，而容器以 uid 10001
-      # 运行 —— 结果是启动时报 `sqlite3.OperationalError: unable to open database
-      # file`（那个报错既不说路径也不说原因，很容易误以为是路径配错了）。
-      # 上面的 data-perms sidecar 会在启动时自动 chown；只有在它明确报「无法
-      # 修正属主」（网络文件系统等）时才需要下面的人工修法。
-      # 宿主机在 compose 所在目录执行一次即可：
-      #   chown -R 10001:10001 ./data
-      # 若目录在网络文件系统（NFS/SMB）上、改不了属主，改用命名卷：
-      #   volumes:
-      #     - wb-manager-data:/app/data
-      #   # 文件末尾另加：
-      #   volumes:
-      #     wb-manager-data:
-      #
-      # **更省事的做法（NAS / 群晖 / 没开 SSH）**：不用改这份文件，也不用 chown。
-      # 命名卷首次创建时会继承镜像内 /app/data 的属主（10001），容器直接可写。
-      # 在 compose 同目录的 .env 里加一行，再执行 `docker compose up -d`：
-      #   WB_DATA_VOLUME=wb-manager-data
-      # 不设该变量时，下面这行等价于原来的 `- ./data:/app/data`，老部署行为不变。
-      # 切过去之后数据库不再落在宿主 ./data 里，取文件用：
-      #   docker compose cp workbuddy-manager:/app/data/manager.db ./manager.db
+      # 数据持久化。群晖/NAS 的 bind mount 属主常是 root（容器用 uid 10001），
+      # 写不进去会报「无法打开数据库文件」：宿主执行 chown -R 10001:10001 ./data，
+      # 或 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷（首次创建自动继承属主）。
       - ${WB_DATA_VOLUME:-./data}:/app/data
-      # 上游**整个仓库目录**。一次挂载覆盖下面三件事（分开挂子路径会互相重叠，
-      # 反而让权限语义变模糊）：
-      #   · 读/写上游 config.json —— 管理端「设置」页保存的目标
-      #   · 读/写 auths/ —— 扫码添加账号会落盘 workbuddy-<uid>.json（见
-      #     tencent.write_auth_file），所以**不能只读**
-      #   · 读上游 docker-compose.yml 做端口收敛；「更新上游」时在容器内
-      #     git fetch/pull 并重建上游容器
-      #
-      # **权限提示（与上游 issue #108 同款问题）**：bind mount 的目录属主由宿主机
-      # 决定，镜像内的 chown 不起作用。若管理端显示「0 个账号」而 auths 里明明有
-      # 文件，或添加账号报权限错误，通常是跨 uid 读写不到——宿主机执行一次：
-      #   chown -R 10001:10001 ../workbuddy2api/auths
-      # （10001 是上游容器内进程的 uid，管理端也用同一 uid，见 Dockerfile）
-      #
-      # 若你**不想**让管理端碰上游仓库（例如上游由别人维护），改成只挂 config.json
-      # 与 auths/ 两条子路径即可：此时「更新上游」会不可用，界面会如实提示。
-      - ../workbuddy2api:/opt/workbuddy2api
-      # docker 控制套接字：**默认不挂**（opt-in）。
-      #
-      # **安全性说明（值得读）**：挂 docker.sock 等于把宿主 root 权限交给本容器
-      # （`docker run -v /:/host` 即可拿到宿主文件系统）。管理端是持有全部账号
-      # 凭据的高价值目标，Web 应用被攻破的可能性永远不为零，所以这不该是默认
-      # 状态。需要「保存设置后自动重载上游 / 读上游日志 / 一键更新上游」这些
-      # 界面功能时，把下面这行与文件末尾的 group_add 一并取消注释，并把宿主
-      # socket 的真实 GID 写进 .env（见 deploy/README.md「容器内操作 docker」）。
-      #
-      # 不挂时依赖 docker 的功能会自动降级为「请到宿主机执行 docker compose ...」，
-      # 界面如实提示，不会静默失败。
-      #
+      # 上游仓库目录。默认挂空卷（相关功能自动降级）；在 .env 设 WB_UPSTREAM_DIR
+      # 为宿主机实际路径（如 /volume1/docker/workbuddy2api）即可启用。
+      - ${WB_UPSTREAM_DIR:-workbuddy2api-upstream}:/opt/workbuddy2api
+      # 需要在容器内更新上游/读日志时挂 docker.sock 并放开 group_add，见 deploy/README.md。
       # - /var/run/docker.sock:/var/run/docker.sock
-
-    # 与上面的挂载配套（同样默认注释掉）：
-    # 挂上 socket 只是必要条件 —— 还得**进得了那个组**。宿主的 socket 通常归
-    # root:docker（GID 998/999），而本容器以 uid 10001 运行，不在那个组里就是
-    # permission denied。GID 因机器而异，所以用变量：
-    #   DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)   # 写进 .env
-    # 默认 999 是 Debian/Ubuntu 上最常见的值；取错了不会静默失败 —— 更新上游时
-    # 会给出取真实 GID 的提示。
     # group_add:
-    #   - "${DOCKER_GID:-999}"
-
+    #   - "${DOCKER_GID:-999}"   # 宿主 socket 组：stat -c '%g' /var/run/docker.sock
     extra_hosts:
       # 让容器能通过 host.docker.internal 访问宿主机上的上游
       - "host.docker.internal:host-gateway"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7864/api/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
 
-# 顶层卷声明：只在 .env 里设置 WB_DATA_VOLUME=wb-manager-data 时才会被引用。
-# 默认（未设变量）仍走 ./data，这个卷不会被写入数据，也不影响已有部署。
 volumes:
   wb-manager-data:
+  workbuddy2api-upstream:

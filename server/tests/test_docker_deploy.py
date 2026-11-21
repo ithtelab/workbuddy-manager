@@ -554,31 +554,26 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         self.assertIn('wb-manager-data', (dc.get('volumes') or {}),
                       '顶层没声明 wb-manager-data，切到命名卷会失败')
 
-    def test_compose_autofixes_data_volume_ownership(self) -> None:
-        """compose 必须自带权限修复 sidecar，不再要求用户先上宿主机 chown。
+    def test_compose_documents_data_permission_fix(self) -> None:
+        """精简版 compose 不引入 sidecar，但权限问题的修法必须写在注释里。
 
-        实测复发过两次：.env.example 已默认命名卷，但老部署的 .env 没有该变量，
-        仍然走 root 属主的 ./data，启动照样炸。让 compose 自己在启动前 chown
-        同一个数据卷，才能覆盖「老 .env + 没 SSH」这类场景。
+        标准最小化写法只保留一个服务；群晖/NAS 上 bind mount 属主是 root 时，
+        用户要能从 compose 注释里直接看到两种修法（宿主 chown / 命名卷开关），
+        否则又会回到「无法打开数据库文件」却无从下手。
         """
         import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        text = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
+        dc = yaml.safe_load(text)
         services = dc.get('services') or {}
-        sidecar = services.get('data-perms')
-        self.assertIsNotNone(sidecar, '缺少 data-perms sidecar：bind mount 属主错误会再次炸启动')
-        vols = [str(v) for v in (sidecar.get('volumes') or [])]
-        self.assertTrue(
-            any('${WB_DATA_VOLUME:-./data}:/data' in v for v in vols),
-            'sidecar 必须挂与管理容器完全相同的数据卷（含命名卷开关）')
-        cmd = ' '.join(str(x) for x in (sidecar.get('command') or []))
-        self.assertIn('chown', cmd, 'sidecar 没做 chown')
-        self.assertIn('10001:10001', cmd, '必须改成容器进程的 uid/gid')
-        app = services.get('workbuddy-manager') or {}
-        deps = app.get('depends_on') or {}
-        self.assertEqual(
-            (deps.get('data-perms') or {}).get('condition'),
-            'service_completed_successfully',
-            '管理容器必须等权限修复成功后再启动，否则仍有启动时序竞争')
+        self.assertNotIn('data-perms', services,
+                         '精简版 compose 不应再引入 alpine sidecar 服务')
+        idx = text.find('- ${WB_DATA_VOLUME:-./data}:/app/data')
+        self.assertGreater(idx, 0, 'data 挂载行丢了')
+        above = text[max(0, idx - 600):idx]
+        self.assertIn('chown -R 10001:10001', above,
+                      'data 挂载缺少宿主 chown 修法提示')
+        self.assertIn('WB_DATA_VOLUME=wb-manager-data', above,
+                      'data 挂载缺少命名卷开关提示')
 
 
 class DockerAssetsTest(unittest.TestCase):

@@ -25,6 +25,7 @@
 ### 变更
 
 - **Docker Compose 默认拉取上游官方镜像，不再在部署时本地构建**：`docker compose up -d` 现在直接用 `ghcr.io/ithtelab/workbuddy-manager:latest`，不再需要本机装 Docker 构建环境或下载源码编译前端。如果你 fork 了本项目、按 `deploy/fork-image/README.md` 构建了自己的镜像，只需在 `.env` 里设 `WB_MANAGER_IMAGE=ghcr.io/<你的用户名>/workbuddy-manager:latest` 即可切到自己仓库，compose 文件无需改动。
+- **Docker Compose 精简为标准最小化写法，避免群晖/NAS 启动失败**：旧版默认挂载 `../workbuddy2api` 上游目录，宿主机上没这个目录时容器会直接报「Bind mount failed: ... does not exist」起不来。现在上游目录默认挂一个空卷、相关功能降级提示，需要在面板里读写上游配置时再到 `.env` 设 `WB_UPSTREAM_DIR` 指向实际路径。同时移除了额外的权限修复辅助容器与健康检查，compose 只保留一个服务，部署更简单。数据目录的持久化与权限修法说明仍保留。
 
 ### 修复
 
