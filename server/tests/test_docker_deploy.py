@@ -529,8 +529,8 @@ class DbOpenFailureMessageTest(unittest.TestCase):
     def test_compose_documents_data_ownership(self) -> None:
         """compose 里 data 挂载必须带权限提示（上游 compose 就有，issue #30）。"""
         compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
-        idx = compose.find('- ${WB_DATA_VOLUME:-./data}:/app/data')
-        self.assertGreater(idx, 0, '没找到 data 挂载（默认值必须仍是 ./data）')
+        idx = compose.find('- ${WB_DATA_VOLUME:-./data}:/opt/workbuddy')
+        self.assertGreater(idx, 0, '没找到 data 挂载（应是 ./data → /opt/workbuddy）')
         # 挂载行上方要有「为什么不可写 + 怎么修」，光报错不解决用户的实际问题
         above = compose[max(0, idx - 1400):idx]
         self.assertIn('chown', above, 'data 挂载缺少属主提示（issue #30 的成因）')
@@ -541,7 +541,7 @@ class DbOpenFailureMessageTest(unittest.TestCase):
     def test_compose_named_volume_switch_is_declared(self) -> None:
         """NAS / SMB 改不了属主时，一行 .env 就能切到命名卷（issue #30 复发）。
 
-        命名卷首次创建会继承镜像内 /app/data 的属主（10001），所以无需宿主 chown。
+        命名卷首次创建会继承镜像内 /opt/workbuddy 的属主（10001），所以无需宿主 chown。
         开关要同时满足两点：挂载行做变量插值、顶层声明同名卷 —— 只改挂载行
         而不声明卷，compose 会把它当成相对路径的 bind mount 并报错。
         """
@@ -549,7 +549,7 @@ class DbOpenFailureMessageTest(unittest.TestCase):
         dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
         vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
         self.assertTrue(
-            any('${WB_DATA_VOLUME:-./data}:/app/data' in v for v in vols),
+            any('${WB_DATA_VOLUME:-./data}:/opt/workbuddy' in v for v in vols),
             'data 挂载未做成可切换的卷；默认值必须是 ./data，别破坏已有部署')
         self.assertIn('wb-manager-data', (dc.get('volumes') or {}),
                       '顶层没声明 wb-manager-data，切到命名卷会失败')
@@ -688,24 +688,56 @@ class DockerAssetsTest(unittest.TestCase):
                         '端口未绑定到 127.0.0.1 —— 管理端不应默认暴露公网')
 
     def test_compose_persists_data(self) -> None:
+        """宿主机只需建一个 ./data，容器内也只有一个根 /opt/workbuddy。
+
+        管理端数据库与上游的 config.json / auths / scripts 都在这一条挂载里，
+        各占一个子目录（data/manager/、data/workbuddy2api/）。
+
+        只保留**一条**挂载是刻意的：docker 逐个校验挂载源，两条就得先在宿主机建好
+        两个子目录，少建一个直接 `Bind mount failed` 起不来（群晖 Container Manager
+        与新版 docker 都这样）。收成一条后只校验 ./data，子目录由程序自建。
+        """
         import yaml
         dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
-        vols = dc['services']['workbuddy-manager'].get('volumes') or []
-        self.assertTrue(any('/app/data' in str(v) for v in vols),
-                        '未持久化 data 卷 —— 重建容器会丢失统计与审计记录')
+        svc = dc['services']['workbuddy-manager']
+        vols = [str(v) for v in (svc.get('volumes') or [])]
+        data_vols = [v for v in vols if 'docker.sock' not in v]
+        self.assertEqual(
+            data_vols, ['${WB_DATA_VOLUME:-./data}:/opt/workbuddy'],
+            f'数据挂载应只有一条（宿主机只需建 ./data），实际：{data_vols}')
+
+        env = svc['environment']
+        expected = {
+            'WB_DATA_DIR': '/opt/workbuddy/manager',
+            'WB_AUTH_DIR': '/opt/workbuddy/workbuddy2api/auths',
+            'WB_UPSTREAM_CONFIG': '/opt/workbuddy/workbuddy2api/config.json',
+        }
+        for key, want in expected.items():
+            self.assertEqual(env.get(key), want, f'{key} 应为 {want}')
+            # 三个路径必须都落在挂载点之内，否则数据写进容器可写层 —— 重建即丢
+            self.assertTrue(str(env[key]).startswith('/opt/workbuddy/'),
+                            f'{key} 没落在挂载点 /opt/workbuddy 下')
 
     def test_upstream_dir_mounted(self) -> None:
-        """必须挂载上游仓库目录。
+        """必须挂载上游整个仓库目录。
 
         没挂的话容器内既拿不到上游的 docker-compose.yml（端口收敛无从下手），
         也无法在容器内 git pull —— 「更新上游」直接做不到。
         （这正是初版的问题：只挂了 auths 与 config.json 两条子路径。）
+
+        现在它随唯一那条挂载进来（`./data/workbuddy2api/`），由环境变量指到
+        `/opt/workbuddy/workbuddy2api`；指错了不会报「路径不存在」，而是数据落到
+        容器可写层、重启即丢，界面上表现为「未找到账号池配置文件」。
         """
         import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
-        vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
-        self.assertTrue(any('/opt/workbuddy2api' in v for v in vols),
-                        '未挂载上游目录 —— 容器版将无法更新上游')
+        text = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
+        dc = yaml.safe_load(text)
+        env = dc['services']['workbuddy-manager']['environment']
+        self.assertEqual(env.get('WB_UPSTREAM_CONFIG'),
+                         '/opt/workbuddy/workbuddy2api/config.json',
+                         '上游配置路径没指到挂载点下 —— 界面会报找不到配置')
+        self.assertNotRegex(text, r'\.\./workbuddy2api',
+                            '不要再挂上级目录 ../workbuddy2api —— 与 ./data 单目录布局冲突')
 
     def test_docker_socket_is_opt_in(self) -> None:
         """docker.sock **默认不挂**，以注释形式保留显式开启的路径（2026-10-21

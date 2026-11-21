@@ -579,7 +579,7 @@ def _explain_db_open_failure(exc: Exception) -> str:
 
     这个报错的原始信息**完全无法定位**（issue #30）：它既不说哪个路径，
     也不说为什么。实测最常见的原因是**目录/文件的属主不对** ——
-    容器以 uid 10001 运行，而 bind mount（`./data:/app/data`）的属主由宿主机
+    容器以 uid 10001 运行，而 bind mount（`./data:/opt/workbuddy`）的属主由宿主机
     决定：docker 首次自动创建 `./data` 时归 root，容器内的 10001 就写不进去。
 
     上游自己的 compose 对 `./data` 写了 chown 提示，我们的漏了 —— 于是同样的坑
@@ -611,7 +611,7 @@ def _explain_db_open_failure(exc: Exception) -> str:
     lines.append(f'  原始错误：{exc}')
     lines.append(
         '  最常见的成因是**目录属主不对**：容器以 uid 10001 运行，而 bind mount\n'
-        '  （compose 里的 `./data:/app/data`）属主由宿主机决定 —— docker 首次自动\n'
+        '  （compose 里的 `./data:/opt/workbuddy`）属主由宿主机决定 —— docker 首次自动\n'
         '  创建该目录时归 root，容器内的 10001 写不进去。两种修法任选其一：\n'
         '  ① 能改属主：在 docker-compose.yml 所在目录执行\n'
         '       sudo chown -R 10001:10001 ./data\n'
@@ -623,7 +623,7 @@ def _explain_db_open_failure(exc: Exception) -> str:
         '       WB_DATA_VOLUME=wb-manager-data\n'
         '     再执行 docker compose up -d —— 命名卷首次创建会继承镜像内目录的\n'
         '     属主，不需要 chown。旧版 compose 没有这个变量时，把挂载整行改成\n'
-        '     `- wb-manager-data:/app/data`，并在文件末尾加顶层 `volumes:` 声明。'
+        '     `- wb-manager-data:/opt/workbuddy`，并在文件末尾加顶层 `volumes:` 声明。'
     )
     return '\n'.join(lines)
 
