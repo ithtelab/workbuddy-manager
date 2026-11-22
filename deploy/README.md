@@ -449,8 +449,12 @@ WB_GITHUB_MIRROR=https://gh-proxy.com/
 「一键更新」即可；想在容器里跑命令行也行：
 
 ```bash
-docker compose exec workbuddy-manager python /app/deploy/update.py --target both
+docker compose exec -u app workbuddy-manager python /app/deploy/update.py --target both
 ```
+
+> `-u app` 不能省。容器入口会先以 root 对齐挂载目录属主、再降权运行，但
+> `docker compose exec` **不走入口脚本**，不加这个参数就是 root shell ——
+> 用它改出来的文件属主是 root，之后面板以 `app` 身份更新时会写不进去。
 
 > 这条命令结束时**会按设计终止容器**（更新进程发信号给 PID 1，再由 compose 的
 > `restart: unless-stopped` 用新代码拉起），所以 `exec` 会跟着断开 —— 这是正常的。
@@ -589,8 +593,8 @@ chmod g+s /opt/workbuddy2api/auths
 
 **Q：容器反复重启，日志报 `unable to open database file` / 「目录不可写：/app/data」**
 
-这是**权限**问题，不是数据库坏了，也不是路径配错。管理端容器以 uid 10001 运行
-（Dockerfile 里的 `USER app`），而 compose 默认把宿主 `./data` bind mount 到
+这是**权限**问题，不是数据库坏了，也不是路径配错。管理端容器以非 root 用户运行
+（镜像里的 `app`，默认 uid 10001），而 compose 默认把宿主 `./data` bind mount 到
 `/app/data` —— 这个目录的属主由宿主机决定，Docker 首次自动创建时归 `root`，
 容器内的 10001 写不进去，SQLite 连库文件都建不了，启动即失败；配合
 `restart: unless-stopped` 就表现为一直重启、页面打不开。
@@ -601,7 +605,21 @@ chmod g+s /opt/workbuddy2api/auths
 ls -ld ./data     # drwxr-xr-x root root → 中招
 ```
 
-**修法一（能 SSH、能改属主，推荐）**：只改权限，不动配置，也不用重建容器：
+**修法一（本版默认行为，什么都不用做）**：镜像入口会探测挂载目录的实际属主，
+把容器内用户的 uid/gid 改成它，再对齐属主、降权运行 —— 群晖 / 极空间 / Unraid
+这类图形界面设备不用开 SSH。日志里会有一行：
+
+```
+[entrypoint] 修正 /app/data 属主 → 1026:100
+```
+
+需要固定身份时在 `.env` 里填 `PUID` / `PGID`（值取 `stat -c '%u' ./data` 与
+`stat -c '%g' ./data`；留空即自动探测）。填 `0` 不会生效：探测到 root 会回落
+10001，业务进程始终不以 root 运行。想关掉这段逻辑（自己用 `user:` 接管容器
+身份）就设 `WB_FIX_OWNERSHIP=0`。
+
+**修法二（老镜像，或已设 `WB_FIX_OWNERSHIP=0`）**：只改权限，不动配置，也不用
+重建容器：
 
 ```bash
 sudo chown -R 10001:10001 ./data
@@ -611,7 +629,7 @@ docker restart workbuddy-manager
 > 只 `restart`，不要 `docker compose up -d`：后者会用镜像里的代码重建容器，
 > 之前通过面板「一键更新」装进容器的新代码会退回旧版（见上表）。
 
-**修法二（NAS / 群晖 / SMB / 没开 SSH，改不了属主）**：换成命名卷。命名卷首次
+**修法三（NFS / SMB 上改不了属主）**：换成命名卷。命名卷首次
 创建时会继承镜像内 `/app/data` 的属主（10001），不需要 chown。
 
 - 新版 compose（挂载行是 `${WB_DATA_VOLUME:-./data}:/app/data`）：在 compose
