@@ -2,9 +2,18 @@
 #
 # 设计取舍说明（值得先读，因为它解释了为什么容器版有些功能是"降级"的）：
 #
-# 1. **本镜像不含上游 workbuddy2api**。上游是独立的 Go 服务、自带
+# 1. **本镜像不含上游 workbuddy2api 服务**。上游是独立的 Go 服务、自带
 #    docker-compose.yml 与 auths/data 卷，硬塞进来会让两边的升级互相牵制。
-#    推荐做法：两边分别用 compose 起，管理端通过 WB2API_BASE 连接上游。
+#    推荐做法：两边分别用 compose 起，管理端通过 WB2API_BASE 连接上游
+#    （`docker-compose.full.yml` 就是一份起全套的现成文件）。
+#
+#    唯一例外是**上游的 Python 脚本**（scripts/task_runner.py 等）与
+#    config.example.json —— 它们不是服务，只是面板「成长任务」要执行的本地
+#    脚本。此前脚本只有两个来源：宿主机上的上游源码目录，或挂 docker.sock
+#    后从上游容器 `docker cp`。对 NAS / 图形化部署的用户两条都不成立（前者
+#    要求先备一份源码，后者要求交出宿主 root），于是「拉个镜像就能用」偏偏
+#    卡在最关键的一步。现在构建期从**上游镜像**里取一份，随本镜像分发：
+#    /app/upstream/scripts 是只读回落，宿主机有源码时仍以宿主机为准。
 #
 # 2. **容器内的一键更新不能自我重启**。更新进程可以下载并替换代码，但容器里
 #    没有 systemd、也不能重启自己所在的容器。所以容器形态下的「更新」是：
@@ -56,6 +65,23 @@
 #    关键依赖（psycopg-binary / uvloop / pydantic-core 等）均有 musllinux_1_2
 #    的 cp312 预编译 wheel（x86_64 与 aarch64 都齐），所以 Alpine 上无需源码
 #    编译即可安装；deps 阶段的编译工具只是万一某天某个传递依赖没 wheel 时的兜底。
+
+# ── 上游脚本阶段（只取脚本与配置模板，不取服务）────────────
+#
+# 为什么单独一个阶段：跨阶段拷贝的源必须是**阶段名**（镜像名不能直接写变量），
+# 而 FROM 接受变量，所以先把上游镜像建成一个阶段，运行阶段再跨阶段拷贝两样东西：
+#   · /app/scripts/           task_runner.py 及其依赖（task_common 等）
+#   · /app/config.json        上游镜像里的 config.example.json（模板）
+#
+# 版本对齐：CI 用同一份发布包源码、同一次发版构建上游镜像，所以默认取 latest
+# 时最多滞后一个版本；要严格钉版本就 `--build-arg UPSTREAM_IMAGE=...:<版本>`。
+# 另外面板的「一键更新」会把发布包里的上游源码同步进数据目录，那条路径优先级
+# 高于本内置副本，能自行修掉滞留。
+#
+# 只影响构建期：它是一次额外的公开镜像拉取（几百 KB 的脚本 + 一个二进制的层
+# 缓存），不进最终镜像的服务进程。
+ARG UPSTREAM_IMAGE=ghcr.io/ithtelab/workbuddy2api:latest
+FROM ${UPSTREAM_IMAGE} AS upstream
 
 # ── 前端构建阶段 ─────────────────────────────────────────
 #
@@ -280,6 +306,17 @@ COPY server /app/server
 COPY --from=web-builder /dist /app/web/out
 COPY deploy /app/deploy
 COPY CHANGELOG.md README.md /app/
+
+# 上游的任务脚本与配置模板（来自文件顶部的 upstream 阶段）。
+#
+# 用途有两条，都不涉及上游服务本身：
+#   1. 面板「成长任务」要执行的 task_runner.py —— 宿主机没有上游源码、也没挂
+#      docker.sock 时，`taskrun._script_path()` 回落到这里；
+#   2. 首次启动时就地生成上游 config.json（见 deploy/docker-entrypoint.sh）——
+#      上游容器挂的是同一个数据目录，于是「先起管理端、再起上游」不需要任何
+#      手工准备配置的步骤。
+COPY --from=upstream /app/scripts /app/upstream/scripts
+COPY --from=upstream /app/config.json /app/upstream/config.example.json
 
 # 建 app 用户，默认 uid/gid 10001（与上游账号池容器对齐，跨容器写同一个卷时
 # 不会互相踩权限）。入口脚本启动时会按 PUID/PGID 把它改成目标值 ——

@@ -1489,3 +1489,82 @@ class EntrypointPermissionsTest(unittest.TestCase):
                          'Alpine 没有 su-exec，必须显式安装')
         self.assertRegex(df, r'apk add[^\n]*shadow',
                          'busybox 的 adduser 没有 usermod/groupmod，必须装 shadow')
+
+
+class BundledUpstreamAssetsTest(unittest.TestCase):
+    """镜像自带上游脚本与配置模板，做到「只拉镜像、不做宿主准备」（issue #30 后续）。
+
+    现场：NAS 上按单根布局部署，`data/workbuddy2api/` 只有 `auths/` —— 没有上游
+    源码目录，也没挂 docker.sock，于是「成长任务」三条取脚本的路全断，界面只报
+    「未找到任务脚本」。而任务脚本只是几个纯标准库 Python 文件，完全可以随镜像
+    分发：它不涉及上游服务本身，也就不违反「镜像不含上游服务」那条取舍。
+
+    这组断言锁三件事：脚本真的被打进镜像、面板按「宿主 → 内置 → docker cp」的
+    顺序找它、以及首次启动会就地生成上游 config.json（上游容器才好直接挂）。
+    """
+
+    def test_image_bakes_upstream_scripts(self) -> None:
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        self.assertRegex(df, r'ARG UPSTREAM_IMAGE=',
+                         '缺可覆盖的上游镜像参数，离线/钉版本时没法构建')
+        self.assertRegex(df, r'FROM \$\{UPSTREAM_IMAGE\} AS upstream',
+                         'ARG 不能直接写进 COPY --from，要先建成阶段')
+        self.assertIn('COPY --from=upstream /app/scripts /app/upstream/scripts', df)
+        self.assertIn(
+            'COPY --from=upstream /app/config.json /app/upstream/config.example.json',
+            df,
+            '配置模板也要随镜像：首次启动靠它生成 config.json',
+        )
+
+    def test_script_path_prefers_bundled_over_docker_cp(self) -> None:
+        src = (_ROOT / 'server' / 'services' / 'taskrun.py').read_text(encoding='utf-8')
+        self.assertIn("_BUNDLED_SCRIPT_DIR = Path('/app/upstream/scripts')", src)
+        body = src[src.index('def _script_path()'):]
+        body = body[:body.index('def _python()')]
+        self.assertLess(
+            body.index('_bundled_script()'), body.index('extract_scripts'),
+            '内置脚本要排在 docker cp 之前：后者要求挂 docker.sock',
+        )
+
+    def test_fallback_does_not_shadow_host_source(self) -> None:
+        """宿主机有上游源码时仍以宿主机为准：那条路径能跟着「一键更新」走。"""
+        src = (_ROOT / 'server' / 'services' / 'taskrun.py').read_text(encoding='utf-8')
+        body = src[src.index('def _script_path()'):]
+        body = body[:body.index('def _python()')]
+        self.assertLess(body.index('_host_script()'), body.index('_bundled_script()'))
+
+    def test_entrypoint_materialises_upstream_config_once(self) -> None:
+        s = (_ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
+        self.assertIn('init_upstream_conf', s)
+        self.assertIn('/app/upstream/config.example.json', s)
+        self.assertIn('WB_UPSTREAM_CONFIG', s,
+                      '目标路径要走配置变量，否则单根布局下会写错地方')
+        self.assertIn('[ ! -f "$_cfg" ]', s,
+                      '只能在文件缺失时生成，绝不能覆盖已有的 api_key / 线路表')
+        self.assertIn('api_key', s)
+        self.assertIn('mkdir -p "$_dir/auths"', s,
+                      '上游的相对路径需要 auths/ 与 data/ 先存在')
+
+    def test_full_compose_runs_manager_and_upstream(self) -> None:
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.full.yml').read_text(encoding='utf-8'))
+        svcs = dc['services']
+        self.assertIn('workbuddy2api', svcs, '缺上游服务就还是「只起了一半」')
+        mgr, up = svcs['workbuddy-manager'], svcs['workbuddy2api']
+
+        self.assertEqual(mgr['environment']['WB2API_BASE'], 'http://workbuddy2api:7863',
+                         '同网络里要用服务名，不能用 host.docker.internal')
+        self.assertEqual(mgr['environment']['WB_UPSTREAM_CONFIG'],
+                         '/opt/workbuddy/workbuddy2api/config.json')
+        self.assertIn('10001', str(mgr['environment']['PUID']),
+                      '上游镜像固定 10001，共享 auths 时 uid 必须一致')
+        self.assertEqual(up['working_dir'], '/conf',
+                         '上游的 auth_dir/state_file 是相对工作目录的')
+        self.assertEqual(up['volumes'], ['${WB_DATA_VOLUME:-./data}/workbuddy2api:/conf'],
+                         '只挂一个目录：单独挂 config.json 文件时，文件不存在会被建成目录')
+        self.assertNotIn('ports', up, '7863 不该发布到宿主，同网络访问即可')
+        self.assertIn('condition', up.get('depends_on', {}).get('workbuddy-manager', {}),
+                      '上游要等管理端健康后再起：config.json 由管理端首次生成')
+        for vol in mgr['volumes']:
+            self.assertNotIn('docker.sock', str(vol),
+                             '本文件的卖点是不交出宿主 root，不能挂 socket')

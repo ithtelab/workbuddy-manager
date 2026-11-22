@@ -70,6 +70,42 @@ warn_fail() {
     echo "[entrypoint] 警告：$1 无法 chown（NFS/SMB 挂载？），继续启动" >&2
 }
 
+# 上游配置与目录的首次初始化。$1/$2 = 目标 uid/gid（留空则不改属主）。
+#
+# 为什么要做：上游容器挂的是同一个数据目录下的 config.json。该文件不存在时，
+# docker 会把 bind mount 的源**建成目录**，上游随后报「config.json 是目录」而
+# 起不来 —— 此前只能由用户先手工备一份配置绕开（NAS 用户基本做不到）。镜像里
+# 带了上游的 config.example.json（构建期从上游镜像取），于是这里就地生成：
+# 只补一个随机 api_key，其余保持上游默认值。
+#
+# 只在这三样**不存在**时创建，绝不覆盖：config.json 里有 api_key、线路表、
+# 定时任务；auths/ 与 data/ 里是账号凭据与池子状态。
+init_upstream_conf() {  # $1 = uid, $2 = gid
+    _cfg="${WB_UPSTREAM_CONFIG:-/opt/workbuddy2api/config.json}"
+    _dir="$(dirname "$_cfg")"
+    mkdir -p "$_dir/auths" "$_dir/data" 2>/dev/null || true
+    if [ ! -f "$_cfg" ] && [ -f /app/upstream/config.example.json ]; then
+        if python - "$_cfg" <<'PY'
+import json, secrets, sys, pathlib
+dst = pathlib.Path(sys.argv[1])
+cfg = json.loads(pathlib.Path('/app/upstream/config.example.json').read_text(encoding='utf-8'))
+cfg['api_key'] = secrets.token_hex(16)
+dst.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+PY
+        then
+            echo "[entrypoint] 已就地生成上游配置 $_cfg（api_key 随机）" >&2
+        else
+            echo "[entrypoint] 生成上游配置失败（继续启动，可在「设置」里补）" >&2
+        fi
+    fi
+    if [ -n "${1:-}" ] && [ -n "${2:-}" ]; then
+        chown -R "$1:$2" "$_dir/auths" "$_dir/data" 2>/dev/null || true
+        if [ -f "$_cfg" ]; then
+            chown "$1:$2" "$_cfg" 2>/dev/null || warn_fail "$_cfg"
+        fi
+    fi
+}
+
 needs_fix() {  # $1 = 路径；属主不是目标值时返回 0
     [ -e "$1" ] || return 1
     [ "$(stat -c %u:%g "$1" 2>/dev/null)" != "$PUID:$PGID" ]
@@ -116,6 +152,10 @@ if [ "$(id -u)" = "0" ]; then
             warn_fail /opt/workbuddy2api/config.json
     fi
 
+    # 首次启动补齐上游的 config.json / auths / data（放在属主修正之后，新建的
+    # 文件才不会落成 root 所有——否则面板写不动配置、上游也读不了账号）。
+    init_upstream_conf "$PUID" "$PGID"
+
     # 降权后 HOME 仍是 /root，会让部分工具往不可写的位置落盘，指回 app 的 home。
     export HOME=/app
     exec su-exec "$PUID:$PGID" "$@"
@@ -125,4 +165,6 @@ fi
 if [ "$(id -u)" != "$PUID" ]; then
     echo "[entrypoint] 当前 uid=$(id -u)，与 PUID=$PUID 不同（由 docker 的 user: 决定）" >&2
 fi
+# 非 root 时也要补配置：此时改不了属主，只建文件（属主自然是当前用户）。
+init_upstream_conf "" ""
 exec "$@"
