@@ -1562,6 +1562,10 @@ class BundledUpstreamAssetsTest(unittest.TestCase):
                          '上游的 auth_dir/state_file 是相对工作目录的')
         self.assertEqual(up['volumes'], ['${WB_DATA_VOLUME:-./data}/workbuddy2api:/conf'],
                          '只挂一个目录：单独挂 config.json 文件时，文件不存在会被建成目录')
+        self.assertEqual(up['entrypoint'], ['/app/wb2api', '-config', '/conf/config.json'],
+                         '要用 entrypoint 覆盖：镜像 ENTRYPOINT 已带 -config，写 command '
+                         '只会变成追加参数，读到的还是镜像内那份示例配置')
+        self.assertNotIn('command', up, 'entrypoint 已经给出完整命令，别再写 command')
         self.assertNotIn('ports', up, '7863 不该发布到宿主，同网络访问即可')
         self.assertIn('condition', up.get('depends_on', {}).get('workbuddy-manager', {}),
                       '上游要等管理端健康后再起：config.json 由管理端首次生成')

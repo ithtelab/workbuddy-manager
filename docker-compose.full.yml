@@ -49,12 +49,13 @@ services:
       # 一键更新的下载代理 / GitHub 镜像加速（国内机器建议填后者）
       WB_UPDATE_PROXY: ${WB_UPDATE_PROXY:-}
       WB_GITHUB_MIRROR: ${WB_GITHUB_MIRROR:-}
-      # 进程 uid/gid。**默认 10001**：上游镜像里固定以 10001 运行，而两边要共享
-      # auths/ 与 config.json，uid 不一致就会出现「面板有账号、池子里 0 个」。
-      # 想跟随宿主目录属主（如群晖的 1026/100）就显式填 PUID/PGID —— 但那样上游
-      # 读不到账号，除非你另外改上游的 user:。
-      PUID: ${PUID:-10001}
-      PGID: ${PGID:-10001}
+      # 进程 uid/gid。这里**写死 10001**，不跟 .env 里的 PUID/PGID 走：上游镜像里
+      # 固定以 10001 运行（USER app），两边共享 auths/ 与 config.json 时 uid 必须
+      # 一致，不一致就是「面板有账号、池子里 0 个」。若你在 .env 里设过 1026 之类
+      # （docker-compose.yml 的 bind mount 场景），这里也不会被带偏。
+      # 真要换 uid，得同时给上游服务加 user: 并把 auths 的属主改过去，不建议。
+      PUID: "10001"
+      PGID: "10001"
     volumes:
       - ${WB_DATA_VOLUME:-./data}:/opt/workbuddy
     ports:
@@ -82,7 +83,11 @@ services:
     # 相对的是**工作目录**；把它指到数据目录，配置、账号、状态就都落在同一处，
     # 也与管理端的 WB_AUTH_DIR / WB_UPSTREAM_CONFIG 完全一致。
     working_dir: /conf
-    command: ["/app/wb2api", "-config", "/conf/config.json"]
+    # 必须覆盖 entrypoint 而不是 command：上游镜像的 ENTRYPOINT 已经是
+    # ["/app/wb2api", "-config", "/app/config.json"]，写 command 只会变成它的**追加
+    # 参数**，实际执行成 `wb2api -config /app/config.json /app/wb2api -config ...`，
+    # 读的还是镜像里那份示例配置。
+    entrypoint: ["/app/wb2api", "-config", "/conf/config.json"]
     volumes:
       # 只挂这一个目录：config.json、auths/、data/ 全在里面。
       # 不像上游自带 compose 那样单独挂 config.json 文件 —— 文件不存在时 docker
