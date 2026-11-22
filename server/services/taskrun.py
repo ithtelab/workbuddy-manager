@@ -117,6 +117,19 @@ def _extract_dir() -> Path:
     return config.DATA_DIR / 'upstream-scripts'
 
 
+# 镜像自带的脚本副本（构建期从账号池服务镜像取，见 Dockerfile 顶部第 1 条）。
+#
+# 为什么要有这一条：单容器部署下宿主机没有账号池服务源码，也没挂 docker.sock，
+# 前两条路同时失效，界面只会报「未找到任务脚本」。而脚本本身只是几个纯标准库
+# Python 文件，随镜像分发不涉及服务本体，也就不违反「一个容器两个进程」的取舍。
+_BUNDLED_SCRIPT_DIR = Path('/app/upstream/scripts')
+
+
+def _bundled_script() -> Path | None:
+    p = _BUNDLED_SCRIPT_DIR / 'task_runner.py'
+    return p if p.is_file() else None
+
+
 # 提取失败的冷却时间（秒）。
 #
 # 为什么需要：界面的「一键执行」面板闲着时每 15 秒轮询一次 `status()`，而
@@ -243,18 +256,23 @@ def extract_scripts(rep: logging.Logger | None = None) -> tuple[bool, str]:
 
 
 def _script_path() -> Path:
-    """定位 task_runner.py：宿主机挂载目录优先，其次容器提取。
+    """定位 task_runner.py：镜像自带 → 宿主机挂载目录 → 从容器提取。
 
-    两种部署形态各对应一条：
-      · 源码 / 完整挂载（`WB_UPSTREAM_DIR` 是宿主机上的仓库）→ 直接用挂载目录，
-        这是最省事的，也不需要 docker；
-      · **官方镜像部署**（issue #29）→ 脚本被 COPY 进镜像的 `/app/scripts/`，
-        宿主机那个目录里**根本没有 scripts/**（你只挂了 config.json 与 auths），
-        所以回落去容器里提取。
+    三条来源对应三种部署形态：
+      · **容器部署**（本镜像内置了账号池服务）→ 脚本在 `/app/upstream/scripts/`，
+        与镜像同版本。**必须排第一**：宿主机上如果有历史残留的 scripts/（早期
+        版本用 `docker cp` 留在数据目录里的那种），按旧顺序会被优先选中，于是
+        「脚本比服务新/旧」——症状是调用参数对不上，报错却指向业务逻辑；
+      · 宿主机直装（无镜像）→ 用挂载目录里的源码，`/app/upstream` 不存在，自动落到这条；
+      · 分离部署但宿主没有源码（issue #29）→ 从账号池服务容器里 `docker cp` 提取
+        （需要挂 docker.sock）。
 
-    注意不要为了「让第一条路径有东西」而让用户手动拷贝脚本：那样每次上游更新
+    注意不要为了「让某条路径有东西」而让用户手动拷贝脚本：那样每次上游更新
     都要重来一次，迟早版本对不上（issue 里正是这么抱怨的）。
     """
+    bundled = _bundled_script()
+    if bundled is not None:
+        return bundled
     host = _host_script()
     if host is not None:
         return host
@@ -294,14 +312,15 @@ def available(auth_dir: Path | str | None = None) -> tuple[bool, str]:
     script = _script_path()
     if not script.is_file():
         return False, (
-            f'未找到上游任务脚本（{script}）。'
-            '该功能调用的是上游 workbuddy2api 自带的 scripts/task_runner.py。\n'
-            '两种部署形态各有一种修法：\n'
-            '  · 官方镜像部署：本面板会尝试用 `docker cp` 从上游容器里提取脚本，'
-            '但它需要能访问 docker（挂载 /var/run/docker.sock，且容器名与 '
-            'WB2API_CONTAINER 一致）。请检查这两项，然后点「预览」重试。\n'
-            '  · 源码部署：请确认上游目录（WB_UPSTREAM_DIR）已挂载且版本较新，'
-            '可到「设置 → 系统更新」更新上游。'
+            f'未找到任务脚本（{script}）。'
+            '该功能调用的是账号池服务自带的 scripts/task_runner.py。\n'
+            '下面三条来源按顺序自动尝试，任意一条成立即可用：\n'
+            '  · 镜像自带副本：用官方镜像部署时脚本就在 /app/upstream/scripts，'
+            '重建容器即可（不需要账号池服务源码，也不需要 docker.sock）；\n'
+            '  · 账号池服务源码目录：确认该目录（WB_UPSTREAM_DIR）已挂载且版本较新，'
+            '可到「设置 → 系统更新」同步随包分发的源码；\n'
+            '  · 从账号池服务容器提取：需要能访问 docker（挂载 /var/run/docker.sock，'
+            '且容器名与 WB2API_CONTAINER 一致），然后点「预览」重试。'
         )
     auths = _auth_dir(auth_dir)
     if not auths.is_dir():

@@ -2,9 +2,17 @@
 #
 # 设计取舍说明（值得先读，因为它解释了为什么容器版有些功能是"降级"的）：
 #
-# 1. **本镜像不含上游 workbuddy2api**。上游是独立的 Go 服务、自带
-#    docker-compose.yml 与 auths/data 卷，硬塞进来会让两边的升级互相牵制。
-#    推荐做法：两边分别用 compose 起，管理端通过 WB2API_BASE 连接上游。
+# 1. **本镜像内置上游 workbuddy2api，默认一个容器跑两个服务**（7864 管理端 +
+#    7863 账号池服务）。上游是 `CGO_ENABLED=0` 静态编译的 Go 二进制，与
+#    python:3.12-alpine 的 musl 基础层天然兼容，放进同一个容器没有额外运行期依赖。
+#
+#    2026-11 的修订理由：分离部署要求用户先备一份上游源码、再对齐两个容器的 uid、
+#    再让它们共享同一个 auths/ —— 任何一项没做对，症状都是「面板有账号、池子里 0 个」
+#    或「未找到任务脚本」，而面板自己判断不出是哪一种。合并后这些前提全部消失：
+#    两个进程同一个 uid、auths 只有一个属主、7863 就在 127.0.0.1。
+#
+#    代价是升级粒度变粗：升级账号池服务 = 重建本镜像。构建期用 ARG UPSTREAM_IMAGE
+#    钉版本，随管理端一起发版。
 #
 # 2. **容器内的一键更新不能自我重启**。更新进程可以下载并替换代码，但容器里
 #    没有 systemd、也不能重启自己所在的容器。所以容器形态下的「更新」是：
@@ -14,18 +22,12 @@
 #    而进程是 uid 10001 —— 所以更新时装到**用户站点**（/app/.local，见下面的
 #    PYTHONUSERBASE 与 adduser 那一步），而不是往 root 的目录里写。
 #
-# 3. **挂载 docker.sock 是可选的，默认提供**。挂上它，容器内的管理端就能像
-#    宿主机部署那样操作上游容器（重载配置 / 读日志 / 一键更新上游）。
+# 3. **不需要挂 docker.sock**。账号池服务的二进制、任务脚本与配置模板都在本镜像
+#    里，没有「从另一个容器里取文件」或「重建另一个容器」的需求。
 #
-#    关于安全性的一次修正：初版这里写的是"挂了等于把宿主 root 交给容器，比
-#    少一个功能危险得多"，**这个说法不准确**。事实是——宿主部署时本服务
-#    **本来就是以 root 运行的**（systemd 单元无 User=，安装脚本要求 root），
-#    而 root 的宿主进程本来就能 `docker run -v /:/host` 拿到宿主文件系统。
-#    也就是说，宿主部署的权限**已经等价于**挂 docker.sock，两者并无本质高下。
-#    所以挂上它只是让容器版与宿主版能力对齐，而不是引入一个新的风险等级。
-#
-#    若你的威胁模型要求最小权限，把 compose 里那行卷注掉即可：此时依赖 docker
-#    的功能会自动降级为「请到宿主机操作」，界面会如实提示（不会静默失败）。
+#    旧形态要靠 socket 才能做「重载上游 / 读上游日志 / 一键更新上游」；现在这三件事
+#    分别是：同容器内重启进程、读挂载目录里的日志文件、重建本镜像。挂 socket 只会
+#    把宿主 root 白白交给一个持有全部账号凭据的 Web 进程，不换来任何能力。
 #
 # 4. **数据与凭据全部走卷**，不烘进镜像：data/（数据库、日志、更新状态）、
 #    以及上游的 auths/ 与 config.json。
@@ -56,6 +58,19 @@
 #    关键依赖（psycopg-binary / uvloop / pydantic-core 等）均有 musllinux_1_2
 #    的 cp312 预编译 wheel（x86_64 与 aarch64 都齐），所以 Alpine 上无需源码
 #    编译即可安装；deps 阶段的编译工具只是万一某天某个传递依赖没 wheel 时的兜底。
+
+# ── 账号池服务阶段 ───────────────────────────────────────
+#
+# 把上游镜像的运行时资产整体搬进运行镜像：Go 二进制（静态编译）、签到/登录/领奖
+# 等辅助二进制、shell 脚本体、Python 任务脚本、配置模板。
+#
+# 为什么单开一个阶段而不是直接把镜像名当成 COPY 的来源：那种写法只接受阶段名
+# 或字面镜像名，**不接受变量**，而 FROM 接受 —— 所以先把可覆盖的镜像建成阶段。
+#
+# 版本策略：默认 latest，发版时 CI 传与本次一致的 tag；想钉死就
+#   docker build --build-arg UPSTREAM_IMAGE=ghcr.io/ithtelab/workbuddy2api:v1.4.2 .
+ARG UPSTREAM_IMAGE=ghcr.io/ithtelab/workbuddy2api:latest
+FROM ${UPSTREAM_IMAGE} AS upstream
 
 # ── 前端构建阶段 ─────────────────────────────────────────
 #
@@ -187,6 +202,8 @@ ARG COMPOSE_VERSION=v2.40.3
 # 可选：GitHub Releases 加速前缀，用法是「前缀 + 原始 URL」，例如 https://ghfast.top/。
 ARG COMPOSE_URL_PREFIX=""
 # 下载后会 strip 掉这两个 Go 二进制的调试符号（对功能无影响，显著减小镜像）。
+# 本阶段只要 curl（下载）与 binutils（strip）；su-exec / shadow 是运行阶段的事，
+# 装在这里既不生效，还会让「是否装了」的检查误判成已完成（踩过一次）。
 RUN set -eux; \
     apk add --no-cache curl binutils; \
     case "${TARGETARCH:-$(uname -m)}" in \
@@ -232,33 +249,40 @@ ENV PYTHONUNBUFFERED=1 \
     WB_MANAGER_HOST=0.0.0.0 \
     WB_MANAGER_PORT=7864 \
     WB_INSTALL_DIR=/app \
-    WB_DATA_DIR=/app/data \
+    WB_DATA_DIR=/opt/workbuddy/manager \
     WB_STATIC_DIR=/app/web/out \
-    WB_AUTH_DIR=/opt/workbuddy2api/auths \
-    WB_UPSTREAM_CONFIG=/opt/workbuddy2api/config.json \
+    WB_AUTH_DIR=/opt/workbuddy/workbuddy2api/auths \
+    WB_UPSTREAM_CONFIG=/opt/workbuddy/workbuddy2api/config.json \
     WB2API_BASE=http://127.0.0.1:7863 \
+    WB2API_EMBEDDED=1 \
     WB_BASE_PATH="" \
     PYTHONUSERBASE=/app/.local
 
 # 可选：Alpine 软件源镜像（留空 = 官方源）。兼容旧名 DEBIAN_MIRROR。
 ARG ALPINE_MIRROR=""
 ARG DEBIAN_MIRROR=""
-# 容器时区（构建参数）。留空 = 不装 tzdata、系统按 UTC 跑，与 Debian slim 的
-# 老行为一致（那边也没装 tzdata）。
+# 容器时区（构建参数）。**默认 Asia/Shanghai**：本项目的按日统计（`db.day_of()`
+# 的 `time.localtime`、SQL 里的 `'localtime'` 修饰符）、密钥每日 Token 限额的复位
+# 时刻、任务日报的分桶全都取**本地时区**；镜像不带 tzdata 时 Alpine 会静默退回
+# UTC，表现为「时区明明是 +8，统计却按 UTC 分天」，且不报任何错。
 #
-# ⚠️ **一旦设了 TZ 就必须装 tzdata**：本项目的按日统计（`db.day_of()` 的
-# `time.localtime`、SQL 里的 `'localtime'` 修饰符）、密钥每日 Token 限额的
-# 复位时刻、任务日报的分桶全都取**本地时区**。Alpine 的 busybox 不带 tzdata，
-# 缺了它 `/etc/localtime` 设不上、`localtime` 会静默退回 UTC —— 表现是
-# 「时区明明是 +8，统计却按 UTC 分天」，而且不报任何错。
-ARG TZ=""
+# 所以这里不能留空等运行期设 TZ —— `docker run -e TZ=...` 只改环境变量，没 tzdata
+# 照样退回 UTC。想用 UTC 就显式传 --build-arg TZ=UTC。
+ARG TZ="Asia/Shanghai"
+# 运行阶段的系统包。**su-exec 与 shadow 必须在这里装**：入口脚本降权用 su-exec、
+# 按 PUID/PGID 对齐 app 账号用 groupmod/usermod，而 bins 阶段装的那份不会跨阶段
+# 拷过来。漏了就是启动即 `groupmod: not found`（set -e 下直接退出 → 反复重启），
+# 或修好一半后卡在 `su-exec: not found`。
+#
+# 注意：下面这个 RUN 是反斜杠续行，**不要在中间插 # 注释** —— 续行会把 `#` 之后
+# 的内容整段当注释吃掉，后面的 apk add 就不执行了（结构自检会拦住）。
 RUN set -eu; \
     MIRROR="${ALPINE_MIRROR:-$DEBIAN_MIRROR}"; \
     if [ -n "${MIRROR}" ]; then \
         echo "apk: 使用指定软件源 ${MIRROR}"; \
         sed -i -E "s#(https?://)[^/]+#\1${MIRROR}#g" /etc/apk/repositories; \
     fi; \
-    apk add --no-cache git curl ca-certificates; \
+    apk add --no-cache git curl ca-certificates bash wget su-exec shadow; \
     if [ -n "${TZ}" ]; then \
         echo "时区：${TZ}"; \
         apk add --no-cache tzdata; \
@@ -281,9 +305,19 @@ COPY --from=web-builder /dist /app/web/out
 COPY deploy /app/deploy
 COPY CHANGELOG.md README.md /app/
 
-# 非 root 运行。目录归属交给 app 用户，使容器内更新能写回代码目录。
-# 注意与上游 auths/data 卷的 uid 对齐：上游容器以 uid 10001 运行，
-# 这里用同一 uid 可避免跨容器写同一个卷时的权限问题。
+# 账号池服务的整套运行时资产（见顶部第 1 条）。两处必须处理的差异：
+#   · 上游镜像的 /app/config.json 就是 config.example.json 的内容 —— 改名存起来，
+#     避免和运行期真配置混淆（真配置由入口脚本在数据目录里生成）；
+#   · 上游的 auths/ 与 data/ 只是空目录 —— 删掉，运行时一律用数据卷里那份，
+#     否则脚本按 __file__ 自定位会读到镜像内的空目录。
+COPY --from=upstream /app /app/upstream
+RUN mv /app/upstream/config.json /app/upstream/config.example.json \
+    && rm -rf /app/upstream/auths /app/upstream/data \
+    && chmod +x /app/upstream/wb2api /app/upstream/*.sh \
+    && test -f /app/upstream/scripts/task_runner.py
+
+# 建 app 用户，默认 uid/gid 10001。入口脚本启动时会按 PUID/PGID 把它改成目标值
+# —— 这里的 10001 只是默认值，不是死规定。
 #
 # /app/.local 是 PYTHONUSERBASE 的落点（见上面的 ENV）：容器内更新装新依赖时
 # 只能写用户站点，且该目录必须**先存在**，否则重启后的新进程不在 sys.path 上找它。
@@ -292,13 +326,18 @@ COPY CHANGELOG.md README.md /app/
 RUN addgroup -g 10001 app \
     && adduser -D -u 10001 -s /bin/sh -h /app -G app app \
     && mkdir -p /app/data /app/.local /opt/workbuddy2api \
-    && chown -R 10001:10001 /app /opt/workbuddy2api
+              /opt/workbuddy/manager /opt/workbuddy/workbuddy2api \
+    && chmod +x /app/deploy/docker-entrypoint.sh \
+    && sed -i 's/\r$//' /app/deploy/docker-entrypoint.sh \
+    && chown -R 10001:10001 /app /opt/workbuddy2api /opt/workbuddy
 
 USER app
 
-EXPOSE 7864
+EXPOSE 7863 7864
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:7864/api/healthz || exit 1
+# 两个进程都起来才算健康：面板的 /api/healthz + 账号池服务的 /healthz。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS -o /dev/null http://127.0.0.1:7864/api/healthz \
+        && curl -fsS -o /dev/null http://127.0.0.1:7863/healthz || exit 1
 
 CMD ["python", "-m", "uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "7864", "--timeout-graceful-shutdown", "20"]

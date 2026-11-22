@@ -697,6 +697,14 @@ def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
       · 只增改、不删除：包里没有的文件保留原地（宁可留旧文件，也不误删用户的）。
     """
     incoming = src / 'docker-compose.yml'
+    # 单容器部署（WB2API_EMBEDDED=1）：账号池服务的二进制、脚本、配置模板都在
+    # 管理端镜像里，UPSTREAM_DIR 只是它的数据目录（config.json / auths / data）。
+    # 这里同步源码只会往数据目录里塞一堆用不上的文件，还会让宿主脚本与镜像内的
+    # 服务版本错位 —— 升级账号池服务的正确方式是拉新版管理端镜像。
+    if (os.environ.get('WB2API_EMBEDDED') or '').strip() == '1':
+        rep.log('账号池服务内置在管理端镜像里（WB2API_EMBEDDED=1），跳过源码同步：'
+                '升级它请拉取新版管理端镜像')
+        return 0
     if not incoming.is_file():
         rep.log('本次包内未含上游源码（upstream/），跳过上游代码同步')
         return 0
