@@ -94,11 +94,6 @@ services:
       # 启动失败时只打精简说明 + 项目栈帧。临时抓请求时设 WB_ACCESS_LOG=1。
       WB_ACCESS_LOG: ${WB_ACCESS_LOG:-0}
       WB_STARTUP_FAILURE_STACK: ${WB_STARTUP_FAILURE_STACK:-1}
-      # 容器内进程的 uid/gid（入口脚本据此对齐挂载目录属主）。留空 = 自动
-      # 取挂载目录的属主，通常不用填；想固定下来就填 `stat -c '%u' ./data`
-      # 与 `stat -c '%g' ./data` 的两个数字（群晖上常见 1026 / 100）。
-      PUID: ${PUID:-}
-      PGID: ${PGID:-}
     ports:
       # **只监听本机**：管理端必须藏在反向代理之后。
       # 若确需直接从别的机器访问，改成 "7864:7864"，但请先确保有 HTTPS 与访问控制——
@@ -112,9 +107,7 @@ services:
       # chown 不起作用。docker 首次自动创建 ./data 时归 root，而容器以 uid 10001
       # 运行 —— 结果是启动时报 `sqlite3.OperationalError: unable to open database
       # file`（那个报错既不说路径也不说原因，很容易误以为是路径配错了）。
-      # 正常情况下不用管：入口脚本会按 PUID/PGID（不填则取挂载目录属主）
-      # 自动对齐 —— 容器以 root 起、改完属主再 su-exec 降权到非 root 运行。
-      # 若入口被 WB_FIX_OWNERSHIP=0 关掉，宿主机在 compose 所在目录执行一次：
+      # 宿主机在 compose 所在目录执行一次即可：
       #   chown -R 10001:10001 ./data
       # 若目录在网络文件系统（NFS/SMB）上、改不了属主，改用命名卷：
       #   volumes:

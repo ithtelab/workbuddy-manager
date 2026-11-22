@@ -12,10 +12,6 @@
 # 里就是 LF-only 的 .cmd。
 *.cmd text eol=crlf
 
-# Shell 脚本在容器里由 /bin/sh 直接执行，CRLF 会让 shebang 变成
-# `#!/bin/sh\r` 而报 ": not found"。锁成 LF，Windows 检出也一样。
-*.sh text eol=lf
-
 # Patch context contains significant whitespace and CRLF from the bundled
 # upstream snapshot. Check patch applicability instead of treating its context
 # markers as trailing whitespace in ordinary source code.

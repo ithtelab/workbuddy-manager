@@ -128,10 +128,8 @@ jobs:
           # docs-pack:end
           cp .env.example README.md README.en.md CHANGELOG.md LICENSE "$STAGE/"
           # 容器部署资产一并打包：用户下载发布包后可直接 docker compose up，
-          # 不必再回仓库取这些文件（实测漏打包过，Docker 用户拿不到）
-          # docker-compose.full.yml = 管理端 + 上游各一个容器（都用镜像），
-          # 是 NAS / 不想准备源码的部署方式，同样要随包分发。
-          cp Dockerfile docker-compose.yml docker-compose.full.yml "$STAGE/"
+          # 不必再回仓库取这两个文件（实测漏打包过，Docker 用户拿不到）
+          cp Dockerfile docker-compose.yml "$STAGE/"
           # 再放一份到 server/：一键更新必然整体替换 server/，而旧版更新器
           # 不替换根目录文件。放进 server/ 后，任何部署（含从旧版升上来的）
           # 都拿得到更新日志，避免界面报「未找到更新日志文件」。
@@ -448,17 +446,6 @@ jobs:
           # 多平台必须走 buildx 并直接 push：本地镜像库放不下多架构的 manifest list
           platforms: linux/amd64,linux/arm64
           push: true
-          # 管理端镜像在构建期会从**上游镜像**里取一份任务脚本与配置模板
-          # （见 Dockerfile 的 `FROM ${UPSTREAM_IMAGE} AS upstream`）。
-          # 必须显式钉到**本次发布的版本**：不传的话 Dockerfile 的默认值是
-          # `:latest`，而 latest 此刻还指着上一版 —— 内置脚本就会滞后一个版本，
-          # 与「随包上游同版本」的承诺不符。
-          #
-          # 因此上游镜像的构建被挪到了本步骤**之前**；若上游构建失败/被跳过
-          # （has_upstream=0），这里回落到 latest —— 那种情况下发布包本身也不含
-          # upstream/，管理端镜像里的内置脚本只是尽力而为。
-          build-args: |
-            UPSTREAM_IMAGE=ghcr.io/${{ github.repository_owner }}/workbuddy2api:${{ steps.build_upstream.outcome == 'success' && steps.vars.outputs.version || 'latest' }}
           # 镜像标签用小写（GHCR 要求），去掉 v 前缀
           tags: |
             ${{ steps.image.outputs.name }}:${{ steps.vars.outputs.version }}
