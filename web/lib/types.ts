@@ -1105,6 +1105,8 @@ export interface CheckinLog {
   ts: number;
   uid: string;
   nickname: string;
+  /** 账号备注（后端按 uid/唯一前缀从本端库解析） */
+  note?: string;
   /** 触发来源：manual 手动 / manual-batch 批量 / add 添加账号 / auto 上游自动 */
   source: string;
   /** 类型：checkin 签到 / keepalive 保活 */
@@ -1132,6 +1134,8 @@ export interface TaskLog {
   message_cn?: string;
   /** 账号昵称（后端按 uid/前缀解析；上游日志只带 uid 前 8 位） */
   nickname?: string;
+  /** 账号备注（后端按 uid/唯一前缀从本端库解析） */
+  note?: string;
 }
 
 export interface TaskLogResponse {

@@ -339,6 +339,17 @@ class RenewOnceTest(unittest.TestCase):
         self.assertEqual(stats['failed'], 1)
         self.assertEqual(calls, [], '没有 refreshToken 却还是发了请求')
 
+    def test_failure_log_records_real_uid_not_filename(self) -> None:
+        """续期失败落库时 uid 必须是账号真实 uid，写文件名会导致版本筛选过滤掉该记录。"""
+        renew._last_fail_log.clear()
+        self._write('real-uid-001', expires_in=3600, refresh='')
+        logged: list[dict] = []
+        with mock.patch.object(renew.db, 'add_task_logs', side_effect=lambda items: logged.extend(items)):
+            stats = asyncio.run(renew.renew_once())
+        self.assertEqual(stats['failed'], 1)
+        self.assertEqual(len(logged), 1)
+        self.assertEqual(logged[0]['uid'], 'real-uid-001')
+
     def test_upstream_failure_does_not_penalise(self) -> None:
         """刷新失败只是记一笔 —— 不冷却、不禁用账号。
 
@@ -378,6 +389,44 @@ class WiringTest(unittest.TestCase):
                / 'server/services/renew.py').read_text(encoding='utf-8')
         self.assertIn("'kind': 'keepalive'", src)
         self.assertIn('db.add_task_logs', src)
+
+    def test_task_logs_realm_filter_includes_secondary_groups_and_notes(self) -> None:
+        from server import db, upstreamsvc
+        from server.routers import accounts as accounts_router
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orig = config.DB_PATH, config.AUTH_DIR
+            try:
+                config.DB_PATH = root / 'manager.db'
+                config.AUTH_DIR = root / 'auths-default'
+                config.AUTH_DIR.mkdir()
+                sec_dir = root / 'auths-sec'
+                sec_dir.mkdir()
+                db._conn = None
+                db.connect()
+                sec_uid = 'feedbeef-0000-0000-0000-000000000002'
+                (sec_dir / 'workbuddy-sec.json').write_text(json.dumps({
+                    'account': {'uid': sec_uid, 'nickname': '138****9999'},
+                    'auth': {'accessToken': 'at', 'refreshToken': 'rt', 'expiresAt': int(time.time()) + 86400,
+                             'realm': 'cn', 'domain': 'copilot.tencent.com'},
+                }), encoding='utf-8')
+                db.set_account_note(sec_uid, '二组备用号')
+                db.add_task_logs([{
+                    'ts': int(time.time()), 'uid': sec_uid[:8], 'kind': 'travel',
+                    'level': 'credit', 'credits': 10, 'message': 'claim ok record=1 reward=10',
+                    'dedup_key': 'sec-1',
+                }])
+                sec_group = {'id': 2, 'name': '分组二', 'auth_dir': str(sec_dir), 'is_default': False}
+                with mock.patch.object(upstreamsvc, 'list_upstreams', return_value=[sec_group]):
+                    res = accounts_router.task_logs(realm='cn', user={'role': 'admin'})
+                self.assertEqual(len(res['logs']), 1)
+                self.assertEqual(res['logs'][0]['nickname'], '138****9999')
+                self.assertEqual(res['logs'][0]['note'], '二组备用号')
+            finally:
+                if db._conn:
+                    db._conn.close()
+                db._conn = None
+                config.DB_PATH, config.AUTH_DIR = orig
 
 
 if __name__ == '__main__':

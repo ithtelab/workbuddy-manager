@@ -278,11 +278,11 @@ export default function TasksPage() {
     }
   }, [reload]);
 
-  function accountLabel(l: TaskLog) {
+  function accountLabel(l: {uid?: string; nickname?: string; note?: string}) {
     const uid = l.uid || '';
     if (!uid) return '—';
-    // 昵称由后端解析：上游 2026-09-12 起只打 uid 前 8 位，前端拿不到完整 uid
-    return l.nickname || uid;
+    const base = l.nickname || uid;
+    return l.note ? `${base} (${l.note})` : base;
   }
 
   /** 签到来源显示名（后端给的是固定枚举 manual / auto / add…） */
@@ -468,7 +468,7 @@ export default function TasksPage() {
                 {checkinLogs.map((l) => (
                   <div key={l.id} className="rounded-xl bg-background/60 px-3 py-1.5">
                     <div className="flex items-center justify-between gap-2">
-                      <span className="truncate text-xs font-medium">{l.nickname || l.uid || '—'}</span>
+                      <span className="truncate text-xs font-medium" title={l.note ? `${l.nickname || l.uid} · ${l.note}` : undefined}>{accountLabel(l)}</span>
                       <span
                         className={
                           'shrink-0 text-[11px] font-medium ' +
@@ -505,7 +505,7 @@ export default function TasksPage() {
                         <TableCell className="pl-4 text-xs tabular-nums text-muted-foreground">
                           {fmtDateTimeMarked(l.ts)}
                         </TableCell>
-                        <TableCell className="max-w-[120px] truncate text-xs">{l.nickname || l.uid || '—'}</TableCell>
+                        <TableCell className="max-w-[160px] truncate text-xs" title={l.note ? `${l.nickname || l.uid} · ${l.note}` : undefined}>{accountLabel(l)}</TableCell>
                         <TableCell className="text-xs text-muted-foreground">
                           {sourceLabel(l.source)}
                         </TableCell>
