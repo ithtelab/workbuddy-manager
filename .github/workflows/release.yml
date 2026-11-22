@@ -403,50 +403,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 构建并推送容器镜像（amd64 + arm64）
-        # 镜像只是**附属产物**：发布包与 Release 才是主体。首次实测时此步因缺少
-        # packages: write 权限失败，整个 workflow 被标红——但 Release 其实已成功
-        # 创建，很容易被误读成「发版失败」。加 continue-on-error 后，镜像推不上去
-        # 只影响这一步，发布结果不受牵连。
-        continue-on-error: true
-        if: github.event_name == 'push' || inputs.tag != ''
-        id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          # 多平台必须走 buildx 并直接 push：本地镜像库放不下多架构的 manifest list
-          platforms: linux/amd64,linux/arm64
-          push: true
-          # 镜像标签用小写（GHCR 要求），去掉 v 前缀
-          tags: |
-            ${{ steps.image.outputs.name }}:${{ steps.vars.outputs.version }}
-            ${{ steps.image.outputs.name }}:latest
-          # 关掉 provenance 证明：它会在 manifest list 里塞入 attestation 条目，
-          # 某些旧版 Docker（< 25）拉取时会报 unknown/unknown platform。
-          # 本项目不依赖该证明，关掉换来更干净的索引。
-          provenance: false
-
-      - name: 记录镜像 digest
-        if: steps.build.outcome == 'success'
-        run: |
-          # digest 是内容寻址的，用户可用它核对拉到的镜像与本次构建完全一致。
-          # 多架构构建下镜像不在本地库里，digest 只能取自 build-push-action 的输出。
-          echo "镜像：${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
-          echo "平台：linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
-
-      # ── 构建并发布**上游**容器镜像（issue #241）───────────────────────
-      #
-      # 管理端镜像按设计不含上游（见 Dockerfile 头注释），要跑多个上游容器做分组
-      # 的用户此前只能自己 build：先拉 golang 基础镜像、再编译 6 个二进制，国内
-      # 网络常常卡在拉基础镜像那一步，或者被拿到的第三方镜像版本拖偏（issue #241
-      # 的现场：「更新 2.8.0 之后显示与项目上游源码不一致」）。
-      #
-      # 这里用**发布包里那份源码**（= upstream-src 资产 + 全部补丁，前面已校验
-      # 过补丁一条不少）原样构建，镜像与面板随包上游是同一份代码，不存在版本漂移。
-      # 取不到上游源码（has_upstream=0）时整段跳过，不阻断发布。
-      #
-      # 首次发布后要在仓库 Packages 里把该包设为 **public**：GHCR 新建包默认私有，
-      # 用户在未登录状态下 `docker pull` 会 401（管理端镜像当年也踩过这一步）。
       - name: 解析上游镜像名
         # GHCR 仓库名必须全小写（与上面管理端镜像同理）
         if: steps.pack.outputs.has_upstream == '1' && (github.event_name == 'push' || inputs.tag != '')
@@ -478,6 +434,61 @@ jobs:
         run: |
           echo "上游镜像：${{ steps.upstream_image.outputs.name }}@${{ steps.build_upstream.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
 
+      - name: 构建并推送容器镜像（amd64 + arm64）
+        # 镜像只是**附属产物**：发布包与 Release 才是主体。首次实测时此步因缺少
+        # packages: write 权限失败，整个 workflow 被标红——但 Release 其实已成功
+        # 创建，很容易被误读成「发版失败」。加 continue-on-error 后，镜像推不上去
+        # 只影响这一步，发布结果不受牵连。
+        continue-on-error: true
+        if: github.event_name == 'push' || inputs.tag != ''
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          # 多平台必须走 buildx 并直接 push：本地镜像库放不下多架构的 manifest list
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # 管理端镜像在构建期会从**上游镜像**里取一份任务脚本与配置模板
+          # （见 Dockerfile 的 `FROM ${UPSTREAM_IMAGE} AS upstream`）。
+          # 必须显式钉到**本次发布的版本**：不传的话 Dockerfile 的默认值是
+          # `:latest`，而 latest 此刻还指着上一版 —— 内置脚本就会滞后一个版本，
+          # 与「随包上游同版本」的承诺不符。
+          #
+          # 因此上游镜像的构建被挪到了本步骤**之前**；若上游构建失败/被跳过
+          # （has_upstream=0），这里回落到 latest —— 那种情况下发布包本身也不含
+          # upstream/，管理端镜像里的内置脚本只是尽力而为。
+          build-args: |
+            UPSTREAM_IMAGE=ghcr.io/${{ github.repository_owner }}/workbuddy2api:${{ steps.build_upstream.outcome == 'success' && steps.vars.outputs.version || 'latest' }}
+          # 镜像标签用小写（GHCR 要求），去掉 v 前缀
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ steps.vars.outputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+          # 关掉 provenance 证明：它会在 manifest list 里塞入 attestation 条目，
+          # 某些旧版 Docker（< 25）拉取时会报 unknown/unknown platform。
+          # 本项目不依赖该证明，关掉换来更干净的索引。
+          provenance: false
+
+      - name: 记录镜像 digest
+        if: steps.build.outcome == 'success'
+        run: |
+          # digest 是内容寻址的，用户可用它核对拉到的镜像与本次构建完全一致。
+          # 多架构构建下镜像不在本地库里，digest 只能取自 build-push-action 的输出。
+          echo "镜像：${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "平台：linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+
+      # ── 构建并发布**上游**容器镜像（issue #241）───────────────────────
+      #
+      # 管理端镜像按设计不含上游（见 Dockerfile 头注释），要跑多个上游容器做分组
+      # 的用户此前只能自己 build：先拉 golang 基础镜像、再编译 6 个二进制，国内
+      # 网络常常卡在拉基础镜像那一步，或者被拿到的第三方镜像版本拖偏（issue #241
+      # 的现场：「更新 2.8.0 之后显示与项目上游源码不一致」）。
+      #
+      # 这里用**发布包里那份源码**（= upstream-src 资产 + 全部补丁，前面已校验
+      # 过补丁一条不少）原样构建，镜像与面板随包上游是同一份代码，不存在版本漂移。
+      # 取不到上游源码（has_upstream=0）时整段跳过，不阻断发布。
+      #
+      # 首次发布后要在仓库 Packages 里把该包设为 **public**：GHCR 新建包默认私有，
+      # 用户在未登录状态下 `docker pull` 会 401（管理端镜像当年也踩过这一步）。
       - name: 部署说明
         run: |
           cat <<'EOF' >> $GITHUB_STEP_SUMMARY
