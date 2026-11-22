@@ -278,13 +278,19 @@ ARG DEBIAN_MIRROR=""
 # 缺了它 `/etc/localtime` 设不上、`localtime` 会静默退回 UTC —— 表现是
 # 「时区明明是 +8，统计却按 UTC 分天」，而且不报任何错。
 ARG TZ=""
+# `su-exec` 与 `shadow` **必须装在运行阶段这一层**，不能只装在 `bins`/`deps` 阶段：
+# 跨阶段只 `COPY` 文件，不会带过来 apk 的依赖与 /etc/passwd 钩子；而入口脚本
+# 降权用 `su-exec`、把 app 的 uid/gid 对齐挂载目录属主用 `usermod`/`groupmod`
+# （Alpine 的 busybox adduser 没有这两个）。v2.11.22 就漏在这里：镜像里三个工具
+# 一个都没有，容器启动几毫秒后 `exec: line 161: su-exec: not found`、exit 127，
+# `restart: unless-stopped` 下无限重启（issue #473）。
 RUN set -eu; \
     MIRROR="${ALPINE_MIRROR:-$DEBIAN_MIRROR}"; \
     if [ -n "${MIRROR}" ]; then \
         echo "apk: 使用指定软件源 ${MIRROR}"; \
         sed -i -E "s#(https?://)[^/]+#\1${MIRROR}#g" /etc/apk/repositories; \
     fi; \
-    apk add --no-cache git curl ca-certificates; \
+    apk add --no-cache git curl ca-certificates su-exec shadow; \
     if [ -n "${TZ}" ]; then \
         echo "时区：${TZ}"; \
         apk add --no-cache tzdata; \
