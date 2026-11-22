@@ -74,6 +74,27 @@ def main() -> int:
     if not re.search(r'(?m)^COPY\s+--from=\S+\s+\S+\s+/app/web/out\s*$', df):
         problems.append('没有把前端产物拷到 /app/web/out 的 COPY 指令')
 
+    # 6. 入口接线（issue #473 / PR #471 的教训）
+    #
+    # 入口脚本负责三件事：按 PUID/PGID 对齐挂载目录属主、su-exec 降权、首次启动
+    # 生成上游 config.json。它被打进镜像却没人调用时，这些全部静默失效 ——
+    # 容器照样能起（CMD 直接跑 uvicorn），只是 NAS 上会 Permission denied、
+    # 或者属性对齐没做。PR #471 就是这样：脚本 COPY 进来了、chmod +x 也做了，
+    # 但 ENTRYPOINT 被删，103 个单测全绿。
+    if not re.search(r'(?m)^ENTRYPOINT\s+\[.*docker-entrypoint\.sh.*\]', df):
+        problems.append('缺少 ENTRYPOINT 指向 deploy/docker-entrypoint.sh —— '
+                        '属主对齐与降权脚本不会被调用')
+    if not re.search(r'(?m)^COPY\s+deploy\s+/app/deploy\s*$', df):
+        problems.append('没有把 deploy/ 拷进镜像 —— ENTRYPOINT 指向的脚本不存在')
+
+    # 入口脚本以 root 起、改完属主再 su-exec 降权。写死 USER 会让那段 root
+    # 分支整段不可达（`if [ "$(id -u)" = "0" ]` 恒假），PUID/PGID 探测与 chown
+    # 全成死代码。最终阶段因此不能有 USER。
+    last_stage = df.rsplit('\nFROM ', 1)[-1]
+    if re.search(r'(?m)^USER\s+\S', last_stage):
+        problems.append('最终阶段写了 USER —— 入口脚本的 root 分支（属主对齐）'
+                        '将不可达；降权应由脚本自己用 su-exec 完成')
+
     if problems:
         print('Dockerfile 自检发现问题：')
         for p in problems:

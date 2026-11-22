@@ -915,6 +915,47 @@ class ReleasePackageIncludesDockerAssetsTest(unittest.TestCase):
                           f'发布包没打进去 {asset} —— 用户拿到包也用不了容器部署')
 
 
+class BuildImageWorkflowTagContractTest(unittest.TestCase):
+    """默认分支镜像构建工作流不得占用发布标签。
+
+    `release.yml` 在发版时推 `:<版本号>` 与 `:latest`，它们是对用户的承诺：
+    钉 `:2.11.23` 拉到的字节必须永远对应 v2.11.23 那个 release。
+
+    而 `build-image.yml` 跑在每次 push 默认分支之后，此时 `server/main.py` 的
+    版本号还是**上一个已发布版本**（只在发版提交里 +1）。若它也推版本号或
+    `:latest`，发版后任何普通提交都会把 `:2.11.23` 覆盖成未发布代码 ——
+    用户钉版本拉到的字节悄悄变了，且没有任何报错。
+
+    所以这里锁两条：工作流存在（有预构建镜像可用），且它只用 sha-* 与分支名
+    这类滚动标签。
+    """
+
+    def _workflow(self) -> str:
+        path = _ROOT / '.github' / 'workflows' / 'build-image.yml'
+        self.assertTrue(path.is_file(), '缺少默认分支镜像构建工作流')
+        return path.read_text(encoding='utf-8')
+
+    def test_tags_do_not_collide_with_release(self) -> None:
+        wf = self._workflow()
+        # 只看真正写进 tags 的那段，避免被注释里的解释误判。
+        self.assertNotRegex(
+            wf, r'(?m)^\s*(echo\s+")?' r'\$\{IMAGE\}:latest',
+            '不要推 :latest —— 那是发版契约，会被未发布代码覆盖')
+        self.assertNotIn('${IMAGE}:${VERSION}', wf,
+                         '不要推 :<版本号> —— 版本号只在发版时前进，'
+                         '这里推会把已发布的 tag 覆盖成未发布代码')
+
+    def test_uses_content_addressed_tag(self) -> None:
+        wf = self._workflow()
+        self.assertIn('sha-${SHORT}', wf, '缺少内容寻址标签 sha-<短哈希>')
+
+    def test_builds_both_architectures(self) -> None:
+        wf = self._workflow()
+        line = next((l for l in wf.splitlines() if 'platforms:' in l), '')
+        self.assertIn('linux/amd64', line)
+        self.assertIn('linux/arm64', line, 'ARM 用户拉不到镜像')
+
+
 class MultiArchImageTest(unittest.TestCase):
     """镜像必须同时支持 amd64 与 arm64。
 
@@ -1574,6 +1615,42 @@ class EntrypointPermissionsTest(unittest.TestCase):
         self.assertEqual([], missing,
                          '入口脚本用到但运行阶段没有的命令：%s（#473 同类问题）'
                          % ', '.join(missing))
+
+    def test_skip_ownership_still_generates_upstream_config(self) -> None:
+        """`WB_FIX_OWNERSHIP=0` 只该跳过 chown，不该跳过首启配置生成。
+
+        那个开关的文档语义是「我自己接管容器身份」。但上游 config.json 的
+        兜底生成与属主无关 —— 少了它，上游容器会因读不到配置反复重启，
+        而日志里只有上游的报错，看不出是管理端少走了一步。
+
+        这条锁住结构：开关只出现在「root 且要修属主」这个条件的**同一行**，
+        而且末尾那条 init_upstream_conf 不在任何 if 分支里（两条路径都会走到）。
+        """
+        src = (_ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
+
+        # 开关不能再有独立的 early-exit 分支（`exec "$@"` 直接跳出脚本）。
+        self.assertNotRegex(
+            src, r'if \[ "\$\{WB_FIX_OWNERSHIP:-1\}" != "1" \]; then\s*\n\s*exec',
+            'WB_FIX_OWNERSHIP=0 不能直接 exec —— 那样首启配置不会生成')
+
+        # 开关应与 root 判定合并在同一个 if 里。
+        self.assertRegex(
+            src, r'if \[ "\$\{WB_FIX_OWNERSHIP:-1\}" = "1" \] && '
+                 r'\[ "\$\(id -u\)" = "0" \]; then',
+            'WB_FIX_OWNERSHIP 应与 root 判定合并在同一个条件里')
+
+        # 末尾那句 init_upstream_conf 必须在顶格（不在任何 if 分支内）：
+        # 顶格 = 该行前导只有空白，且前一个非空行不是 `then`/`else` 之类的分支起始。
+        tail = src.rsplit('init_upstream_conf "" ""', 1)
+        self.assertEqual(2, len(tail), '末尾缺少 init_upstream_conf 兜底调用')
+        last = src.rfind('init_upstream_conf "" ""')
+        line_start = src.rfind('\n', 0, last) + 1
+        self.assertEqual('init_upstream_conf "" ""',
+                         src[line_start:last + len('init_upstream_conf "" ""')].strip(),
+                         '兜底的 init_upstream_conf 应独占一行')
+        self.assertNotIn(src[line_start:last], (' ', '\t'),
+                         '末尾的 init_upstream_conf 不能在 if 分支里（有缩进）—— '
+                         '它在 WB_FIX_OWNERSHIP=0 与非 root 两条路径上都要执行')
 
 
 class BundledUpstreamAssetsTest(unittest.TestCase):

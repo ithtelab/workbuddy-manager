@@ -1,0 +1,203 @@
+# 构建 WorkBuddy Manager 容器镜像，推送到本仓库的 GHCR。
+#
+# 来源是上游给 fork 用的模板 deploy/fork-image/build-image.yml，针对本仓库改了几处：
+#
+#   · 镜像名去掉 -multiarch 后缀，沿用本仓库已经在用的
+#     ghcr.io/<owner>/workbuddy-manager —— 这个包归本仓库所有，令牌有写权限，
+#     不必为躲开同名包另起一个名字；
+#   · 只推 GHCR。上游那份还带 Docker Hub 的可选分支，本仓库用不到，删掉少两层判断；
+#   · **不推 `:latest`，也不推 `:<版本号>`** —— 见下面「标签契约」。
+#
+# 镜像面向「跑起来」而非「发版」：它不含 wb2api（账号池服务），那是独立的上游
+# 容器，管理端通过 WB2API_BASE 连它。
+#
+# ── 标签契约（与 release.yml 的分工）─────────────────────────
+#
+# `release.yml` 在**发版时**推 `:<版本号>` 与 `:latest`，两者是发布契约：
+# 用户钉某个版本拉到的字节必须永远对应那个 release。
+#
+# 这个工作流跑在每次 push 默认分支之后，此时 `server/main.py` 的版本号还是
+# **上一个已发布版本**（版本号只在发版提交里 +1）。如果这里也推
+# `:<版本号>`/`:latest`，发版后任何一次普通提交都会把 `:2.11.23` 与 `:latest`
+# 覆盖成未发布的代码 —— 钉版本的用户拿到的字节悄悄变了，而且没有任何报错。
+#
+# 所以这里只推两个**不承诺对应发布**的标签：
+#
+#   ghcr.io/<owner>/workbuddy-manager:main         跟着默认分支走（滚动）
+#   ghcr.io/<owner>/workbuddy-manager:sha-<短哈希> 内容寻址，可核对来源
+#
+# 部署请用 `sha-*` 或等发版后用版本号；要跟主线用 `:main`，但那是「最新代码」
+# 不是「最新发布」，出问题没有对应 release 可以回溯。
+#
+# ── 触发 ─────────────────────────────────────────────────────
+#
+# 推默认分支且改动会影响镜像内容时自动构建（arm64 是 QEMU 交叉构建，纯文档
+# 改动不值得跑几分钟），也可以在 Actions 页面手动运行。
+#
+# 平台：linux/amd64 + linux/arm64 合并成一个 manifest list，拉取时按机器架构自动选。
+
+name: Build Image
+
+on:
+  push:
+    # 刻意不写分支名：写死 main 的话，默认分支改名后这个工作流会安静地失效。
+    # 任何分支的推送都先进来，再由下面 job 上的 if 判断是不是默认分支。
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - 'server/**'
+      - 'web/**'
+      - 'deploy/**'
+      - '.github/workflows/build-image.yml'
+  workflow_dispatch:
+
+# 连续推两次时排队而不是互相打断：两个运行同时推同一个标签，指向谁不好说。
+# （排队，不取消。）
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # 推镜像到 GHCR 必须显式声明；只给 contents 会被拒。
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 只在默认分支上构建。其余分支会进到这里但被跳过 —— 跳过不消耗构建时间，
+    # 也不会让滚动标签被 feature 分支覆盖。
+    if: github.ref_name == github.event.repository.default_branch
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # 先把前端构建好再交给 Dockerfile 复用（Dockerfile 的逻辑是「有 web/out
+      # 就直接用，没有才在容器里现场构建」）。好处有两个：
+      #   · arm64 靠 QEMU 交叉构建，若让 npm 安装与编译也跑在模拟环境里，
+      #     会成为整个构建最慢的一段；
+      #   · 前端构建失败会在**构建镜像之前**报出来，不必等几分钟才发现。
+      # Node 版本与 Dockerfile 里的 node:20-alpine 对齐。
+      - name: 安装 Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端静态导出
+        working-directory: web
+        run: |
+          npm ci
+          npm run build:export
+
+      - name: 校验前端产物
+        run: |
+          test -f web/out/index.html || { echo "构建失败：缺少 web/out/index.html"; exit 1; }
+          echo "前端产物：$(du -sh web/out | cut -f1)"
+
+      - name: 解析镜像名与标签
+        id: image
+        run: |
+          # 小写转换**不能省**：GHCR 要求镜像名全小写，而仓库所有者可能含大写
+          # 字母，直接拼进去会被拒收，报
+          # `repository name must be lowercase`。
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/workbuddy-manager"
+          IMAGE="${IMAGE,,}"
+          SHORT="${GITHUB_SHA::7}"
+
+          # 分支名直接进标签会把 `feat/foo` 之类变成非法或含斜杠；这里只保留
+          # 默认分支的名字（本工作流本来就只在默认分支上跑）。
+          BRANCH="${GITHUB_REF_NAME}"
+          SAFE_BRANCH=$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' \
+            | sed 's/[^a-z0-9._-]/-/g')
+
+          # **不要加 `:latest` 或 `:<版本号>`**：那两个是 release.yml 的发布
+          # 契约，而这里构建的是未发布的默认分支代码。详见文件头的「标签契约」。
+          TAGS="${IMAGE}:sha-${SHORT}"$'\n'"${IMAGE}:${SAFE_BRANCH}"
+
+          {
+            echo "name=${IMAGE}"
+            echo "tags<<__TAGS__"
+            printf '%s\n' "$TAGS"
+            echo "__TAGS__"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "本次将推送："
+          printf '%s\n' "$TAGS"
+
+      - name: 设置 QEMU
+        # 在 amd64 机器上构建 arm64 层需要它（模拟出 arm64 执行环境）
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送（amd64 + arm64）
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          # 两个架构合并成一个 manifest list，本地镜像库放不下它，
+          # 所以必须直接推送到仓库（不能只构建不推）。
+          platforms: linux/amd64,linux/arm64
+          push: true
+          labels: |
+            org.opencontainers.image.title=WorkBuddy Manager
+            org.opencontainers.image.description=腾讯 CodeBuddy 账号池管理控制台 · OpenAI 兼容网关
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          tags: ${{ steps.image.outputs.tags }}
+          # 关掉这个证明：它会在 manifest list 里塞进 attestation 条目，某些
+          # 旧版 Docker 拉取时报 unknown/unknown platform。本项目不依赖它。
+          provenance: false
+          # 复用上一次的层缓存，省掉 apk / pip / npm 那几层的重复下载。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 输出结果
+        run: |
+          # 摘要是给人看的，所以直接给出**可原样粘贴**的命令。真实镜像名只有
+          # 跑到这一步才知道，文档里只能写占位符。
+          IMAGE="${{ steps.image.outputs.name }}"
+          SHA_TAG="${IMAGE}:sha-${GITHUB_SHA::7}"
+          BRANCH_TAG="${IMAGE}:${{ github.ref_name }}"
+          {
+            echo "## 镜像已推送"
+            echo ""
+            echo "这是**默认分支的最新代码**，不是发布版本 —— 它不占用 \`:latest\`"
+            echo "与 \`:<版本号>\`（那两个由发版流程推送）。"
+            echo ""
+            echo "内容寻址标签（推荐）："
+            echo ""
+            echo '```bash'
+            echo "docker pull ${SHA_TAG}"
+            echo '```'
+            echo ""
+            echo "跟主线（滚动，会被下一次推送覆盖）："
+            echo ""
+            echo '```bash'
+            echo "docker pull ${BRANCH_TAG}"
+            echo '```'
+            echo ""
+            echo "平台：linux/amd64, linux/arm64（拉取时按机器架构自动选择）"
+            echo ""
+            echo "digest：\`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "### 用它部署"
+            echo ""
+            echo '```bash'
+            echo "# 在 docker-compose.yml 所在目录，用预构建镜像起（不本地构建）"
+            echo "WB_MANAGER_IMAGE=${SHA_TAG} docker compose up -d --no-build"
+            echo '```'
+            echo ""
+            echo "记得让 \`WB2API_BASE\` 指向能访问到的 wb2api（7863）。"
+          } >> "$GITHUB_STEP_SUMMARY"

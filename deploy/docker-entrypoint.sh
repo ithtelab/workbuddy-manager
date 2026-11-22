@@ -20,13 +20,13 @@
 #
 # 修完属主后立即 su-exec 降权，root 只存在于 PID 1 启动的头几毫秒。
 #
-# 逃生开关：WB_FIX_OWNERSHIP=0 时完全跳过本脚本，直接执行 CMD
+# 逃生开关：WB_FIX_OWNERSHIP=0 时跳过**属主修正**，直接以当前身份执行 CMD
 # （用于「我就想让容器以某个显式 user: 运行」的场景）。
+#
+# 它只关掉 chown 那一段，**不跳过**首启时兜底生成上游 config.json ——
+# 那件事和属主无关，跳过的话上游容器会因为读不到配置反复重启，而日志里
+# 只有上游的报错，看不出是管理端少走了一步。改不了属主就按当前用户建文件。
 set -eu
-
-if [ "${WB_FIX_OWNERSHIP:-1}" != "1" ]; then
-    exec "$@"
-fi
 
 # 可能被挂载的目录。不同部署的挂载布局不同：默认是 /app/data + /opt/workbuddy2api，
 # 也有人把两者收进同一个根（/opt/workbuddy）。
@@ -86,11 +86,17 @@ init_upstream_conf() {  # $1 = uid, $2 = gid
     mkdir -p "$_dir/auths" "$_dir/data" 2>/dev/null || true
     if [ ! -f "$_cfg" ] && [ -f /app/upstream/config.example.json ]; then
         if python - "$_cfg" <<'PY'
-import json, secrets, sys, pathlib
+import json, os, secrets, sys, pathlib
 dst = pathlib.Path(sys.argv[1])
 cfg = json.loads(pathlib.Path('/app/upstream/config.example.json').read_text(encoding='utf-8'))
 cfg['api_key'] = secrets.token_hex(16)
 dst.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+# 这个文件里有 api_key，而它落在**宿主挂载目录**里 —— 同机其它用户默认能读。
+# 0600 是唯一合理权限；写失败不算致命（容器仍能用），但要让用户看到。
+try:
+    os.chmod(dst, 0o600)
+except OSError as exc:
+    sys.stderr.write('[entrypoint] 警告：无法把 %s 权限设为 0600（%s）\n' % (dst, exc))
 PY
         then
             echo "[entrypoint] 已就地生成上游配置 $_cfg（api_key 随机）" >&2
@@ -111,7 +117,7 @@ needs_fix() {  # $1 = 路径；属主不是目标值时返回 0
     [ "$(stat -c %u:%g "$1" 2>/dev/null)" != "$PUID:$PGID" ]
 }
 
-if [ "$(id -u)" = "0" ]; then
+if [ "${WB_FIX_OWNERSHIP:-1}" = "1" ] && [ "$(id -u)" = "0" ]; then
     # app 用户的 uid/gid 对齐到目标值。Alpine 的 busybox 没有 usermod/groupmod，
     # 镜像里装了 shadow 包提供它们；-o 允许 uid/gid 与宿主已有账号重复。
     if [ "$(id -g app 2>/dev/null || echo '')" != "$PGID" ]; then
@@ -161,10 +167,14 @@ if [ "$(id -u)" = "0" ]; then
     exec su-exec "$PUID:$PGID" "$@"
 fi
 
-# 已经以非 root 启动（compose 里写了 user:）：尊重它，只提示不干预。
+# 走到这里的两种情况：
+#   · 容器不是以 root 启动（compose 里写了 user:）—— 尊重它，只提示不干预；
+#   · 设了 WB_FIX_OWNERSHIP=0 —— 用户显式接管身份，跳过属主修正。
 if [ "$(id -u)" != "$PUID" ]; then
-    echo "[entrypoint] 当前 uid=$(id -u)，与 PUID=$PUID 不同（由 docker 的 user: 决定）" >&2
+    echo "[entrypoint] 当前 uid=$(id -u)，与 PUID=$PUID 不同（由 docker 的 user: 或 WB_FIX_OWNERSHIP=0 决定）；跳过属主修正" >&2
 fi
-# 非 root 时也要补配置：此时改不了属主，只建文件（属主自然是当前用户）。
+# 两条路径都仍要补配置：改不了属主就只建文件（属主自然是当前用户）。
+# 这一步不能省 —— 少了它上游容器会因读不到 config.json 反复重启，而日志里
+# 只有上游的报错，看不出是管理端跳过了生成。
 init_upstream_conf "" ""
 exec "$@"
