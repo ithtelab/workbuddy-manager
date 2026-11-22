@@ -1,0 +1,93 @@
+# WorkBuddy —— 管理端 + 上游，一条命令起全套
+#
+# 用法：
+#   1) docker compose -f docker-compose.full.yml up -d
+#   2) 浏览器打开 http://<服务器IP>:7864
+#      首启未设 WB_ADMIN_PASSWORD 时，随机密码打印在容器日志：
+#      docker compose -f docker-compose.full.yml logs workbuddy-manager | grep -A2 密码
+#
+# 与 docker-compose.yml 的区别（选一个用，不要混）：
+#   · docker-compose.yml        只起管理端，上游由你自己部署（源码形态，可用容器内
+#                               的一键更新维护）。适合已有上游、或要跑多个分组池的人。
+#   · docker-compose.full.yml   **本文件**：管理端 + 上游各一个容器，全部用官方镜像，
+#                               不需要在宿主机准备上游源码、不需要 chown、不需要挂
+#                               docker.sock。适合 NAS / 群晖 / 只想要「拉镜像即用」的人。
+#
+# 为什么这样就不需要源码：
+#   · 任务脚本：管理端镜像构建期已从上游镜像取了一份（/app/upstream/scripts），
+#     宿主机没有上游目录也能跑「成长任务」；
+#   · 上游配置：管理端启动时会就地生成 config.json（补一个随机 api_key），
+#     上游容器挂同一个目录，直接读它启动 —— 不需要用户先备配置。
+#
+# 数据布局（宿主机 ./data/ ↔ 容器内 /opt/workbuddy）：
+#   data/manager/        管理端数据库、管理员、日志
+#   data/workbuddy2api/  上游 config.json、auths/、data/、scripts/（后两者由程序建）
+#
+# 注意：本文件要求数据根是**宿主目录**（bind mount），不能用命名卷 ——
+# 上游服务挂的是 `${WB_DATA_VOLUME}/workbuddy2api` 这个子路径，命名卷不支持子路径。
+
+services:
+  workbuddy-manager:
+    image: ${WB_MANAGER_IMAGE:-ghcr.io/ithtelab/workbuddy-manager:latest}
+    container_name: workbuddy-manager
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      # 单根布局：数据、上游配置、账号目录都在同一条挂载下（见下面 volumes）。
+      # 这三项必须一起给，缺一个就会有一半功能落在空目录上。
+      WB_DATA_DIR: /opt/workbuddy/manager
+      WB_AUTH_DIR: /opt/workbuddy/workbuddy2api/auths
+      WB_UPSTREAM_CONFIG: /opt/workbuddy/workbuddy2api/config.json
+      # 用**服务名**而不是 host.docker.internal：两个容器在同一个 compose 网络里，
+      # 服务名就是稳定地址，也不依赖宿主端口是否发布。
+      WB2API_BASE: http://workbuddy2api:7863
+      # 容器名，供依赖 docker 的功能定位上游（本文件默认不挂 docker.sock，
+      # 这些功能会如实降级为「请到宿主机操作」）。
+      WB2API_CONTAINER: workbuddy2api
+      # 首启管理员密码；不设则随机生成并打印到日志（推荐首启后立即改）
+      # WB_ADMIN_PASSWORD: "改成你的强密码"
+      # 一键更新的下载代理 / GitHub 镜像加速（国内机器建议填后者）
+      WB_UPDATE_PROXY: ${WB_UPDATE_PROXY:-}
+      WB_GITHUB_MIRROR: ${WB_GITHUB_MIRROR:-}
+      # 进程 uid/gid。**默认 10001**：上游镜像里固定以 10001 运行，而两边要共享
+      # auths/ 与 config.json，uid 不一致就会出现「面板有账号、池子里 0 个」。
+      # 想跟随宿主目录属主（如群晖的 1026/100）就显式填 PUID/PGID —— 但那样上游
+      # 读不到账号，除非你另外改上游的 user:。
+      PUID: ${PUID:-10001}
+      PGID: ${PGID:-10001}
+    volumes:
+      - ${WB_DATA_VOLUME:-./data}:/opt/workbuddy
+    ports:
+      # 只监听本机：管理端持有全部账号凭据，必须藏在反向代理之后。
+      - "127.0.0.1:7864:7864"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7864/api/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  workbuddy2api:
+    image: ${WB_UPSTREAM_IMAGE:-ghcr.io/ithtelab/workbuddy2api:latest}
+    container_name: workbuddy2api
+    restart: unless-stopped
+    # 等管理端健康后再起：管理端会在启动时生成 config.json 与 auths/、data/ 目录，
+    # 上游晚了才有得读。反过来（先起上游）会因配置缺失反复重启。
+    depends_on:
+      workbuddy-manager:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    # 上游的配置里 auth_dir / state_file 是相对路径（"./auths"、"./data"），
+    # 相对的是**工作目录**；把它指到数据目录，配置、账号、状态就都落在同一处，
+    # 也与管理端的 WB_AUTH_DIR / WB_UPSTREAM_CONFIG 完全一致。
+    working_dir: /conf
+    command: ["/app/wb2api", "-config", "/conf/config.json"]
+    volumes:
+      # 只挂这一个目录：config.json、auths/、data/ 全在里面。
+      # 不像上游自带 compose 那样单独挂 config.json 文件 —— 文件不存在时 docker
+      # 会把它建成**目录**，上游随即报「是目录」起不来。
+      - ${WB_DATA_VOLUME:-./data}/workbuddy2api:/conf
+    # 不发布 7863：只有同一 compose 网络内的管理端需要访问它。
+    expose:
+      - "7863"

@@ -112,6 +112,20 @@ def _host_script() -> Path | None:
     return p if p.is_file() else None
 
 
+# 镜像内置的上游脚本（构建期从上游镜像取，见 Dockerfile 顶部第 1 条取舍）。
+#
+# 为什么需要第三条来源：宿主机目录要求先备一份上游源码，`docker cp` 要求挂
+# docker.sock（= 交出宿主 root）。对 NAS / 图形化部署的用户两条都不是「拉个
+# 镜像就能用」，而成长任务又恰恰只缺这一个文件。
+_BUNDLED_SCRIPT_DIR = Path('/app/upstream/scripts')
+
+
+def _bundled_script() -> Path | None:
+    """镜像自带的脚本副本（`/app/upstream/scripts`），没有则 None。"""
+    p = _BUNDLED_SCRIPT_DIR / 'task_runner.py'
+    return p if p.is_file() else None
+
+
 def _extract_dir() -> Path:
     """从上游容器镜像提取出的脚本的存放目录。"""
     return config.DATA_DIR / 'upstream-scripts'
@@ -243,14 +257,17 @@ def extract_scripts(rep: logging.Logger | None = None) -> tuple[bool, str]:
 
 
 def _script_path() -> Path:
-    """定位 task_runner.py：宿主机挂载目录优先，其次容器提取。
+    """定位 task_runner.py：宿主目录 → 镜像内置 → 容器提取。
 
-    两种部署形态各对应一条：
+    三条来源按「对用户的要求从少到多」排序：
       · 源码 / 完整挂载（`WB_UPSTREAM_DIR` 是宿主机上的仓库）→ 直接用挂载目录，
         这是最省事的，也不需要 docker；
-      · **官方镜像部署**（issue #29）→ 脚本被 COPY 进镜像的 `/app/scripts/`，
+      · **镜像内置**（新版管理端镜像的 `/app/upstream/scripts`）→ 拉镜像即自带，
+        同样不需要 docker，不需要宿主机有源码。这一条是为「只拉镜像、不做任何
+        宿主准备」的部署准备的（NAS / 群晖 / 图形化界面用户）；
+      · **官方镜像部署**（issue #29）→ 脚本被 COPY 进上游镜像的 `/app/scripts/`，
         宿主机那个目录里**根本没有 scripts/**（你只挂了 config.json 与 auths），
-        所以回落去容器里提取。
+        所以回落去容器里提取 —— 这需要 docker.sock。
 
     注意不要为了「让第一条路径有东西」而让用户手动拷贝脚本：那样每次上游更新
     都要重来一次，迟早版本对不上（issue 里正是这么抱怨的）。
@@ -258,6 +275,9 @@ def _script_path() -> Path:
     host = _host_script()
     if host is not None:
         return host
+    bundled = _bundled_script()
+    if bundled is not None:
+        return bundled
     extracted = _extract_dir() / 'task_runner.py'
     if extracted.is_file() and _cache_is_fresh():
         return extracted
@@ -296,12 +316,13 @@ def available(auth_dir: Path | str | None = None) -> tuple[bool, str]:
         return False, (
             f'未找到上游任务脚本（{script}）。'
             '该功能调用的是上游 workbuddy2api 自带的 scripts/task_runner.py。\n'
-            '两种部署形态各有一种修法：\n'
-            '  · 官方镜像部署：本面板会尝试用 `docker cp` 从上游容器里提取脚本，'
-            '但它需要能访问 docker（挂载 /var/run/docker.sock，且容器名与 '
-            'WB2API_CONTAINER 一致）。请检查这两项，然后点「预览」重试。\n'
-            '  · 源码部署：请确认上游目录（WB_UPSTREAM_DIR）已挂载且版本较新，'
-            '可到「设置 → 系统更新」更新上游。'
+            '下面三条来源按顺序自动尝试，任意一条成立即可用：\n'
+            '  · 镜像内置副本：新版管理端镜像自带 /app/upstream/scripts，'
+            '用官方镜像重建容器即可（不需要上游源码，也不需要 docker.sock）；\n'
+            '  · 上游源码目录：确认上游目录（WB_UPSTREAM_DIR）已挂载且版本较新，'
+            '可到「设置 → 系统更新」同步随包分发的上游源码；\n'
+            '  · 从上游容器提取：需要能访问 docker（挂载 /var/run/docker.sock，'
+            '且容器名与 WB2API_CONTAINER 一致），然后点「预览」重试。'
         )
     auths = _auth_dir(auth_dir)
     if not auths.is_dir():
