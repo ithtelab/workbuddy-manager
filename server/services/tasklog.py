@@ -21,6 +21,7 @@ import hashlib
 import re
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .. import config, db, upstreamsvc
 from . import wb2api
@@ -582,15 +583,28 @@ async def _read_logs(name: str | None, limit: int) -> list[str]:
 
 async def _collect_once(limit: int = TAIL_LINES) -> tuple[int, int]:
     """读一次所有上游容器的日志并入库，返回 (解析到的任务行数, 新增条数)。"""
+    auth_dir_by_container: dict[str, Path | None] = {}
+    for upstream in upstreamsvc.list_upstreams(include_default=False):
+        cname = str(upstream.get('container') or '').strip()
+        raw_dir = str(upstream.get('auth_dir') or '').strip()
+        if cname and cname not in auth_dir_by_container:
+            auth_dir_by_container[cname] = Path(raw_dir) if raw_dir else None
+
+    grouped_events: list[tuple[Path | None, list[dict]]] = []
     events: list[dict] = []
     for name in _log_containers():
         lines = await _read_logs(name, limit)
-        events.extend(parse_lines(lines))
+        parsed = parse_lines(lines)
+        if parsed:
+            auth_dir = config.AUTH_DIR if name is None else auth_dir_by_container.get(name)
+            grouped_events.append((auth_dir, parsed))
+            events.extend(parsed)
     if not events:
         return 0, 0
     added = await asyncio.to_thread(db.add_task_logs, events)
     from . import accountrisk
-    await accountrisk.handle_tasks(events)
+    for auth_dir, parsed in grouped_events:
+        await accountrisk.handle_tasks(parsed, directory=auth_dir)
     return len(events), added
 
 

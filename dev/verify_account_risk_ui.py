@@ -60,21 +60,30 @@ with sync_playwright() as pw:
                 state['ack'] = True
             data = dict(ok=True)
         elif path == '/api/account-risk':
-            warning = dict(id='paused-event',uid='paused',nickname='保护暂停账号',group='测试分组',realm='cn',
+            warning = dict(id='paused-event',uid='paused',nickname='保护暂停账号',note='主力测试号',group='测试分组',realm='cn',
                            operation='token_refresh',http_status=429,ts=now,historical=False,
+                           detail='token refresh throttled (http 429)',detail_cn='令牌刷新限流（HTTP 429）',
                            acknowledged=state['ack'],paused=None if state['unknown'] else not state['resumed'],action_error='', pause_until=now+300,needs_review=not state['resumed'],failures=3)
-            history = dict(warning,id='history-event',uid='good',nickname='正常账号',ts=now-86400,
+            travel_warn = dict(id='travel-event',uid='good',nickname='134****4653',note='传说中的小菜叶',group='测试分组',realm='cn',
+                               operation='travel',http_status=500,ts=now-60,historical=False,
+                               detail='claim record=1: grant credits failed',detail_cn='领奖失败：record=1: grant credits failed',
+                               acknowledged=state['ack'],paused=False,action_error='',pause_until=0,needs_review=False,failures=0)
+            history = dict(warning,id='history-event',uid='good',nickname='正常账号',note='',ts=now-86400,
                            historical=True,paused=False,acknowledged=False)
-            data = dict(items=[warning] + ([history] if not state['ack'] or 'include_acknowledged=true' in route.request.url else []),failed_groups=['测试分组'] if state['unknown'] else [],total=2)
+            extra = []
+            if not state['ack'] or 'include_acknowledged=true' in route.request.url:
+                extra = [travel_warn, history]
+            data = dict(items=[warning] + extra,failed_groups=['测试分组'] if state['unknown'] else [],total=3)
         route.fulfill(status=200, content_type='application/json', body=json.dumps(data))
     context.route('**/api/**', api)
-    # 预警的位置是「设置 → 上游」：那一页就是账号保护策略（连续失败自动暂停、
-    # 账号冷却）的配置处。仪表盘与账号页不再显示它 —— 两页都是「每天看一眼」的
-    # 页面，而这条提示只在真出事时才有意义。
     page.goto(base+'/settings/upstream/', wait_until='networkidle')
     panel = page.get_by_role('region', name='账号保护预警')
     panel.wait_for()
     assert '暂停·需人工复核' in panel.inner_text()
+    assert '主力测试号' in panel.inner_text()
+    assert '传说中的小菜叶' in panel.inner_text()
+    assert '猫猫旅行' in panel.inner_text()
+    assert '领奖失败' in panel.inner_text()
     assert '历史记录（未据此自动暂停）' in panel.inner_text()
     assert '429 本身不能证明账号被封' in panel.inner_text()
     for width in (1440, 390):
@@ -93,9 +102,8 @@ with sync_playwright() as pw:
     page.set_viewport_size({'width':1440,'height':1000})
     page.goto(base+'/accounts',wait_until='networkidle')
     page.locator('tbody tr').first.wait_for()
-    # 账号页不再挂这条预警（位置已改到「设置 → 上游」）：页头是每天都要看的区域，
-    # 不该被一条只在真出事时才有意义的提示长期占着。
-    assert page.get_by_role('region', name='账号保护预警').count() == 0
+    # 仍处于保护暂停时，账号页 activeOnly 顶栏必须可见；解除暂停且已确认后自动消失
+    assert page.get_by_role('region', name='账号保护预警').count() == 1
     good = page.locator('tbody tr').filter(has_text='正常账号')
     assert '在线' in good.inner_text(), 'Healthy account must remain usable'
     assert '冷却中' in page.locator('tbody tr').filter(has_text='11140软冷却账号').inner_text()
@@ -106,10 +114,9 @@ with sync_playwright() as pw:
     page.goto(base+'/settings/upstream/', wait_until='networkidle')
     panel = page.get_by_role('region', name='账号保护预警')
     panel.wait_for()
-    # 暂停状态未知时 pausedCount 为 0 → 预警默认收起，先展开
+    # 暂停状态未知时 pausedCount 为 0 → 预警默认收起，先展开即可直接查看明细
     expand = panel.get_by_role('button', name='展开', exact=True)
     if expand.count(): expand.click()
-    panel.locator('summary').click()
     assert '暂停状态待确认' in panel.inner_text()
     assert '暂时无法确认' in panel.inner_text()
     state['unknown'] = False
@@ -121,7 +128,10 @@ with sync_playwright() as pw:
     page.get_by_role('button',name='已复核，解除保护暂停').click()
     page.wait_for_timeout(300)
     assert state['resumed']
+    page.goto(base+'/accounts',wait_until='networkidle')
+    page.locator('tbody tr').first.wait_for()
+    assert page.get_by_role('region', name='账号保护预警').count() == 0, 'Once resumed and acknowledged, activeOnly banner hides'
     assert not errors, errors
     browser.close()
-    print('PASS: risk warnings live on settings/upstream (not dashboard/accounts), acknowledgement does not resume, '
+    print('PASS: risk warnings show note/task/detail, activeOnly surfaces live pauses/warnings and hides once resolved, '
           'historical/active/unknown states, healthy account unaffected, desktop/mobile layout, no browser errors')

@@ -640,9 +640,15 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     if resp.status_code >= 400:
         if resp.status_code == 429:
             paused = False
+            retry_after = _refresh_retry_after(resp)
             if '_risk_auth_dir' in auth:
                 from . import accountrisk
-                paused = await accountrisk.pause_refresh(str(auth.get('uid') or ''), auth['_risk_auth_dir'], retry_after=_refresh_retry_after(resp))
+                paused = await accountrisk.pause_refresh(
+                    str(auth.get('uid') or ''),
+                    auth['_risk_auth_dir'],
+                    retry_after=retry_after,
+                    detail=f'token refresh throttled (http 429, retry_after={retry_after}s)',
+                )
             return False, ('令牌刷新接口限流（HTTP 429），不是凭证失效；'
                            + ('已保护性暂停该账号，请查看账号预警' if paused else '请查看账号预警，暂停状态尚未确认')), {}
         # 12153 / session dead 的典型表现：refreshToken 也失效了，只能重新登录。

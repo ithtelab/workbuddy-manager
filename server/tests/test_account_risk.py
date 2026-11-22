@@ -194,3 +194,69 @@ class AccountRiskTest(unittest.TestCase):
         from server.services import tasklog
         event=tasklog.parse_line('2026-11-01T01:00:00Z keepalive done: checked=49 ok=35 failed=14 skipped=0')
         self.assertIn('尝试 49，成功 35，失败 14',event['message'])
+
+    def test_warnings_include_account_note_task_and_backfilled_detail(self):
+        db.set_account_note(self.uid, '传说中的小菜叶')
+        raw_msg = 'claim record=63955533: upstream server (http 500): {"code":500,"msg":"grant credits failed"}'
+        db.add_task_logs([{
+            'ts': self.now,
+            'uid': self.uid[:8],
+            'kind': 'travel',
+            'level': 'error',
+            'credits': 0,
+            'message': raw_msg,
+            'dedup_key': 'travel-err-1',
+        }])
+        # Simulate a legacy row created before `detail` existed (empty detail)
+        accountrisk.record(config.AUTH_DIR, {'uid': self.uid, 'nickname': '134****4653', 'realm': 'cn'},
+                           'travel', 500, self.now)
+        items = asyncio.run(accountrisk.warnings())['items']
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['note'], '传说中的小菜叶')
+        self.assertEqual(items[0]['operation'], 'travel')
+        self.assertIn('grant credits failed', items[0]['detail'])
+        self.assertIn('领奖失败', items[0]['detail_cn'])
+
+    def test_school_and_cat_errors_are_classified(self):
+        asyncio.run(accountrisk.handle_tasks([
+            self.event(kind='school', message='http 502 bad gateway'),
+            self.event(kind='cat', message='http 429 rate limited'),
+        ]))
+        ops = {(it['operation'], it['http_status']) for it in asyncio.run(accountrisk.warnings())['items']}
+        self.assertEqual(ops, {('school', 502), ('cat', 429)})
+
+    def test_multi_group_collector_routes_events_to_secondary_group_scope(self):
+        from server.services import tasklog
+        sec_dir = self.root / 'auths-group-b'
+        sec_dir.mkdir()
+        sec_uid = 'feedbeef-0000-0000-0000-000000000002'
+        (sec_dir / 'workbuddy-sec.json').write_text(json.dumps({
+            'account': {'uid': sec_uid, 'nickname': '138****9999'},
+            'auth': {'accessToken': 'at2', 'refreshToken': 'rt2', 'expiresAt': self.now + 86400,
+                     'realm': 'cn', 'domain': 'copilot.tencent.com'},
+        }), encoding='utf-8')
+        db.set_account_note(sec_uid, '二组备用号')
+        sec_group = {
+            'id': 2, 'name': '分组二', 'base_url': 'http://127.0.0.1:17863',
+            'api_key': '', 'container': 'wb2api-group-b',
+            'auth_dir': str(sec_dir), 'enabled': True, 'is_default': False,
+        }
+        default_group = upstreamsvc.default_upstream()
+        log_line = f'2026-11-21T01:00:01Z travel {sec_uid[:8]}: claim record=1: upstream server (http 500): grant credits failed'
+
+        async def fake_read_logs(name, limit):
+            return [log_line] if name == 'wb2api-group-b' else []
+
+        with mock.patch.object(upstreamsvc, 'list_upstreams', side_effect=lambda include_default=True: (
+                [default_group, sec_group] if include_default else [sec_group])), \
+             mock.patch.object(upstreamsvc, 'get_upstream', return_value=sec_group), \
+             mock.patch.object(tasklog, '_read_logs', side_effect=fake_read_logs):
+            parsed, added = asyncio.run(tasklog._collect_once())
+            self.assertEqual((parsed, added), (1, 1))
+            # Default group must NOT get a bogus account_not_found warning
+            self.assertEqual(asyncio.run(accountrisk.warnings())['items'], [])
+            sec_items = asyncio.run(accountrisk.warnings(group_id=2))['items']
+            self.assertEqual(len(sec_items), 1)
+            self.assertEqual(sec_items[0]['uid'], sec_uid)
+            self.assertEqual(sec_items[0]['action_error'], '')
+            self.assertEqual(sec_items[0]['note'], '二组备用号')

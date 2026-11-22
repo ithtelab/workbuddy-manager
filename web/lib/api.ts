@@ -192,10 +192,11 @@ const groupQs = (upstreamId?: number | null): string =>
   upstreamId == null ? '' : `?upstream_id=${encodeURIComponent(String(upstreamId))}`;
 
 export interface AccountRiskEvent {
-  id: string; uid: string; nickname: string; group: string; realm: string;
+  id: string; uid: string; nickname: string; note?: string; group: string; realm: string;
   operation: string; http_status: number; ts: number; historical: boolean;
   acknowledged: boolean; paused: boolean | null; action_error: string;
   pause_until: number; needs_review: boolean; failures: number;
+  detail?: string; detail_cn?: string;
 }
 
 export const accountRiskApi = {

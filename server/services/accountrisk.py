@@ -12,6 +12,9 @@ from . import wb2api
 
 _task: asyncio.Task | None = None
 MIN_WAIT, MAX_WAIT = 300, 21600
+_RISK_TASK_KINDS = (
+    'keepalive', 'checkin', 'travel', 'activity', 'user-resource', 'school', 'cat', 'taskrun',
+)
 
 
 def initialize() -> int:
@@ -20,12 +23,14 @@ def initialize() -> int:
         nickname TEXT NOT NULL, realm TEXT NOT NULL, operation TEXT NOT NULL,
         http_status INTEGER NOT NULL, ts INTEGER NOT NULL, historical INTEGER NOT NULL,
         acknowledged INTEGER NOT NULL DEFAULT 0, action_error TEXT NOT NULL DEFAULT '',
-        protection_active INTEGER NOT NULL DEFAULT 0)''')
+        protection_active INTEGER NOT NULL DEFAULT 0, detail TEXT NOT NULL DEFAULT '')''')
     with db._lock:
         columns = {row['name'] for row in db.query('PRAGMA table_info(account_risk_events)')}
         for name in ('pause_until', 'needs_review', 'failures', 'last_failure_at'):
             if name not in columns:
                 db.execute(f'ALTER TABLE account_risk_events ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0')
+        if 'detail' not in columns:
+            db.execute("ALTER TABLE account_risk_events ADD COLUMN detail TEXT NOT NULL DEFAULT ''")
         enabled = db.get_setting('account_risk_enabled_at')
         if not isinstance(enabled, int) or enabled <= 0:
             enabled = int(time.time())
@@ -51,19 +56,24 @@ def is_risk_pause(account: dict) -> bool:
 
 
 def record(directory: Path | str | None, account: dict, operation: str, status: int,
-           ts: int, *, historical: bool = False) -> tuple[str, bool]:
+           ts: int, *, historical: bool = False, detail: str = '') -> tuple[str, bool]:
     initialize()
     scope, uid = scope_of(directory), str(account.get('uid') or '')
+    clean_detail = ' '.join(str(detail or '').split())[:300]
     ident = hashlib.sha256(f'{scope}\0{uid}\0{operation}\0{status}\0{ts}'.encode()).hexdigest()[:32]
     with db._lock:
         conn = db.connect()
         cursor = conn.execute('''INSERT OR IGNORE INTO account_risk_events
-            (id,scope,uid,nickname,realm,operation,http_status,ts,historical)
-            VALUES (?,?,?,?,?,?,?,?,?)''',
+            (id,scope,uid,nickname,realm,operation,http_status,ts,historical,detail)
+            VALUES (?,?,?,?,?,?,?,?,?,?)''',
             (ident, scope, uid, str(account.get('nickname') or uid), account.get('realm') or 'cn',
-             operation, status, ts, int(historical)))
+             operation, status, ts, int(historical), clean_detail))
+        inserted = cursor.rowcount == 1
+        if not inserted and clean_detail:
+            conn.execute("UPDATE account_risk_events SET detail=? WHERE id=? AND detail=''",
+                         (clean_detail, ident))
         conn.commit()
-        return ident, cursor.rowcount == 1
+        return ident, inserted
 
 
 def observe_pause(directory: Path | str | None, account: dict) -> None:
@@ -109,12 +119,12 @@ async def paused(uid: str, directory: Path | str | None) -> bool:
 
 
 async def pause_refresh(uid: str, directory: Path | str | None, *, ts: int | None = None,
-                        retry_after: int = MIN_WAIT) -> bool:
+                        retry_after: int = MIN_WAIT, detail: str = '') -> bool:
     now = int(time.time()) if ts is None else ts
     account = next((a for a in wb2api.list_auth_accounts(Path(scope_of(directory))) if a.get('uid') == uid), None)
     if account is None:
         return False
-    ident, inserted = record(directory, account, 'token_refresh', 429, now)
+    ident, inserted = record(directory, account, 'token_refresh', 429, now, detail=detail)
     group = _group(directory)
     if group is None:
         db.execute('UPDATE account_risk_events SET action_error=? WHERE id=?', ('group_unavailable', ident))
@@ -141,44 +151,83 @@ async def pause_refresh(uid: str, directory: Path | str | None, *, ts: int | Non
 
 
 def classify_task(event: dict) -> tuple[str, int] | None:
-    message, kind = str(event.get('message') or ''), event.get('kind')
-    if kind not in ('keepalive', 'checkin', 'travel', 'activity', 'user-resource'):
+    message, kind = str(event.get('message') or ''), str(event.get('kind') or '')
+    if kind not in _RISK_TASK_KINDS:
         return None
     if re.search(r'\b429\b', message):
-        return ('token_refresh' if kind == 'keepalive' or 'refresh:' in message else str(kind), 429)
+        return ('token_refresh' if kind == 'keepalive' or 'refresh:' in message else kind, 429)
     server_error = re.search(r'http (5\d\d)', message, re.I)
     if server_error or 'grant credits failed' in message:
-        return str(kind), int(server_error.group(1)) if server_error else 500
+        return kind, int(server_error.group(1)) if server_error else 500
     return None
 
 
-async def handle_tasks(events: list[dict]) -> None:
+def _backfill_detail(row) -> str:
+    raw = str(row['detail'] or '') if 'detail' in row.keys() else ''
+    if raw:
+        return raw
+    uid = str(row['uid'] or '')
+    if not uid:
+        return ''
+    kind = 'keepalive' if row['operation'] == 'token_refresh' else str(row['operation'] or '')
+    log_row = db.query_one(
+        'SELECT message FROM task_logs WHERE ts=? AND kind=? AND (uid=? OR uid=?) LIMIT 1',
+        (int(row['ts'] or 0), kind, uid, uid[:8]),
+    )
+    if log_row and log_row['message']:
+        found = ' '.join(str(log_row['message']).split())[:300]
+        db.execute("UPDATE account_risk_events SET detail=? WHERE id=? AND detail=''",
+                   (found, row['id']))
+        return found
+    return ''
+
+
+async def handle_tasks(events: list[dict], directory: Path | str | None = None) -> None:
     enabled = initialize()
-    directory = config.AUTH_DIR
-    accounts = wb2api.list_auth_accounts(directory)
+    if directory is not None:
+        target = Path(scope_of(directory))
+        dir_accounts = [(target, a) for a in wb2api.list_auth_accounts(target)]
+    else:
+        seen_scopes: set[str] = set()
+        dir_accounts = []
+        for raw_dir in [config.AUTH_DIR, *(g['auth_dir'] for g in _groups())]:
+            sc = scope_of(raw_dir)
+            if sc in seen_scopes:
+                continue
+            seen_scopes.add(sc)
+            dir_accounts.extend((Path(sc), a) for a in wb2api.list_auth_accounts(Path(sc)))
+    fallback_dir = directory or config.AUTH_DIR
     for event in events:
         classified = classify_task(event)
         if not classified or not event.get('uid'):
             continue
-        matches = [a for a in accounts if str(a.get('uid') or '').startswith(str(event['uid']))]
+        uid_prefix = str(event['uid'])
+        matches = [(d, a) for d, a in dir_accounts
+                   if str(a.get('uid') or '').startswith(uid_prefix)]
         operation, status = classified
         ts = int(event.get('ts') or 0)
         if ts <= 0:
             continue
+        detail = str(event.get('message') or '')
         if len(matches) != 1:
-            ident, _ = record(directory, {'uid': str(event['uid'])}, operation, status, ts, historical=ts < enabled)
+            ident, _ = record(fallback_dir, {'uid': uid_prefix}, operation, status, ts,
+                              historical=ts < enabled, detail=detail)
             db.execute('UPDATE account_risk_events SET action_error=? WHERE id=?',
                        ('account_id_ambiguous' if matches else 'account_not_found', ident))
             continue
+        matched_dir, matched_acct = matches[0]
         if operation == 'token_refresh' and status == 429 and ts >= enabled:
-            await pause_refresh(matches[0]['uid'], directory, ts=ts)
+            await pause_refresh(matched_acct['uid'], matched_dir, ts=ts, detail=detail)
         else:
-            record(directory, matches[0], operation, status, ts, historical=ts < enabled)
+            record(matched_dir, matched_acct, operation, status, ts,
+                   historical=ts < enabled, detail=detail)
 
 
 async def warnings(*, group_id: int | None = None, all_groups: bool = False, realm: str | None = None,
                    include_acknowledged: bool = False) -> dict:
     initialize()
+    from . import tasklog
+    notes = db.account_notes()
     groups = _groups() if all_groups else [upstreamsvc.default_upstream() if group_id is None else upstreamsvc.get_upstream(group_id)]
     items, failed_groups, total = [], [], 0
     for group in groups:
@@ -210,8 +259,12 @@ async def warnings(*, group_id: int | None = None, all_groups: bool = False, rea
                 continue
             if active:
                 seen_paused.add(row['uid'])
-            items.append({k: row[k] for k in ('id', 'uid', 'nickname', 'realm', 'operation', 'http_status', 'ts', 'action_error')} |
-                         {'paused': active if known else None, 'pause_until': risk.get('until', 0),
+            detail = _backfill_detail(row)
+            nickname = str(local.get(row['uid'], {}).get('nickname') or row['nickname'] or row['uid'])
+            items.append({k: row[k] for k in ('id', 'uid', 'realm', 'operation', 'http_status', 'ts', 'action_error')} |
+                         {'nickname': nickname, 'note': notes.get(str(row['uid'] or ''), ''),
+                          'detail': detail, 'detail_cn': tasklog.translate_message(detail) if detail else '',
+                          'paused': active if known else None, 'pause_until': risk.get('until', 0),
                           'needs_review': bool(risk.get('needs_review')), 'failures': risk.get('failures', 0),
                           'group': group['name'], 'historical': bool(row['historical']), 'acknowledged': bool(row['acknowledged'])})
     return {'items': sorted(items, key=lambda x: x['ts'], reverse=True), 'failed_groups': failed_groups, 'total': total}
@@ -258,7 +311,13 @@ def acknowledge(ident: str) -> bool:
 
 async def _loop() -> None:
     initialize()
-    rows = db.query("SELECT * FROM task_logs WHERE ts>=? AND kind IN ('keepalive','checkin','travel','activity','user-resource') AND (message LIKE '%429%' OR lower(message) LIKE '%http 5%' OR message LIKE '%grant credits failed%') ORDER BY ts DESC LIMIT 500", (int(time.time())-48*3600,))
+    placeholders = ','.join('?' for _ in _RISK_TASK_KINDS)
+    rows = db.query(
+        f"SELECT * FROM task_logs WHERE ts>=? AND kind IN ({placeholders}) "
+        "AND (message LIKE '%429%' OR lower(message) LIKE '%http 5%' OR message LIKE '%grant credits failed%') "
+        "ORDER BY ts DESC LIMIT 500",
+        (int(time.time()) - 48 * 3600, *_RISK_TASK_KINDS),
+    )
     await handle_tasks([dict(r) for r in rows])
     while True:
         try:
