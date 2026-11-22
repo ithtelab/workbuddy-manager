@@ -12,6 +12,11 @@
 # 里就是 LF-only 的 .cmd。
 *.cmd text eol=crlf
 
+# 容器入口脚本由 /bin/sh 直接执行，CRLF 会让它在容器里报「: not found」。
+# Windows 上 core.autocrlf=true 检出的是 CRLF，所以这里锁死 LF（Dockerfile
+# 里另有 tr -d '\r' 兜底，防止工作区里已存在的 CRLF 被烘进镜像）。
+deploy/docker-entrypoint.sh text eol=lf
+
 # Patch context contains significant whitespace and CRLF from the bundled
 # upstream snapshot. Check patch applicability instead of treating its context
 # markers as trailing whitespace in ordinary source code.

@@ -57,6 +57,15 @@
 #    的 cp312 预编译 wheel（x86_64 与 aarch64 都齐），所以 Alpine 上无需源码
 #    编译即可安装；deps 阶段的编译工具只是万一某天某个传递依赖没 wheel 时的兜底。
 
+# 7. **容器入口先对齐文件属主，再降权执行**（deploy/docker-entrypoint.sh）。
+#    bind mount 的属主由宿主机决定（群晖上 ./data 归 admin 1026），而镜像里
+#    钉的是 10001 —— 两者不一致时，启动第一步 mkdir 数据目录就
+#    `PermissionError: [Errno 13]`，然后 restart 策略无限重启。手工 chown 能修，
+#    但要求 NAS 用户开 SSH，不是合理的前置条件。所以入口以 root 起，按
+#    PUID/PGID（都不填则取挂载目录属主）改 app 用户的 uid、chown 挂载点，
+#    再用 su-exec 降权执行 CMD —— 业务进程始终是普通用户。
+#    要自己接管（例如显式 user: "0:0"）设 WB_FIX_OWNERSHIP=0。
+
 # ── 前端构建阶段 ─────────────────────────────────────────
 #
 # 这一步的存在是为了修 issue #38：`git pull && docker build .` 会失败在
@@ -258,7 +267,7 @@ RUN set -eu; \
         echo "apk: 使用指定软件源 ${MIRROR}"; \
         sed -i -E "s#(https?://)[^/]+#\1${MIRROR}#g" /etc/apk/repositories; \
     fi; \
-    apk add --no-cache git curl ca-certificates; \
+    apk add --no-cache git curl ca-certificates su-exec shadow; \
     if [ -n "${TZ}" ]; then \
         echo "时区：${TZ}"; \
         apk add --no-cache tzdata; \
@@ -281,9 +290,22 @@ COPY --from=web-builder /dist /app/web/out
 COPY deploy /app/deploy
 COPY CHANGELOG.md README.md /app/
 
-# 非 root 运行。目录归属交给 app 用户，使容器内更新能写回代码目录。
-# 注意与上游 auths/data 卷的 uid 对齐：上游容器以 uid 10001 运行，
-# 这里用同一 uid 可避免跨容器写同一个卷时的权限问题。
+# 容器入口：启动时把挂载目录的属主对齐到进程 uid（PUID/PGID），再 su-exec 降权。
+#
+# 为什么要有 root 阶段：bind mount 的属主由宿主机决定，镜像里钉死的 10001
+# 写不进去，表现就是 DATA_DIR.mkdir() 抛 PermissionError、Application startup
+# failed、无限重启。以 USER app 直接启动则连补救机会都没有。
+#
+# `tr -d '\r'` 不能省：Windows 上 core.autocrlf=true 检出的是 CRLF，而 CRLF
+# 的 #!/bin/sh 脚本在容器里会以「: not found」失败（busybox 不认 ^M）。
+COPY deploy/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN tr -d '\r' < /usr/local/bin/docker-entrypoint.sh > /usr/local/bin/.ep \
+    && mv /usr/local/bin/.ep /usr/local/bin/docker-entrypoint.sh \
+    && chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
+# 建 app 用户，默认 uid/gid 10001（与上游账号池容器对齐，跨容器写同一个卷时
+# 不会互相踩权限）。入口脚本启动时会按 PUID/PGID 把它的 uid/gid 改成目标值，
+# 并把 /app 与挂载点的属主一并对齐 —— 这里的 10001 只是默认值，不是死规定。
 #
 # /app/.local 是 PYTHONUSERBASE 的落点（见上面的 ENV）：容器内更新装新依赖时
 # 只能写用户站点，且该目录必须**先存在**，否则重启后的新进程不在 sys.path 上找它。
@@ -295,7 +317,10 @@ RUN addgroup -g 10001 app \
        /opt/workbuddy/manager /opt/workbuddy/workbuddy2api \
     && chown -R 10001:10001 /app /opt/workbuddy /opt/workbuddy2api
 
-USER app
+# 以 root 启动入口脚本，由它对齐属主后 su-exec 降权到 PUID/PGID（默认 10001）。
+# 直接 USER app 降权更早，但那样连 chown 的机会都没有 —— 群晖用户的无限重启
+# 正是这么来的。
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 EXPOSE 7864
 

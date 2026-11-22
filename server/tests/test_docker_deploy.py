@@ -561,7 +561,16 @@ class DockerAssetsTest(unittest.TestCase):
     def test_dockerfile_present_and_non_root(self) -> None:
         df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
         self.assertIn('FROM python:3.12', df)
-        self.assertIn('USER app', df, '不应以 root 运行容器')
+        # 不能钉死 `USER app`：入口脚本要在 root 阶段把挂载目录的属主对齐到
+        # PUID 再 su-exec 降权。直接 USER app 就再没有 chown 的机会 ——
+        # 群晖上 data 属 admin(1026)，必然 PermissionError → 无限重启。
+        self.assertIn('ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]', df,
+                      '缺少 entrypoint —— 启动时无法对齐挂载目录属主')
+        self.assertNotRegex(df, r'(?m)^USER app\s*$',
+                            '仍钉死 USER app：entrypoint 拿不到 root，chown 必然失败')
+        self.assertIn('su-exec', df, '缺少降权工具：修完属主必须落回普通用户')
+        self.assertIn('shadow', df,
+                      'Alpine 的 busybox 没有 usermod/groupmod，必须装 shadow')
         self.assertIn('WB_RUN_MODE=docker', df,
                       '镜像里没设运行形态 —— 容器内会误判成宿主、去调 systemctl')
         # 前端产物必须来自静态导出（server 构建会产出 server 版，FastAPI 托管不了）。
@@ -1440,3 +1449,54 @@ class ComposeTimezoneWiringTest(unittest.TestCase):
         self.assertIsNotNone(run_tz, 'environment 缺 TZ')
         self.assertEqual(build_tz.group(1).strip(), run_tz.group(1).strip(),
                          'build 与 runtime 的 TZ 必须一致，否则会按错误时区分天')
+
+class EntrypointPermissionsTest(unittest.TestCase):
+    """容器入口必须在启动时对齐挂载目录属主，且不能以 root 运行业务进程。
+
+    现场（群晖 Container Manager / 新版 docker）：宿主机 ./data 属 admin(1026)，
+    镜像里钉的是 uid 10001，启动第一步就
+
+        PermissionError: [Errno 13] Permission denied: '/opt/workbuddy/manager'
+        ERROR:    Application startup failed. Exiting.
+
+    然后 restart: unless-stopped 无限重启。要求用户 SSH 进去 chown 是不合理的
+    前置条件，所以改由入口脚本按 PUID/PGID（linuxserver 惯例）自动对齐，修完再降权。
+    """
+
+    SCRIPT = _ROOT / 'deploy' / 'docker-entrypoint.sh'
+
+    def test_script_exists_and_is_lf(self) -> None:
+        raw = self.SCRIPT.read_bytes()
+        self.assertTrue(raw.startswith(b'#!/bin/sh'), '首行必须是 sh 的 shebang')
+        # CRLF 的 shell 脚本在容器里会以「: not found」失败（存在感极差的故障：
+        # 容器一启动就退出，日志只有一行）。
+        self.assertNotIn(
+            b'\r', raw,
+            '入口脚本含 CR 字节 —— /bin/sh 会把 ^M 当成命令的一部分；'
+            'Windows 工作区（core.autocrlf=true）请确认 .gitattributes 的'
+            ' eol=lf 与 Dockerfile 里的 tr -d 都还在')
+
+    def test_script_aligns_owner_then_drops_privileges(self) -> None:
+        text = self.SCRIPT.read_text(encoding='utf-8')
+        self.assertIn('chown -R', text, '缺少属主对齐')
+        self.assertIn('su-exec', text, '修完属主必须降权，不能以 root 运行业务进程')
+        self.assertIn('PUID', text)
+        self.assertIn('PGID', text)
+        self.assertIn('WB_FIX_OWNERSHIP', text, '缺少跳过入口逻辑的逃生开关')
+        self.assertIn('export HOME=/app', text,
+                      '降权后 HOME 仍是 /root，部分工具会往不可写的位置落盘')
+        # 自动探测：不填 PUID/PGID 时取挂载目录属主，NAS 用户零配置。
+        self.assertIn('stat -c', text, '缺少挂载目录属主探测 —— 不填变量时无法自动对齐')
+
+    def test_dockerfile_scrubs_entrypoint_crlf(self) -> None:
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        self.assertRegex(
+            df, r"tr -d '\\r'",
+            'Dockerfile 未净化入口脚本的 CRLF —— Windows 上构建会产出无法执行的镜像')
+
+    def test_compose_passes_puid_pgid(self) -> None:
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        env = dc['services']['workbuddy-manager']['environment']
+        self.assertIn('PUID', env, 'compose 未透传 PUID —— .env 里填了也不生效')
+        self.assertIn('PGID', env, 'compose 未透传 PGID')

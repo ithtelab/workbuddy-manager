@@ -93,6 +93,11 @@ services:
       WB_GITHUB_MIRROR: ${WB_GITHUB_MIRROR:-}
       # 新账号默认绑定的命名线路（名字要在上游 config.json 的 proxies 里）
       WB_DEFAULT_ACCOUNT_PROXY: ${WB_DEFAULT_ACCOUNT_PROXY:-}
+      # 容器内进程的 uid/gid。两项都留空 = 自动跟随 ./data 挂载目录的属主
+      # （群晖上通常是 1026:100）—— 群晖/极空间用户什么都不用填就能起来。
+      # 要固定就用宿主上的数字：id -u 用户名 / id -g 用户名，或 ls -ldn data。
+      PUID: ${PUID:-}
+      PGID: ${PGID:-}
     ports:
       # **只监听本机**：管理端必须藏在反向代理之后。
       # 若确需直接从别的机器访问，改成 "7864:7864"，但请先确保有 HTTPS 与访问控制——
@@ -107,34 +112,13 @@ services:
       #   data/manager/        管理端数据库、管理员账号、日志
       #   data/workbuddy2api/  上游 config.json、auths/、scripts/（见下面一段）
       #
-      # 为什么不再分成两条：docker 会**逐条**校验 bind mount 的源路径，目录不存在
-      # 就直接拒绝启动（`Bind mount failed: ... does not exist` —— 群晖 Container
-      # Manager 与新版 docker 都是这个行为）。两条挂载要求宿主机先手工建出两个子
-      # 目录，NAS 上不开 SSH 时很容易漏一个就卡住；收成一条后只校验 `./data`，
-      # 两个子目录由程序首次启动时自建（`server/config.py` 的 `ensure_dirs()`）。
-      #
-      # **权限提示（issue #30）**：bind mount 的目录属主由宿主机决定，镜像内的
-      # chown 不起作用。docker 首次自动创建 ./data 时归 root，而容器以 uid 10001
-      # 运行 —— 结果是启动时报 `sqlite3.OperationalError: unable to open database
-      # file`（那个报错既不说路径也不说原因，很容易误以为是路径配错了）。
-      # 宿主机在 compose 所在目录执行一次即可：
-      #   chown -R 10001:10001 ./data
-      # 若目录在网络文件系统（NFS/SMB）上、改不了属主，改用命名卷：
-      #   volumes:
-      #     - wb-manager-data:/opt/workbuddy
-      #   # 文件末尾另加：
-      #   volumes:
-      #     wb-manager-data:
-      # 注意改用命名卷后上游数据也在卷里，账号池源码要用 cp 放进去：
-      #   docker compose cp ./upstream/. workbuddy-manager:/opt/workbuddy/workbuddy2api/
-      #
-      # **更省事的做法（NAS / 群晖 / 没开 SSH）**：不用改这份文件，也不用 chown。
-      # 命名卷首次创建时会继承镜像内 /opt/workbuddy 的属主（10001），容器直接可写。
-      # 在 compose 同目录的 .env 里加一行，再执行 `docker compose up -d`：
-      #   WB_DATA_VOLUME=wb-manager-data
-      # 不设该变量时走下面这行 bind mount，数据就在宿主 ./data 里（位置与升级前
-      # 一致，老部署不受影响）。切到命名卷之后取文件用：
-      #   docker compose cp workbuddy-manager:/opt/workbuddy/manager/manager.db ./manager.db
+      # 属主不用手工处理：镜像入口会把容器进程的 uid/gid 对齐到本目录的属主
+      # （见 environment 里的 PUID/PGID），群晖/极空间/Unraid 直接 up -d 即可，
+      # 不必开 SSH。只有 WB_FIX_OWNERSHIP=0、或目录无法 chown（NFS/SMB）时才手工：
+      #   mkdir -p data && sudo chown -R 10001:10001 data
+      # 那种情况也可 .env 设 WB_DATA_VOLUME=wb-manager-data 改用命名卷：
+      # 卷首次创建会继承镜像内 /opt/workbuddy 的属主，不需要 chown；
+      # 代价是目录不在宿主机上，账号池源码要用 docker compose cp 放进去。
       - ${WB_DATA_VOLUME:-./data}:/opt/workbuddy
       # 上游数据在同一条挂载里（`data/workbuddy2api/` → `/opt/workbuddy/workbuddy2api`，
       # 由上面的 WB_AUTH_DIR / WB_UPSTREAM_CONFIG 指定）。一次挂载覆盖下面三件事

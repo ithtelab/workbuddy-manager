@@ -131,6 +131,55 @@ sudo bash deploy/install.sh
 
 ---
 
+## 一·五、群晖 / 极空间 / Unraid：全图形界面部署（不用 SSH）
+
+> 适用 Container Manager（群晖 DSM 7.x）、极空间、Unraid、威联通等只能网页操作的
+> 环境。全程在图形界面里点，**不需要打开终端**。
+
+**1. 建目录**：在 File Station 里选 `docker` 共享文件夹，新建 `workbuddy`，
+再在它里面新建 `data`。只建这两层 —— `manager`、`workbuddy2api` 由程序自己建。
+
+**2. 放文件**：把仓库根目录的 `docker-compose.yml` 与 `.env.example`（复制一份
+改名为 `.env`）放进 `workbuddy/`。
+
+**3. 建项目**：Container Manager → 项目 → 新增，路径选 `docker/workbuddy`，
+compose 文件用上一步那份，一路下一步并启动。
+
+**4. 看日志**：出现 `Uvicorn running on http://0.0.0.0:7864` 即成功，首次启动
+会打印初始管理员密码。
+
+### 关于目录属主：以前要敲命令，现在不用了
+
+旧版本要求先 SSH 进去执行：
+
+```bash
+sudo chown -R 10001:10001 /volume1/docker/workbuddy/data
+```
+
+漏了这一步，启动就报 `Permission denied: '/opt/workbuddy/manager'` 并无限重启。
+**现在不需要了**：容器启动时会自动把进程的 uid/gid 对齐到你 `data` 目录的属主
+（群晖默认是 `1026:100`），日志里会有一行 `[entrypoint] 修正 ... 属主`。
+
+想固定身份就在 `.env` 里写两行（`ls -ldn data` 输出的第 3、4 列就是这两个数字）：
+
+```bash
+PUID=1026
+PGID=100
+```
+
+填 `0` 会被拒绝 —— 业务进程始终是普通用户，不会以 root 运行。
+
+### 如果日志里仍然是 Permission denied
+
+说明那个位置不支持改属主（SMB/NFS 网络盘，或 DSM 在该共享文件夹上开了 ACL
+限制）。两条出路：
+
+1. `.env` 里设 `WB_DATA_VOLUME=wb-manager-data` 改用命名卷 —— 卷由 Docker 管理，
+   属主自动正确，不需要 chown；
+2. 把 `data` 放到本地存储卷（`/volume1` 下的物理磁盘，而不是网络盘）重来一次。
+
+---
+
 ## 二、通过 git clone 部署
 
 ```bash
@@ -449,9 +498,13 @@ WB_GITHUB_MIRROR=https://gh-proxy.com/
 「一键更新」即可；想在容器里跑命令行也行：
 
 ```bash
-docker compose exec workbuddy-manager python /app/deploy/update.py --target both
+docker compose exec -u app workbuddy-manager python /app/deploy/update.py --target both
 ```
 
+> `-u app` 不能省：镜像的 PID 1 是入口脚本（root 阶段用来对齐挂载目录属主），
+> 而 `docker exec` 不会经过 entrypoint —— 不指定用户就会以 root 写文件，
+> 之后容器以普通用户运行时反而写不进去。
+>
 > 这条命令结束时**会按设计终止容器**（更新进程发信号给 PID 1，再由 compose 的
 > `restart: unless-stopped` 用新代码拉起），所以 `exec` 会跟着断开 —— 这是正常的。
 

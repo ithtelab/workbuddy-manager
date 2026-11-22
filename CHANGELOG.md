@@ -24,8 +24,12 @@
 
 ### 变更
 
-- **Docker 部署的数据挂载收成一条，宿主机只需建一个 `./data`**：管理端数据与上游数据现在各占 `./data/` 下的一个子目录（`data/manager/`、`data/workbuddy2api/`），容器内对应 `/opt/workbuddy/manager` 与 `/opt/workbuddy/workbuddy2api`，宿主机与容器内同名同构。此前是两条挂载，docker 会逐条校验源路径，少建一个子目录就报「Bind mount failed: ... does not exist」起不来（群晖 Container Manager 上尤其容易卡在这一步）；现在只校验 `./data`，两个子目录由程序首次启动时自动创建，首次部署执行一次 `mkdir -p data && sudo chown -R 10001:10001 data` 即可。`.env.example` 里的命名卷开关改为默认关闭（`WB_DATA_VOLUME` 处于注释状态）—— 启用它时上游数据也会进卷，账号池源码需用 `docker compose cp` 放入。
-- **从上一版升级要挪一次账号池目录**：原来与部署目录同级的 `../workbuddy2api` 现在要放进 `./data/workbuddy2api`（`mv ../workbuddy2api ./data/workbuddy2api`，再 `sudo chown -R 10001:10001 ./data`）。管理端数据仍在 `./data`，位置不变；用命名卷的部署同样需要把账号池源码放进卷里。
+- **Docker 部署的数据挂载收成一条，宿主机只需建一个 `./data`**：管理端数据与上游数据现在各占 `./data/` 下的一个子目录（`data/manager/`、`data/workbuddy2api/`），容器内对应 `/opt/workbuddy/manager` 与 `/opt/workbuddy/workbuddy2api`，宿主机与容器内同名同构。此前是两条挂载，docker 会逐条校验源路径，少建一个子目录就报「Bind mount failed: ... does not exist」起不来（群晖 Container Manager 上尤其容易卡在这一步）；现在只校验 `./data`，两个子目录由程序首次启动时自动创建，宿主机不必预先建出它们。`.env.example` 里的命名卷开关改为默认关闭（`WB_DATA_VOLUME` 处于注释状态）—— 启用它时上游数据也会进卷，账号池源码需用 `docker compose cp` 放入。
+- **从上一版升级要挪一次账号池目录**：原来与部署目录同级的 `../workbuddy2api` 现在要放进 `./data/workbuddy2api`（`mv ../workbuddy2api ./data/workbuddy2api`）。管理端数据仍在 `./data`，位置不变；用命名卷的部署同样需要把账号池源码放进卷里。
+
+### 修复
+
+- **群晖 / 极空间等 NAS 上不用再开 SSH 改目录属主**：此前宿主机 `data` 目录的属主与容器内进程不一致时，启动就报「Permission denied: '/opt/workbuddy/manager'」，然后无限重启，只能手工 `chown`。现在容器启动时会自动把进程的 uid/gid 对齐到该目录的属主，修完再以普通用户身份运行业务进程；也可以用 `PUID` / `PGID` 固定身份。属主改不了的环境（NFS / SMB）仍可按日志提示改用命名卷。
 
 ---
 
