@@ -1,11 +1,21 @@
 # WorkBuddy Manager —— Docker Compose 部署
 #
-# 用法：
-#   1) 按需修改下面的环境变量（至少确认上游地址与路径）
-#   2) docker compose up -d --build
-#   3) 浏览器打开 http://<服务器IP>:7864
-#      首次启动若未设 WB_ADMIN_PASSWORD，会随机生成密码并打印到容器日志：
-#      docker compose logs workbuddy-manager | grep -A2 密码
+# 用法（两条路径，选一条）：
+#
+#   A. 用 GHCR 预构建镜像 —— 不需要源码，也不在本地构建：
+#        1) 在 .env 里写一行（镜像名见本仓库 Actions 的「Build Image」摘要）：
+#             WB_MANAGER_IMAGE=ghcr.io/realkiro/workbuddy-manager:latest
+#        2) docker compose up -d --no-build
+#      **--no-build 不能省**：本文件带 build 段，不带这个参数时 compose 会先
+#      本地构建，再把它 tag 成上面那个名字 —— 结果是用本地构建覆盖了拉下来的镜像。
+#
+#   B. 从源码本地构建：
+#        1) 按需修改下面的环境变量（至少确认上游地址与路径）
+#        2) docker compose up -d --build
+#
+#   浏览器打开 http://<服务器IP>:7864
+#   首次启动若未设 WB_ADMIN_PASSWORD，会随机生成密码并打印到容器日志：
+#     docker compose logs workbuddy-manager | grep -A2 密码
 #
 # 与宿主机安装（deploy/install.sh + systemd）的区别，见 Dockerfile 顶部说明。
 # 简述：容器版**能**在界面上更新上游 —— 镜像内置了 docker CLI 与 compose 插件，
@@ -57,7 +67,11 @@ services:
         # 与下面 environment 里的 WB_BASE_PATH 取值必须一致。
         #   docker compose build --build-arg BASE_PATH=/workbuddy-manager
         BASE_PATH: ""
-    image: workbuddy-manager:latest
+    # 镜像名。默认与下面 build 的产物同名；要直接用 GHCR 上的预构建镜像，
+    # 在 .env 里设 WB_MANAGER_IMAGE=<完整引用> 后
+    # `docker compose up -d --no-build`（必须先拉下来：docker pull <完整引用>）。
+    # 留空 = 本地构建，行为与不带这个变量时一致。
+    image: ${WB_MANAGER_IMAGE:-workbuddy-manager:latest}
     container_name: workbuddy-manager
     # 这个 restart 策略是容器版「一键更新」能生效的前提：
     # 更新完成后容器内的进程会退出，靠它用新代码重新拉起。
