@@ -1,10 +1,27 @@
 # 部署指南
 
-本项目管理端**依赖上游 workbuddy2api**（提供账号池调度与 OpenAI 兼容接口）。
-单独 clone 本仓库是跑不起来的 —— 为此我们提供了一键脚本，会在干净机器上安装好两者。
+本项目由两部分组成：**管理端**（面板，7864）与**账号池服务**（workbuddy2api，7863）。
+Docker 单容器形态下两者跑在同一个容器里，拉镜像即可用；宿主机直装或分离部署时
+它们是两个独立进程。
 
-> **重要**：请勿把本项目管理端的数据目录与上游账号目录提交或公开分享，
+> **重要**：请勿把管理端的数据目录与账号池的账号目录提交或公开分享，
 > 其中含账号授权凭据。
+
+## 部署形态速查
+
+| 形态 | 怎么做 | 适用 |
+|---|---|---|
+| **Docker 单容器（推荐）** | `docker compose up -d` | 一台常开的机器；宿主不用备源码、不用 chown、不用挂 `docker.sock` |
+| 宿主机直装 | `deploy/install.sh` + systemd | 不用 Docker，想用 systemd / journalctl 托管 |
+
+Docker 形态只有一个容器：账号池服务的**二进制、任务脚本、配置模板**都在管理端
+镜像里，容器入口以同一 uid 拉起两个进程（7864 与 127.0.0.1:7863）。因此本文后面
+「上游源码从哪来」「共享 auths 的 uid 对齐」这些内容**只对宿主机直装有意义**。
+
+> 旧版「两个容器分开部署」已不再是推荐形态：它要求你先准备一份账号池服务源码、
+> 手动对齐两个容器的 uid、并保证两边挂的是同一个 `auths/` —— 这三件事任何一件没做对，
+> 症状都是「面板有账号、池子里 0 个」或「未找到任务脚本」。现在这些前提由容器入口
+> 统一处理，不再暴露给部署者。
 
 ---
 
@@ -99,6 +116,43 @@ services:
 - 镜像自带 `dev.workbuddy.upstream-id` label，面板读运行中容器的这个 label 判断
   「镜像部署且与本次发布同源」，同源时不会提示「随包上游与本机不一致」。读不到
   label 的旧镜像（≤ 2.8.2）仍按部署目录的 `.upstream-id` 判定，行为不变。
+
+### 完全不准备上游源码：一个容器起全套
+
+如果这台机器上**不想放任何源码**（NAS / 群晖 / 只想拉镜像的场景），直接用仓库里的
+`docker-compose.yml` 就够了：账号池服务的二进制、任务脚本与配置模板都打进管理端镜像，
+容器入口以同一个 uid 拉起两个进程。
+
+```bash
+mkdir -p workbuddy && cd workbuddy
+curl -fsSLO https://raw.githubusercontent.com/ithtelab/workbuddy-manager/main/docker-compose.yml
+docker compose up -d          # 数据默认落在 ./data
+```
+
+它替你省掉了三件事：
+
+| 通常要做的 | 现在如何免掉 |
+|---|---|
+| 准备上游源码目录（`../workbuddy2api`） | 账号池服务与任务脚本都在管理端镜像里（构建期从同版本上游镜像取） |
+| 手工放一份 `config.json` | 首次启动就地生成（自动写入随机 `api_key`），内置服务直接读 |
+| `chown` 数据目录 / 挂 `docker.sock` | 入口脚本按挂载目录属主（或 `PUID`/`PGID`）对齐后降权，全程不需要 socket |
+
+数据布局（容器内单根 `/opt/workbuddy`，宿主侧就是 `./data`）：
+
+```
+./data/
+├── manager/         管理端数据库、管理员、日志
+└── workbuddy2api/   账号池服务 config.json、auths/、data/
+```
+
+三点注意：
+
+- **数据根建议用宿主目录**（默认 `./data`）：这样文件能直接在 File Station 里看、备份、
+  改配置。改用命名卷也行（`WB_DATA_VOLUME=wb-workbuddy` + 在 compose 末尾声明该卷）。
+- `7863` **不发布到宿主**，只在容器内供管理端访问；对外只暴露 `127.0.0.1:7864`
+  （同样要放在反向代理之后）。
+- 升级账号池服务 = 升级管理端镜像（`docker compose pull && up -d --force-recreate`）。
+  面板「一键更新」里的上游源码同步那一步在单容器形态下会被跳过，这是预期行为。
 
 ### 许可
 
@@ -314,27 +368,29 @@ NEXT_PUBLIC_BASE_PATH=/workbuddy-manager npm run build:export
 ```
 
 容器部署时前端是**在镜像构建阶段**编译的（宿主机上没有 `web/out`），所以前缀要传给
-构建而不是运行时：
+构建而不是运行时。`docker-compose.yml` 只拉现成镜像、不带 `build:`，因此自己构建一份
+并在 `.env` 里指过去：
 
 ```bash
-docker compose build --build-arg BASE_PATH=/workbuddy-manager
+docker build -t workbuddy-manager:local --build-arg BASE_PATH=/workbuddy-manager .
+# .env 里写：WB_MANAGER_IMAGE=workbuddy-manager:local
 docker compose up -d
 ```
 
-也可以直接写进 `docker-compose.yml` 的 `build.args.BASE_PATH`（留空 = 根路径部署，与
-改动前一致）。
+留空 `BASE_PATH` = 根路径部署（默认，与改动前一致）。
 
 **② 后端与反代对齐前缀**
 
-加到 **systemd unit 的 `Environment=`** 里（容器部署则把 compose 的 `environment:` 里
-那行 `WB_BASE_PATH` 取消注释），取值与上面完全一致：
+systemd 部署加到 unit 的 `Environment=` 里；容器部署写进 compose 同目录的 `.env`
+（compose 里 `WB_BASE_PATH: ${WB_BASE_PATH:-}` 会透传）。取值与上面完全一致：
 
 ```
 WB_BASE_PATH=/workbuddy-manager
 ```
 
-> **这一项（`WB_BASE_PATH`）别写在 `.env` 里**：它在构建期与前缀绑定，必须落在
-> systemd 的 `Environment=` / compose 的 `environment:` 这类**显式变量**里，
+> **这一项（`WB_BASE_PATH`）不是一个「写进目录就会生效」的配置文件项**：它在构建期与
+> 前缀绑定，必须真的进到进程环境里（systemd 的 `Environment=`、compose 的
+> `environment:`、或 compose 读的 `.env`），
 > 症状很隐蔽 —— 配置看起来加了，但前缀没被剥掉，表现为「页面能打开、接口全 404」，
 > 容易误判成反代写错了。
 >
@@ -457,7 +513,7 @@ docker compose exec workbuddy-manager python /app/deploy/update.py --target both
 
 **更新的代码落在哪**（决定了什么操作会让它「退回旧版」）：
 
-| 内容 | 位置 | `docker restart` | 重建容器（`up -d --build`） |
+| 内容 | 位置 | `docker restart` | 重建容器（`up -d --force-recreate`） |
 |---|---|---|---|
 | 管理端代码 | 容器可写层 `/app/server`、`/app/web/out` | 保留 | **退回镜像里的版本** |
 | 更新时新装的依赖 | `/app/.local`（`PYTHONUSERBASE`） | 保留 | **丢失** |
@@ -469,39 +525,47 @@ docker compose exec workbuddy-manager python /app/deploy/update.py --target both
 #### 一次性：离线更新（也是「更新后打不开面板」的救法）
 
 **更新器本身也在被更新的代码里** —— 这一版跑的仍是上一版的更新逻辑。所以这两种
-情况必须用发布包重建镜像，面板里的按钮帮不上忙：
+情况必须自己构建一份镜像，面板里的按钮帮不上忙：
 
 - 更新后管理端起不来（例如新版本引入了新依赖，而容器里装不上）；
 - 你要升级的是**镜像本身**（Dockerfile / compose / 基础依赖有变化）。
+
+`docker-compose.yml` 只拉现成镜像、不带 `build:`，所以构建与运行分两步：
 
 ```bash
 # 在部署目录（有 docker-compose.yml 的地方）
 tar xzf workbuddy-manager-vX.Y.Z.tar.gz
 cd workbuddy-manager-vX.Y.Z
-docker compose up -d --build workbuddy-manager
+docker build -t workbuddy-manager:local .
+WB_MANAGER_IMAGE=workbuddy-manager:local docker compose up -d --force-recreate
+```
+
+只升级到官方新版（不改代码）时不必构建：
+
+```bash
+docker compose pull && docker compose up -d --force-recreate
 ```
 
 发布包里带 `Dockerfile`、`docker-compose.yml`、`server/`、`web/out/` 与 `upstream/`，
 所以这一步既能救砖、也能把镜像升到最新。`./data` 与 `../workbuddy2api` 都是挂载卷，
 不会被覆盖。
 
-#### 容器内操作 docker（更新上游 / 重载配置）
+#### 容器内操作 docker（可选）
 
-**默认不挂 docker.sock**：挂上它等于把宿主 root 权限交给管理端容器（`docker run -v /:/host`
-即可拿到宿主文件系统），这不该是默认状态。需要「保存设置后自动重载上游容器 / 一键更新上游」
-这些界面功能时，再按下面两步显式开启：
+**单容器形态默认不需要 docker.sock**：账号池服务就在同一个容器里，没有「另一个容器」
+要重载；升级它等于升级管理端镜像。挂上 socket 等于把宿主 root 权限交给管理端容器
+（`docker run -v /:/host` 即可拿到宿主文件系统），不该是默认状态。
 
-1. 把 `docker-compose.yml` 里 `docker.sock` 挂载与 `group_add` 两段的注释解开；
-2. 把宿主 socket 的真实 GID 填进 `.env`（容器以 uid 10001 运行，宿主的
-   `/var/run/docker.sock` 通常归 `root:docker`，不在那个组里就是 `permission denied`）：
+宿主上还跑着别的东西、需要面板代为操作时，再自己往 `docker-compose.yml` 里加两条：
 
-```bash
-echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
-docker compose up -d workbuddy-manager
+```yaml
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # 追加到已有 volumes 里
+    group_add:
+      - ${DOCKER_GID:-999}   # 取值：stat -c '%g' /var/run/docker.sock
 ```
 
-不配也不会静默失败：更新上游时会提示你去取真实 GID。不挂 socket 时，相关功能
-会如实降级为「请到宿主机执行 docker compose ...」。
+不配也不会静默失败：相关功能会如实降级为「请到宿主机执行 docker compose ...」。
 
 ---
 
@@ -587,21 +651,44 @@ chgrp -R workbuddy /opt/workbuddy2api/auths
 chmod g+s /opt/workbuddy2api/auths
 ```
 
-**Q：容器反复重启，日志报 `unable to open database file` / 「目录不可写：/app/data」**
+**Q：容器反复重启，日志报 `unable to open database file` / 「目录不可写」/ `groupmod: not found`**
 
-这是**权限**问题，不是数据库坏了，也不是路径配错。管理端容器以 uid 10001 运行
-（Dockerfile 里的 `USER app`），而 compose 默认把宿主 `./data` bind mount 到
-`/app/data` —— 这个目录的属主由宿主机决定，Docker 首次自动创建时归 `root`，
+这是**权限或镜像缺件**问题，不是数据库坏了，也不是路径配错。管理端容器以非 root 用户
+运行（镜像里的 `app`，默认 uid 10001），而 compose 默认把宿主 `./data` bind mount 到
+`/opt/workbuddy` —— 这个目录的属主由宿主机决定，Docker 首次自动创建时归 `root`，
 容器内的 10001 写不进去，SQLite 连库文件都建不了，启动即失败；配合
 `restart: unless-stopped` 就表现为一直重启、页面打不开。
 
-在 docker-compose.yml 所在目录确认一下：
+日志里若是 `groupmod: not found`（或 `su-exec: not found`），说明镜像太旧、缺了
+入口脚本要用的系统工具：拉一次新镜像重建容器即可，这条与属主无关。
+
+```bash
+docker compose pull && docker compose up -d --force-recreate
+```
+
+在 docker-compose.yml 所在目录确认一下属主：
 
 ```bash
 ls -ld ./data     # drwxr-xr-x root root → 中招
 ```
 
-**修法一（能 SSH、能改属主，推荐）**：只改权限，不动配置，也不用重建容器：
+**修法一（本版默认行为，什么都不用做）**：镜像入口会探测挂载目录的实际属主，
+把容器内用户的 uid/gid 改成它，再对齐属主、降权运行 —— 群晖 / 极空间 / Unraid
+这类图形界面设备不用开 SSH。日志里会有一行：
+
+```
+[entrypoint] 修正 /opt/workbuddy 属主 → 1026:100（挂载根，不递归）
+[entrypoint] 账号池服务已启动：pid 27，监听 7863
+[entrypoint] 管理端已启动：pid 31
+```
+
+需要固定身份时在 `.env` 里填 `PUID` / `PGID`（值取 `stat -c '%u' ./data` 与
+`stat -c '%g' ./data`；留空即自动探测）。填 `0` 不会生效：探测到 root 会回落
+10001，业务进程始终不以 root 运行。想关掉这段逻辑（自己用 `user:` 接管容器
+身份）就设 `WB_FIX_OWNERSHIP=0`。
+
+**修法二（老镜像，或已设 `WB_FIX_OWNERSHIP=0`）**：只改权限，不动配置，也不用
+重建容器：
 
 ```bash
 sudo chown -R 10001:10001 ./data
@@ -611,24 +698,26 @@ docker restart workbuddy-manager
 > 只 `restart`，不要 `docker compose up -d`：后者会用镜像里的代码重建容器，
 > 之前通过面板「一键更新」装进容器的新代码会退回旧版（见上表）。
 
-**修法二（NAS / 群晖 / SMB / 没开 SSH，改不了属主）**：换成命名卷。命名卷首次
-创建时会继承镜像内 `/app/data` 的属主（10001），不需要 chown。
+**修法三（NFS / SMB 上改不了属主）**：换成命名卷。命名卷首次
+创建时由容器自己写入，属主随容器身份走，不需要 chown。
 
-- 新版 compose（挂载行是 `${WB_DATA_VOLUME:-./data}:/app/data`）：在 compose
-  同目录的 `.env` 里加一行 `WB_DATA_VOLUME=wb-manager-data`，再
-  `docker compose up -d`。
-- 旧版 compose（挂载行是 `- ./data:/app/data`）：把整行改成
-  `- wb-manager-data:/app/data`，并在文件末尾加：
+在 compose 同目录的 `.env` 里加一行 `WB_DATA_VOLUME=wb-manager-data`，并在
+`docker-compose.yml` 末尾声明该卷：
 
-  ```yaml
-  volumes:
-    wb-manager-data:
-  ```
+```yaml
+volumes:
+  wb-manager-data:
+```
 
-  然后 `docker compose up -d --force-recreate workbuddy-manager`。
+再 `docker compose up -d`。挂载点仍是容器内的 `/opt/workbuddy`，里面照旧分
+`manager/` 与 `workbuddy2api/` 两个子目录。
 
-切过去之后数据库不再落在宿主 `./data`，取备份用
-`docker compose cp workbuddy-manager:/app/data/manager.db ./manager.db`。
+切过去之后数据不再落在宿主 `./data`，取备份用：
+
+```bash
+docker compose cp workbuddy-manager:/opt/workbuddy/manager/manager.db ./manager.db
+```
+
 首次启动就失败时 `./data` 是空的，直接切即可；若里面已有数据，先用
 `cp -a ./data/ ./data.bak/` 留一份再操作。
 

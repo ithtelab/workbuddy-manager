@@ -128,7 +128,8 @@ jobs:
           # docs-pack:end
           cp .env.example README.md README.en.md CHANGELOG.md LICENSE "$STAGE/"
           # 容器部署资产一并打包：用户下载发布包后可直接 docker compose up，
-          # 不必再回仓库取这两个文件（实测漏打包过，Docker 用户拿不到）
+          # 不必再回仓库取这些文件（实测漏打包过，Docker 用户拿不到）。
+          # 单容器形态下账号池服务在镜像里，没有第二份 compose 要分发。
           cp Dockerfile docker-compose.yml "$STAGE/"
           # 再放一份到 server/：一键更新必然整体替换 server/，而旧版更新器
           # 不替换根目录文件。放进 server/ 后，任何部署（含从旧版升上来的）

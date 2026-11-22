@@ -182,11 +182,24 @@
 > 等个人数据会保留。卸载：**设置 → 应用** 或开始菜单「卸载 WorkBuddy Manager」，
 > 可选保留账号与配置。细节见 [Windows 启动器](windows/README.md#启动器安装版)。
 
-**② Docker（自己起容器）**
+**② Docker（一个容器起全套）**
+
+管理端与账号池服务在同一个容器里（7864 + 7863），不需要第二份源码、不用对齐两个
+容器的 uid，也不用挂 `docker.sock`。取一份 [docker-compose.yml](docker-compose.yml) 放好即可：
 
 ```bash
-# 端口只绑本机：公网访问请走反向代理（HTTPS + 访问控制），直接暴露管理面风险高
-docker run -d --name workbuddy-manager -p 127.0.0.1:7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/ithtelab/workbuddy-manager:latest
+mkdir -p workbuddy && cd workbuddy
+curl -fsSLO https://raw.githubusercontent.com/ithtelab/workbuddy-manager/main/docker-compose.yml
+docker compose up -d          # 端口只绑本机：公网访问请走反向代理（HTTPS + 访问控制）
+```
+
+最小等价写法（数据落在 `./data`，你要自己保证这个目录存在）：
+
+```bash
+docker run -d --name workbuddy-manager \
+  -p 127.0.0.1:7864:7864 \
+  -v "$PWD/data:/opt/workbuddy" \
+  ghcr.io/ithtelab/workbuddy-manager:latest
 ```
 
 **③ 服务器一键脚本（装依赖、拉包、配 systemd）**
