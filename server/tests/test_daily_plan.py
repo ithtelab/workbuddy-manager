@@ -373,3 +373,32 @@ class ReloadPendingGuardTest(unittest.TestCase):
         finally:
             reload_mod._pending = False
             reload_mod._state['pending'] = False
+
+
+class UnifiedScheduleUiTest(unittest.TestCase):
+    """上游定时任务与防风控错峰已用统一的每日任务行组件整合至 RefreshPlanCard，底部高级设置独立承载全局间隔。"""
+
+    def setUp(self) -> None:
+        self.root = Path(__file__).resolve().parents[2]
+
+    def test_upstream_tasks_use_unified_task_row_and_bottom_advanced_pacing(self) -> None:
+        card = (self.root / 'web/components/common/accounts/RefreshPlanCard.tsx').read_text(encoding='utf-8')
+        sched_lib = (self.root / 'web/lib/upstream-schedule.ts').read_text(encoding='utf-8')
+        settings_layout = (self.root / 'web/app/(main)/settings/layout.tsx').read_text(encoding='utf-8')
+        self.assertIn('function UnifiedTaskRow(', card)
+        self.assertGreaterEqual(card.count('<UnifiedTaskRow'), 7,
+                                '原生任务与上游任务必须统一复用同一个 UnifiedTaskRow 组件')
+        self.assertNotIn('bg-background/60', card,
+                         '不应在每日任务卡片内嵌套独立深色背景块造成视觉割裂')
+        self.assertIn("t('tasks.advancedPacingTitle')", card,
+                      '防风控随机延迟与账号间隔应作为底部独立高级设置区域')
+        self.assertEqual(card.count('onClick={saveAll}'), 1,
+                         '每日任务与高级设置应合并为同一个保存按钮')
+        for key in ('checkin_enabled', 'travel_enabled', 'activity_enabled',
+                    'keepalive_enabled', 'school_enabled', 'cat_enabled'):
+            self.assertIn(key, sched_lib)
+        self.assertNotIn("id: 'schedule'", settings_layout,
+                         '设置页不应再保留第二套可视化定时任务卡片')
+        self.assertIn('tasks.upstreamMovedAction', settings_layout)
+        self.assertIn("saveJson('schedule', schedText)", settings_layout,
+                      '设置页高级 JSON 模式仍保留原始 schedule 段编辑能力')

@@ -1,8 +1,10 @@
 'use client';
 
 import {useCallback, useEffect, useRef, useState} from 'react';
+import Link from 'next/link';
 import {
   Settings as SettingsIcon,
+  CalendarClock,
   RefreshCw,
   Plus,
   Trash2,
@@ -33,7 +35,7 @@ import {settingsApi, upstreamApi, errText} from '@/lib/api';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {UpstreamEndpoints} from '@/components/settings/UpstreamEndpoints';
 import {AccountRiskWarnings} from '@/components/common/accounts/AccountRiskWarnings';
-import {scheduleDelayError} from '@/lib/schedule-validation';
+import {hoursToText, parseHours} from '@/lib/upstream-schedule';
 import {
   DEFAULT_SETTINGS_TAB,
   SETTINGS_TABS,
@@ -195,159 +197,6 @@ function durationOk(f: DurationField, raw: unknown): boolean {
   if (f.allowEmpty && text === '') return true;
   return DURATION_RE.test(text);
 }
-
-/** 把时刻数组格式化为可读文本，如 [9,21] -> "9, 21" */
-function hoursToText(v: unknown): string {
-  if (Array.isArray(v)) {
-    return v
-      .filter((x): x is number => typeof x === 'number')
-      .sort((a, b) => a - b)
-      .join(', ');
-  }
-  return '';
-}
-
-/** 解析用户输入的时刻列表：返回 {ok, hours?, error?} */
-function parseHours(text: string): {ok: boolean; hours: number[]; error?: string} {
-  const parts = text.split(/[,，\s]+/).filter(Boolean);
-  if (!parts.length) return {ok: false, hours: [], error: tGlobal('settings.errNeedOneHour')};
-  const out: number[] = [];
-  for (const p of parts) {
-    const n = Number(p);
-    if (!Number.isInteger(n) || n < 0 || n > 23) {
-      return {ok: false, hours: [], error: tGlobal('settings.errHourRange', {v: p})};
-    }
-    if (!out.includes(n)) out.push(n);
-  }
-  return {ok: true, hours: out.sort((a, b) => a - b)};
-}
-
-const SCHEDULE_FIELDS: Field[] = [
-  {
-    key: 'account_delay_min_seconds',
-    kind: 'num',
-    label: '账号最短间隔',
-    desc: '自动任务逐个处理账号，完成一个后再随机等待；建议最短 30 秒、最长 120 秒',
-    unit: '秒',
-    min: 0,
-    max: 600,
-    def: 0,
-  },
-  {
-    key: 'account_delay_max_seconds',
-    kind: 'num',
-    label: '账号最长间隔',
-    desc: '适用于上游自动任务、管理端每日计划和令牌续期；两项填 0 保持原行为，手动执行不受影响',
-    unit: '秒',
-    min: 0,
-    max: 600,
-    def: 0,
-  },
-  {
-    key: 'random_delay_minutes',
-    kind: 'num',
-    label: '每日任务随机延迟',
-    desc: '上游每天各类任务在原定整点后随机延迟 0～N 分钟；0 表示整点执行。同一天重启沿用原时刻，不改变管理端每日计划',
-    unit: '分钟',
-    min: 0,
-    max: 60,
-    def: 0,
-  },
-  {
-    key: 'checkin_enabled',
-    kind: 'bool',
-    label: '自动签到',
-    desc: '每天自动领取免费额度；签到时的余额查询还能解冻被冷却的账号',
-    def: true,
-  },
-  {
-    key: 'checkin_hours',
-    kind: 'hours',
-    label: '签到时刻',
-    desc: '在哪些整点执行签到（0-23，可多个）。签到时同时刷新余额并解冻冷却账号',
-    def: [9, 21],
-  },
-  {
-    key: 'travel_enabled',
-    kind: 'bool',
-    label: '猫猫旅行',
-    desc: '自动推进「猫猫旅行」：领养 / 派出 / 领取到站奖励，可获得积分',
-    def: true,
-  },
-  {
-    key: 'travel_hours',
-    kind: 'hours',
-    label: '旅行时刻',
-    desc: '在哪些整点推进旅行（0-23，可多个）。默认两趟闭环：早上领奖并派出，晚上领当日奖励',
-    def: [9, 21],
-  },
-  {
-    key: 'activity_enabled',
-    kind: 'bool',
-    label: '活跃上报',
-    desc: '每日上报一次对话活跃，点亮连续登录并解锁领养前置任务（领猫需要）',
-    def: true,
-  },
-  {
-    key: 'activity_hours',
-    kind: 'hours',
-    label: '上报时刻',
-    desc: '在哪些整点上报（0-23，可多个）。每号每天一次即可，重复上报无额外收益',
-    def: [10],
-  },
-  {
-    key: 'keepalive_enabled',
-    kind: 'bool',
-    label: '自动保活',
-    desc: '定期刷新登录令牌，避免账号因长期闲置掉线',
-    def: true,
-  },
-  {
-    key: 'keepalive_hours',
-    kind: 'hours',
-    label: '保活时刻',
-    desc: '在哪些整点刷新令牌（0-23，可多个）',
-    def: [22],
-  },
-  {
-    key: 'school_enabled',
-    kind: 'bool',
-    label: '开学季任务',
-    desc: '自动完成开学季任务中心的活动并抽空抽奖余额（仅国内版；国际版由脚本内部跳过）',
-    def: true,
-  },
-  {
-    key: 'school_hours',
-    kind: 'hours',
-    label: '开学季时刻',
-    desc: '在哪些整点执行开学季任务（0-23，可多个）。活动未开启时会自动跳过，不算失败',
-    def: [12],
-  },
-  {
-    key: 'cat_enabled',
-    kind: 'bool',
-    label: '夜猫任务',
-    desc: '在夜猫窗口（23:00–08:00）补做一次夜猫任务；窗口外会自动跳过',
-    def: true,
-  },
-  {
-    key: 'cat_hours',
-    kind: 'hours',
-    label: '夜猫时刻',
-    desc: '在哪些整点尝试夜猫任务（0-23，可多个）。默认凌晨 1 点；窗口内每天最多补一次',
-    def: [1],
-  },
-  {
-    key: 'activity_report_count',
-    kind: 'num',
-    label: '每次上报条数',
-    desc: '每个账号每次活跃上报发几条。领养猫需要 5 次对话，默认 5 条一次刷满；填 1 即旧行为',
-    unit: '条',
-    min: 1,
-    max: 20,
-    def: 5,
-  },
-];
 
 const COOLDOWN_FIELDS: Field[] = [
   {
@@ -693,7 +542,7 @@ const ADMIN_FIELDS: Field[] = [
   },
 ];
 
-type Group = 'schedule' | 'prompt' | 'cooldown' | 'features' | 'session' | 'pool' | 'server' | 'upstream' | 'global' | 'admin';
+type Group = 'prompt' | 'cooldown' | 'features' | 'session' | 'pool' | 'server' | 'upstream' | 'global' | 'admin';
 
 /** 高级 JSON 编辑器里可直写的上游配置段（与后端 _EDITABLE_SECTIONS 一致） */
 type WireSection =
@@ -718,13 +567,6 @@ interface GroupDef {
 }
 
 const GROUPS: GroupDef[] = [
-  {
-    id: 'schedule',
-    section: 'schedule',
-    title: '定时任务',
-    desc: '六类任务各自独立排程：签到 / 猫猫旅行 / 活跃上报 / 保活 / 开学季 / 夜猫。可分别开关并设置执行时刻。签到、旅行、开学季、夜猫**只对国内版账号生效**——国际版没有这些体系；**活跃上报与保活两边都执行**，国际版没有签到，活跃上报是它唯一能刷新活跃状态的动作',
-    fields: SCHEDULE_FIELDS,
-  },
   {
     id: 'prompt',
     section: 'prompt',
@@ -1026,7 +868,6 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
 
   /** 可视化表单状态 */
   const [form, setForm] = useState<Record<Group, Record<string, FieldValue>>>({
-    schedule: defaultValues(SCHEDULE_FIELDS),
     prompt: defaultValues(PROMPT_FIELDS),
     cooldown: defaultValues(COOLDOWN_FIELDS),
     pool: defaultValues(POOL_FIELDS),
@@ -1039,7 +880,6 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
   });
   /** 加载时的原始值，用于只提交改动过的项 */
   const original = useRef<Record<Group, Record<string, FieldValue>>>({
-    schedule: defaultValues(SCHEDULE_FIELDS),
     prompt: defaultValues(PROMPT_FIELDS),
     cooldown: defaultValues(COOLDOWN_FIELDS),
     pool: defaultValues(POOL_FIELDS),
@@ -1082,7 +922,6 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
   useEffect(() => {
     if (!cfg || cfg.available === false) return;
     const picked = {
-      schedule: pickValues(SCHEDULE_FIELDS, cfg.schedule),
       prompt: pickValues(PROMPT_FIELDS, cfg.prompt),
       cooldown: pickValues(COOLDOWN_FIELDS, cfg.cooldown),
       pool: pickValues(POOL_FIELDS, cfg.pool),
@@ -1101,7 +940,6 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
     };
     setForm(picked);
     original.current = {
-      schedule: {...picked.schedule},
       prompt: {...picked.prompt},
       cooldown: {...picked.cooldown},
       pool: {...picked.pool},
@@ -1198,13 +1036,6 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
   /** 只提交改动过的字段，避免覆盖其他未展示的配置项 */
   async function saveGroup(group: Group) {
     const cur = form[group];
-    if (group === 'schedule') {
-      const error = scheduleDelayError(cur);
-      if (error) {
-        notify.err(tp(error));
-        return;
-      }
-    }
     const org = original.current[group];
     const patch: Record<string, boolean | number | number[] | string> = {};
     // 顶层键单独收：它们不属于任何段，必须放在请求体根上
@@ -1526,6 +1357,25 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
                 }}
               />
             </div>
+          </div>
+
+          {/* 定时任务与错峰设置已整合至「账号 → 任务」：避免两处配置割裂 */}
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-[20px] bg-muted px-3.5 py-3">
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="flex items-center gap-1.5 text-sm font-medium">
+                <CalendarClock className="h-4 w-4 shrink-0 text-muted-foreground" />
+                <span>{t('tasks.upstreamMovedTitle')}</span>
+              </div>
+              <div className="text-[11px] leading-4 text-muted-foreground">
+                {t('tasks.upstreamMovedDesc')}
+              </div>
+            </div>
+            <Button asChild size="sm" variant="outline" className="shrink-0 rounded-full">
+              <Link href="/tasks">
+                <CalendarClock className="h-3.5 w-3.5" />
+                {t('tasks.upstreamMovedAction')}
+              </Link>
+            </Button>
           </div>
 
           {/* 可视化设置卡片 */}
