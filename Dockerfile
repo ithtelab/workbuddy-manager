@@ -252,13 +252,20 @@ ARG DEBIAN_MIRROR=""
 # 缺了它 `/etc/localtime` 设不上、`localtime` 会静默退回 UTC —— 表现是
 # 「时区明明是 +8，统计却按 UTC 分天」，而且不报任何错。
 ARG TZ=""
+# shadow 提供 groupmod / usermod（busybox 里没有）；su-exec 让入口脚本能以目标
+# uid 降权起业务进程。**两样都必须装在最后这个阶段**：跨阶段只能 COPY 文件，
+# 阶段里 apk add 的包不会跟过来 —— 曾经把它们装进 bins 阶段，运行阶段就报
+# `groupmod: not found`，容器反复重启。
+#
+# 注释必须写在 RUN 之外：续行中间的 `#` 行会终止续行，把后面的 apk add 变成
+# 一条独立指令（dev/check_dockerfile.py 会报「非法指令」）。
 RUN set -eu; \
     MIRROR="${ALPINE_MIRROR:-$DEBIAN_MIRROR}"; \
     if [ -n "${MIRROR}" ]; then \
         echo "apk: 使用指定软件源 ${MIRROR}"; \
         sed -i -E "s#(https?://)[^/]+#\1${MIRROR}#g" /etc/apk/repositories; \
     fi; \
-    apk add --no-cache git curl ca-certificates; \
+    apk add --no-cache git curl ca-certificates shadow su-exec; \
     if [ -n "${TZ}" ]; then \
         echo "时区：${TZ}"; \
         apk add --no-cache tzdata; \
@@ -281,9 +288,10 @@ COPY --from=web-builder /dist /app/web/out
 COPY deploy /app/deploy
 COPY CHANGELOG.md README.md /app/
 
-# 非 root 运行。目录归属交给 app 用户，使容器内更新能写回代码目录。
+# 镜像内容的默认属主：app 用户（uid 10001），使容器内更新能写回代码目录。
 # 注意与上游 auths/data 卷的 uid 对齐：上游容器以 uid 10001 运行，
 # 这里用同一 uid 可避免跨容器写同一个卷时的权限问题。
+# 运行期若 PUID/PGID 不同，入口脚本会把 /app 整棵改成目标属主（见 ENTRYPOINT）。
 #
 # /app/.local 是 PYTHONUSERBASE 的落点（见上面的 ENV）：容器内更新装新依赖时
 # 只能写用户站点，且该目录必须**先存在**，否则重启后的新进程不在 sys.path 上找它。
@@ -292,9 +300,19 @@ COPY CHANGELOG.md README.md /app/
 RUN addgroup -g 10001 app \
     && adduser -D -u 10001 -s /bin/sh -h /app -G app app \
     && mkdir -p /app/data /app/.local /opt/workbuddy2api \
-    && chown -R 10001:10001 /app /opt/workbuddy2api
+    && chown -R 10001:10001 /app /opt/workbuddy2api \
+    && chmod +x /app/deploy/docker-entrypoint.sh
 
-USER app
+# 入口脚本以 root 起、对齐挂载目录属主后立刻 su-exec 降权，业务进程始终是 10001
+# 或 PUID 指定的 uid —— 不会以 root 运行。
+#
+# 为什么不再用 `USER app`：bind mount 的目录属主由宿主机决定（群晖 1026、普通
+# Linux 1000、root 建的则是 0），镜像固定 10001 时会 `unable to open database
+# file` 然后无限重启。要支持 PUID/PGID 就必须有一个「启动前执行」的时机，而
+# USER 指令给不了 —— 它把身份钉死在构建期。
+#
+# 入口脚本已经 chmod +x；Windows 检出不会破坏它（.gitattributes 把 *.sh 锁 LF）。
+ENTRYPOINT ["/app/deploy/docker-entrypoint.sh"]
 
 EXPOSE 7864
 

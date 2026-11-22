@@ -78,6 +78,18 @@ services:
     restart: unless-stopped
     environment:
       TZ: Asia/Shanghai
+      # ── 运行身份：容器内进程的 uid/gid ─────────────────────
+      # 两个都留空（默认）= 自动取 ./data 挂载目录的属主，零配置即可启动。
+      # 想固定就填真实值：PUID=$(stat -c %u ./data)  PGID=$(stat -c %g ./data)
+      # 填 0 无效：探测到 root 会回落 10001，业务进程不会以 root 运行。
+      #
+      # 与**外置 wb2api** 共存的要点：那个服务以 uid 10001 运行并和你共享
+      # /opt/workbuddy2api（config.json、auths/）。管理端若用别的 uid，面板里
+      # 改线路/定时任务会写不进去 —— 除非你显式设 WB_FIX_UPSTREAM_OWNER=1 让
+      # 本容器接管该目录属主（前提是 wb2api 也用同一 uid）。
+      # 稳妥做法：管理端也留 10001，即 PUID: "10001" / PGID: "10001"。
+      PUID: ${PUID:-}
+      PGID: ${PGID:-}
       # 首启管理员密码；不设则随机生成并打印到日志（推荐首启后立即改）
       # WB_ADMIN_PASSWORD: "改成你的强密码"
       # 上游地址：若上游与本品在同一 compose 网络，用服务名；否则填宿主机地址
@@ -154,22 +166,31 @@ services:
       # **安全性说明（值得读）**：挂 docker.sock 等于把宿主 root 权限交给本容器
       # （`docker run -v /:/host` 即可拿到宿主文件系统）。管理端是持有全部账号
       # 凭据的高价值目标，Web 应用被攻破的可能性永远不为零，所以这不该是默认
-      # 状态。需要「保存设置后自动重载上游 / 读上游日志 / 一键更新上游」这些
-      # 界面功能时，把下面这行与文件末尾的 group_add 一并取消注释，并把宿主
-      # socket 的真实 GID 写进 .env（见 deploy/README.md「容器内操作 docker」）。
+      # 状态。需要「保存设置后自动重载上游 / 读上游日志（账号回填）/ 一键更新
+      # 上游」这些界面功能时才开。
+      #
+      # 开启只要一步：取消下面 socket 那一行的注释，重启容器。
+      # 属组由入口脚本自动处理 —— 它探测 socket 的真实 GID，建成容器内的组并
+      # 加给 app 用户，再用 `su-exec app` 降权，所以**不用**填 DOCKER_GID、
+      # 也**不用** group_add（原因见下方 group_add 段的说明）。
       #
       # 不挂时依赖 docker 的功能会自动降级为「请到宿主机执行 docker compose ...」，
       # 界面如实提示，不会静默失败。
       #
       # - /var/run/docker.sock:/var/run/docker.sock
 
-    # 与上面的挂载配套（同样默认注释掉）：
+    # 与上面的挂载配套的**上游原版**写法（本仓库的入口脚本接管了这一步，通常
+    # 不需要；保留在这里是为了兼容「不用入口脚本、直接 user: 启动」的形态）。
+    #
     # 挂上 socket 只是必要条件 —— 还得**进得了那个组**。宿主的 socket 通常归
-    # root:docker（GID 998/999），而本容器以 uid 10001 运行，不在那个组里就是
-    # permission denied。GID 因机器而异，所以用变量：
+    # root:docker（GID 998/999），不在那个组里就是 permission denied。
+    #
+    # 注意 group_add 给的是**附加组**，而入口脚本降权用的是 `su-exec app`：
+    # 这条路径会按 /etc/group 重算组列表，group_add 里的组不在 /etc/group，
+    # 因此**不会**被带上 —— 入口脚本改的是「把 socket 的 GID 建成容器内的组」
+    # 这条路。只有在 compose 里写了 `user:`（不经 su-exec）时，组才会被保留，
+    # 那时才需要这行：
     #   DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)   # 写进 .env
-    # 默认 999 是 Debian/Ubuntu 上最常见的值；取错了不会静默失败 —— 更新上游时
-    # 会给出取真实 GID 的提示。
     # group_add:
     #   - "${DOCKER_GID:-999}"
 

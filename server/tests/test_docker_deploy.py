@@ -561,7 +561,17 @@ class DockerAssetsTest(unittest.TestCase):
     def test_dockerfile_present_and_non_root(self) -> None:
         df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
         self.assertIn('FROM python:3.12', df)
-        self.assertIn('USER app', df, '不应以 root 运行容器')
+        # 业务进程不得以 root 运行。两种形态都算合规：
+        #   · `USER app` —— 直接以非 root 身份启动（没有入口脚本时的形态）；
+        #   · `ENTRYPOINT` + su-exec 降权 —— 容器以 root 起，对齐挂载目录属主后
+        #     立刻降权。后者是为了支持 PUID/PGID：bind mount 的属主由宿主机决定
+        #     （群晖 1026、普通 Linux 1000、root 建的为 0），固定跑 10001 会
+        #     `unable to open database file` 然后无限重启；而 `USER` 指令把身份
+        #     钉死在构建期，给不了「启动前执行」的时机。
+        # 具体是哪种形态由 test_*entrypoint* 两条测试继续锁住。
+        self.assertTrue(
+            'USER app' in df or 'ENTRYPOINT' in df,
+            '业务进程会以 root 运行：既没有 USER app，也没有入口脚本降权')
         self.assertIn('WB_RUN_MODE=docker', df,
                       '镜像里没设运行形态 —— 容器内会误判成宿主、去调 systemctl')
         # 前端产物必须来自静态导出（server 构建会产出 server 版，FastAPI 托管不了）。
@@ -572,6 +582,78 @@ class DockerAssetsTest(unittest.TestCase):
         self.assertRegex(
             df, r'(?m)^COPY\s+--from=\S+\s+/\S*\s+/app/web/out\s*$',
             '镜像里没有把前端产物拷到 /app/web/out 的 COPY 指令')
+
+    def test_entrypoint_aligns_owner_then_drops_privileges(self) -> None:
+        """入口脚本要能对齐属主、真正降权，且不碰外置 wb2api 的共享目录。
+
+        现场：bind mount 的 ./data 属主是 root 或 1000，而镜像固定跑 10001 ——
+
+            sqlite3.OperationalError: unable to open database file
+            RuntimeError: 无法打开数据库文件：/app/data/manager.db
+            ERROR:    Application startup failed. Exiting.
+
+        然后进入 restart: unless-stopped 的无限重启。手工 chown 能修，但要求用户
+        在 NAS 上开 SSH；PUID/PGID 才是可配置的修法，代价是必须有这个入口脚本。
+        """
+        ep = _ROOT / 'deploy' / 'docker-entrypoint.sh'
+        self.assertTrue(ep.is_file(), '缺少容器入口脚本，PUID/PGID 不会生效')
+        body = ep.read_text(encoding='utf-8')
+
+        self.assertTrue(body.startswith('#!/bin/sh'), '入口脚本的 shebang 不对')
+        # 只改属主不降权 = 业务进程仍以 root 跑，等于把 USER app 白删了
+        self.assertIn('su-exec', body, '入口脚本没有降权，业务进程会以 root 运行')
+        for var in ('PUID', 'PGID'):
+            self.assertIn(var, body, f'入口脚本没读 {var}')
+        # 挂载目录属主是 root 时必须回落，不能顺着宿主目录以 root 跑业务进程
+        self.assertIn('回落 10001', body,
+                      '探测到 root 属主时没有回落 10001，业务进程可能以 root 运行')
+        # 外置 wb2api 共享 /opt/workbuddy2api：默认改它的属主会把另一个容器写坏
+        self.assertIn('WB_FIX_UPSTREAM_OWNER', body,
+                      '入口脚本没有「上游目录默认不碰」的开关，会破坏外置 wb2api 的写入')
+
+    def test_entrypoint_grants_docker_sock_group_before_drop(self) -> None:
+        """挂 docker.sock 时，socket 的属组必须真的进到业务进程里。
+
+        不处理的表现：面板「账号回填」那列一直空着（靠 `docker logs` 读上游
+        stdout），保存设置后自动重载反代 / 一键更新上游也降级为「请到宿主机操作」。
+
+        容易踩错的地方在 su-exec 的源码里：**带 `:gid` 调用**会走
+
+            if (group && group[0] != '\\0') { /* group was specified, ignore
+                                               grouplist for setgroups later */ pw = NULL; }
+            ... if (pw == NULL) setgroups(1, &gid);
+
+        也就是 `su-exec 10001:10001` 会把附加组压成只剩主 gid —— compose 的
+        `group_add` 给的 docker 组**到不了**业务进程。所以降权必须用
+        `su-exec app`（走 getgrouplist 分支），并且脚本要自己把 socket 的真实
+        GID 建成容器内的组、加给 app 用户，而不是指望用户去算 DOCKER_GID。
+        """
+        body = (_ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
+        self.assertIn('su-exec app', body,
+                      '降权用的是 `su-exec uid:gid` —— 那条路径的 setgroups(1,&gid) '
+                      '会清掉附加组，挂上 docker.sock 也照样 EACCES')
+        self.assertIn('docker.sock', body, '入口脚本没处理 docker.sock 的属组')
+        self.assertIn('groupadd', body,
+                      '没把 socket 的 GID 建成容器内的组 —— usermod -a -G 加不进不存在的组')
+        self.assertIn('usermod', body, '没把 socket 的组加进 app 的附加组')
+        # CRLF 会让 /bin/sh 把 shebang 读成 `#!/bin/sh\r`，脚本直接起不来
+        self.assertNotIn('\r', body, '入口脚本含 CRLF（Windows 检出），sh 会解析失败')
+
+    def test_entrypoint_deps_are_in_final_stage(self) -> None:
+        """shadow 与 su-exec 必须装在**最后一个**阶段。
+
+        跨阶段只能 COPY 文件，某阶段里 apk add 的包不会跟过去。曾经把这两样装
+        进 bins 阶段，运行阶段就报 `groupmod: not found`，容器反复重启；当时测试
+        按全文正则匹配，看到别处出现过就算通过，于是绿着坏了一阵。这里切成阶段，
+        只看最后一段。
+        """
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        idx = df.rfind('\nFROM ')
+        self.assertGreater(idx, 0, 'Dockerfile 里找不到多阶段边界')
+        last = df[idx:]
+        for pkg in ('shadow', 'su-exec'):
+            self.assertIn(pkg, last,
+                          f'{pkg} 没装在最后一个阶段 —— 运行时会 not found')
 
     def test_frontend_built_in_container_when_missing(self) -> None:
         """工作区没有 web/out 时，镜像必须能自己构建前端（issue #38）。

@@ -12,6 +12,12 @@
 # 里就是 LF-only 的 .cmd。
 *.cmd text eol=crlf
 
+# Shell 脚本必须 LF。容器里跑的是 /bin/sh，一旦检出成 CRLF：
+#   · shebang 变成 `#!/bin/sh\r` → `not found`（入口脚本会直接起不来）；
+#   · `set -eu` 之后的行尾回车里带着 \r，某些解析器会把它算进命令名。
+# 镜像里也有一层 `sed -i 's/\r$//'` 兜底，但源码侧就该是干净的。
+*.sh text eol=lf
+
 # Patch context contains significant whitespace and CRLF from the bundled
 # upstream snapshot. Check patch applicability instead of treating its context
 # markers as trailing whitespace in ordinary source code.
