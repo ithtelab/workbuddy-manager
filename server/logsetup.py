@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import traceback
 
 from . import config
@@ -90,3 +92,31 @@ def report_startup_failure(exc: BaseException) -> None:
     """打一条精简的启动失败说明。"""
     logger.error('%s', format_startup_failure(
         exc, include_stack=config.STARTUP_FAILURE_STACK))
+
+
+def exit_on_startup_failure(exc: BaseException) -> None:
+    """打印精简说明后**立即以非零码退出进程**，不把异常抛回框架。
+
+    为什么不能只 `raise SystemExit(1)`：实测（`WB_DATA_DIR` 指向一个普通文件，
+    制造真实的 `FileExistsError`）Starlette 的 lifespan 处理器仍会
+    `logger.error` 打完整 traceback，uvicorn 再补一句 —— 精简输出后面照样跟
+    150 行框架栈，PR 想要的降噪只完成了一半。
+
+    `os._exit` 不做清理（不 flush 缓冲、不跑 finally）。这里可以接受：
+      · 输出**直接写 stderr 并 flush**（见下方说明），不依赖 logging 配置；
+      · 启动阶段失败时**没有任何服务需要优雅关闭** —— `_start_services()` 是
+        串行执行的，抛错点之前的那些 scheduler 都是 daemon 线程，进程退出即结束；
+      · 容器场景下 PID 1 直接拿到退出码才是关键（Docker 据此决定是否重启）。
+    """
+    text = format_startup_failure(exc, include_stack=config.STARTUP_FAILURE_STACK)
+    # **直接写 stderr，不依赖 logging**：实测 `logger.error` 在这里可能一句话都
+    # 没输出（`os._exit` 会跳过缓冲刷新，`logging.shutdown()` 又不保证 uvicorn
+    # 那套 handler 的刷新顺序）。启动失败时「根因必须看得到」比「走正规日志通道」
+    # 重要得多。
+    try:
+        sys.stderr.write(text + '\n')
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+    logging.shutdown()
+    os._exit(1)

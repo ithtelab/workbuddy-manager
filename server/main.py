@@ -48,8 +48,9 @@ async def lifespan(app: FastAPI):
         # 主动接管启动异常：先把根因与修法打清楚，再让 Starlette 干净退出。
         # 不接管的话它会把几十层 merged_lifespan / __aenter__ 框架栈刷满屏，
         # 真正有用的信息反而被淹没（一次权限故障实测 350 行里 96 行是框架栈）。
-        logsetup.report_startup_failure(exc)
-        raise SystemExit(1) from None
+        # 打印精简说明后直接退出：`raise SystemExit` 仍会让 Starlette 打一遍
+        # 完整 traceback（实测 150 行框架栈），见 exit_on_startup_failure 的说明。
+        logsetup.exit_on_startup_failure(exc)
     try:
         yield
     finally:

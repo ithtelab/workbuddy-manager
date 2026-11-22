@@ -561,7 +561,14 @@ class DockerAssetsTest(unittest.TestCase):
     def test_dockerfile_present_and_non_root(self) -> None:
         df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
         self.assertIn('FROM python:3.12', df)
-        self.assertIn('USER app', df, '不应以 root 运行容器')
+        # 镜像不再写死 USER：属主要按挂载目录的实际属主对齐，那需要 root 权限。
+        # 改为入口脚本以 root 起、改完属主再 su-exec 降权 —— 业务进程仍是非 root，
+        # 这条语义由下面的 EntrypointPermissionsTest 守住。
+        self.assertNotRegex(df, r'(?m)^USER\s+\S+\s*$',
+                            '镜像里不该写死 USER：以 root 起才有机会对齐挂载目录属主')
+        self.assertRegex(df, r'(?m)^ENTRYPOINT\s+\[.*docker-entrypoint\.sh.*\]',
+                         '缺 ENTRYPOINT：属主对齐脚本不会被调用，NAS 上又会 Permission denied')
+        self.assertIn('su-exec', df, '入口脚本靠 su-exec 降权，镜像里必须装它')
         self.assertIn('WB_RUN_MODE=docker', df,
                       '镜像里没设运行形态 —— 容器内会误判成宿主、去调 systemctl')
         # 前端产物必须来自静态导出（server 构建会产出 server 版，FastAPI 托管不了）。
@@ -1422,3 +1429,63 @@ class ComposeTimezoneWiringTest(unittest.TestCase):
         """镜像名可由 WB_MANAGER_IMAGE 覆盖，默认仍是本地构建产物名。"""
         self.assertIn('${WB_MANAGER_IMAGE:-workbuddy-manager:latest}', self.src,
                       '镜像名未参数化，无法改用预构建镜像')
+
+class EntrypointPermissionsTest(unittest.TestCase):
+    """镜像入口按 PUID/PGID 对齐挂载目录属主（NAS 不用开 SSH，issue #30 复发）。
+
+    现场：群晖 Container Manager 用 bind mount 部署，宿主 `data/` 属 1026:100，
+    镜像里写死 uid 10001 —— 启动第一步 `DATA_DIR.mkdir()` 就
+    `PermissionError: [Errno 13]`，然后 restart 策略无限重启，日志刷屏。
+
+    修法不能靠文档要求用户 `chown`：NAS 用户多数没有终端。入口脚本以 root 起、
+    把 app 的 uid 改到挂载目录的属主、chown 完再 su-exec 降权，一次搞定。
+    这组断言锁的是「降权不能让业务进程变成 root」和「别假定挂载布局」。
+    """
+
+    def _script(self) -> str:
+        return (_ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
+
+    def test_script_is_lf_only(self) -> None:
+        raw = (_ROOT / 'deploy' / 'docker-entrypoint.sh').read_bytes()
+        self.assertTrue(raw.startswith(b'#!/bin/sh\n'),
+                        '首行必须是 #!/bin/sh 且为 LF')
+        self.assertNotIn(b'\r', raw,
+                         '出现 CR 会让容器里报 "#!/bin/sh: not found"')
+
+    def test_aligns_owner_then_drops_privileges(self) -> None:
+        s = self._script()
+        for token in ('PUID', 'PGID', 'su-exec', 'chown'):
+            self.assertIn(token, s, '入口脚本缺 %s' % token)
+        self.assertIn('WB_FIX_OWNERSHIP', s, '缺逃生开关：显式 user: 的部署要能关掉本脚本')
+        self.assertRegex(s, r'PUID" = "0"',
+                         '探测到 root 时必须回落 10001，不能把业务进程变成 root')
+
+    def test_covers_both_mount_layouts(self) -> None:
+        """默认布局是 /app/data + /opt/workbuddy2api，也有人把两者收进一个根。"""
+        s = self._script()
+        self.assertIn('/app/data', s)
+        self.assertIn('/opt/workbuddy2api', s)
+        self.assertIn('/opt/workbuddy/manager', s, '单根布局的子目录也要覆盖')
+        self.assertIn('/proc/mounts', s,
+                      '要按实际挂载点探测：只按目录是否存在判断，没挂载时也会误改属主')
+
+    def test_recursive_fix_survives_uid_change(self) -> None:
+        """老部署把子目录建成了 10001，换 PUID 后只看顶层会误判「已经对了」。"""
+        s = self._script()
+        self.assertIn('chown -R', s, '数据目录必须递归修正，否则子目录还是旧属主')
+
+    def test_compose_passes_puid_pgid(self) -> None:
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        env = dc['services']['workbuddy-manager']['environment']
+        for key in ('PUID', 'PGID'):
+            self.assertIn(key, env, 'compose 没透传 %s，入口脚本收不到' % key)
+        self.assertIn('PUID=', (_ROOT / '.env.example').read_text(encoding='utf-8'),
+                      '.env.example 没给出 PUID，用户不知道该填什么')
+
+    def test_image_installs_su_exec_and_shadow(self) -> None:
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        self.assertRegex(df, r'apk add[^\n]*su-exec',
+                         'Alpine 没有 su-exec，必须显式安装')
+        self.assertRegex(df, r'apk add[^\n]*shadow',
+                         'busybox 的 adduser 没有 usermod/groupmod，必须装 shadow')

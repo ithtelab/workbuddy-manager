@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import pathlib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -114,9 +115,41 @@ class WiringTest(unittest.TestCase):
         """防止以后有人把 lifespan 改回「异常裸露给框架刷栈」的写法。"""
         src = (_ROOT / 'server' / 'main.py').read_text(encoding='utf-8')
         self.assertIn('logsetup.configure_access_log()', src)
-        self.assertIn('logsetup.report_startup_failure(exc)', src)
-        self.assertIn('raise SystemExit(1) from None', src,
-                      '必须让框架干净退出，否则仍会补一遍框架栈')
+        # 审查修复：`report_startup_failure` + `raise SystemExit` 的组合实测仍会
+        # 让 starlette 打 150 行框架栈（见 StartupExitTest），改为直接退出。
+        self.assertIn('logsetup.exit_on_startup_failure(exc)', src)
+        self.assertNotIn('raise SystemExit(1) from None', src,
+                         'SystemExit 不足以抑制框架栈 —— 要用 exit_on_startup_failure')
+
+
+
+class StartupExitTest(unittest.TestCase):
+    """启动失败必须「说清根因 + 干净退出」，不能刷框架栈（PR #464 的审查修复）。
+
+    发现过程：按 PR 原实现（`raise SystemExit(1)`）实测 `WB_DATA_DIR` 指向普通
+    文件时，输出 **164 行**，其中 150 行是 starlette/fastapi 的 lifespan 框架栈
+    —— 精简说明只完成了前半段，降噪目标没达成。
+
+    修法：打印后 `os._exit(1)`，且**直接写 stderr**（实测 `logger.error` 那条路
+    在 `os._exit` 下可能一个字都不输出）。
+    """
+
+    def test_exit_uses_os_exit_after_writing_stderr(self) -> None:
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / 'logsetup.py').read_text(encoding='utf-8')
+        body = src[src.index('def exit_on_startup_failure'):]
+        self.assertIn('os._exit(1)', body,
+                      '启动失败必须直接退出进程 —— raise SystemExit 仍会让框架打完整栈')
+        self.assertIn('sys.stderr.write', body,
+                      '必须直接写 stderr：os._exit 会跳过 logging 的缓冲刷新')
+        self.assertIn('flush()', body, '写 stderr 后必须 flush')
+
+    def test_main_uses_the_exit_helper(self) -> None:
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / 'main.py').read_text(encoding='utf-8')
+        self.assertIn('logsetup.exit_on_startup_failure(exc)', src)
+        self.assertNotIn('raise SystemExit(1) from None', src,
+                         'SystemExit 不足以抑制框架栈（实测 150 行）')
 
 
 if __name__ == '__main__':

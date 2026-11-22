@@ -188,7 +188,7 @@ ARG COMPOSE_VERSION=v2.40.3
 ARG COMPOSE_URL_PREFIX=""
 # 下载后会 strip 掉这两个 Go 二进制的调试符号（对功能无影响，显著减小镜像）。
 RUN set -eux; \
-    apk add --no-cache curl binutils; \
+    apk add --no-cache curl binutils su-exec shadow; \
     case "${TARGETARCH:-$(uname -m)}" in \
         amd64 | x86_64)  DOCKER_ARCH=x86_64;  COMPOSE_ARCH=x86_64 ;; \
         arm64 | aarch64) DOCKER_ARCH=aarch64; COMPOSE_ARCH=aarch64 ;; \
@@ -281,9 +281,9 @@ COPY --from=web-builder /dist /app/web/out
 COPY deploy /app/deploy
 COPY CHANGELOG.md README.md /app/
 
-# 非 root 运行。目录归属交给 app 用户，使容器内更新能写回代码目录。
-# 注意与上游 auths/data 卷的 uid 对齐：上游容器以 uid 10001 运行，
-# 这里用同一 uid 可避免跨容器写同一个卷时的权限问题。
+# 建 app 用户，默认 uid/gid 10001（与上游账号池容器对齐，跨容器写同一个卷时
+# 不会互相踩权限）。入口脚本启动时会按 PUID/PGID 把它改成目标值 ——
+# 这里的 10001 只是默认值，不是死规定。
 #
 # /app/.local 是 PYTHONUSERBASE 的落点（见上面的 ENV）：容器内更新装新依赖时
 # 只能写用户站点，且该目录必须**先存在**，否则重启后的新进程不在 sys.path 上找它。
@@ -292,9 +292,14 @@ COPY CHANGELOG.md README.md /app/
 RUN addgroup -g 10001 app \
     && adduser -D -u 10001 -s /bin/sh -h /app -G app app \
     && mkdir -p /app/data /app/.local /opt/workbuddy2api \
+    && chmod +x /app/deploy/docker-entrypoint.sh \
+    && sed -i 's/\r$//' /app/deploy/docker-entrypoint.sh \
     && chown -R 10001:10001 /app /opt/workbuddy2api
 
-USER app
+# 不在镜像里写死 USER：属主要按挂载目录的实际属主对齐，那需要 root 权限。
+# 入口脚本以 root 起 → 改 app 的 uid/gid → chown 挂载点 → su-exec 降权执行 CMD，
+# 业务进程始终是非 root（详见 deploy/docker-entrypoint.sh）。
+ENTRYPOINT ["/app/deploy/docker-entrypoint.sh"]
 
 EXPOSE 7864
 
