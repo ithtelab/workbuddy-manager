@@ -447,6 +447,17 @@ jobs:
           # 多平台必须走 buildx 并直接 push：本地镜像库放不下多架构的 manifest list
           platforms: linux/amd64,linux/arm64
           push: true
+          # 管理端镜像在构建期会从**上游镜像**里取一份任务脚本与配置模板
+          # （见 Dockerfile 的 `FROM ${UPSTREAM_IMAGE} AS upstream`）。
+          # 必须显式钉到**本次发布的版本**：不传的话 Dockerfile 的默认值是
+          # `:latest`，而 latest 此刻还指着上一版 —— 内置脚本就会滞后一个版本，
+          # 与「随包上游同版本」的承诺不符。
+          #
+          # 上游镜像的构建被挪到了本步骤**之前**；若上游构建失败/被跳过
+          # （has_upstream=0），这里回落到 latest —— 那种情况下发布包本身也不含
+          # upstream/，管理端镜像里的内置脚本只是尽力而为。
+          build-args: |
+            UPSTREAM_IMAGE=ghcr.io/${{ github.repository_owner }}/workbuddy2api:${{ steps.build_upstream.outcome == 'success' && steps.vars.outputs.version || 'latest' }}
           # 镜像标签用小写（GHCR 要求），去掉 v 前缀
           tags: |
             ${{ steps.image.outputs.name }}:${{ steps.vars.outputs.version }}

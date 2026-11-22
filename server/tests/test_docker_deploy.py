@@ -1536,6 +1536,21 @@ class SingleContainerUpstreamTest(unittest.TestCase):
         self.assertIn('EXPOSE 7863 7864', df,
                       '两个端口都要声明，否则编排工具看不到 7863')
 
+    def test_release_pins_upstream_image_for_build(self) -> None:
+        """Dockerfile 有上游阶段时，发布流程必须把版本钉进构建参数。
+
+        不传 UPSTREAM_IMAGE 就回落到 Dockerfile 的默认 `:latest`，而 latest 在
+        构建管理端镜像这一刻仍指着**上一版** —— 镜像内置的任务脚本会滞后一个版本，
+        症状是「面板升级了、任务脚本还是旧的」，且全程没有任何报错。
+        """
+        wf = (self.ROOT / '.github' / 'workflows' / 'release.yml').read_text(
+            encoding='utf-8')
+        self.assertIn('build-args:', wf, '发布流程没给管理端镜像传构建参数')
+        self.assertRegex(wf, r'UPSTREAM_IMAGE=.*workbuddy2api:\$\{\{',
+                         'UPSTREAM_IMAGE 没钉到本次发布的版本，会静默用 latest')
+        self.assertIn("steps.build_upstream.outcome == 'success'", wf,
+                      '上游构建失败/被跳过时应回落到 latest，否则这步会整体失败')
+
     def test_entrypoint_supervises_both_and_forwards_signals(self) -> None:
         s = (self.ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
         self.assertIn('supervise()', s, '没有双进程监督函数')
