@@ -88,7 +88,7 @@
     "traces": "トレース"
   },
   "login": {
-    "subtitle": "Tencent CodeBuddy アカウントプール管理 · OpenAI 互換ゲートウェイ",
+    "subtitle": "Tencent CodeBuddy アカウントプール管理 · OpenAI 互換リバースプロキシゲートウェイ",
     "username": "ユーザー名",
     "usernamePlaceholder": "ユーザー名（既定: admin）",
     "password": "パスワード",
@@ -122,7 +122,7 @@
     "communityTitle": "本プロジェクトは LINUX DO コミュニティで公開・議論されています",
     "help": "ヘルプ",
     "about": "WorkBuddy Manager について",
-    "aboutDesc": "WorkBuddy Manager は workbuddy2api 向けのアカウントプール管理と OpenAI 互換ゲートウェイです。複数アカウントの QR 取り込み、自動チェックイン、キー配布、IP 制御、使用量統計に対応します。",
+    "aboutDesc": "WorkBuddy Manager は workbuddy2api 向けのアカウントプール管理と OpenAI 互換リバースプロキシゲートウェイです。複数アカウントの QR 取り込み、自動チェックイン、キー配布、IP 制御、使用量統計に対応します。",
     "versionFallback": "（実行中のバージョンを取得できませんでした）",
     "logout": "ログアウト",
     "logoutTitle": "ログアウトしますか？",

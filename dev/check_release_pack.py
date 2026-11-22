@@ -52,7 +52,7 @@ def main() -> int:
                         ignore=shutil.ignore_patterns('__pycache__', '.pytest_cache'))
     shutil.copytree(ROOT / 'web' / 'out', repo / 'web' / 'out')
     for name in ('.env.example', 'README.md', 'README.en.md', 'CHANGELOG.md', 'LICENSE',
-                 'Dockerfile', 'docker-compose.yml', 'docker-compose.full.yml'):
+                 'Dockerfile', 'docker-compose.yml'):
         src = ROOT / name
         if src.is_file():
             shutil.copyfile(src, repo / name)
@@ -98,8 +98,6 @@ def main() -> int:
 
     check((stage / '.version').is_file(), '.version 已写入')
     check((stage / 'server' / 'main.py').is_file(), 'server/ 已打包')
-    check((stage / 'docker-compose.full.yml').is_file(),
-          'docker-compose.full.yml 已打包（一条命令起全套的部署方式要用它）')
     check((stage / 'deploy' / 'install.sh').is_file(), 'deploy/install.sh 已打包')
 
     # 打成 tar 再验一次（发布产物就是这个）。用 tarfile 读清单：本机 tar 的输出

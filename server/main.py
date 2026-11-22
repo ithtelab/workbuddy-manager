@@ -14,7 +14,7 @@ from starlette.middleware.gzip import GZipMiddleware
 import json
 import logging
 
-from . import config, db, inflight, logsetup, redpacket, security
+from . import config, db, inflight, redpacket, security
 from .iputil import client_ip
 from .stdio_utf8 import force_utf8_stdio
 from .routers import (
@@ -39,25 +39,6 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # uvicorn 的 logging 配置在 lifespan 之前已完成，此时改才不会被 dictConfig
-    # 重置（见 logsetup.configure_access_log 的说明）。
-    logsetup.configure_access_log()
-    try:
-        _start_services()
-    except Exception as exc:
-        # 主动接管启动异常：先把根因与修法打清楚，再让 Starlette 干净退出。
-        # 不接管的话它会把几十层 merged_lifespan / __aenter__ 框架栈刷满屏，
-        # 真正有用的信息反而被淹没（一次权限故障实测 350 行里 96 行是框架栈）。
-        # 打印精简说明后直接退出：`raise SystemExit` 仍会让 Starlette 打一遍
-        # 完整 traceback（实测 150 行框架栈），见 exit_on_startup_failure 的说明。
-        logsetup.exit_on_startup_failure(exc)
-    try:
-        yield
-    finally:
-        await _stop_services()
-
-
-def _start_services() -> None:
     config.ensure_dirs()
     db.connect()
     security.load_users()  # 首次启动会自动生成管理员并打印一次密码
@@ -104,23 +85,23 @@ def _start_services() -> None:
     # 自动更新：按「设置 → 更新」里的开关与时间窗定时检测并执行一键更新。
     # 默认关闭；真正的更新仍走 updater.start_update（与按钮同一条路）。
     autoupdate.start_scheduler()
-
-
-async def _stop_services() -> None:
-    tasklog.stop_collector()
-    accountrisk.stop()
-    taskrun.stop_scheduler()
-    renew.stop_scheduler()
-    cooling.stop_scheduler()
-    modelrecovery.stop_scheduler()
-    dailyplan.stop_scheduler()
-    accountlog.stop_collector()
-    pgsync.stop_scheduler()
-    watchdog.stop_scheduler()
-    autoupdate.stop_scheduler()
-    # 出站客户端是共享的（issue #144：Windows 上每次新建要 ~1 秒），
-    # 退出时统一关掉，别把连接池与 SSL 上下文丢在原地。
-    await config.close_clients()
+    try:
+        yield
+    finally:
+        tasklog.stop_collector()
+        accountrisk.stop()
+        taskrun.stop_scheduler()
+        renew.stop_scheduler()
+        cooling.stop_scheduler()
+        modelrecovery.stop_scheduler()
+        dailyplan.stop_scheduler()
+        accountlog.stop_collector()
+        pgsync.stop_scheduler()
+        watchdog.stop_scheduler()
+        autoupdate.stop_scheduler()
+        # 出站客户端是共享的（issue #144：Windows 上每次新建要 ~1 秒），
+        # 退出时统一关掉，别把连接池与 SSL 上下文丢在原地。
+        await config.close_clients()
 
 
 def _warn_weak_upstream_key() -> None:
@@ -169,7 +150,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='2.11.22',
+    version='2.11.20',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，

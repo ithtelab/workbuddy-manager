@@ -88,7 +88,7 @@
     "traces": "추적"
   },
   "login": {
-    "subtitle": "Tencent CodeBuddy 계정 풀 관리 · OpenAI 호환 게이트웨이",
+    "subtitle": "Tencent CodeBuddy 계정 풀 관리 · OpenAI 호환 리버스 프록시 게이트웨이",
     "username": "사용자 이름",
     "usernamePlaceholder": "사용자 이름 (기본: admin)",
     "password": "비밀번호",
@@ -122,7 +122,7 @@
     "communityTitle": "이 프로젝트는 LINUX DO 커뮤니티에서 공개되고 논의됩니다",
     "help": "도움말",
     "about": "WorkBuddy Manager 정보",
-    "aboutDesc": "WorkBuddy Manager는 workbuddy2api를 위한 계정 풀 관리 및 OpenAI 호환 게이트웨이로, 여러 계정의 QR 등록, 자동 출석, 키 배포, IP 제어, 사용량 통계를 지원합니다.",
+    "aboutDesc": "WorkBuddy Manager는 workbuddy2api를 위한 계정 풀 관리 및 OpenAI 호환 리버스 프록시 게이트웨이로, 여러 계정의 QR 등록, 자동 출석, 키 배포, IP 제어, 사용량 통계를 지원합니다.",
     "versionFallback": " (실행 중인 버전을 가져오지 못했습니다)",
     "logout": "로그아웃",
     "logoutTitle": "로그아웃하시겠습니까?",
