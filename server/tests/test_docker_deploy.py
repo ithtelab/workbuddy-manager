@@ -67,6 +67,19 @@ class _Rep:
         return [m for lvl, m in self.lines if lvl == 'error']
 
 
+def _last_stage(dockerfile: str) -> str:
+    """返回 Dockerfile 最后一个构建阶段（即运行阶段）的文本。
+
+    多阶段构建里同一个包名经常出现在「准备阶段」，只按全文匹配会误判成已安装。
+    """
+    lines = dockerfile.splitlines()
+    start = 0
+    for i, line in enumerate(lines):
+        if line.lstrip().upper().startswith('FROM '):
+            start = i
+    return '\n'.join(lines[start:])
+
+
 def _load_update_mod(**env):
     keys = ['WB_RUN_MODE', *env.keys()]
     old = {k: os.environ.get(k) for k in keys}
@@ -529,34 +542,54 @@ class DbOpenFailureMessageTest(unittest.TestCase):
     def test_compose_documents_data_ownership(self) -> None:
         """compose 里 data 挂载必须带权限提示（上游 compose 就有，issue #30）。"""
         compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
-        idx = compose.find('- ${WB_DATA_VOLUME:-./data}:/app/data')
-        self.assertGreater(idx, 0, '没找到 data 挂载（默认值必须仍是 ./data）')
-        # 挂载行上方要有「为什么不可写 + 怎么修」，光报错不解决用户的实际问题
-        above = compose[max(0, idx - 1400):idx]
-        self.assertIn('chown', above, 'data 挂载缺少属主提示（issue #30 的成因）')
-        self.assertIn('10001', above, '应写明 uid')
-        self.assertIn('WB_DATA_VOLUME=wb-manager-data', above,
-                      '改不了属主的环境要有能直接照做的命名卷开关')
+        idx = compose.find('- ${WB_DATA_VOLUME:-./data}:/opt/workbuddy')
+        self.assertGreater(idx, 0, '没找到数据挂载（默认值必须仍是 ./data）')
+        # 挂载行上方要写清「只挂一条」与「为什么」——用户最容易在这里多建一层目录
+        above = compose[max(0, idx - 900):idx]
+        self.assertIn('Bind mount failed', above,
+                      'data 挂载缺少「少建子目录就起不来」的说明（issue #30 的成因）')
+        # 属主问题由 PUID 自动对齐解决，说明可以离挂载行远一些，但全文必须有
+        self.assertIn('自动取挂载目录', compose,
+                      '没说明属主会自动对齐 —— 用户会以为还要手工 chown')
 
     def test_compose_named_volume_switch_is_declared(self) -> None:
-        """NAS / SMB 改不了属主时，一行 .env 就能切到命名卷（issue #30 复发）。
+        """NFS / SMB 改不了属主时，仍要给一条能用命名卷的出路。
 
-        命名卷首次创建会继承镜像内 /app/data 的属主（10001），所以无需宿主 chown。
-        开关要同时满足两点：挂载行做变量插值、顶层声明同名卷 —— 只改挂载行
-        而不声明卷，compose 会把它当成相对路径的 bind mount 并报错。
+        bind mount 在 SMB 上改不了属主，入口脚本 chown 会失败。此时换成命名卷
+        即可（卷首建继承镜像内属主）。compose 只负责把这条路写在注释里 ——
+        默认仍是宿主目录，因为多数人需要能直接打开、备份数据。
         """
         import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
+        dc = yaml.safe_load(compose)
         vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
         self.assertTrue(
-            any('${WB_DATA_VOLUME:-./data}:/app/data' in v for v in vols),
-            'data 挂载未做成可切换的卷；默认值必须是 ./data，别破坏已有部署')
-        self.assertIn('wb-manager-data', (dc.get('volumes') or {}),
-                      '顶层没声明 wb-manager-data，切到命名卷会失败')
+            any('${WB_DATA_VOLUME:-./data}:/opt/workbuddy' in v for v in vols),
+            '数据挂载没做成可切换的卷；默认值必须是 ./data')
+        self.assertIn('WB_DATA_VOLUME=wb-workbuddy', compose,
+                      '改不了属主的环境要有能直接照做的命名卷开关')
+        self.assertIn('wb-workbuddy:', compose,
+                      '提到命名卷却没给顶层声明，照着写会报「volume 未定义」')
 
 
 class DockerAssetsTest(unittest.TestCase):
     """部署资产存在且关键约定正确（这些错了用户装不起来）。"""
+
+    def test_admin_password_is_passed_from_env(self) -> None:
+        """`.env` 里的 WB_ADMIN_PASSWORD 必须真的传进容器。
+
+        `.env.example` 写明「留空则随机生成并打印到日志」；若 compose 里是注释掉的
+        固定值，用户按模板填的密码不会生效，只会静默走随机密码。
+        """
+        src = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
+        self.assertIn('WB_ADMIN_PASSWORD: ${WB_ADMIN_PASSWORD', src,
+                      'compose 未透传 WB_ADMIN_PASSWORD，.env 里设的初始密码不生效')
+
+    def test_image_name_can_be_overridden(self) -> None:
+        """镜像名可由 WB_MANAGER_IMAGE 覆盖（fork / 自建 / 钉版本都靠它）。"""
+        src = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
+        self.assertIn('${WB_MANAGER_IMAGE:-', src,
+                      '镜像名未参数化，无法改用预构建镜像')
 
     def test_dockerfile_present_and_non_root(self) -> None:
         df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
@@ -614,32 +647,21 @@ class DockerAssetsTest(unittest.TestCase):
             self.assertNotIn(bad, lines,
                              f'.dockerignore 里的 {bad!r} 会连带排除前端源码与 out/')
 
-    def test_compose_passes_npm_registry_arg(self) -> None:
-        """compose 要能传 npm 镜像源（国内构建前端时必需），且与 Dockerfile 对齐。"""
-        import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
-        args = (dc['services']['workbuddy-manager'].get('build') or {}).get('args') or {}
-        self.assertIn('NPM_REGISTRY', args, 'compose 没有暴露 NPM_REGISTRY')
-        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
-        self.assertRegex(df, r'(?m)^ARG\s+NPM_REGISTRY',
-                         'Dockerfile 未声明 NPM_REGISTRY —— compose 传了也会被忽略')
+    def test_build_args_declared_for_source_builds(self) -> None:
+        """源码构建的可选开关必须在 Dockerfile 里声明。
 
-    def test_compose_passes_mirror_and_base_path_args(self) -> None:
-        """镜像里的两个国外下载源、以及子路径前缀，同样要 compose ↔ Dockerfile 对齐。
-
-        这类「可选开关」最容易出的错法不是写坏，而是**只加了一边**：compose 里
-        列了参数、Dockerfile 却没声明同名 ARG —— docker 对多余的 build-arg 只是
-        忽略，于是用户填了值、构建照样卡在 download.docker.com / GitHub 上，
-        而且没有任何报错。这条与上面的 NPM_REGISTRY 同款。
+        compose 不再承担构建（用户直接拉镜像），但 `docker build --build-arg`
+        仍然要能用。最容易出的错法不是写坏，而是**只加了一边**：传了没声明的
+        ARG，docker 静默忽略 —— 用户填了值、构建照样卡在
+        download.docker.com / GitHub / npm registry 上，且没有任何报错。
         """
-        import yaml
-        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
-        args = (dc['services']['workbuddy-manager'].get('build') or {}).get('args') or {}
         df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
-        for name in ('DOCKER_CLI_BASE', 'COMPOSE_URL_PREFIX', 'BASE_PATH'):
-            self.assertIn(name, args, f'compose 没有暴露 {name}')
-            self.assertRegex(df, rf'(?m)^ARG\s+{name}',
-                             f'Dockerfile 未声明 {name} —— compose 传了也会被忽略')
+        for name in ('NPM_REGISTRY', 'DOCKER_CLI_BASE', 'COMPOSE_URL_PREFIX',
+                     'BASE_PATH', 'ALPINE_MIRROR', 'PIP_INDEX_URL', 'TZ',
+                     'UPSTREAM_IMAGE'):
+            with self.subTest(arg=name):
+                self.assertRegex(df, rf'(?m)^ARG\s+{name}',
+                                 f'Dockerfile 未声明 {name} —— 构建时传了也会被忽略')
 
     def test_dockerfile_structure_checker_passes(self) -> None:
         """跑一遍 Dockerfile 结构自检（指令拼写 / 阶段引用 / shell 配平）。
@@ -690,46 +712,43 @@ class DockerAssetsTest(unittest.TestCase):
     def test_compose_persists_data(self) -> None:
         import yaml
         dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
-        vols = dc['services']['workbuddy-manager'].get('volumes') or []
-        self.assertTrue(any('/app/data' in str(v) for v in vols),
-                        '未持久化 data 卷 —— 重建容器会丢失统计与审计记录')
+        vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
+        self.assertTrue(any('/opt/workbuddy' in v for v in vols),
+                        '未持久化数据目录 —— 重建容器会丢失统计、账号与审计记录')
 
-    def test_upstream_dir_mounted(self) -> None:
-        """必须挂载上游仓库目录。
+    def test_upstream_is_bundled_not_mounted(self) -> None:
+        """账号池服务在镜像里，**不再要求宿主挂一份源码目录**。
 
-        没挂的话容器内既拿不到上游的 docker-compose.yml（端口收敛无从下手），
-        也无法在容器内 git pull —— 「更新上游」直接做不到。
-        （这正是初版的问题：只挂了 auths 与 config.json 两条子路径。）
+        旧形态要挂 `../workbuddy2api`，于是部署前必须准备源码、两边 uid 还要对齐；
+        漏一步就是「面板有账号、池子里 0 个」或「未找到任务脚本」。现在它由镜像
+        自带，宿主机只需要一个数据目录。
         """
         import yaml
         dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
         vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
-        self.assertTrue(any('/opt/workbuddy2api' in v for v in vols),
-                        '未挂载上游目录 —— 容器版将无法更新上游')
+        self.assertFalse(any('/opt/workbuddy2api' in v for v in vols),
+                         '还在挂上游源码目录 —— 单容器形态不需要，也不该要求用户准备')
+        # 内置资产必须真的进了镜像，否则「不挂载」就变成「没有」
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        self.assertIn('COPY --from=upstream /app /app/upstream', df,
+                      '镜像没有内置账号池服务 —— 不挂载就真的没有服务可跑了')
+        self.assertRegex(df, r'(?m)^FROM\s+\$\{UPSTREAM_IMAGE\}\s+AS\s+upstream',
+                         '缺可覆盖的上游镜像阶段：版本会被钉死在代码里')
 
-    def test_docker_socket_is_opt_in(self) -> None:
-        """docker.sock **默认不挂**，以注释形式保留显式开启的路径（2026-10-21
-        安全检查 H2）。
+    def test_docker_socket_not_needed(self) -> None:
+        """单容器形态不需要 docker.sock —— 整个文件里都不该出现它。
 
-        曾经的默认是挂载，理由是"宿主部署本来就是 root，两者权限等价"。该论据
-        随宿主形态降权（unit 专用账号 + 沙箱指令）不再成立：容器隔离的意义正是
-        阻断 Web 应用漏洞直达宿主，把宿主 root 交给一个持有全部账号凭据的
-        Web 进程不该是默认状态。挂载后功能不会静默失效（界面如实降级提示），
-        想要完整能力的用户按注释两步开启。
+        旧形态要靠它从上游容器里 `docker cp` 抠脚本、重建上游容器；现在脚本与
+        服务都在本镜像内，挂 socket 只是白白把宿主 root 交出去。
         """
         compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
+        active = [l for l in compose.splitlines()
+                  if 'docker.sock' in l and not l.strip().startswith('#')]
+        self.assertFalse(active, 'compose 里出现了 docker.sock 挂载：单容器形态不需要')
         import yaml
         dc = yaml.safe_load(compose)
-        vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
-        self.assertFalse(any('docker.sock' in v for v in vols),
-                         'docker.sock 不应默认挂载 —— 想要完整能力请按注释显式开启')
-        groups = [str(g) for g in (dc['services']['workbuddy-manager'].get('group_add') or [])]
-        self.assertFalse(groups, 'group_add 应与挂载一同默认关闭')
-        # 开启路径必须完整可照做：挂载行与 group_add 都以注释保留
-        self.assertIn('# - /var/run/docker.sock:/var/run/docker.sock', compose,
-                      '挂载行的注释模板丢了 —— 用户想开也不知道怎么写')
-        self.assertIn('# group_add:', compose,
-                      'group_add 的注释模板丢了 —— 只挂 socket 不进组照样 EACCES')
+        self.assertFalse(dc['services']['workbuddy-manager'].get('group_add'),
+                         'group_add 不该出现：那是为进 docker 组准备的')
 
     def test_env_file_actually_reaches_both_deployments(self) -> None:
         """`.env` 里的可选项（出口代理等）必须真能到达进程。
@@ -780,23 +799,6 @@ class DockerSocketPreflightTest(unittest.TestCase):
     而原来只会得到一句「权限不足，请确认以 root 或具备 docker 权限的用户执行」，
     容器里没有 root 可变，用户无从下手。
     """
-
-    def test_compose_group_add_uses_env_gid(self) -> None:
-        """开启 docker.sock 后，compose 要能用宿主**真实的** docker 组 GID 补组。
-
-        挂载与 group_add 默认都是注释状态（opt-in，见 DockerAssetsTest 的
-        docker.sock 用例）；这里钉住的是**注释模板本身**要能直接照抄：宿主 GID
-        因机器而异，必须用 DOCKER_GID 变量而不是写死。
-        """
-        compose = (_ROOT / 'docker-compose.yml').read_text(encoding='utf-8')
-        self.assertIn('#   - "${DOCKER_GID:-999}"', compose,
-                      '注释模板里的 group_add 没用 DOCKER_GID 变量 —— 照抄也会因 GID 不对而 EACCES')
-        self.assertIn('stat -c', compose,
-                      '注释里要给出取 GID 的命令：stat -c %g /var/run/docker.sock')
-        env = (_ROOT / '.env.example').read_text(encoding='utf-8')
-        self.assertIn('DOCKER_GID', env, '.env.example 没说明 DOCKER_GID 怎么取')
-        self.assertIn('stat -c', env,
-                      '要给出取 GID 的命令：stat -c %g /var/run/docker.sock')
 
     def test_diagnose_permission_denied_gives_socket_recipe(self) -> None:
         """socket 连不上的权限错误要指向 group_add，而不是"请用 root 执行"。"""
@@ -1382,43 +1384,212 @@ class AlpineTimezoneTest(unittest.TestCase):
                             'useradd 在 Alpine 上不存在（是 Debian 的）')
 
 class ComposeTimezoneWiringTest(unittest.TestCase):
-    """compose 的 TZ 必须在**构建期**与**运行期**两处都给（审计发现的缺口）。
+    """时区必须在**镜像构建期**与**运行期**两处都给（审计发现的缺口）。
 
     `environment.TZ` 只影响进程环境；镜像里没有 tzdata、`/etc/localtime` 没指向
     目标时区的话，musl 的 `localtime()` 会静默退回 UTC。而本项目的按日统计与
     每日 Token 限额复位都按本地时区 —— 两处不一致的表现是「时区写着 +8、
     数字按 UTC 分天」，不报任何错。
+
+    用户拉的是预构建镜像，构建参数由 CI 决定，所以 Dockerfile 里的**默认值**
+    必须是可用时区（不能是空串等运行期补），compose 再保证运行期与之一致。
     """
 
     COMPOSE = _ROOT / 'docker-compose.yml'
+    DOCKERFILE = _ROOT / 'Dockerfile'
 
     def setUp(self) -> None:
-        self.src = self.COMPOSE.read_text(encoding='utf-8')
+        self.compose = self.COMPOSE.read_text(encoding='utf-8')
+        self.df = self.DOCKERFILE.read_text(encoding='utf-8')
 
-    def test_build_arg_tz_exists(self) -> None:
-        head = self.src[: self.src.index('environment:')]
-        self.assertIn('TZ:', head, '必须在 build.args 里传 TZ（决定装不装 tzdata）')
+    def test_dockerfile_tz_default_is_a_real_zone(self) -> None:
+        m = re.search(r'^ARG\s+TZ="?([^"\n]*)"?', self.df, re.M)
+        self.assertIsNotNone(m, 'Dockerfile 没有 ARG TZ：tzdata 装不装无从控制')
+        self.assertTrue(m.group(1).strip(),
+                        'ARG TZ 默认留空会让预构建镜像不带 tzdata，统计按 UTC 分天')
 
-    def test_runtime_and_build_tz_agree(self) -> None:
-        head = self.src[: self.src.index('environment:')]
-        tail = self.src[self.src.index('environment:'):]
-        build_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', head, re.M)
-        run_tz = re.search(r'^\s+TZ:\s*"?([^"\n]+)"?', tail, re.M)
-        self.assertIsNotNone(build_tz, 'build.args 缺 TZ')
-        self.assertIsNotNone(run_tz, 'environment 缺 TZ')
+    def test_runtime_tz_matches_image_default(self) -> None:
+        build_tz = re.search(r'^ARG\s+TZ="?([^"\n]*)"?', self.df, re.M)
+        run_tz = re.search(r'^\s+TZ:\s*"?\$\{TZ:-([^"}]+)\}"?', self.compose, re.M)
+        self.assertIsNotNone(run_tz, 'environment 缺 TZ（或没写成 ${TZ:-默认值}）')
         self.assertEqual(build_tz.group(1).strip(), run_tz.group(1).strip(),
-                         'build 与 runtime 的 TZ 必须一致，否则会按错误时区分天')
+                         '镜像默认时区与运行期默认值必须一致，否则按错误时区分天')
 
-    def test_admin_password_is_passed_from_env(self) -> None:
-        """`.env` 里的 WB_ADMIN_PASSWORD 必须真的传进容器。
 
-        `.env.example` 写明「留空则随机生成并打印到日志」；若 compose 里仍是
-        注释掉的固定值，用户按模板填的密码不会生效，只会静默走随机密码。
+class EntrypointPermissionsTest(unittest.TestCase):
+    """镜像入口按 PUID/PGID 对齐挂载目录属主（NAS 不用开 SSH，issue #30 复发）。
+
+    现场：群晖 Container Manager 用 bind mount 部署，宿主 `data/` 属 1026:100，
+    镜像里写死 uid 10001 —— 启动第一步 `DATA_DIR.mkdir()` 就
+    `PermissionError: [Errno 13]`，然后 restart 策略无限重启，日志刷屏。
+
+    修法不能靠文档要求用户 `chown`：NAS 用户多数没有终端。入口脚本以 root 起、
+    把 app 的 uid 改到挂载目录的属主、chown 完再 su-exec 降权，一次搞定。
+    这组断言锁的是「降权不能让业务进程变成 root」和「别假定挂载布局」。
+    """
+
+    def _script(self) -> str:
+        return (_ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
+
+    def test_script_is_lf_only(self) -> None:
+        raw = (_ROOT / 'deploy' / 'docker-entrypoint.sh').read_bytes()
+        self.assertTrue(raw.startswith(b'#!/bin/sh\n'),
+                        '首行必须是 #!/bin/sh 且为 LF')
+        self.assertNotIn(b'\r', raw,
+                         '出现 CR 会让容器里报 "#!/bin/sh: not found"')
+
+    def test_aligns_owner_then_drops_privileges(self) -> None:
+        s = self._script()
+        for token in ('PUID', 'PGID', 'su-exec', 'chown'):
+            self.assertIn(token, s, '入口脚本缺 %s' % token)
+        self.assertIn('WB_FIX_OWNERSHIP', s, '缺逃生开关：显式 user: 的部署要能关掉本脚本')
+        self.assertRegex(s, r'PUID" = "0"',
+                         '探测到 root 时必须回落 10001，不能把业务进程变成 root')
+
+    def test_mount_layout_is_single_root(self) -> None:
+        """只有一个挂载点：/opt/workbuddy（下面分 manager/ 与 workbuddy2api/）。"""
+        s = self._script()
+        self.assertIn('MOUNT_CANDIDATES="/opt/workbuddy"', s,
+                      '探测的挂载点必须只有单根那一个')
+        self.assertIn('/opt/workbuddy/manager', s, '单根布局的子目录要覆盖')
+        self.assertIn('/opt/workbuddy/workbuddy2api', s, '账号池服务子目录要覆盖')
+        self.assertIn('/proc/mounts', s,
+                      '要按实际挂载点探测：只按目录是否存在判断，没挂载时也会误改属主')
+        self.assertNotIn('/opt/workbuddy2api', s,
+                         '不该再认旧的分离布局路径 —— 新形态下那些目录不存在')
+
+    def test_recursive_fix_survives_uid_change(self) -> None:
+        """老部署把子目录建成了 10001，换 PUID 后只看顶层会误判「已经对了」。"""
+        s = self._script()
+        self.assertIn('chown -R', s, '数据目录必须递归修正，否则子目录还是旧属主')
+
+    def test_compose_passes_puid_pgid(self) -> None:
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        env = dc['services']['workbuddy-manager']['environment']
+        for key in ('PUID', 'PGID'):
+            self.assertIn(key, env, 'compose 没透传 %s，入口脚本收不到' % key)
+        self.assertIn('PUID=', (_ROOT / '.env.example').read_text(encoding='utf-8'),
+                      '.env.example 没给出 PUID，用户不知道该填什么')
+
+    def test_uid_alignment_never_aborts_startup(self) -> None:
+        """groupmod/usermod 缺失时不能把容器弄成重启死循环。
+
+        entrypoint 是 `set -eu`，一句 `groupmod: not found`（退出码 127）就能让
+        脚本直接结束 —— 7864 永不监听，日志里只剩这一行。所以必须先探测命令是否存在，
+        并且有「直接改写 /etc/passwd、/etc/group」的兜底路径。
         """
-        self.assertIn('WB_ADMIN_PASSWORD: ${WB_ADMIN_PASSWORD', self.src,
-                      'compose 未透传 WB_ADMIN_PASSWORD，.env 里设的初始密码不生效')
+        s = self._script()
+        self.assertIn('command -v groupmod', s,
+                      '要先探测 groupmod 是否存在，不能直接调用')
+        self.assertIn('/etc/passwd', s, '工具缺失时要有改写 /etc/passwd 的兜底')
+        self.assertIn('/etc/group', s, '组 id 同样要兜底改写 /etc/group')
+        # 兜底里不许出现裸调用（会被 set -e 带走）
+        for cmd in ('groupmod -o', 'usermod -o'):
+            self.assertGreaterEqual(
+                s.count(cmd), 1, '保留常规路径：%s' % cmd)
 
-    def test_image_name_can_be_overridden(self) -> None:
-        """镜像名可由 WB_MANAGER_IMAGE 覆盖，默认仍是本地构建产物名。"""
-        self.assertIn('${WB_MANAGER_IMAGE:-workbuddy-manager:latest}', self.src,
-                      '镜像名未参数化，无法改用预构建镜像')
+    def test_image_installs_su_exec_and_shadow(self) -> None:
+        """su-exec 与 shadow 必须装在**运行阶段**，不是随便哪个阶段。
+
+        踩过的坑：`bins` 阶段（只负责下载 docker CLI）里写了 `apk add ... su-exec
+        shadow`，运行阶段那行却没有 —— 正则按全文匹配能过，容器却一启动就
+        `groupmod: not found`（set -e 下直接退出，7864 永不监听）。所以这里先切出
+        最后一个 FROM 之后的运行阶段再断言。
+        """
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        stage = _last_stage(df)
+        for pkg in ('su-exec', 'shadow'):
+            self.assertRegex(
+                stage, r'apk add[^\n]*\b%s\b' % pkg,
+                '运行阶段必须装 %s：入口脚本要用它（bins 阶段装的那份不会跨阶段拷过来）' % pkg)
+
+
+class SingleContainerUpstreamTest(unittest.TestCase):
+    """一个容器同时跑管理端与账号池服务（2026-11 的架构调整）。
+
+    旧形态要两个容器：管理端 + workbuddy2api。代价是部署者必须自己准备账号池服务
+    源码、把两个容器的 uid 对齐、并保证两边挂同一个 auths/ —— 任何一步没做对，
+    症状都是「面板有账号、池子里 0 个」或「未找到任务脚本」，而面板判断不出是哪一种。
+
+    现在账号池服务（CGO_ENABLED=0 的静态 Go 二进制）直接打进管理端镜像，容器入口
+    以同一 uid 拉起两个进程。这组断言锁住四件事：资产真的在镜像里、入口真的管两个
+    进程与信号、compose 真的只有一个服务一条挂载、任务脚本真的不需要源码目录。
+    """
+
+    ROOT = _ROOT
+
+    def test_image_bundles_upstream_runtime(self) -> None:
+        df = (self.ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        self.assertRegex(df, r'(?m)^ARG\s+UPSTREAM_IMAGE=',
+                         '缺可覆盖的上游镜像参数，钉版本/走镜像源时没法构建')
+        self.assertRegex(df, r'(?m)^FROM\s+\$\{UPSTREAM_IMAGE\}\s+AS\s+upstream',
+                         'ARG 不能直接写进 COPY 的来源，要先建成阶段')
+        self.assertIn('COPY --from=upstream /app /app/upstream', df,
+                      '没有把账号池服务的二进制与脚本搬进镜像')
+        self.assertIn('chmod +x /app/upstream/wb2api', df,
+                      '二进制没有可执行位，入口起不来')
+        self.assertIn('config.example.json', df,
+                      '缺配置模板：首启就生成不出 config.json')
+        self.assertIn('WB2API_EMBEDDED=1', df,
+                      '镜像没有默认开启内置服务')
+        self.assertIn('EXPOSE 7863 7864', df,
+                      '两个端口都要声明，否则编排工具看不到 7863')
+
+    def test_entrypoint_supervises_both_and_forwards_signals(self) -> None:
+        s = (self.ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
+        self.assertIn('supervise()', s, '没有双进程监督函数')
+        self.assertIn('wb2api -config', s, '没有启动账号池服务的命令')
+        self.assertIn('trap _stop TERM INT', s,
+                      '没有转发停止信号：docker stop 会 SIGKILL 掉账号池服务')
+        self.assertIn('kill -TERM "$_backend"', s, '停止时没有通知账号池服务')
+        self.assertIn('cd "$_dir"', s,
+                      '配置里的 auth_dir/state_file 是相对路径，必须切到配置目录再起')
+        self.assertIn('WB2A_AUTHS', s,
+                      '任务脚本按 WB2A_AUTHS 找 auths，不指就会读到空目录')
+
+    def test_entrypoint_reenters_after_dropping_privileges(self) -> None:
+        """root 只存在于启动头几毫秒：监督进程本身也必须是非 root。"""
+        s = (self.ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
+        self.assertIn('su-exec "$PUID:$PGID" "$SELF" --supervise', s,
+                      '降权后没有以 --supervise 重入：两个进程会以 root 运行')
+        self.assertIn('exec "$SELF" --supervise', s,
+                      '非 root 启动路径没有进入监督分支')
+
+    def test_compose_is_one_service_one_mount(self) -> None:
+        import yaml
+        dc = yaml.safe_load((self.ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        self.assertEqual(list(dc['services']), ['workbuddy-manager'],
+                         'compose 又变成多服务了 —— 单容器是这次调整的核心')
+        svc = dc['services']['workbuddy-manager']
+        self.assertEqual([str(v) for v in svc['volumes']],
+                         ['${WB_DATA_VOLUME:-./data}:/opt/workbuddy'],
+                         '只该有一条挂载；多一条就要求宿主预先建子目录')
+        env = svc['environment']
+        self.assertEqual(env['WB2API_BASE'], 'http://127.0.0.1:7863',
+                         '同容器内要用回环，不是 host.docker.internal 或服务名')
+        self.assertEqual(str(env['WB2API_EMBEDDED']), '1')
+        self.assertEqual(env['WB_DATA_DIR'], '/opt/workbuddy/manager')
+        self.assertEqual(env['WB_AUTH_DIR'], '/opt/workbuddy/workbuddy2api/auths')
+        self.assertEqual(env['WB_UPSTREAM_CONFIG'],
+                         '/opt/workbuddy/workbuddy2api/config.json')
+        self.assertEqual(len([p for p in svc['ports'] if not str(p).startswith('#')]), 1,
+                         '默认只发布面板端口；7863 不该暴露到宿主')
+
+    def test_stop_grace_period_outlasts_uvicorn(self) -> None:
+        import yaml
+        dc = yaml.safe_load((self.ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        grace = str(dc['services']['workbuddy-manager']['stop_grace_period'])
+        self.assertTrue(grace.endswith('s'), f'stop_grace_period 格式异常：{grace}')
+        self.assertGreaterEqual(int(grace[:-1]), 25,
+                                'uvicorn 的优雅退出上限是 20s，这里必须更长')
+
+    def test_task_script_does_not_need_host_source(self) -> None:
+        src = (self.ROOT / 'server' / 'services' / 'taskrun.py').read_text(encoding='utf-8')
+        self.assertIn("_BUNDLED_SCRIPT_DIR = Path('/app/upstream/scripts')", src)
+        body = src[src.index('def _script_path()'):]
+        body = body[:body.index('def _python()')]
+        self.assertLess(body.index('_bundled_script()'), body.index('_host_script()'),
+                        '镜像自带的脚本要优先：宿主机上的历史残留会盖住与服务配套的版本')
+        self.assertLess(body.index('_host_script()'), body.index('extract_scripts'),
+                        'docker cp 只能当最后手段：它要求挂 docker.sock')
