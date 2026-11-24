@@ -445,6 +445,8 @@
     "sortDescending": "Descending",
     "sortDirectionToggle": "Currently {direction}; switch sort direction",
     "sortAddedHint": "Uses the date added recorded by this panel. Older accounts and directly copied files without a recorded date appear last.",
+    "pageSize": "Per page",
+    "pageSizeAria": "How many accounts to show per page",
     "pageInfo": "{total} accounts · page {page} / {pages}",
     "noMatchTitle": "No matching accounts",
     "noMatchDesc": "Try another keyword, or set the status filter back to “All”.",

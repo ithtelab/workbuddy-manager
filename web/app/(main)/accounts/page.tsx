@@ -109,11 +109,25 @@ import {Tooltip, TooltipContent, TooltipTrigger} from '@/components/ui/tooltip';
 /**
  * 一页显示多少个账号。
  *
- * 账号一多（几十个）整张表会把页面撑得很长，翻页比无限滚动更适合「我要找某一个号」
- * 的场景；页码条同时给出「共 N 个」，不会让人以为剩下的号不见了。
+ * 账号一多（几十个）整张表会把页面撑得很长，翻页比无限滚动更适合「我要找某一个号」的
+ * 场景；页码条同时给出「共 N 个」，不会让人以为剩下的号不见了。
  * **只有超过一页时才渲染页码条**，小池子看不到多余的控件。
+ *
+ * 20 是历史默认值，保留成「页面刚打开时的样子」——老部署升级后列表长度不变。
+ * 更大的值给「一眼扫完整个池子」的场景（50 个号时 20/页要翻三页）。
+ * 选中的值写 localStorage：它是**阅读偏好**而不是查询条件，刷新后不该复位。
  */
-const PAGE_SIZE = 20;
+const PAGE_SIZE_OPTIONS = [20, 25, 50, 100] as const;
+type PageSize = (typeof PAGE_SIZE_OPTIONS)[number];
+const DEFAULT_PAGE_SIZE: PageSize = PAGE_SIZE_OPTIONS[0];
+const PAGE_SIZE_STORAGE_KEY = 'wb.accounts.page-size';
+
+/**
+ * localStorage 里可能是任意脏数据（手改过、旧版本写的），必须过白名单才敢用：
+ * 直接 `Number()` 一个 `"abc"` 会得到 NaN，`paginate` 拿 NaN 算页数会整页空掉。
+ */
+const isPageSize = (v: unknown): v is PageSize =>
+  PAGE_SIZE_OPTIONS.includes(v as PageSize);
 
 /**
  * 账号 → 4 组展示语义。
@@ -184,6 +198,13 @@ export default function AccountsPage() {
   /** 正在被拖动的账号 uid；null = 没在拖（行上据此出高亮） */
   const [draggingUid, setDraggingUid] = useState<string | null>(null);
   const [page, setPage] = useState(1);
+  /**
+   * 每页显示多少个账号。
+   *
+   * 首帧用默认值、挂载后再读偏好：服务端预渲染读不到 localStorage，直接读会让
+   * SSR 与客户端首帧不一致（同 layout 里那几处偏好的处理）。
+   */
+  const [pageSize, setPageSize] = useState<PageSize>(DEFAULT_PAGE_SIZE);
   /**
    * 账号分组（多账号池）：一个分组 = 一套上游实例（账号池）。
    * null = 默认分组（升级前那套，行为逐字不变）；其余 = 上游记录的 id。
@@ -511,7 +532,30 @@ export default function AccountsPage() {
     [visible, q, statusGroup, sort, sortDirection, liveCredits, manualOrder],
   );
 
-  const paged = useMemo(() => paginate(filtered, page, PAGE_SIZE), [filtered, page]);
+  /**
+   * 读回「每页多少个」偏好。读不到 / 值不合法就保持默认。
+   * 依赖为空：这是**挂载时读一次**的阅读偏好，不随筛选或分页变化。
+   */
+  useEffect(() => {
+    try {
+      const raw = Number(window.localStorage.getItem(PAGE_SIZE_STORAGE_KEY));
+      if (isPageSize(raw)) setPageSize(raw);
+    } catch { /* 隐私模式 / 被禁用：按默认走，不影响其它功能 */ }
+  }, []);
+
+  /** 切换每页条数：页码归位到第 1 页 —— 第 N 页在新页大小下已不是同一批账号了。 */
+  const changePageSize = useCallback((next: PageSize) => {
+    setPageSize(next);
+    setPage(1);
+    try {
+      window.localStorage.setItem(PAGE_SIZE_STORAGE_KEY, String(next));
+    } catch { /* 写不进去只影响下次打开时的默认值 */ }
+  }, []);
+
+  const paged = useMemo(
+    () => paginate(filtered, page, pageSize),
+    [filtered, page, pageSize],
+  );
 
   /**
    * 页码越界时在**渲染期**夹回来（删掉一个账号、或改筛选让条数变少就会越界）。
@@ -1673,7 +1717,7 @@ export default function AccountsPage() {
                 </Button>
               ))}
             </div>
-            <div className="flex shrink-0 items-center gap-1.5">
+            <div className="flex shrink-0 flex-wrap items-center gap-1.5">
               <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground" />
               <Select value={sort} onValueChange={(v) => {
                 setSort(v as SortKey); setSortDirection(v === 'added' ? 'desc' : 'asc'); setPage(1);
@@ -1695,6 +1739,22 @@ export default function AccountsPage() {
                   {t(sortDirection === 'asc' ? 'accounts.sortAscending' : 'accounts.sortDescending')}
                 </Button>
               )}
+              {/* 每页条数：常驻在选择器里（不是只在多页时出现）——
+                  账号少于一页时同样要能改，否则「改成 100」之后就没法改回来了。 */}
+              <span className="flex shrink-0 items-center gap-1 pl-0.5 text-[11px] text-muted-foreground">
+                {t('accounts.pageSize')}
+              </span>
+              <Select value={String(pageSize)}
+                onValueChange={(v) => changePageSize(Number(v) as PageSize)}>
+                <SelectTrigger className="h-9 w-[92px] bg-background" aria-label={t('accounts.pageSizeAria')}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PAGE_SIZE_OPTIONS.map((n) => (
+                    <SelectItem key={n} value={String(n)}>{n}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           </div>
           {sort === 'added' && <p className="mt-2 text-xs text-muted-foreground">{t('accounts.sortAddedHint')}</p>}

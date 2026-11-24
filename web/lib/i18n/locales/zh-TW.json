@@ -418,6 +418,8 @@
     "sortDescending": "降冪",
     "sortDirectionToggle": "目前{direction}，點擊切換排序方向",
     "sortAddedHint": "依本面板記錄的加入時間排序；舊帳號或直接複製的帳號沒有歷史加入時間，排在最後。",
+    "pageSize": "每頁",
+    "pageSizeAria": "每頁顯示多少個帳號",
     "pageInfo": "共 {total} 個帳號 · 第 {page} / {pages} 頁",
     "noMatchTitle": "沒有符合的帳號",
     "noMatchDesc": "換個關鍵字，或把狀態篩選切回「全部」。",
