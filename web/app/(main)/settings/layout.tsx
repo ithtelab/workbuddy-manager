@@ -819,9 +819,20 @@ function pickValues(fields: Field[], source: Record<string, unknown> | undefined
         // 上游为 []int；表单里用 "9, 21" 这样的字符串承载，保存时再解析回数组
         out[f.key] = Array.isArray(raw) ? hoursToText(raw) : hoursToText(f.def);
         break;
-      case 'duration':
-        out[f.key] = durationOk(f, raw) ? String(raw).trim() : f.def;
+      case 'duration': {
+        // **必须先归一成字符串再判合法，且「键不存在」要直接回退默认值**。
+        //
+        // 原写法 `durationOk(f, raw) ? String(raw).trim() : f.def` 有个错位：
+        // `durationOk` 内部是 `String(raw ?? '')`，所以 `raw === undefined`
+        // （config.json 里没有这个键）会被当成**空串**判成合法（`allowEmpty`
+        // 的 credit_exhausted 就是这样），紧接着 `String(raw).trim()` 却把
+        // 字符串 "undefined" 塞进表单 —— 设置页那一栏显示 undefined + 红框。
+        // 归一化后校验与取值看的是同一个值；键不存在则明确走默认值。
+        const present = raw !== undefined && raw !== null;
+        const text = present ? String(raw).trim() : '';
+        out[f.key] = present && durationOk(f, text) ? text : f.def;
         break;
+      }
       case 'select':
         // 只接受枚举内的取值；配置里是别的值（上游改过枚举）时回退默认
         out[f.key] = typeof raw === 'string' && f.options.some((o) => o.value === raw) ? raw : f.def;

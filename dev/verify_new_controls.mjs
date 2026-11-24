@@ -118,6 +118,19 @@ if (hasField) {
   const input = await row.asElement().$('input');
   step(!!input, '这一栏有输入框');
 
+  // 回归：config.json 里**没有** cooldown.credit_exhausted 时，输入框必须是空、
+  // 不能有格式错误。此前 pickValues 的 `durationOk(f, raw) ? String(raw).trim() : f.def`
+  // 对 `raw === undefined` 判成合法（durationOk 内部按空串处理），随后
+  // `String(undefined)` 把字符串 "undefined" 填进输入框并亮红框。
+  const blank = await page.evaluate((el) => {
+    const i = el.querySelector('input');
+    return {value: i ? i.value : null,
+            hasErr: !!el.querySelector('.text-destructive')};
+  }, row);
+  step(blank.value === '' && !blank.hasErr,
+       '配置缺该键时输入框为空、无格式错误（不显示 undefined）',
+       `value=${JSON.stringify(blank.value)} hasErr=${blank.hasErr}`);
+
   // 填 0：前端必须**当场**报格式错（而不是等保存后被上游拒绝）
   await input.fill('0');
   await page.waitForTimeout(250);
