@@ -1,0 +1,115 @@
+diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -889,12 +889,21 @@
+ }
+ 
+ // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
+ // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
+ // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
+ // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
++// keepaliveRefreshWindow 保活只刷「剩余有效期小于该窗口」的号。
++//
++// 为什么要这道闸：AT 有效期 30 天，而保活每天都把全池号刷一遍。30+ 个号在同一分钟
++// 内刷新会被上游判为过频（429 Too Many Requests，见 v2.11.12 #413 的提示）；429 之后
++// 这些号仍带着已过期的 access token 继续打聊天接口，网关层直接返回
++// 「401 Authorization Required」（openresty/APISIX 的 HTML 页），从使用方看就是
++// 「大批账号同时 401」。只刷快过期的号，量级从 30+/天 降到 0~3/天。
++const keepaliveRefreshWindow = 72 * time.Hour
++
+ func (s *Scheduler) RunKeepaliveNow() { s.runKeepalive(context.Background()) }
+ 
+ func (s *Scheduler) runKeepalive(ctx context.Context) {
+ 	checked, okN, failed, skipped := 0, 0, 0, 0
+ 	defer func() {
+ 		log.Printf("keepalive done: checked=%d ok=%d failed=%d skipped=%d", checked, okN, failed, skipped)
+@@ -907,24 +916,38 @@
+ 		}
+ 		a := s.cfg.Pool.AuthByUID(st.UID)
+ 		if a == nil || a.RefreshTokenValue() == "" {
+ 			skipped++
+ 			continue
+ 		}
+-		if !first && !sleepCtx(ctx, s.accountGap(ctx, 0)) {
++		// 只刷新「临近到期」的号（默认 72 小时内）。AT 有效期 30 天，
++		// 每天全量刷新 30+ 个号会在同一分钟打出几十次 token 刷新 → 上游 429；
++		// 429 之后这些号带着过期 AT 继续请求，网关层直接回 401 HTML（APISIX），
++		// 表现为「大批账号同时 401」。
++		if !a.NeedsRefresh(keepaliveRefreshWindow) {
++			skipped++
++			continue
++		}
++		if !first && !sleepCtx(ctx, s.accountGap(ctx, 2*time.Second)) {
+ 			return
+ 		}
+ 		if ctx.Err() != nil {
+ 			return
+ 		}
+ 		first = false
+ 		checked++
+ 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
++			var ue *upstream.Error
++			// 429 是上游限流，不是账号故障：记跳过，别算失败、也别触发 session_dead 计数。
++			if errors.As(err, &ue) && ue.Kind == upstream.ErrSoftRate {
++				skipped++
++				log.Printf("keepalive %s: rate limited upstream, skip", logfmt.Label(st.UID, st.Nickname))
++				continue
++			}
+ 			failed++
+ 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+-			var ue *upstream.Error
+ 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+ 				if s.cfg.Pool.NoteSessionDead(st.UID) {
+ 					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
+ 				}
+ 			}
+ 			continue
+diff --git a/internal/scheduler/refresh_race_test.go b/internal/scheduler/refresh_race_test.go
+--- a/internal/scheduler/refresh_race_test.go
++++ b/internal/scheduler/refresh_race_test.go
+@@ -16,12 +16,13 @@
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
++	"time"
+ 
+ 	"workbuddy2api/internal/auth"
+ 	"workbuddy2api/internal/pool"
+ 	"workbuddy2api/internal/upstream"
+ )
+ 
+@@ -36,14 +37,14 @@
+ 		}
+ 		w.Write([]byte(`{"code":0,"data":{"accessToken":"newat","expiresIn":3600}}`))
+ 	}))
+ 	defer srv.Close()
+ 
+ 	p := pool.New("")
+-	p.Add(&auth.Auth{UID: "no-rt", AccessToken: "at", ExpiresAt: 9999999999})
+-	p.Add(&auth.Auth{UID: "has-rt", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.Add(&auth.Auth{UID: "no-rt", AccessToken: "at", ExpiresAt: time.Now().Add(2 * time.Hour).Unix()})
++	p.Add(&auth.Auth{UID: "has-rt", AccessToken: "at", RefreshToken: "rt", ExpiresAt: time.Now().Add(2 * time.Hour).Unix()})
+ 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+ 	s := New(Config{Pool: p, Upstream: up})
+ 
+ 	s.RunKeepaliveNow()
+ 
+ 	if got := refreshCalls.Load(); got != 1 {
+@@ -65,13 +66,13 @@
+ 		// 守卫读与写落在同一字段上（否则该写入被挡掉，竞争不可见）。
+ 		w.Write([]byte(`{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":3600}}`))
+ 	}))
+ 	defer srv.Close()
+ 
+ 	p := pool.New("")
+-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: time.Now().Add(2 * time.Hour).Unix()})
+ 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+ 	s := New(Config{Pool: p, Upstream: up})
+ 
+ 	var wg sync.WaitGroup
+ 	stop := make(chan struct{})
+ 
