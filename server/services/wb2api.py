@@ -191,6 +191,22 @@ def token_issued_at(access_token: str) -> int | None:
     return times[0] if times else None
 
 
+_SESSION_DEAD_CACHE: dict = {'at': 0.0, 'set': set()}
+
+
+def _session_dead_cached() -> set[str]:
+    """30 秒内复用同一份「登录态失效」集合，避免列表里每个账号查一次库。"""
+    now = time.time()
+    if now - float(_SESSION_DEAD_CACHE['at']) > 30:
+        try:
+            from .credits import session_dead_uids
+            _SESSION_DEAD_CACHE['set'] = session_dead_uids()
+        except Exception:  # noqa: BLE001
+            pass
+        _SESSION_DEAD_CACHE['at'] = now
+    return _SESSION_DEAD_CACHE['set']  # type: ignore[return-value]
+
+
 def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
     """读取 auths/ 目录下的本地账号（与 /status 的运行时状态互补）。
 
@@ -331,9 +347,16 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
             # 反而要去查文件（实测会在界面上产生这种误导）。
             if a.get('disabled_by_panel') and not a.get('invalid_reason'):
                 a['invalid_reason'] = '已在本面板临时禁用（不会被上游加载）'
+            if a.get('uid') in _session_dead_cached() and not a.get('invalid_reason'):
+                a['invalid_reason'] = '登录态失效（被上游作废），需重登'
             continue
         credits = p.get('credits')
         a['credits'] = int(credits) if isinstance(credits, (int, float)) else None
+        if a.get('uid') in _session_dead_cached():
+            # 登录态已失效：快照是「上次调度时记下的」，继续展示会误导，置空并提示重登。
+            a['credits'] = None
+            if not a.get('invalid_reason'):
+                a['invalid_reason'] = '登录态失效（被上游作废），需重登'
         a['cooling'] = bool(p.get('cooling'))
         # 冷却剩余秒数：上游状态机给的是权威值（可能是它解析出的「上游重置时刻」，
         # 也可能是无时间文案时的有界退避）。展示出来，用户就知道还要等多久，

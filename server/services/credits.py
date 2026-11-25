@@ -208,6 +208,80 @@ def record_balance(uid: str, nickname: str, credits: int | float | None,
     return income or None
 
 
+# ── 登录态失效标记（本地增强）────────────────────────────────────────────
+# 为什么需要它：账号登录态被上游作废后，billing 接口返回 APISIX 的 401 HTML，
+# 面板拿不到实时积分，只能回退展示 /status 旧快照。那个数字会误导用户以为
+# 账号还能用。这里把「查询遇到 401」记下来，列表据此显示「需重登」。
+_SESSION_DEAD_KEY = 'credits_session_dead'
+_SESSION_DEAD_TTL = 7 * 86400
+
+
+def _session_dead_raw() -> dict:
+    try:
+        raw = db.get_setting(_SESSION_DEAD_KEY)
+    except Exception:  # noqa: BLE001
+        return {}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def session_dead_uids() -> set[str]:
+    """最近 7 天内被判定「登录态失效」的 uid 集合。"""
+    now = time.time()
+    out = set()
+    for uid, ts in _session_dead_raw().items():
+        try:
+            if now - float(ts) <= _SESSION_DEAD_TTL:
+                out.add(str(uid))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _set_session_dead(uid: str, dead: bool) -> None:
+    if not uid:
+        return
+    marks = {}
+    for k, v in _session_dead_raw().items():
+        try:
+            marks[str(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    if dead:
+        marks[uid] = time.time()
+    else:
+        marks.pop(uid, None)
+    try:
+        db.set_setting(_SESSION_DEAD_KEY, json.dumps(marks))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _refresh_confirms_dead(auth: dict) -> bool:
+    """用一次真实刷新确认「登录态是否真的失效」。
+
+    为什么必须二次确认：billing 接口的 401 有两种来源——
+      1) 登录态真的被上游作废（刷新也会 401）
+      2) 上游网关瞬时抖动（同一批账号一起 401，几十秒后自愈）
+    只按 (1) 打标记；否则一次抖动就会把整批好号标成「需重登」。
+    """
+    try:
+        res = await tencent.refresh_token(auth)
+    except Exception:  # noqa: BLE001 —— 网络异常既不能证明死也不能证明活
+        return False
+    ok = res[0] if isinstance(res, (tuple, list)) else bool(res)
+    if ok:
+        return False
+    detail = ''
+    if isinstance(res, (tuple, list)) and len(res) > 1:
+        detail = str(res[1])
+    return '401' in detail or '失效' in detail
+
+
 async def get_credits(
     auth: dict,
     *,
@@ -229,6 +303,20 @@ async def get_credits(
             return ok, credits, f'{message}（缓存）', True, cache_age(uid), expiries
 
     ok, credits, message, expiries = await tencent.fetch_credits(auth)
+    if uid:
+        # 单次 billing 401 **不能**判定登录态失效：上游 APISIX 会整批抖一下
+        # （实测一次抖动让 14 个正常账号同时回 401），误判会把好号标成「需重登」。
+        # 只有「刷新 token 也 401」才算真的失效；刷新成功则重试一次。
+        if ok:
+            _set_session_dead(uid, False)
+        elif '401' in str(message):
+            if await _refresh_confirms_dead(auth):
+                _set_session_dead(uid, True)
+            else:
+                _set_session_dead(uid, False)
+                ok2, credits2, message2, expiries2 = await tencent.fetch_credits(auth)
+                if ok2:
+                    ok, credits, message, expiries = ok2, credits2, message2, expiries2
     if uid:
         # 仅缓存成功结果：失败往往是临时网络问题，不该被缓存住
         if ok:
