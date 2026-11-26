@@ -26,7 +26,7 @@ from .routers import (
 )
 from .services import (
     accountlog, accountrisk, autoupdate, cooling, dailyplan, gatewaycors, modelrecovery, pgsync,
-    renew, tasklog, taskrun, watchdog,
+    renew, speedhealth, tasklog, taskrun, watchdog,
 )
 
 # 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
@@ -89,6 +89,7 @@ def _start_services() -> None:
     # 定时冷却变成永久停用（见 services/cooling.py）。
     cooling.start_scheduler()
     modelrecovery.start_scheduler()
+    speedhealth.start_scheduler()
     # 每日任务计划（签到 / 领奖 / 做任务）：管理端自己的调度器，把「一键」动作
     # 做成每天到点自动跑。默认全部关闭，由用户在账号页显式开启（full 有风控风险）。
     dailyplan.start_scheduler()
@@ -113,6 +114,7 @@ async def _stop_services() -> None:
     renew.stop_scheduler()
     cooling.stop_scheduler()
     modelrecovery.stop_scheduler()
+    speedhealth.stop_scheduler()
     dailyplan.stop_scheduler()
     accountlog.stop_collector()
     pgsync.stop_scheduler()

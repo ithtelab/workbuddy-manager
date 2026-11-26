@@ -519,20 +519,7 @@ async def account_set_weight(
 def _speed_context(group: dict, window: int) -> tuple[dict, dict]:
     """收集吞吐 → 结合当前权重算出建议。只读，不写文件。"""
     auth_dir = _require_dir(group)
-    stats = speedhealth.collect(window)
-    index = speedhealth.index_accounts(auth_dir)
-    weights: dict[str, float] = {}
-    for uid, acc in index.items():
-        try:
-            weights[uid] = float(acc.get('weight') or 1.0)
-        except (TypeError, ValueError):
-            weights[uid] = 1.0
-    result = speedhealth.plan(stats, current_weight=weights)
-    for change in result['changes']:
-        acc = index.get(change['uid']) or {}
-        change['file'] = acc.get('file') or ''
-        change['nickname'] = acc.get('nickname') or ''
-    return result, index
+    return speedhealth.evaluate_for_dir(auth_dir, window), {}
 
 
 @router.get('/accounts/speed-health')
@@ -552,7 +539,37 @@ async def account_speed_health(
     """
     group = _group(upstream_id)
     result, _index = _speed_context(group, window)
-    return {'window_seconds': window, **result}
+    return {'window_seconds': window, 'scheduler': speedhealth.state(), **result}
+
+
+@router.get('/accounts/speed-health/settings')
+async def account_speed_health_settings(
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """读自动降权的开关（默认关）与上次运行结果。"""
+    return speedhealth.state()
+
+
+@router.put('/accounts/speed-health/settings')
+async def account_speed_health_settings_put(
+    body: dict = Body(...),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """改开关 / 间隔 / 窗口 / 是否预演。改完立即生效（调度器每轮重读设置）。"""
+    try:
+        saved = speedhealth.save_settings(body)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    security.audit(user, 'update_speed_health', '', json.dumps(saved, ensure_ascii=False))
+    return {'ok': True, **saved}
+
+
+@router.post('/accounts/speed-health/run')
+async def account_speed_health_run(
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """立刻跑一轮（受 enabled 开关约束，不会绕过它）。"""
+    return await speedhealth.run_once()
 
 
 @router.post('/accounts/speed-health/apply')

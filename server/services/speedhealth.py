@@ -39,13 +39,17 @@ issue #494：同一模型、同一客户端、全 200 的情况下，一部分�
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import statistics
 import time
 from pathlib import Path
 
-from .. import db
+from .. import db, upstreamsvc
 from . import wb2api
+
+logger = logging.getLogger(__name__)
 
 WINDOW_SECONDS = 15 * 60
 MIN_TOKENS = 300          # 低于此值的样本不进统计（首帧占比过大）
@@ -180,3 +184,149 @@ def index_accounts(auth_dir: Path) -> dict[str, dict]:
             continue
         out[uid[:8]] = acc
     return out
+
+
+# ---------------------------------------------------------------- 调度与设置
+
+SETTINGS_KEY = 'speed_health'
+TICK_SECONDS = 60
+
+DEFAULT_SETTINGS = {
+    'enabled': False,          # 默认关闭：不替用户擅自改权重
+    'interval_minutes': 15,    # 多久评估一次
+    'window_minutes': 15,      # 用多长的窗口算速率
+    'dry_run': True,           # 默认只出建议，不落盘
+}
+
+_MIN_INTERVAL = 5
+_MAX_INTERVAL = 24 * 60
+
+_task: asyncio.Task | None = None
+_state: dict = {'last_at': 0.0, 'last_result': None, 'last_error': ''}
+
+
+def normalize_settings(raw: object) -> dict:
+    """把存进 settings 的 JSON 收敛成可用配置；坏值一律回默认。"""
+    src = raw if isinstance(raw, dict) else {}
+
+    def _int(key: str, lo: int, hi: int) -> int:
+        value = src.get(key, DEFAULT_SETTINGS[key])
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return int(DEFAULT_SETTINGS[key])
+        return max(lo, min(hi, value))
+
+    enabled = src.get('enabled', DEFAULT_SETTINGS['enabled'])
+    dry = src.get('dry_run', DEFAULT_SETTINGS['dry_run'])
+    return {
+        'enabled': bool(enabled) if isinstance(enabled, bool) else str(enabled).lower() in ('1', 'true', 'on'),
+        'interval_minutes': _int('interval_minutes', _MIN_INTERVAL, _MAX_INTERVAL),
+        'window_minutes': _int('window_minutes', _MIN_INTERVAL, _MAX_INTERVAL),
+        'dry_run': bool(dry) if isinstance(dry, bool) else str(dry).lower() not in ('0', 'false', 'off'),
+    }
+
+
+def load_settings() -> dict:
+    try:
+        return normalize_settings(db.get_setting(SETTINGS_KEY, None))
+    except Exception:  # noqa: BLE001 —— 读设置失败不该让调度器炸
+        return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(patch: dict) -> dict:
+    merged = {**load_settings(), **(patch or {})}
+    settings = normalize_settings(merged)
+    db.set_setting(SETTINGS_KEY, settings)
+    return settings
+
+
+def evaluate_for_dir(auth_dir: Path, window_seconds: int) -> dict:
+    """收集 + 评估 + 把 uid 映射到账号文件。只读。"""
+    stats = collect(window_seconds)
+    index = index_accounts(auth_dir)
+    weights: dict[str, float] = {}
+    for uid, acc in index.items():
+        try:
+            weights[uid] = float(acc.get('weight') or 1.0)
+        except (TypeError, ValueError):
+            weights[uid] = 1.0
+    result = plan(stats, current_weight=weights)
+    for change in result['changes']:
+        acc = index.get(change['uid']) or {}
+        change['file'] = acc.get('file') or ''
+        change['nickname'] = acc.get('nickname') or ''
+    return result
+
+
+def state() -> dict:
+    return {**_state, 'settings': load_settings()}
+
+
+async def run_once(now: float | None = None) -> dict:
+    """跑一轮：评估每个上游分组的账号池，按设置决定是否落盘。"""
+    now = time.time() if now is None else now
+    settings = load_settings()
+    if not settings['enabled']:
+        return {'skipped': 'disabled'}
+    window = settings['window_minutes'] * 60
+    groups = 0
+    changed = 0
+    details = []
+    for group in upstreamsvc.list_upstreams():
+        if not group.get('enabled'):
+            continue
+        auth_dir = str(group.get('auth_dir') or '').strip()
+        if not auth_dir:
+            continue
+        directory = Path(auth_dir)
+        if not directory.is_dir():
+            continue
+        groups += 1
+        try:
+            result = evaluate_for_dir(directory, window)
+            applied = apply(result['changes'], directory, dry_run=settings['dry_run'])
+            changed += sum(1 for item in applied if item.get('ok') and not item.get('dry_run'))
+            details.append({
+                'group': group.get('name') or '默认',
+                'pool_median': result['pool_median'],
+                'reason': result['reason'],
+                'changes': applied,
+            })
+        except Exception as exc:  # noqa: BLE001 —— 单个分组失败不影响其它
+            logger.warning('吞吐降权失败（%s）: %s', group.get('name'), exc)
+            details.append({'group': group.get('name') or '默认', 'error': str(exc)})
+    _state.update({'last_at': now, 'last_result': {'groups': groups, 'changed': changed,
+                                                   'dry_run': settings['dry_run'],
+                                                   'details': details}, 'last_error': ''})
+    if groups:
+        logger.info('吞吐降权：%d 个分组，%s %d 个账号',
+                    groups, '预演' if settings['dry_run'] else '实际调整', changed)
+    return _state['last_result'] or {'skipped': 'no-group'}
+
+
+async def _loop() -> None:
+    while True:
+        try:
+            settings = load_settings()
+            await asyncio.sleep(max(_MIN_INTERVAL, settings['interval_minutes']) * 60)
+            await run_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _state['last_error'] = str(exc)
+            logger.warning('吞吐降权调度异常: %s', exc)
+            await asyncio.sleep(TICK_SECONDS)
+
+
+def start_scheduler() -> None:
+    global _task
+    if _task is None or _task.done():
+        _task = asyncio.get_running_loop().create_task(_loop())
+
+
+def stop_scheduler() -> None:
+    global _task
+    if _task and not _task.done():
+        _task.cancel()
+    _task = None
