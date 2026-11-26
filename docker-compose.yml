@@ -78,6 +78,10 @@ services:
       # WB_BASE_PATH: /workbuddy-manager
       # 反向代理在后面时，真实 IP 取自它覆盖写入的 X-Real-IP
       WB_TRUST_PROXY: "1"
+      # 流式响应的「内容空闲」上限（秒，0 = 关闭，留空 = 默认 120）。
+      # 上游开着保活时，逐字节读超时会被保活帧不断重置，正文不产出的请求能挂到
+      # 十几分钟；这里按「距上一个正文帧」计时，超时主动断开（issue #485）。
+      WB_STREAM_IDLE_TIMEOUT: ${WB_STREAM_IDLE_TIMEOUT:-}
       # 生产环境不暴露 /docs 与 /openapi.json
       WB_ENABLE_DOCS: "0"
       # 出口代理（可选）：写在与本文件同目录的 .env 里即可，compose 用 ${} 取过来。

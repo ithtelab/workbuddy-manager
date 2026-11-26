@@ -1138,9 +1138,22 @@ async def messages(request: Request):
         error_text: str | None = None
         first_token_ms: int | None = None
         abort = False   # 中途出错需中止转发（缓冲超限 / 上游回 error 帧）
+        # 内容空闲看门狗（issue #485）。只按正文续命：保活帧会不断重置 httpx
+        # 的 read timeout，于是「连接还活着、正文早就不产出」的流可以挂十几分钟。
+        # 断开后走下面既有的 error 事件收尾（发在 message_stop 之前）。
+        idle_limit = config.STREAM_IDLE_TIMEOUT
+        last_content_at = time.monotonic()
 
         try:
             async for chunk in resp.aiter_bytes():
+                if await request.is_disconnected():
+                    error_text = 'client disconnected'
+                    abort = True
+                    break
+                if idle_limit > 0 and time.monotonic() - last_content_at > idle_limit:
+                    error_text = 'upstream idle for %ds without content' % idle_limit
+                    abort = True
+                    break
                 piece = chunk.decode('utf-8', errors='ignore')
                 raw_stream.feed(piece)
                 pending += piece
@@ -1206,8 +1219,10 @@ async def messages(request: Request):
                         client_stream.feed(event.decode('utf-8', 'ignore'))
                         yield event
 
-                    if translator.saw_content and first_token_ms is None:
-                        first_token_ms = int((time.time() - started) * 1000)
+                    if translator.saw_content:
+                        last_content_at = time.monotonic()
+                        if first_token_ms is None:
+                            first_token_ms = int((time.time() - started) * 1000)
 
                 if abort:
                     break

@@ -86,6 +86,12 @@ BASE_PATH = f'/{_BASE_PATH_RAW}' if _BASE_PATH_RAW else ''
 
 # 网络
 UPSTREAM_TIMEOUT = _env_int('WB_UPSTREAM_TIMEOUT', 120)
+# 流式转发的「内容空闲」上限（秒），0 = 关闭。issue #485：
+#   `UPSTREAM_TIMEOUT` 是 httpx 的 read timeout，**每收到一个字节就重置**；
+#   而上游开着 keepalive 时，保活帧会不断把它刷新 —— 于是一条「连接还在、
+#   正文早就不产出了」的请求可以挂到十几分钟（实测 999 秒），而客户端早在
+#   600 秒就弃连了。这里按「距上一个正文帧」计时，保活帧不续命。
+STREAM_IDLE_TIMEOUT = _env_int('WB_STREAM_IDLE_TIMEOUT', 120)
 TENCENT_TIMEOUT = _env_int('WB_TENCENT_TIMEOUT', 15)
 # 「全部签到」的并发上限：太低会拖到前端超时（几十个账号时），
 # 太高又容易触发腾讯风控。5 是保守且够快的取值。

@@ -1883,9 +1883,20 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
             defer_finish=True)
         error_text: str | None = None
         first_token_ms: int | None = None
+        # 内容空闲看门狗（issue #485）。只按正文续命：保活帧会不断重置 httpx
+        # 的 read timeout，于是「连接还活着、正文早就不产出」的流可以挂十几分钟，
+        # 一直占着上游并发名额。断开时走下面既有的 response.failed 收尾。
+        idle_limit = config.STREAM_IDLE_TIMEOUT
+        last_content_at = time.monotonic()
 
         try:
             async for chunk in resp.aiter_bytes():
+                if await request.is_disconnected():
+                    error_text = 'client disconnected'
+                    break
+                if idle_limit > 0 and time.monotonic() - last_content_at > idle_limit:
+                    error_text = 'upstream idle for %ds without content' % idle_limit
+                    break
                 piece = chunk.decode('utf-8', errors='ignore')
                 raw_stream.feed(piece)
                 pending += piece
@@ -1927,8 +1938,10 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                         client_stream.feed(event.decode('utf-8', 'ignore'))
                         yield event
 
-                    if translator.saw_content and first_token_ms is None:
-                        first_token_ms = int((time.time() - started) * 1000)
+                    if translator.saw_content:
+                        last_content_at = time.monotonic()
+                        if first_token_ms is None:
+                            first_token_ms = int((time.time() - started) * 1000)
 
                 if error_text:
                     break

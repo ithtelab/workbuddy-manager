@@ -41,6 +41,10 @@ services:
       # 用**服务名**而不是 host.docker.internal：两个容器在同一个 compose 网络里，
       # 服务名就是稳定地址，也不依赖宿主端口是否发布。
       WB2API_BASE: http://workbuddy2api:7863
+      # 流式响应的「内容空闲」上限（秒，0 = 关闭，留空 = 默认 120）。
+      # 上游开着保活时，逐字节读超时会被保活帧不断重置，正文不产出的请求能挂到
+      # 十几分钟；这里按「距上一个正文帧」计时，超时主动断开（issue #485）。
+      WB_STREAM_IDLE_TIMEOUT: ${WB_STREAM_IDLE_TIMEOUT:-}
       # 容器名，供依赖 docker 的功能定位上游（本文件默认不挂 docker.sock，
       # 这些功能会如实降级为「请到宿主机操作」）。
       WB2API_CONTAINER: workbuddy2api
