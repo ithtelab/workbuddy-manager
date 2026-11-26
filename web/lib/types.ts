@@ -103,6 +103,13 @@ export interface Account {
   /** 已知上游不会加载该文件时的原因（空 = 未发现明显问题） */
   invalid_reason?: string;
   /**
+   * 登录态被上游作废（billing 连续返回 401，issue #490）。
+   *
+   * 为 true 时后端已把 `credits` 置空（旧快照会误导），界面应显示「需重登」
+   * 而不是一个看起来正常的余额。重新登录成功或任意一次积分查询成功后自动清除。
+   */
+  needs_relogin?: boolean;
+  /**
    * 本面板**主动临时停用**（issue #21）——文件名带 `.disabled` 后缀，
    * 上游的 `workbuddy*.json` glob 因此不再匹配它、不加载该账号。
    *

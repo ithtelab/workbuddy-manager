@@ -662,7 +662,9 @@
     "reloginQueueEmptyDesc": "Signing in again can repair expired credentials or sessions; it cannot lift an upstream account ban.",
     "reloginQueueCurrentHint": "Test connectivity or start a new authorization login",
     "reloginQueueWaitingCount": "Queue ({count})",
-    "reloginQueueListHint": "Click a row to switch · Re-login jumps straight in"
+    "reloginQueueListHint": "Click a row to switch · Re-login jumps straight in",
+    "badgeNeedsRelogin": "● Re-login",
+    "badgeNeedsReloginTitle": "This account's session was invalidated upstream (billing kept returning 401). Use Re-login to scan again; the flag clears automatically after a successful login."
   },
   "whatsNew": {
     "title": "What's new in v{version}",

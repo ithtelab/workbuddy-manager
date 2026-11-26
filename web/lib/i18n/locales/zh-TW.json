@@ -635,7 +635,9 @@
     "reloginQueueEmptyDesc": "重新登入僅適用於憑證或工作階段失效，不會解除上游帳號封禁。",
     "reloginQueueCurrentHint": "測試其連通性，或發起重新授權登入",
     "reloginQueueWaitingCount": "列表（共 {count} 個）",
-    "reloginQueueListHint": "點擊列切換 · 點重登直達"
+    "reloginQueueListHint": "點擊列切換 · 點重登直達",
+    "badgeNeedsRelogin": "● 需重登",
+    "badgeNeedsReloginTitle": "登入狀態已被上游作廢（積分查詢連續回傳 401）。請點「重登」重新掃碼；重新登入成功後標記會自動清除。"
   },
   "whatsNew": {
     "title": "本次更新：v{version}",

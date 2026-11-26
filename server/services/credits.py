@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import time
 import uuid
 
@@ -208,6 +209,121 @@ def record_balance(uid: str, nickname: str, credits: int | float | None,
     return income or None
 
 
+# ── 登录态失效标记（issue #490）────────────────────────────────────────
+#
+# 现场：账号的登录态被上游作废后，billing 接口返回 401（APISIX 拒在网关层，
+# 响应体常常是一段 HTML），面板拿不到实时积分，只能回退展示 /status 里的旧
+# 快照 —— 那个数字会误导用户以为账号还能用。
+#
+# 判定克制是这里最重要的部分：
+#   · 只认**明确的 401**（`查询失败 code=401`）。非 401 的失败一律不动标记，
+#     否则一次超时就把有效告警抹掉了；
+#   · 连续 `_SESSION_DEAD_MIN_FAILS` 次才置位。上游自己的分类里，纯 401 可能
+#     是网关抖动或 token 轮换竞态（`internal/upstream/client.go` 的
+#     `ErrAuthRejected` 注释），一次就判死太重；
+#   · 置位后 7 天有效；期间任一次查询成功（或重登成功）立即清除。
+_SESSION_DEAD_KEY = 'credits_session_dead'
+_SESSION_DEAD_TTL = 7 * 86400
+_SESSION_DEAD_MIN_FAILS = 2
+_401_RE = re.compile(r'code=401\b')
+
+
+def _is_upstream_401(message: str) -> bool:
+    """错误文案是否是**上游**的 401。
+
+    `tencent.fetch_credits` 的失败文案有两种形态：
+      · `查询失败 code=<业务码>` —— 拿到了响应，业务码来自信封或 HTTP 状态；
+      · `查询异常: ...` —— 网络/代理层异常，不算登录态失效。
+
+    代理认证失败通常以 `查询异常` 出现（httpx 的 ProxyError），不会命中这里；
+    这里再排除文案里带「代理/proxy」的兜底形态。
+    """
+    text = str(message or '')
+    if '查询异常' in text:
+        return False
+    if '代理' in text or 'proxy' in text.lower():
+        return False
+    return bool(_401_RE.search(text))
+
+
+def _session_dead_raw() -> dict:
+    """原始标记表：{uid: {'n': 连续失败次数, 'at': 首次置位时刻}}。"""
+    try:
+        raw = db.get_setting(_SESSION_DEAD_KEY)
+    except Exception:  # noqa: BLE001
+        return {}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            try:
+                out[str(k)] = {'n': int(v.get('n') or 0),
+                               'at': float(v.get('at') or 0)}
+            except (TypeError, ValueError):
+                continue
+        else:
+            # 兼容旧形态（uid -> 时间戳）：当作已置位 1 次。
+            try:
+                out[str(k)] = {'n': _SESSION_DEAD_MIN_FAILS, 'at': float(v)}
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def session_dead_uids() -> set[str]:
+    """已置位且未过期的「登录态失效」uid 集合。"""
+    now = time.time()
+    out: set[str] = set()
+    for uid, rec in _session_dead_raw().items():
+        if rec['n'] < _SESSION_DEAD_MIN_FAILS:
+            continue
+        if now - rec['at'] <= _SESSION_DEAD_TTL:
+            out.add(uid)
+    return out
+
+
+def _save_session_dead(marks: dict) -> None:
+    try:
+        db.set_setting(_SESSION_DEAD_KEY, json.dumps(marks, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def note_session_failure(uid: str) -> None:
+    """记一次 401。只在计数变化时写库（列表轮询会频繁调用）。"""
+    if not uid:
+        return
+    uid = str(uid)
+    marks = _session_dead_raw()
+    rec = marks.get(uid) or {'n': 0, 'at': 0.0}
+    n = min(int(rec['n']) + 1, 99)
+    at = rec['at']
+    if n >= _SESSION_DEAD_MIN_FAILS and not at:
+        at = time.time()   # 首次达到阈值 → TTL 从这里起算
+    if n == rec['n'] and at == rec['at']:
+        return
+    marks[uid] = {'n': n, 'at': at}
+    _save_session_dead(marks)
+
+
+def clear_session_dead(uid: str) -> None:
+    """清除标记（查询成功 / 重登成功 / 账号删除）。"""
+    if not uid:
+        return
+    uid = str(uid)
+    marks = _session_dead_raw()
+    if uid not in marks:
+        return
+    marks.pop(uid, None)
+    _save_session_dead(marks)
+
+
 async def get_credits(
     auth: dict,
     *,
@@ -230,6 +346,13 @@ async def get_credits(
 
     ok, credits, message, expiries = await tencent.fetch_credits(auth)
     if uid:
+        # 登录态失效标记：只在**明确的 401** 上计数，且连续达到阈值才算数。
+        # 非 401 的临时失败（超时 / 5xx / 代理错误）什么都不做 —— 不能把已有的
+        # 有效标记清掉，否则一次网络抖动就抹掉告警。
+        if ok:
+            clear_session_dead(uid)
+        elif _is_upstream_401(message):
+            note_session_failure(uid)
         # 仅缓存成功结果：失败往往是临时网络问题，不该被缓存住
         if ok:
             _cache[uid] = (time.time(), ok, credits, message, expiries)
@@ -260,6 +383,8 @@ def forget(uid: str) -> None:
         snap.pop(uid, None)
         _save_snapshot(snap)
     _cache.pop(uid, None)
+    # 账号已经删了，登录态失效标记也一并清掉，避免 uid 被复用时误报。
+    clear_session_dead(uid)
 
 
 def invalidate(uid: str | None = None) -> None:

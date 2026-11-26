@@ -635,7 +635,9 @@
     "reloginQueueEmptyDesc": "重新登录只适用于凭证或会话失效，不会解除上游账号封禁。",
     "reloginQueueCurrentHint": "测试其连通性，或发起重新授权登录",
     "reloginQueueWaitingCount": "列表（共 {count} 个）",
-    "reloginQueueListHint": "点击行跳转 · 点重登直达"
+    "reloginQueueListHint": "点击行跳转 · 点重登直达",
+    "badgeNeedsRelogin": "● 需重登",
+    "badgeNeedsReloginTitle": "登录态已被上游作废（积分查询连续返回 401）。请点「重登」重新扫码；重新登录成功后该标记会自动清除。"
   },
   "whatsNew": {
     "title": "本次更新：v{version}",

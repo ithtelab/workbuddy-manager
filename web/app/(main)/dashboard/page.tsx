@@ -351,7 +351,8 @@ export default function DashboardPage() {
   /** 可用性分档的汇总（只统计「能正常调用」的，与账号页说法一致） */
   const availability = useMemo(() => {
     const counts: Record<AvailabilityTier, number> = {
-      disabled: 0, disabledByPanel: 0, manualDisabled: 0, riskPaused: 0, expired: 0, unknown: 0, cooling: 0,
+      disabled: 0, disabledByPanel: 0, manualDisabled: 0, needsRelogin: 0, riskPaused: 0,
+      expired: 0, unknown: 0, cooling: 0,
       neverSucceeded: 0, notLoaded: 0, online: 0,
     };
     for (const a of scoped) counts[availabilityOf(a)] += 1;

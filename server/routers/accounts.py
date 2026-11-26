@@ -1231,6 +1231,13 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
     if not existed:
         db.record_account_added(str(result['uid']), auth_dir)
 
+    # 重登成功：清掉「登录态失效」标记（issue #490）。否则这个账号会一直带着
+    # 「需重登」徽章，直到下一次积分查询成功才消失 —— 用户刚登完就看到旧告警。
+    try:
+        creditsvc.clear_session_dead(str(result.get('uid') or ''))
+    except Exception:  # noqa: BLE001
+        pass
+
     # 目标账号只在这里取一次：下面要丢掉 state 上的记账，而提交方（auth_poll）
     # 还要用它做当场解除禁用。
     targeted = bool(_login_targets.get(state))

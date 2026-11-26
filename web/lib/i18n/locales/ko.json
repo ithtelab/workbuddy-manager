@@ -635,7 +635,9 @@
     "reloginQueueEmptyDesc": "다시 로그인은 인증 정보나 세션을 복구할 때 사용합니다. 업스트림 계정 차단은 해제되지 않습니다.",
     "reloginQueueCurrentHint": "연결을 테스트하거나 재인증 로그인을 시작하세요",
     "reloginQueueWaitingCount": "목록(총 {count}개)",
-    "reloginQueueListHint": "행 클릭으로 전환 · 재로그인은 바로 시작"
+    "reloginQueueListHint": "행 클릭으로 전환 · 재로그인은 바로 시작",
+    "badgeNeedsRelogin": "● 재로그인",
+    "badgeNeedsReloginTitle": "로그인 상태가 업스트림에서 무효화되었습니다(청구 조회가 401을 계속 반환). '재로그인'으로 다시 스캔하세요. 성공하면 자동으로 해제됩니다."
   },
   "whatsNew": {
     "title": "이번 업데이트: v{version}",

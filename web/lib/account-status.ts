@@ -39,6 +39,8 @@ export type AvailabilityTier =
   | 'disabledByPanel'
   /** 上游手动停用位（issue #45）：还在池里、任务照常，只是不被选中转发 */
   | 'manualDisabled'
+  /** 登录态被上游作废（billing 连续 401）：积分快照不可信，需要重新登录 */
+  | 'needsRelogin'
   | 'riskPaused'
   | 'expired'
   /** 本次读不到上游状态，运行时字段全部未知（`upstream.connected !== true`） */
@@ -207,6 +209,7 @@ export function availabilityGroup(tier: AvailabilityTier): AvailabilityGroup {
     case 'expired':
     case 'neverSucceeded':
     case 'notLoaded':
+    case 'needsRelogin':
     case 'unknown':
       return 'attention';
   }
@@ -237,6 +240,9 @@ export function availabilityOf(a: Account): AvailabilityTier {
   // 若不先判就会落到 notLoaded，显示成「未加载 / 账号文件可能有问题」——
   // 而它其实是用户自己刚点的「停用」，看着像故障（实测会在界面上造成这种误导）。
   if (a.disabled_by_panel) return 'disabledByPanel';
+  // 登录态被上游作废：这是**能直接修**的故障（重新扫码），比「上游手动停用」
+  // 更该优先提示。积分快照也不可信，后端已经把它置空并写了 invalid_reason。
+  if (a.needs_relogin === true) return 'needsRelogin';
   // 上游的手动停用位（issue #45）。也先于 disabled/cooling 判定：它是运维的
   // 明确意图，与上面那条同源（都是「我主动摘的」），只是机制不同——这条账号
   // **还在池里**，签到与保活照常，所以文案必须与改名那条区分开。
@@ -272,7 +278,10 @@ export function isAccountBanned(a?: Account): boolean {
 }
 
 export function needsRelogin(a: Account): boolean {
-  return availabilityOf(a) === 'disabled' && !isAccountBanned(a);
+  // 两种来源：① 上游已判定禁用且不是封禁（历史口径）；
+  // ② 后端新加的 billing 连续 401 标记（issue #490）。
+  return a.needs_relogin === true
+    || (availabilityOf(a) === 'disabled' && !isAccountBanned(a));
 }
 
 export function disabledReasonText(a: Account): string {
@@ -316,6 +325,8 @@ export function availabilityLabelKey(tier: AvailabilityTier, a?: Account): strin
       return 'accounts.badgeDisabledByPanel';
     case 'manualDisabled':
       return 'accounts.badgeManualDisabled';
+    case 'needsRelogin':
+      return 'accounts.badgeNeedsRelogin';
     case 'riskPaused':
       return a?.refresh_risk?.needs_review ? 'risk.review' : 'risk.paused';
     case 'expired':
@@ -351,6 +362,8 @@ export function availabilityTitleKey(tier: AvailabilityTier, a?: Account): strin
       return 'accounts.badgeDisabledByPanelTitle';
     case 'manualDisabled':
       return 'accounts.badgeManualDisabledTitle';
+    case 'needsRelogin':
+      return 'accounts.badgeNeedsReloginTitle';
     case 'riskPaused':
       return 'risk.recovery';
     // 系统自动禁用（12153 连败 / 11140 被封）必须给出**下一步**：只说「已禁用」
@@ -381,6 +394,7 @@ export function availabilityClass(tier: AvailabilityTier): string {
       return 'text-amber-600 dark:text-amber-400';
     case 'neverSucceeded':
     case 'notLoaded':
+    case 'needsRelogin':
       return 'text-rose-600 dark:text-rose-400';
     case 'online':
       return 'text-emerald-600 dark:text-emerald-400';

@@ -191,6 +191,24 @@ def token_issued_at(access_token: str) -> int | None:
     return times[0] if times else None
 
 
+# 「登录态失效」集合的短缓存：列表页每个账号都会用到它，而它存在 settings 表里；
+# 不缓存就是一次列表请求读一次库。30 秒与其它状态缓存同量级，置位/清除的延迟
+# 对用户不可感知。
+_SESSION_DEAD_CACHE: dict = {'at': 0.0, 'set': set()}
+
+
+def _session_dead_cached() -> set[str]:
+    now = time.time()
+    if now - float(_SESSION_DEAD_CACHE['at']) > 30:
+        try:
+            from .credits import session_dead_uids
+            _SESSION_DEAD_CACHE['set'] = session_dead_uids()
+        except Exception:  # noqa: BLE001
+            _SESSION_DEAD_CACHE['set'] = set()
+        _SESSION_DEAD_CACHE['at'] = now
+    return _SESSION_DEAD_CACHE['set']  # type: ignore[return-value]
+
+
 def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
     """读取 auths/ 目录下的本地账号（与 /status 的运行时状态互补）。
 
@@ -318,9 +336,18 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
         if isinstance(item, dict) and item.get('uid'):
             pool[str(item['uid'])] = item
 
+    dead = _session_dead_cached()
     for a in accounts:
         p = pool.get(a['uid'])
         a['in_pool'] = p is not None
+        # 登录态失效（issue #490）：单独给一个布尔字段，前端据此渲染「需重登」。
+        # 不能只塞中文 invalid_reason —— 前端原来只在「未加载」分支用它，
+        # 池内账号看到的是「在线」+ 积分空白的误导组合。
+        a['needs_relogin'] = a['uid'] in dead
+        if a['needs_relogin']:
+            a['credits'] = None
+            if not a.get('invalid_reason'):
+                a['invalid_reason'] = '登录态失效（被上游作废），需重登'
         if not p:
             # 上游未返回该账号：可能刚添加尚未重载，也可能上游根本没加载成功。
             # 保持其余字段为 None（前端据此单独展示，而不是当成「在线」）。
@@ -333,7 +360,9 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
                 a['invalid_reason'] = '已在本面板临时禁用（不会被上游加载）'
             continue
         credits = p.get('credits')
-        a['credits'] = int(credits) if isinstance(credits, (int, float)) else None
+        # 登录态失效时上游那份 credits 也是旧快照，不能覆盖掉上面刚置的空值。
+        if not a['needs_relogin']:
+            a['credits'] = int(credits) if isinstance(credits, (int, float)) else None
         a['cooling'] = bool(p.get('cooling'))
         # 冷却剩余秒数：上游状态机给的是权威值（可能是它解析出的「上游重置时刻」，
         # 也可能是无时间文案时的有界退避）。展示出来，用户就知道还要等多久，

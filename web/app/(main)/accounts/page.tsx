@@ -882,6 +882,19 @@ export default function AccountsPage() {
         </Badge>
       );
     }
+    if (tier === 'needsRelogin') {
+      // 登录态被上游作废（billing 连续 401）。这是**能直接修**的状态：
+      // 重新扫码即可。用玫红而不是中性灰——它确实需要用户动手。
+      return (
+        <Badge
+          variant="secondary"
+          className="rounded-full text-rose-600 dark:text-rose-400"
+          title={t('accounts.badgeNeedsReloginTitle')}
+        >
+          {label}
+        </Badge>
+      );
+    }
     if (tier === 'riskPaused') {
       return <Badge variant="outline" className="rounded-full text-amber-600" title={t('risk.recovery')}>{label}</Badge>;
     }
@@ -1040,12 +1053,16 @@ export default function AccountsPage() {
     const live = liveCredits[a.uid];
     const value = live ?? a.credits;
     if (value === null || value === undefined) {
+      // 登录态失效时余额本来就不可信：别用「上游尚未返回积分」那套说法，
+      // 它会把人引向「上游不可达」，而真正要做的动作是重新登录。
       return (
         <span
-          className="text-xs text-muted-foreground"
-          title={t('accounts.creditsNoneTitle')}
+          className={`text-xs ${a.needs_relogin ? 'text-rose-600 dark:text-rose-400' : 'text-muted-foreground'}`}
+          title={a.needs_relogin
+            ? t('accounts.badgeNeedsReloginTitle')
+            : t('accounts.creditsNoneTitle')}
         >
-          —
+          {a.needs_relogin ? t('accounts.badgeNeedsRelogin') : '—'}
         </span>
       );
     }
