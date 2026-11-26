@@ -1,0 +1,393 @@
+diff --git a/internal/auth/auth.go b/internal/auth/auth.go
+index eb8bc53..0e46487 100644
+--- a/internal/auth/auth.go
++++ b/internal/auth/auth.go
+@@ -164,6 +164,21 @@ func (a *Auth) RefreshTokenValue() string {
+ 	return a.RefreshToken
+ }
+ 
++// ExpiresAtValue 加锁读取 ExpiresAt（Unix 秒；<=0 表示到期未知）。
++//
++// 与 AccessTokenValue / DomainValue / RefreshTokenValue 同族（#125）：RefreshToken 在
++// a.mu 内写回 ExpiresAt，调度器（keepalive 的到期 / 未知到期判定）与刷新并发，锁外
++// 直读即构成数据竞争。判「到期未知」也必须走这里 —— NeedsRefresh 对 ExpiresAt<=0
++// 恒真，调用方要先区分「未知」与「已过期」才能给出不同的刷新节奏。
++func (a *Auth) ExpiresAtValue() int64 {
++	if a == nil {
++		return 0
++	}
++	a.mu.Lock()
++	defer a.mu.Unlock()
++	return a.ExpiresAt
++}
++
+ // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
+ // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
+ // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭
+diff --git a/internal/scheduler/keepalive_window_test.go b/internal/scheduler/keepalive_window_test.go
+new file mode 100644
+index 0000000..9a85ba2
+--- /dev/null
++++ b/internal/scheduler/keepalive_window_test.go
+@@ -0,0 +1,185 @@
++package scheduler
++
++// 0058 保活闸门的回归测试。
++//
++// 覆盖 review 要求的行为：
++//   - 远期账号（AT 还有 ~59 天）不刷新；
++//   - 已过期（ExpiresAt < now）仍然刷新；
++//   - 429 失败不推进 session_dead 计数（连续多次 429 也不禁用）；
++//   - 非 429 的 12153 session dead 仍按连续计数禁用；
++//   - 最大刷新年龄：AT 还很久但 auth 文件 15 天没写过 → 刷新（RT 至少 14 天轮换一次）；
++//   - expiresAt=0 的存量号：24h 内不刷、超过 24h 才刷（否则等于每轮全刷，闸门失效）。
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/pool"
++	"workbuddy2api/internal/upstream"
++)
++
++const testDay = 24 * time.Hour
++
++// newRefreshRecorder 起一个只处理 refresh 的假上游，返回服务与刷新调用计数。
++// status/body 由用例指定：200 成功、429 限流、401+12153 session dead。
++func newRefreshRecorder(t *testing.T, status int, body string) (*httptest.Server, *atomic.Int32) {
++	t.Helper()
++	var calls atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if !strings.HasSuffix(r.URL.Path, "/token/refresh") {
++			http.NotFound(w, r)
++			return
++		}
++		calls.Add(1)
++		w.WriteHeader(status)
++		_, _ = w.Write([]byte(body))
++	}))
++	t.Cleanup(srv.Close)
++	return srv, &calls
++}
++
++// writeAuthFile 落一份最小 auth 文件，并把 mtime 设为 at（模拟「上次刷新时刻」）。
++func writeAuthFile(t *testing.T, uid string, expiresAt int64, at time.Time) (*auth.Auth, string) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "workbuddy-"+uid+".json")
++	doc := fmt.Sprintf(`{"auth":{"accessToken":"at","refreshToken":"rt","expiresAt":%d},"account":{"uid":%q}}`, expiresAt, uid)
++	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
++		t.Fatalf("write auth file: %v", err)
++	}
++	if err := os.Chtimes(path, at, at); err != nil {
++		t.Fatalf("chtimes: %v", err)
++	}
++	a := &auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: expiresAt, FilePath: path}
++	return a, path
++}
++
++// newKeepaliveScheduler 用一个假上游 + 账号池构建 scheduler（与 refresh_race_test 同构）。
++func newKeepaliveScheduler(t *testing.T, srv *httptest.Server, accounts ...*auth.Auth) *Scheduler {
++	t.Helper()
++	p := pool.New("")
++	for _, a := range accounts {
++		p.Add(a)
++	}
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	return New(Config{Pool: p, Upstream: up})
++}
++
++// TestKeepaliveSkipsFarFutureAccount 远期账号（AT 还有 59 天、刚写过文件）不刷新：
++// 这是 429 缓解的主体收益，量级从「每轮全池」降到「临近到期的几个」。
++func TestKeepaliveSkipsFarFutureAccount(t *testing.T) {
++	srv, calls := newRefreshRecorder(t, http.StatusOK, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":5184000}}`)
++	a, _ := writeAuthFile(t, "far", time.Now().Add(59*testDay).Unix(), time.Now())
++	s := newKeepaliveScheduler(t, srv, a)
++
++	s.RunKeepaliveNow()
++
++	if got := calls.Load(); got != 0 {
++		t.Fatalf("远期账号不应发起刷新，实际 %d 次", got)
++	}
++}
++
++// TestKeepaliveRefreshesExpiredAccount 已过期（ExpiresAt < now）仍然要刷：
++// 闸门只能拦「还很久」的号，不能把到期号一起拦掉。
++func TestKeepaliveRefreshesExpiredAccount(t *testing.T) {
++	srv, calls := newRefreshRecorder(t, http.StatusOK, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":5184000}}`)
++	a, _ := writeAuthFile(t, "expired", time.Now().Add(-time.Hour).Unix(), time.Now())
++	s := newKeepaliveScheduler(t, srv, a)
++
++	s.RunKeepaliveNow()
++
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("已过期账号应刷新一次，实际 %d 次", got)
++	}
++	if got := a.ExpiresAtValue(); got <= time.Now().Unix() {
++		t.Fatalf("刷新成功后 ExpiresAt 应前移，实际 %d", got)
++	}
++}
++
++// TestKeepaliveRateLimitDoesNotCountSessionDead 429 是上游限流、不是账号故障：
++// 连续多轮 429 不得推进 session_dead 连续计数（否则 3 轮就把健康号误禁用）。
++func TestKeepaliveRateLimitDoesNotCountSessionDead(t *testing.T) {
++	srv, calls := newRefreshRecorder(t, http.StatusTooManyRequests, `{"code":6004,"msg":"too many requests"}`)
++	a, _ := writeAuthFile(t, "rate-limited", time.Now().Add(time.Hour).Unix(), time.Now())
++	s := newKeepaliveScheduler(t, srv, a)
++
++	for i := 0; i < pool.SessionDeadThreshold(); i++ {
++		s.RunKeepaliveNow()
++	}
++
++	st, ok := s.cfg.Pool.Status("rate-limited")
++	if !ok {
++		t.Fatal("账号不在池里")
++	}
++	if st.Disabled {
++		t.Fatalf("429 不该累计 session_dead（%d 轮后账号被禁用）", pool.SessionDeadThreshold())
++	}
++	if got, want := calls.Load(), int32(pool.SessionDeadThreshold()); got != want {
++		t.Fatalf("每轮都应尝试刷新：实际 %d 次，期望 %d 次", got, want)
++	}
++}
++
++// TestKeepaliveSessionDeadStillCounts 非 429 的 12153 仍走连续计数：
++// 429 的早退分支不能把真正需要禁用的死会话一起跳过。
++func TestKeepaliveSessionDeadStillCounts(t *testing.T) {
++	srv, calls := newRefreshRecorder(t, http.StatusUnauthorized, `{"code":12153,"msg":"Offline user session not found"}`)
++	a, _ := writeAuthFile(t, "session-dead", time.Now().Add(time.Hour).Unix(), time.Now())
++	s := newKeepaliveScheduler(t, srv, a)
++
++	for i := 0; i < pool.SessionDeadThreshold(); i++ {
++		s.RunKeepaliveNow()
++	}
++
++	st, ok := s.cfg.Pool.Status("session-dead")
++	if !ok {
++		t.Fatal("账号不在池里")
++	}
++	if !st.Disabled {
++		t.Fatalf("连续 %d 次 12153 应禁用账号，实际仍启用", pool.SessionDeadThreshold())
++	}
++	if got, want := calls.Load(), int32(pool.SessionDeadThreshold()); got != want {
++		t.Fatalf("达到阈值前每轮都应尝试刷新：实际 %d 次，期望 %d 次", got, want)
++	}
++}
++
++// TestKeepaliveRefreshesStaleAccountByMaxAge AT 还剩 59 天，但 auth 文件 15 天没写过 →
++// 必须刷新：refresh 会同时轮换 refresh-token，旧「每天全刷」顺带完成的轮换不能丢。
++func TestKeepaliveRefreshesStaleAccountByMaxAge(t *testing.T) {
++	srv, calls := newRefreshRecorder(t, http.StatusOK, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":5184000}}`)
++	a, _ := writeAuthFile(t, "stale", time.Now().Add(59*testDay).Unix(), time.Now().Add(-15*testDay))
++	s := newKeepaliveScheduler(t, srv, a)
++
++	s.RunKeepaliveNow()
++
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("超过最大刷新年龄（14 天）应刷新一次，实际 %d 次", got)
++	}
++}
++
++// TestKeepaliveUnknownExpiryUsesDailyGap expiresAt=0 的存量号（管理端导入会写 0）：
++// NeedsRefresh 对它们恒真，直接沿用等于每轮全刷；按「上次刷新 + 24h」兜底。
++func TestKeepaliveUnknownExpiryUsesDailyGap(t *testing.T) {
++	srv, calls := newRefreshRecorder(t, http.StatusOK, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":5184000}}`)
++	fresh, _ := writeAuthFile(t, "unknown-fresh", 0, time.Now())
++	stale, _ := writeAuthFile(t, "unknown-stale", 0, time.Now().Add(-25*time.Hour))
++	s := newKeepaliveScheduler(t, srv, fresh, stale)
++
++	s.RunKeepaliveNow()
++
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("只有超过 24h 的未知到期号应刷新，实际 %d 次", got)
++	}
++	if got := fresh.ExpiresAtValue(); got != 0 {
++		t.Fatalf("刚写过的未知到期号不应被刷新，ExpiresAt 被改成 %d", got)
++	}
++	if got := stale.ExpiresAtValue(); got <= time.Now().Unix() {
++		t.Fatalf("超过 24h 的未知到期号刷新后应写入真实 ExpiresAt，实际 %d", got)
++	}
++}
+diff --git a/internal/scheduler/refresh_race_test.go b/internal/scheduler/refresh_race_test.go
+index 4a46a08..09a3198 100644
+--- a/internal/scheduler/refresh_race_test.go
++++ b/internal/scheduler/refresh_race_test.go
+@@ -19,6 +19,7 @@ import (
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
++	"time"
+ 
+ 	"workbuddy2api/internal/auth"
+ 	"workbuddy2api/internal/pool"
+@@ -39,8 +40,8 @@ func TestKeepaliveSkipsAccountWithoutRefreshToken(t *testing.T) {
+ 	defer srv.Close()
+ 
+ 	p := pool.New("")
+-	p.Add(&auth.Auth{UID: "no-rt", AccessToken: "at", ExpiresAt: 9999999999})
+-	p.Add(&auth.Auth{UID: "has-rt", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.Add(&auth.Auth{UID: "no-rt", AccessToken: "at", ExpiresAt: time.Now().Add(2 * time.Hour).Unix()})
++	p.Add(&auth.Auth{UID: "has-rt", AccessToken: "at", RefreshToken: "rt", ExpiresAt: time.Now().Add(2 * time.Hour).Unix()})
+ 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+ 	s := New(Config{Pool: p, Upstream: up})
+ 
+@@ -68,7 +69,7 @@ func TestKeepaliveGuardRacesRefreshToken(t *testing.T) {
+ 	defer srv.Close()
+ 
+ 	p := pool.New("")
+-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
++	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: time.Now().Add(2 * time.Hour).Unix()})
+ 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+ 	s := New(Config{Pool: p, Upstream: up})
+ 
+diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
+index ea2116e..991e78b 100644
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -7,6 +7,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log"
++	"os"
+ 	"sort"
+ 	"sync"
+ 	"time"
+@@ -888,10 +889,99 @@ func (s *Scheduler) markRewardClaimed(uid string) {
+ 	s.rewardClaimed[uid] = travelDay(time.Now())
+ }
+ 
+-// RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
++// keepaliveRefreshWindow 保活只刷「AT 剩余有效期小于该窗口」的号。
++//
++// 为什么需要这道闸：refresh 响应实测 expiresIn=5184000 秒 = **60 天**
++// （internal/upstream/client.go 的 preserveExpiry 分支，client.go:1215-1222），
++// 而旧行为每天都把全池号刷一遍 —— 每个令牌一生要打 60 倍于必要的刷新请求，且 30+ 个号
++// 集中在同一分钟刷新，正是上游判「过频」的直接诱因（v2.11.12 #413 的 429 提示）。
++//
++// 旧注释把后果写成「429 → AT 过期 → 网关 401 → 大批账号同时 401」，这条因果链在代码里
++// 没有依据：刷新失败不会让已签发的 AT 提前失效（ExpiresAt 只在 RefreshToken **成功**
++// 时写回，见 client.go 的写回段），而纯 401 另有 ErrAuthRejected 分类
++// （client.go:51-59），与 429 无因果关系。闸门的真实收益是：把刷新量从 30+/天 降到
++// 临近到期的 0~3/天，减少无谓的 token 轮换与上游限流/风控暴露，并让 keepalive 日志
++// 不再被 429 噪声淹没。
++const keepaliveRefreshWindow = 72 * time.Hour
++
++// keepaliveMaxRefreshAge 即使 AT 还很久，也至少每 14 天刷新一次。
++//
++// 为什么需要它：一次 refresh 会**同时轮换 refresh-token**（client.go 的写回段把
++// accessToken 与 refreshToken 一起更新，上游实测两者一起 rotate）。旧行为每天全刷
++// 顺带完成轮换；只按 72h 窗口刷，一个 60 天有效期的号会连续 ~57 天不动 RT。上游对 RT
++// 的服务端有效期 / 撤销策略不公开，长期不轮换的风险不可控，故用 14 天上限兜底：每号
++// 每个令牌生命周期的刷新次数从 ~60 次降到 ~4 次，又不让 RT 长期停滞。
++//
++// 「上次刷新时间」用 auth 文件 mtime 近似：上游刷新成功后 SaveAtomic 原子重写该文件
++// （auth.go SaveAtomic），管理端的定时续期（server/services/renew.py →
++// tencent.update_auth_tokens）与重新导入同样是整份重写 —— 任何一次刷新都会前移 mtime，
++// 与面板「令牌签发时间」的 mtime 回落口径一致（server/services/wb2api.py
++// list_auth_accounts）。非刷新的写入也会前移 mtime，那只会推迟轮换、不会跳过 72h
++// 到期闸门，AT 仍然不会过期；反过来 SaveAtomic 失败时 mtime 不前移，该号会在下一轮
++// keepalive 再试一次 —— keepalive 默认一天一轮，频次与旧行为持平，不会形成洪峰。
++//
++// 不新增 last_refresh 持久化字段的理由：auth 文件会被上游 SaveAtomic / 登录流程与
++// 管理端 write_auth_file 整份重建（只有 update_auth_tokens 保留未知键），新增字段在
++// 任一条写路径上都可能被静默丢掉；mtime 是两侧都天然维护、不会丢的共同信号。
++const keepaliveMaxRefreshAge = 14 * 24 * time.Hour
++
++// keepaliveUnknownExpiryGap expiresAt<=0（到期未知）的存量账号的兜底刷新间隔。
++//
++// NeedsRefresh 对 ExpiresAt<=0 恒为 true（auth.go NeedsRefresh），直接沿用就是
++// 「每轮 keepalive 都刷」：管理端导入对没有到期信息的导出会写 expiresAt=0
++// （server/routers/accounts.py:73-79，不臆造到期时间），存量里一定有这类号，闸门对
++// 它们等于没生效。这类号按「上次刷新（auth 文件 mtime）+ 24h」兜底：一天最多刷一次；
++// 刷新成功后上游返回的 expiresIn 会把 ExpiresAt 写成真实值，账号随即回到正常闸门。
++const keepaliveUnknownExpiryGap = 24 * time.Hour
++
++// authLastWrite 返回账号 auth 文件的最后写入时刻（≈ 最近一次刷新时刻）。
++// FilePath 为空或 stat 失败返回 ok=false，调用方按「无法判断上次刷新」处理。
++func authLastWrite(a *auth.Auth) (time.Time, bool) {
++	if a == nil || a.FilePath == "" {
++		return time.Time{}, false
++	}
++	fi, err := os.Stat(a.FilePath)
++	if err != nil {
++		return time.Time{}, false
++	}
++	return fi.ModTime(), true
++}
++
++// keepaliveRefreshDue 报告本轮保活是否需要刷新该账号（now 由调用方传入，便于测试）。
++//
++// 三条判据，任一成立即刷：
++//  1. AT 剩余有效期 < keepaliveRefreshWindow（包含已过期）；
++//  2. 到期未知（ExpiresAt<=0）且距上次刷新 >= keepaliveUnknownExpiryGap；
++//  3. 距上次刷新 >= keepaliveMaxRefreshAge（保证 RT 至少 14 天轮换一次）。
++//
++// 判据 2/3 依赖 auth 文件 mtime：FilePath 为空或 stat 失败时无法判断「上次刷新」，
++// 此时 2/3 都不成立，只保留判据 1（AT 仍会在到期前被刷）。宁可少刷，也不退回
++// 「每轮全刷」——否则这类号会重新成为 429 的固定来源。
++func keepaliveRefreshDue(a *auth.Auth, now time.Time) bool {
++	if a == nil {
++		return false
++	}
++	expiresAt := a.ExpiresAtValue()
++	last, hasLast := authLastWrite(a)
++	if expiresAt <= 0 {
++		return !hasLast || now.Sub(last) >= keepaliveUnknownExpiryGap
++	}
++	if a.NeedsRefresh(keepaliveRefreshWindow) {
++		return true
++	}
++	return hasLast && now.Sub(last) >= keepaliveMaxRefreshAge
++}
++
++// RunKeepaliveNow 立即跑一轮按需 token 保活；刷新成功的号清 session 死亡计数。
+ // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
+ // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
+ // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
++//
++// **行为变化**：keepalive 不再兼做「死会话探针」。它只刷临近到期 / 到期未知且久未刷 /
++// 久未轮换的号（见 keepaliveRefreshDue），绝大多数账号每轮都不会被请求 —— 靠它发现
++// 12153 已不现实。死会话只能由聊天路径的 401 触发：server/handler.go 在 ErrSessionDead /
++// ErrAuthRejected 分支调 Pool.NoteSessionDead（handler.go:900 一带），仍是连续 3 次才
++// 禁用。keepalive 侧保留 12153 计数，只是让「恰好被刷到的号」不丢原有语义。
+ func (s *Scheduler) RunKeepaliveNow() { s.runKeepalive(context.Background()) }
+ 
+ func (s *Scheduler) runKeepalive(ctx context.Context) {
+@@ -910,7 +1000,12 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
+ 			skipped++
+ 			continue
+ 		}
+-		if !first && !sleepCtx(ctx, s.accountGap(ctx, 0)) {
++		// 按需刷新：临近到期 / 到期未知且久未刷 / 久未轮换（见 keepaliveRefreshDue）。
++		if !keepaliveRefreshDue(a, time.Now()) {
++			skipped++
++			continue
++		}
++		if !first && !sleepCtx(ctx, s.accountGap(ctx, 2*time.Second)) {
+ 			return
+ 		}
+ 		if ctx.Err() != nil {
+@@ -919,9 +1014,15 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
+ 		first = false
+ 		checked++
+ 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
++			var ue *upstream.Error
++			// 429 是上游限流，不是账号故障：记跳过，别算失败、也别触发 session_dead 计数。
++			if errors.As(err, &ue) && ue.Kind == upstream.ErrSoftRate {
++				skipped++
++				log.Printf("keepalive %s: rate limited upstream, skip", logfmt.Label(st.UID, st.Nickname))
++				continue
++			}
+ 			failed++
+ 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+-			var ue *upstream.Error
+ 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+ 				if s.cfg.Pool.NoteSessionDead(st.UID) {
+ 					log.Printf("WARN: keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
