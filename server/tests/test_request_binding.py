@@ -193,6 +193,9 @@ class PostParamLocationAuditTest(unittest.TestCase):
         '/api/accounts/{filename}/move': {'upstream_id'},
         # 账号导入（PR #145）：前端把分组与「是否覆盖同 uid」都按 query 传
         '/api/accounts/upload': {'upstream_id', 'overwrite'},
+        # 吞吐降权（PR #496）：与其它账号写端点同形，分组按 `?upstream_id=` 传；
+        # dry_run / window 走 JSON body（前端不在这里，但形状与 accountApi 一致）。
+        '/api/accounts/speed-health/apply': {'upstream_id'},
         '/api/restart': {'upstream_id'},
     }
 

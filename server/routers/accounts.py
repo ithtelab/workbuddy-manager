@@ -18,7 +18,7 @@ from .. import config, db, security, upstreamsvc
 from ..iputil import client_ip
 from ..services import (
     accountorder, credits as creditsvc, dailyplan, modelcatalog, reload, renew,
-    tasklog, taskrun, tencent, wb2api,
+    speedhealth, tasklog, taskrun, tencent, wb2api,
 )
 from ..services.realm import realm_of, supports_checkin
 from ..services import taskpacing
@@ -514,6 +514,126 @@ async def account_set_weight(
     security.audit(user, 'update_account_weight', filename, f"weight={result['weight']}")
     scheduled = reload.request_restart(_reload_target(group))
     return {'ok': True, **result, 'reload_triggered': scheduled}
+
+
+@router.get('/accounts/speed-health')
+async def account_speed_health(
+    window: int = Query(900, ge=60, le=86400),
+    upstream_id: int | None = Query(None),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """按实测吞吐给出「谁在慢档」和建议权重（**只读**，不动账号文件）。
+
+    口径（与统计页 issue #214 一致）：
+      · 生成耗时 = latency_ms - COALESCE(first_token_ms, 0)；
+      · rate = completion_tokens / (生成耗时 / 1000)；
+      · 只统计流式 + 200 + completion_tokens>=300 + 生成耗时为正的样本；
+      · 基准取同池中位数（相对值），上游整体变慢时 score 仍接近 1。
+
+    realm 隔离：cn / global 各算一份基准；同一 realm 被多个分组共用时
+    `request_logs` 没有 upstream_id 可区分归属，返回 409 而不是给污染结论。
+    """
+    group = _group(upstream_id)
+    auth_dir = _require_dir(group)
+    data = await asyncio.to_thread(speedhealth.evaluate_group, auth_dir, window)
+    if data.get('conflicts'):
+        raise HTTPException(
+            status_code=409,
+            detail=('以下分组与当前分组共用同一版本（realm）：'
+                    f'{"、".join(data["conflicts"])}。request_logs 没有 upstream_id 列，'
+                    '无法区分请求属于哪个分组，因此不做池内比较。请先按 realm 拆开分组。'),
+        )
+    scheduler = await asyncio.to_thread(speedhealth.state)
+    return {'window_seconds': window, 'scheduler': scheduler, **data}
+
+
+@router.get('/accounts/speed-health/settings')
+async def account_speed_health_settings(
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """读自动降权的开关（默认关）与上次运行结果。"""
+    return await asyncio.to_thread(speedhealth.state)
+
+
+@router.put('/accounts/speed-health/settings')
+async def account_speed_health_settings_put(
+    body: dict = Body(...),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """改开关 / 间隔 / 窗口 / 是否预演。改完立即生效（调度器每轮重读设置）。"""
+    try:
+        saved = await asyncio.to_thread(speedhealth.save_settings, body)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    security.audit(user, 'update_speed_health', '', json.dumps(saved, ensure_ascii=False))
+    return {'ok': True, **saved}
+
+
+@router.post('/accounts/speed-health/run')
+async def account_speed_health_run(
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """立刻跑一轮（受 enabled 开关约束，不会绕过它；与调度器互斥）。"""
+    result = await speedhealth.run_once()
+    if result.get('skipped') == 'busy':
+        raise HTTPException(status_code=409, detail='另一轮吞吐评估正在运行，请稍后重试')
+    return result
+
+
+def _speed_dry_run(body: dict) -> bool:
+    """body.dry_run 默认 true；字符串/数字也按布尔语义收（不把 'false' 当真）。"""
+    raw = body.get('dry_run', True) if isinstance(body, dict) else True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ('0', 'false', 'off', 'no')
+
+
+@router.post('/accounts/speed-health/apply')
+async def account_speed_health_apply(
+    body: dict = Body(...),
+    upstream_id: int | None = Query(None),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """把建议权重写进账号文件。`dry_run` 默认 true，只回显不落盘。
+
+    降权同时记下原始权重与恢复时间（6 小时到期 / score 回到 HIGH_SCORE 提前
+    恢复），见 services/speedhealth.py 的「恢复路径」。
+
+    为什么**不**触发上游重启：权重写在账号文件里，上游每 5 秒轮询 auths 目录
+    热加载（internal/pool/watch.go，upsertLocked 整体替换 *auth.Auth），
+    5 秒内自然生效。重启会打断在途请求、清空上游内存状态，代价远大于收益——
+    这一点与手动改权重那条路由不同，那里为了「立刻生效」才去重载。
+    """
+    dry = _speed_dry_run(body)
+    try:
+        window = int((body or {}).get('window', 900) or 900)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail='window 必须是整数秒') from exc
+    window = max(60, min(86400, window))
+    auth_dir = _require_dir(_group(upstream_id))
+    out = await speedhealth.apply_for_group(auth_dir, window, dry_run=dry)
+    if out.get('skipped') == 'busy':
+        raise HTTPException(status_code=409, detail='另一轮吞吐评估正在运行，请稍后重试')
+    if out.get('skipped') == 'group-conflict':
+        raise HTTPException(
+            status_code=409,
+            detail=('以下分组与当前分组共用同一版本（realm）：'
+                    f'{"、".join(out.get("conflict_groups") or [])}。'
+                    'request_logs 没有 upstream_id 列，无法区分请求归属，已拒绝评估。'),
+        )
+    if not dry:
+        for realm in out.get('realms') or []:
+            for item in realm.get('applied') or []:
+                if item.get('ok'):
+                    security.audit(user, 'auto_account_weight',
+                                   str(item.get('file') or ''),
+                                   f"{item.get('from')}->{item.get('to')}")
+            for item in realm.get('restored') or []:
+                if item.get('ok'):
+                    security.audit(user, 'restore_account_weight',
+                                   str(item.get('file') or ''),
+                                   f"{item.get('demoted_to')}->{item.get('original_weight')}")
+    return out
 
 
 @router.get('/accounts')
