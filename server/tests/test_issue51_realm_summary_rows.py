@@ -172,5 +172,51 @@ class CheckinLogsRealmViewTest(unittest.TestCase):
         self.assertEqual(plain_window, 20, '不带版本筛选时的窗口不该变')
 
 
+class LegacyFileUidCompatTest(unittest.TestCase):
+    """旧版续期失败行把 uid 落成了**账号文件名**，读端要兼容（PR #477）。
+
+    旧实现 `_note_failure` 只传 `{'uid': '', 'file': name}`，而 `_record` 取
+    `uid or file` —— 于是历史行的 uid 是 `workbuddy-xxx.json`。只修写入端的话，
+    这些行在版本视图下仍会被过滤掉、或显示成文件名。
+    """
+
+    ROWS = [
+        {'uid': 'g' * 32, 'nickname': '国际号', 'file': 'workbuddy-gl.json',
+         'realm': 'global'},
+        {'uid': 'c' * 32, 'nickname': '国内号', 'file': 'workbuddy-cn.json',
+         'realm': 'cn'},
+    ]
+
+    def _patches(self):
+        return (
+            mock.patch.object(accounts.wb2api, 'list_auth_accounts',
+                              lambda *a, **k: list(self.ROWS)),
+            mock.patch.object(accounts.upstreamsvc, 'list_upstreams', lambda **k: []),
+        )
+
+    def test_filename_matches_realm(self) -> None:
+        p1, p2 = self._patches()
+        with p1, p2:
+            gl = accounts._realm_uid_filter('global')
+            cn = accounts._realm_uid_filter('cn')
+        self.assertEqual('global', gl.get('workbuddy-gl.json'))
+        self.assertEqual('cn', cn.get('workbuddy-cn.json'))
+        self.assertTrue(accounts._uid_matches_realm(
+            'workbuddy-gl.json', gl, 'global'))
+        self.assertFalse(accounts._uid_matches_realm(
+            'workbuddy-gl.json', gl, 'cn'))
+        # 去掉 .json 的形态也要能对上
+        self.assertTrue(accounts._uid_matches_realm(
+            'workbuddy-gl', gl, 'global'))
+
+    def test_filename_resolves_nickname(self) -> None:
+        p1, p2 = self._patches()
+        with p1, p2:
+            resolve = accounts._nickname_resolver()
+        self.assertEqual('国际号', resolve('workbuddy-gl.json'))
+        self.assertEqual('国际号', resolve('workbuddy-gl'))
+        self.assertEqual('国内号', resolve('c' * 32))
+
+
 if __name__ == '__main__':
     unittest.main()

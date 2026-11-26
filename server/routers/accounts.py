@@ -1809,6 +1809,10 @@ def _nickname_resolver() -> object:
     """
     nick_by_uid: dict[str, str] = {}
     nick_by_prefix: dict[str, str] = {}
+    # 旧版续期失败行把 uid 落成了**账号文件名**（`_record` 取 uid or file，
+    # 而当时 uid 为空）。读端必须兼容，否则历史行在版本视图下被过滤掉、
+    # 或显示成一串文件名（PR #477）。这里按文件名（含去掉 .json 的形态）建反向表。
+    nick_by_file: dict[str, str] = {}
     ambiguous: set[str] = set()
     try:
         # 默认目录 + 各分组登记的账号目录：日志里的 uid 可能来自任何一个池，
@@ -1822,6 +1826,12 @@ def _nickname_resolver() -> object:
             for acc in wb2api.list_auth_accounts(base_dir):
                 auid = str(acc.get('uid') or '')
                 nick = str(acc.get('nickname') or '')
+                fname = str(acc.get('file') or '')
+                if nick and fname:
+                    nick_by_file.setdefault(fname, nick)
+                    base_name = fname[:-5] if fname.endswith('.json') else fname
+                    if base_name:
+                        nick_by_file.setdefault(base_name, nick)
                 if not auid or not nick:
                     continue
                 nick_by_uid[auid] = nick
@@ -1838,6 +1848,8 @@ def _nickname_resolver() -> object:
             return ''
         if uid in nick_by_uid:
             return nick_by_uid[uid]
+        if uid in nick_by_file:
+            return nick_by_file[uid]
         prefix = uid[:8]
         return '' if prefix in ambiguous else nick_by_prefix.get(prefix, '')
 
@@ -1861,11 +1873,22 @@ def _realm_uid_filter(realm: str | None) -> dict[str, str] | None:
         accounts = wb2api.list_auth_accounts()
     except Exception:  # noqa: BLE001
         return {}
-    return {
-        str(a.get('uid')): str(a.get('realm') or 'cn')
-        for a in accounts
-        if a.get('uid')
-    }
+    out: dict[str, str] = {}
+    for a in accounts:
+        uid = str(a.get('uid') or '')
+        if not uid:
+            continue
+        realm_of_account = str(a.get('realm') or 'cn')
+        out[uid] = realm_of_account
+        # 旧版续期失败行把 uid 落成了文件名（见 `_nickname_resolver` 的注释）。
+        # 把文件名也映射到版本，``_uid_matches_realm`` 的精确匹配就能覆盖它们。
+        fname = str(a.get('file') or '')
+        if fname:
+            out.setdefault(fname, realm_of_account)
+            base_name = fname[:-5] if fname.endswith('.json') else fname
+            if base_name:
+                out.setdefault(base_name, realm_of_account)
+    return out
 
 
 def _uid_matches_realm(uid: str, realm_map: dict[str, str] | None, realm: str) -> bool:
