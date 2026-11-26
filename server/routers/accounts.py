@@ -18,7 +18,7 @@ from .. import config, db, security, upstreamsvc
 from ..iputil import client_ip
 from ..services import (
     accountorder, credits as creditsvc, dailyplan, modelcatalog, reload, renew,
-    tasklog, taskrun, tencent, wb2api,
+    speedhealth, tasklog, taskrun, tencent, wb2api,
 )
 from ..services.realm import realm_of, supports_checkin
 from ..services import taskpacing
@@ -514,6 +514,75 @@ async def account_set_weight(
     security.audit(user, 'update_account_weight', filename, f"weight={result['weight']}")
     scheduled = reload.request_restart(_reload_target(group))
     return {'ok': True, **result, 'reload_triggered': scheduled}
+
+
+def _speed_context(group: dict, window: int) -> tuple[dict, dict]:
+    """收集吞吐 → 结合当前权重算出建议。只读，不写文件。"""
+    auth_dir = _require_dir(group)
+    stats = speedhealth.collect(window)
+    index = speedhealth.index_accounts(auth_dir)
+    weights: dict[str, float] = {}
+    for uid, acc in index.items():
+        try:
+            weights[uid] = float(acc.get('weight') or 1.0)
+        except (TypeError, ValueError):
+            weights[uid] = 1.0
+    result = speedhealth.plan(stats, current_weight=weights)
+    for change in result['changes']:
+        acc = index.get(change['uid']) or {}
+        change['file'] = acc.get('file') or ''
+        change['nickname'] = acc.get('nickname') or ''
+    return result, index
+
+
+@router.get('/accounts/speed-health')
+async def account_speed_health(
+    window: int = Query(900, ge=60, le=86400),
+    upstream_id: int | None = Query(None),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """按实测吞吐给出「谁在慢档」和建议权重（**只读**，不动账号文件）。
+
+    口径：只统计流式 + 200 + completion_tokens>=300 的样本，
+    rate = completion_tokens / latency；基准取同池中位数（相对值），
+    这样上游整体变慢时 score 仍接近 1，不会误伤全池。
+
+    注意不用 TTFB 当判据：那是「上游多久开始回话」，与「吐字多快」是两件事，
+    max 档下两者能差上百秒（issue #494）。
+    """
+    group = _group(upstream_id)
+    result, _index = _speed_context(group, window)
+    return {'window_seconds': window, **result}
+
+
+@router.post('/accounts/speed-health/apply')
+async def account_speed_health_apply(
+    body: dict = Body(...),
+    upstream_id: int | None = Query(None),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """把建议权重写进账号文件。`dry_run` 默认 true，只回显不落盘。
+
+    为什么**不**触发上游重启：权重写在账号文件里，上游每 5 秒轮询 auths 目录
+    热加载（internal/pool/watch.go，upsertLocked 整体替换 *auth.Auth），
+    5 秒内自然生效。重启会打断在途请求、清空上游内存状态，代价远大于收益——
+    这一点与手动改权重那条路由不同，那里为了「立刻生效」才去重载。
+    """
+    dry = bool(body.get('dry_run', True))
+    window = int(body.get('window', 900) or 900)
+    group = _group(upstream_id)
+    result, _index = _speed_context(group, window)
+    applied = speedhealth.apply(result['changes'], _require_dir(group), dry_run=dry)
+    if not dry:
+        for item in applied:
+            if item.get('ok'):
+                security.audit(user, 'auto_account_weight', str(item.get('file') or ''),
+                               f"{item.get('from')}->{item.get('to')}")
+    return {
+        'dry_run': dry, 'window_seconds': window,
+        'pool_median': result['pool_median'], 'reason': result['reason'],
+        'applied': applied,
+    }
 
 
 @router.get('/accounts')
