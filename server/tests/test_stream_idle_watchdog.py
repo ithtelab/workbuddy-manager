@@ -28,6 +28,11 @@ from server import config, db, keysvc, security
 CONTENT_FRAME = (
     b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
 )
+# 工具调用增量帧：没有正文，但它是**真实产出**，必须续命。
+TOOL_FRAME = (
+    b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+    b'"function":{"arguments":"x"}}]}}]}\n\n'
+)
 # 保活帧：只有注释行 / 空事件，没有任何正文。
 KEEPALIVE_FRAME = b': keepalive\n\n'
 
@@ -50,6 +55,20 @@ class _IdleUpstream:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _ToolStream(_IdleUpstream):
+    """状态 200 的 SSE 上游：先一帧正文，之后只发 tool_calls 增量（无正文）。
+
+    这是真实存在的形态：模型生成一个大文件的工具参数时，可能连续几分钟只有
+    `tool_calls` delta。看门狗按「正文」判会把它误杀，所以必须按数据帧续命。
+    """
+
+    async def aiter_bytes(self):
+        yield CONTENT_FRAME
+        for _ in range(20):
+            await asyncio.sleep(0.03)
+            yield TOOL_FRAME
 
 
 class _Client:
@@ -139,6 +158,25 @@ class StreamIdleWatchdogTest(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertIn('idle', (row['error'] or ''),
                       '中断必须落进日志，否则监控会当成正常长耗时请求')
+
+    def test_tool_call_only_stream_is_not_killed(self) -> None:
+        """只有 tool_calls 增量、没有正文的流不能被看门狗误杀。
+
+        长工具调用（生成大文件的参数）可能连续几分钟没有 `content` delta。
+        看门狗必须按「数据帧」而不是「正文」续命，否则这类合法请求会被中断。
+        """
+        self.upstream = _ToolStream()
+        started = time.monotonic()
+        r = self._chat()
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(200, r.status_code)
+        self.assertGreaterEqual(elapsed, 0.55,
+                                '工具调用流被误判为空闲并提前中断了')
+        row = db.query_one(
+            'SELECT error FROM request_logs ORDER BY id DESC LIMIT 1')
+        self.assertFalse((row['error'] or '').strip(),
+                         '正常的工具调用流不应被记成错误')
 
 
 if __name__ == '__main__':
