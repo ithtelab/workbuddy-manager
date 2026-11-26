@@ -418,6 +418,8 @@
     "sortDescending": "降順",
     "sortDirectionToggle": "現在は{direction}。並び順を切り替え",
     "sortAddedHint": "このパネルで記録した追加日時で並べ替えます。追加日時が不明な既存アカウントや直接コピーしたファイルは最後に表示します。",
+    "pageSize": "1ページあたり",
+    "pageSizeAria": "1ページに表示するアカウント数",
     "pageInfo": "全 {total} 件 · {page} / {pages} ページ",
     "noMatchTitle": "一致するアカウントがありません",
     "noMatchDesc": "別のキーワードを試すか、状態の絞り込みを「すべて」に戻してください。",

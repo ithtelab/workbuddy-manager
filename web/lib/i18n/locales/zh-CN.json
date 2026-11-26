@@ -418,6 +418,8 @@
     "sortDescending": "降序",
     "sortDirectionToggle": "当前{direction}，点击切换排序方向",
     "sortAddedHint": "按本面板记录的添加时间排序；旧账号或直接拷贝的账号没有历史添加时间，排在最后。",
+    "pageSize": "每页",
+    "pageSizeAria": "每页显示多少个账号",
     "pageInfo": "共 {total} 个账号 · 第 {page} / {pages} 页",
     "noMatchTitle": "没有匹配的账号",
     "noMatchDesc": "换个关键词，或把状态筛选切回「全部」。",
