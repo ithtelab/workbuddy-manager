@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -527,3 +528,39 @@ class DeviceFingerprintHeaderTest(_Base):
                                     'realm': 'cn'}, 'glm-5.2'))
         h = self._last()[2]['headers']
         self.assertEqual(h.get('X-Machine-ID'), self._expect('machine'))
+
+
+class ChatUaDesktopAlignmentTest(unittest.TestCase):
+    """issue #497：默认出站 UA 对齐官方桌面端（单段 5.11.3）。
+
+    官方桌面端 `resources/app.asar` 里的实际头是 `User-Agent: WorkBuddy/5.11.3`；
+    三段式（带 CLI 段）是旧形态，只在 `ua_style=cli` 时保留。
+    """
+
+    def setUp(self) -> None:
+        realm.invalidate()
+        self._env = mock.patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        os.environ.pop('WB2A_UA_STYLE', None)
+
+    def test_default_is_desktop_single_segment(self) -> None:
+        with mock.patch.object(realm, '_read_upstream_sec', return_value={}):
+            self.assertEqual(realm._ua(realm.CN), 'WorkBuddy/5.11.3')
+            self.assertEqual(realm._ua(realm.GLOBAL), 'WorkBuddy AI/5.11.3')
+            self.assertNotIn('CLI/', realm._ua(realm.CN))
+
+    def test_cli_style_restores_three_segments(self) -> None:
+        with mock.patch.object(realm, '_read_upstream_sec',
+                               return_value={'ua_style': 'cli'}):
+            self.assertEqual(realm._ua(realm.CN),
+                             'WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.63.2')
+
+    def test_env_override_matches_upstream(self) -> None:
+        with mock.patch.dict(os.environ, {'WB2A_UA_STYLE': 'cli'}):
+            with mock.patch.object(realm, '_read_upstream_sec', return_value={}):
+                self.assertIn('CLI/', realm._ua(realm.CN))
+
+    def test_explicit_versions_still_override(self) -> None:
+        with mock.patch.object(realm, '_read_upstream_sec', return_value={}),              mock.patch.object(realm, 'client_version', return_value='6.0.0'),              mock.patch.object(realm, 'cli_version', return_value='3.0.0'):
+            self.assertEqual(realm._ua(realm.CN), 'WorkBuddy/6.0.0')

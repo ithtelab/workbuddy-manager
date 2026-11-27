@@ -136,7 +136,7 @@ def client_version() -> str:
             return v.strip()
     except Exception:  # noqa: BLE001
         pass
-    return '5.5.4'
+    return '5.11.3'
 
 
 def cli_version() -> str:
@@ -149,16 +149,35 @@ def cli_version() -> str:
             return v.strip()
     except Exception:  # noqa: BLE001
         pass
-    return '2.137.1'
+    return '2.63.2'
+
+
+def ua_style() -> str:
+    """上游出站 UA 形态：`desktop`（默认，单段）/ `cli`（三段）。
+
+    镜像上游 `upstream.ua_style`（环境变量 `WB2A_UA_STYLE` 优先，与上游启动逻辑
+    一致）。默认对齐官方桌面端：CN `WorkBuddy/<ver>`、global `WorkBuddy AI/<ver>`；
+    `cli` 恢复旧的三段式（`WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>`）。
+    """
+    import os
+    env = (os.environ.get('WB2A_UA_STYLE') or '').strip().lower()
+    if env in ('desktop', 'cli'):
+        return env
+    val = str(_read_upstream_sec().get('ua_style') or '').strip().lower()
+    return val if val in ('desktop', 'cli') else 'desktop'
 
 
 def _ua(realm: Realm) -> str:
     """chat 域出站 UA。镜像上游 defaultWorkBuddyUAFor：
-    `WorkBuddy/<ver> <platform>/<ver> CLI/<cli>`，国际版的平台段是 `WorkBuddy AI`。
+
+    - 默认（desktop）：单段 `WorkBuddy/<ver>`，国际版平台段为 `WorkBuddy AI`；
+    - `ua_style=cli`：`WorkBuddy/<ver> <platform>/<ver> CLI/<cli>`。
     """
     ver = client_version()
     platform = 'WorkBuddy AI' if realm == GLOBAL else 'WorkBuddy'
-    return f'WorkBuddy/{ver} {platform}/{ver} CLI/{cli_version()}'
+    if ua_style() == 'cli':
+        return f'WorkBuddy/{ver} {platform}/{ver} CLI/{cli_version()}'
+    return f'{platform}/{ver}'
 
 
 def billing_ua() -> str:
