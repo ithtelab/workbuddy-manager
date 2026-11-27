@@ -1,0 +1,1263 @@
+diff --git a/internal/pool/cost_explore_test.go b/internal/pool/cost_explore_test.go
+index 4e030ae..2c52eb6 100644
+--- a/internal/pool/cost_explore_test.go
++++ b/internal/pool/cost_explore_test.go
+@@ -41,11 +41,13 @@ func exploreLastLen(p *Pool) int {
+ func TestCostExploreSpreadsTrafficAcrossFreeAccounts(t *testing.T) {
+ 	withNoPickGap(t)
+ 	p := New("")
+-	p.SetCostExploreInterval(time.Nanosecond) // 窗口极小：tier 1 存在即探索
++	// 窗口极小：tier 1 存在即探索。每轮显式过窗（时间精度在 Windows 上约
++	// 0.5ms，连续 pick 的 now 可能完全相同，不能只靠 Nanosecond 判定）。
++	p.SetCostExploreInterval(time.Nanosecond)
+ 	p.Add(&auth.Auth{UID: "free1"})
+ 	p.Add(&auth.Auth{UID: "n1"})
+ 	p.Add(&auth.Auth{UID: "n2"})
+-	p.NoteModelCost("free1", "m", 0, 1000) // tier 0 垄断层
++	noteFreeTier(p, "free1", "m") // tier 0 垄断层（两笔 0）
+ 
+ 	counts := map[string]int{}
+ 	for i := 0; i < 300; i++ {
+@@ -53,8 +55,9 @@ func TestCostExploreSpreadsTrafficAcrossFreeAccounts(t *testing.T) {
+ 		if a == nil {
+ 			t.Fatalf("第 %d 次 pick 返回 nil", i)
+ 		}
+-		// 每次成功都写观测（credit=0 免费）：探索→NoteModelCost(0)→毕业自然发生。
+-		p.NoteModelCost(a.UID, "m", 0, 1000)
++		// 每次成功都写观测（credit=0 免费）：每次选中写一笔，累计两笔即毕业。
++		p.NoteModelCost(a.UID, "m", 0, modelCostMinTokens)
++		passExploreWindow(p, "", "m")
+ 		counts[a.UID]++
+ 	}
+ 	for _, uid := range []string{"free1", "n1", "n2"} {
+@@ -82,7 +85,7 @@ func TestCostExploreProbesAndGraduates(t *testing.T) {
+ 	p.SetCostExploreInterval(time.Hour) // 只探一次（后续 elapsed < 1h）
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "unknown"})
+-	p.NoteModelCost("free", "m", 0, 1000) // tier 0
++	noteFreeTier(p, "free", "m") // tier 0
+ 
+ 	// 首个 pick：零值 timer = 从未探索 → 首次即探，tier 1-only 层只有 unknown。
+ 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "unknown" {
+@@ -92,8 +95,10 @@ func TestCostExploreProbesAndGraduates(t *testing.T) {
+ 		t.Fatalf("探索事件数=%d want 1", got)
+ 	}
+ 
+-	// 免费毕业：首观测写入即改变层归属（无延迟），后续 pick 两号均可选。
+-	p.NoteModelCost("unknown", "m", 0, 1000)
++	// 免费毕业：需两笔 credit=0（新语义：单笔 0 仍是未知层），第二笔写入即
++	// 改变层归属（无延迟），后续 pick 两号均可选。
++	p.NoteModelCost("unknown", "m", 0, modelCostMinTokens)
++	p.NoteModelCost("unknown", "m", 0, modelCostMinTokens)
+ 	counts := map[string]int{}
+ 	for i := 0; i < 50; i++ {
+ 		a := p.PickExcludingForRealm(nil, "m", "")
+@@ -118,12 +123,12 @@ func TestCostExploreGraduatesToPaid(t *testing.T) {
+ 	p.SetCostExploreInterval(time.Hour)
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "paid-later"})
+-	p.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p, "free", "m")
+ 
+ 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "paid-later" {
+ 		t.Fatalf("首个 pick=%v want paid-later（探索改道）", a)
+ 	}
+-	p.NoteModelCost("paid-later", "m", 2.9, 1000) // 收费毕业 → tier 2
++	p.NoteModelCost("paid-later", "m", 2.9, modelCostMinTokens) // 收费毕业 → tier 2
+ 
+ 	for i := 0; i < 50; i++ {
+ 		if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "free" {
+@@ -143,7 +148,7 @@ func TestCostExploreBoundedPerWindow(t *testing.T) {
+ 	p.SetCostExploreInterval(time.Hour)
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "unknown"})
+-	p.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p, "free", "m")
+ 
+ 	// 首次 pick 探索（timer 写入）→ 同窗口内后续 50 次全部回到 tier 0。
+ 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "unknown" {
+@@ -178,7 +183,7 @@ func TestCostExploreOff(t *testing.T) {
+ 	p.SetCostExploreInterval(0) // 0 = 关停
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "unknown"})
+-	p.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p, "free", "m")
+ 
+ 	for i := 0; i < 50; i++ {
+ 		if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "free" {
+@@ -214,8 +219,8 @@ func TestCostExploreRequiresTier0AndTier1(t *testing.T) {
+ 	p2.SetCostExploreInterval(time.Hour)
+ 	p2.Add(&auth.Auth{UID: "u1"})
+ 	p2.Add(&auth.Auth{UID: "u2"})
+-	p2.NoteModelCost("u1", "m", 0, 1000)
+-	p2.NoteModelCost("u2", "m", 0, 1000)
++	noteFreeTier(p2, "u1", "m")
++	noteFreeTier(p2, "u2", "m")
+ 	for i := 0; i < 10; i++ {
+ 		p2.PickExcludingForRealm(nil, "m", "")
+ 	}
+@@ -235,7 +240,7 @@ func TestCostExploreRequiresModel(t *testing.T) {
+ 	p.SetCostExploreInterval(time.Hour)
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "unknown"})
+-	p.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p, "free", "m")
+ 
+ 	for i := 0; i < 10; i++ {
+ 		if a := p.Pick(""); a == nil {
+@@ -259,7 +264,7 @@ func TestCostExploreSkipsWhenTier1Unavailable(t *testing.T) {
+ 	p.SetCostExploreInterval(time.Hour)
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "unknown"})
+-	p.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p, "free", "m")
+ 	p.Cooldown("unknown", CoolSoft, time.Minute, "429 rate limit")
+ 	for i := 0; i < 5; i++ {
+ 		if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "free" {
+@@ -276,7 +281,7 @@ func TestCostExploreSkipsWhenTier1Unavailable(t *testing.T) {
+ 	p2.SetMaxInFlight(1)
+ 	p2.Add(&auth.Auth{UID: "free"})
+ 	p2.Add(&auth.Auth{UID: "unknown"})
+-	p2.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p2, "free", "m")
+ 	if !p2.Acquire("unknown") {
+ 		t.Fatal("Acquire(unknown) 失败（上限 1 应可占 1 个名额）")
+ 	}
+@@ -298,7 +303,7 @@ func TestCostExploreFailureNoStorm(t *testing.T) {
+ 	p.SetCostExploreInterval(time.Hour)
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "unknown"})
+-	p.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p, "free", "m")
+ 
+ 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "unknown" {
+ 		t.Fatalf("首个 pick=%v want unknown（探索改道）", a)
+@@ -324,7 +329,7 @@ func TestCostExploreConcurrentSingleFire(t *testing.T) {
+ 	p.SetCostExploreInterval(time.Hour)
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "unknown"})
+-	p.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p, "free", "m")
+ 
+ 	const n = 20
+ 	var wg sync.WaitGroup
+@@ -352,7 +357,7 @@ func TestCostExploreNotPersisted(t *testing.T) {
+ 	p.SetCostExploreInterval(time.Hour)
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "unknown"})
+-	p.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p, "free", "m")
+ 
+ 	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "unknown" {
+ 		t.Fatalf("首个 pick=%v want unknown（探索改道）", a)
+@@ -379,7 +384,7 @@ func TestCostExploreStatusExposed(t *testing.T) {
+ 	p.SetCostExploreInterval(time.Hour)
+ 	p.Add(&auth.Auth{UID: "free"})
+ 	p.Add(&auth.Auth{UID: "unknown"})
+-	p.NoteModelCost("free", "m", 0, 1000)
++	noteFreeTier(p, "free", "m")
+ 
+ 	events, last := p.CostExploreStatus()
+ 	if events != 0 || len(last) != 0 {
+@@ -414,8 +419,8 @@ func TestCostExploreKeyByRealmAndModel(t *testing.T) {
+ 	p.Add(&auth.Auth{UID: "cn2", Domain: ""})
+ 	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
+ 	p.Add(&auth.Auth{UID: "g2", Domain: "workbuddy.ai"})
+-	p.NoteModelCost("cn1", "m", 0, 1000)
+-	p.NoteModelCost("g1", "m", 0, 1000)
++	noteFreeTier(p, "cn1", "m")
++	noteFreeTier(p, "g1", "m")
+ 
+ 	// cn 域探索：只看 cn 候选（cn1 tier0 + cn2 tier1）。
+ 	if a := p.PickExcludingForRealm(nil, "m", "cn"); a == nil || a.UID != "cn2" {
+diff --git a/internal/pool/cost_test.go b/internal/pool/cost_test.go
+index 46c619a..ec0fba4 100644
+--- a/internal/pool/cost_test.go
++++ b/internal/pool/cost_test.go
+@@ -7,6 +7,14 @@ import (
+ 	"workbuddy2api/internal/auth"
+ )
+ 
++// noteFreeTier 写两笔 credit=0 的足量观测，使账号进入 tier 0。
++// issue #491 新语义：单笔 credit=0 只是「未知」（短请求的固定底价豁免），
++// 至少两笔累计为 0 才判免费。
++func noteFreeTier(p *Pool, uid, model string) {
++	p.NoteModelCost(uid, model, 0, modelCostMinTokens)
++	p.NoteModelCost(uid, model, 0, modelCostMinTokens)
++}
++
+ // TestNoteModelCostAndPreferFree 成本账本的核心验收：同一模型上已实测免费的号
+ // 必须优先于已实测收费的号，且这个优先级要压过积分因子。
+ func TestNoteModelCostAndPreferFree(t *testing.T) {
+@@ -22,8 +30,8 @@ func TestNoteModelCostAndPreferFree(t *testing.T) {
+ 	p.SetCredits("free", 1)
+ 	p.SetCredits("paid", 1_000_000)
+ 
+-	p.NoteModelCost("free", "hy4-preview", 0, 1000)   // 免费
+-	p.NoteModelCost("paid", "hy4-preview", 2.9, 1000) // 收费
++	noteFreeTier(p, "free", "hy4-preview")                          // 两笔 0 → tier 0
++	p.NoteModelCost("paid", "hy4-preview", 2.9, modelCostMinTokens) // 收费
+ 
+ 	for i := 0; i < 50; i++ {
+ 		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
+@@ -43,8 +51,8 @@ func TestModelCostCheaperPaidWins(t *testing.T) {
+ 	p.SetRandomSource(func(n int64) int64 { return 0 })
+ 	p.Add(&auth.Auth{UID: "cheap"})
+ 	p.Add(&auth.Auth{UID: "pricey"})
+-	p.NoteModelCost("cheap", "hy4-preview", 0.3, 1000)
+-	p.NoteModelCost("pricey", "hy4-preview", 5.0, 1000)
++	p.NoteModelCost("cheap", "hy4-preview", 0.3, modelCostMinTokens)
++	p.NoteModelCost("pricey", "hy4-preview", 5.0, modelCostMinTokens)
+ 	for i := 0; i < 50; i++ {
+ 		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
+ 		if a == nil || a.UID != "cheap" {
+@@ -67,7 +75,7 @@ func TestModelCostUnknownBeatsKnownPaid(t *testing.T) {
+ 	p.Add(&auth.Auth{UID: "paid"})
+ 	p.SetCredits("unknown", 1)
+ 	p.SetCredits("paid", 1_000_000)
+-	p.NoteModelCost("paid", "hy4-preview", 2.9, 1000)
++	p.NoteModelCost("paid", "hy4-preview", 2.9, modelCostMinTokens)
+ 
+ 	for i := 0; i < 50; i++ {
+ 		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
+@@ -89,7 +97,7 @@ func TestModelCostFreeBeatsUnknown(t *testing.T) {
+ 	p.Add(&auth.Auth{UID: "unknown"})
+ 	p.SetCredits("knownfree", 1)
+ 	p.SetCredits("unknown", 1_000_000)
+-	p.NoteModelCost("knownfree", "hy4-preview", 0, 1000)
++	noteFreeTier(p, "knownfree", "hy4-preview")
+ 
+ 	for i := 0; i < 50; i++ {
+ 		a := p.PickExcludingForRealm(nil, "hy4-preview", "")
+@@ -104,7 +112,7 @@ func TestModelCostFreeBeatsUnknown(t *testing.T) {
+ func TestModelCostStaleIgnored(t *testing.T) {
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.NoteModelCost("u1", "hy4-preview", 0, 1000)
++	noteFreeTier(p, "u1", "hy4-preview")
+ 	p.mu.Lock()
+ 	mc := p.byUID["u1"].modelCost["hy4-preview"]
+ 	mc.LastSeen = time.Now().Add(-2 * modelCostTTL) // 手工做旧
+@@ -127,7 +135,7 @@ func TestModelCostStaleIgnored(t *testing.T) {
+ func TestModelCostPrunedOnPick(t *testing.T) {
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.NoteModelCost("u1", "stale-model", 12, 1000)
++	p.NoteModelCost("u1", "stale-model", 12, modelCostMinTokens)
+ 
+ 	p.mu.Lock()
+ 	if len(p.byUID["u1"].modelCost) != 1 {
+@@ -150,37 +158,133 @@ func TestModelCostPrunedOnPick(t *testing.T) {
+ 	}
+ }
+ 
+-// TestModelCostEMASmoothing 观测按 EMA 平滑，单次异常不主导决策。
+-func TestModelCostEMASmoothing(t *testing.T) {
++// TestModelCostCumulativeNotEMA 累计量语义（issue #491）：不再 EMA，
++// CostPerReq 精确等于 TotalCredit/TotalRequests；CostPer1k 由累计 token 现算，
++// 只作诊断值。
++func TestModelCostCumulativeNotEMA(t *testing.T) {
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.NoteModelCost("u1", "m", 1.0, 1000) // 首次：直接取实测
+-	p.mu.RLock()
+-	first := p.byUID["u1"].modelCost["m"].CostPer1k
+-	p.mu.RUnlock()
+-	if first != 1.0 {
+-		t.Fatalf("首次观测 CostPer1k=%v want 1.0", first)
++	p.NoteModelCost("u1", "m", 1.0, 2000) // 0.5 credits/1k
++	p.NoteModelCost("u1", "m", 3.0, 6000) // 也是 0.5 credits/1k
++	mc, ok := modelCostSnapshot(p, "u1", "m")
++	if !ok {
++		t.Fatal("成本观测未写入")
+ 	}
+-	p.NoteModelCost("u1", "m", 3.0, 1000) // 第二次：EMA 拉向 3.0 但不等于 3.0
+-	p.mu.RLock()
+-	second := p.byUID["u1"].modelCost["m"].CostPer1k
+-	samples := p.byUID["u1"].modelCost["m"].Samples
+-	p.mu.RUnlock()
+-	if second <= 1.0 || second >= 3.0 {
+-		t.Errorf("EMA 后 CostPer1k=%v, want 介于 1.0 与 3.0 之间", second)
++	if mc.TotalCredit != 4.0 || mc.TotalRequests != 2 || mc.TotalTokens != 8000 {
++		t.Fatalf("累计量=%+v, want credit=4 requests=2 tokens=8000", mc)
++	}
++	if got := mc.costPerReq(); got != 2.0 {
++		t.Errorf("CostPerReq=%v want 2.0（4 credit / 2 requests，不是 EMA）", got)
++	}
++	if got := mc.per1k(); got != 0.5 {
++		t.Errorf("CostPer1k=%v want 0.5（4 credit / 8000 tokens ×1000）", got)
++	}
++	if mc.Samples != 2 {
++		t.Errorf("Samples=%d want 2", mc.Samples)
++	}
++}
++
++// TestModelCostShortRequestIgnored 观测门槛（issue #491）：tokens<2000 的请求
++// 不更新账本（不创建条目、不改变累计量）——一次 max_tokens=5 探测不得污染排序。
++func TestModelCostShortRequestIgnored(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	// 首笔就是短请求：不建条目（保留 tier 1 未知）。
++	p.NoteModelCost("u1", "m", 5.0, modelCostMinTokens-1)
++	if _, ok := modelCostSnapshot(p, "u1", "m"); ok {
++		t.Fatal("短请求不应创建成本账本条目")
++	}
++	// 长请求建立基线。
++	p.NoteModelCost("u1", "m", 2.0, modelCostMinTokens)
++	before, _ := modelCostSnapshot(p, "u1", "m")
++	// 再来一笔短请求（金额很大）：累计量与 LastSeen 都不得变化。
++	p.NoteModelCost("u1", "m", 99.0, 5)
++	after, _ := modelCostSnapshot(p, "u1", "m")
++	if after.TotalCredit != before.TotalCredit ||
++		after.TotalRequests != before.TotalRequests ||
++		after.TotalTokens != before.TotalTokens {
++		t.Errorf("短请求改变了累计量: before=%+v after=%+v", before, after)
++	}
++	if !after.LastSeen.Equal(before.LastSeen) {
++		t.Errorf("短请求不应刷新 LastSeen: before=%v after=%v", before.LastSeen, after.LastSeen)
++	}
++}
++
++// TestModelCostZeroCreditTierRequiresTwo 单笔 credit=0 不判免费（未知，tier 1）；
++// 两笔累计 0 才进 tier 0。行为断言：两笔 0 的号压过单笔 0 的号。
++func TestModelCostZeroCreditTierRequiresTwo(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "one"})
++	p.NoteModelCost("one", "m", 0, modelCostMinTokens)
++	one, _ := modelCostSnapshot(p, "one", "m")
++	if got := one.costTier(); got != 1 {
++		t.Errorf("单笔 credit=0 costTier=%d want 1（未知，不是免费）", got)
++	}
++
++	p2 := New("")
++	withNoPickGap(t)
++	p2.SetCostExploreInterval(0)
++	p2.SetRandomSource(func(n int64) int64 { return 0 })
++	p2.Add(&auth.Auth{UID: "one"})
++	p2.Add(&auth.Auth{UID: "two"})
++	p2.NoteModelCost("one", "m", 0, modelCostMinTokens)
++	noteFreeTier(p2, "two", "m")
++	two, _ := modelCostSnapshot(p2, "two", "m")
++	if got := two.costTier(); got != 0 {
++		t.Fatalf("两笔 credit=0 costTier=%d want 0", got)
++	}
++	for i := 0; i < 20; i++ {
++		if a := p2.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "two" {
++			t.Fatalf("第 %d 次选中 %v，want two（两笔 0 = tier 0；单笔 0 = tier 1）", i, a)
++		}
++	}
++}
++
++// TestModelCostPerRequestOrdering 同样 credit、不同请求长度 → per-req 相同，
++// 不应再出现旧 per1k 口径下 1300 倍的「长请求账号更便宜」假象。
++//
++// 只使用公开 API，便于在 0058 基线上做反向验证（旧实现按 per1k 排序会选中
++// b-long，本测试会失败）。
++func TestModelCostPerRequestOrdering(t *testing.T) {
++	withNoPickGap(t)
++	p := New("")
++	p.SetCostExploreInterval(0)
++	p.SetRandomSource(func(n int64) int64 { return 0 })
++	p.Add(&auth.Auth{UID: "a-short"})
++	p.Add(&auth.Auth{UID: "b-long"})
++	p.NoteModelCost("a-short", "m", 0.14, 2000) // per1k=0.07
++	p.NoteModelCost("b-long", "m", 0.14, 8000)  // per1k=0.0175（旧口径下的「便宜」）
++	// 两号 per-req 都是 0.14：cost 并列后按权重/UID 稳定排序（a-short 在前），
++	// 随机源 0 取第一个。旧实现会把 b-long 排在前面并选中它。
++	if a := p.PickExcludingForRealm(nil, "m", ""); a == nil || a.UID != "a-short" {
++		t.Fatalf("选中 %v, want a-short（per-req 相同，不应按请求长度偏袒长请求号）", a)
++	}
++}
++
++// TestModelCostPerRequestTotals 内部断言：per-req 相同、per1k 是诊断值且不同。
++func TestModelCostPerRequestTotals(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "a-short"})
++	p.Add(&auth.Auth{UID: "b-long"})
++	p.NoteModelCost("a-short", "m", 0.14, 2000)
++	p.NoteModelCost("b-long", "m", 0.14, 8000)
++	short, _ := modelCostSnapshot(p, "a-short", "m")
++	long, _ := modelCostSnapshot(p, "b-long", "m")
++	if short.costPerReq() != 0.14 || long.costPerReq() != 0.14 {
++		t.Errorf("per-req short=%v long=%v，want 都是 0.14", short.costPerReq(), long.costPerReq())
+ 	}
+-	if samples != 2 {
+-		t.Errorf("Samples=%d want 2", samples)
++	if short.per1k() == long.per1k() {
++		t.Errorf("per1k 诊断值应因请求长度不同而不同: short=%v long=%v", short.per1k(), long.per1k())
+ 	}
+ }
+ 
+-// TestModelCostIgnoresInvalidInput 无法折算单价的输入不应写入账本（防污染）。
++// TestModelCostIgnoresInvalidInput 无法折算的输入不应写入账本（防污染）。
+ func TestModelCostIgnoresInvalidInput(t *testing.T) {
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.NoteModelCost("u1", "m", 5.0, 0)  // tokens=0
+-	p.NoteModelCost("", "m", 5.0, 1000) // 空 uid
+-	p.NoteModelCost("u1", "", 5.0, 1000)
++	p.NoteModelCost("u1", "m", 5.0, 0)                 // tokens=0
++	p.NoteModelCost("", "m", 5.0, modelCostMinTokens)  // 空 uid
++	p.NoteModelCost("u1", "", 5.0, modelCostMinTokens) // 空 model
+ 	p.mu.RLock()
+ 	n := len(p.byUID["u1"].modelCost)
+ 	p.mu.RUnlock()
+@@ -195,7 +299,7 @@ func TestModelCostEmptyModelUnaffected(t *testing.T) {
+ 	withNoPickGap(t)
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.NoteModelCost("u1", "hy4-preview", 5.0, 1000)
++	p.NoteModelCost("u1", "hy4-preview", 5.0, modelCostMinTokens)
+ 	if a := p.PickExcludingForRealm(nil, "", ""); a == nil {
+ 		t.Error("空模型名不应被成本分层影响（应仍能选出账号）")
+ 	}
+diff --git a/internal/pool/entry.go b/internal/pool/entry.go
+index 81385dc..f18b719 100644
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -48,10 +48,11 @@ type Status struct {
+ 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
+ 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
+ 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
+-	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
+-	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
+-	// samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失（零回归，
+-	// 只读遍历零风险）。tier 不单独落字段（可由 per1k≤0 推出，零冗余）。
++	//「为什么总选它」——tier 0（两笔以上 0 免费）垄断 / tier 2 按 per-req 排序
++	// 一眼可见；cost_per_1k 仅作诊断。
++	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_req + 诊断 cost_per_1k +
++	// last_seen + samples）；无观测/全部过期 → nil（tier 1 未知层）。过期即消失
++	// （零回归，只读遍历零风险）。tier 不单独落字段（由累计量推出，零冗余）。
+ 	ModelCosts     []ModelCostStatus `json:"model_costs,omitempty"`
+ 	Disabled       bool              `json:"disabled"`
+ 	DisabledReason string            `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+@@ -90,15 +91,19 @@ type RateLimitedModel struct {
+ }
+ 
+ // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
+-// tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
+-// 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
++// tier 不单独落字段：tier 由累计量推出（见 modelCostEntry.costTier），
++// 无观测即 tier 1——避免双表示漂移。
+ type ModelCostStatus struct {
+ 	Model string `json:"model"`
+-	// CostPer1k 实测每千 token 单价（EMA 平滑值）。≤0 = 实测免费（tier 0）。
++	// CostPerReq 实测每次请求的平均扣费（TotalCredit/TotalRequests），选号分层的
++	// 权威口径。credit 主要是每次请求的固定底价，per-req 才反映账号真实成本。
++	CostPerReq float64 `json:"cost_per_req"`
++	// CostPer1k 每千 token 单价（TotalCredit/TotalTokens*1000）——**诊断值**，
++	// 仅用于解释「为什么这个号 per-req 是这个数」，不再参与选号排序。
+ 	CostPer1k float64 `json:"cost_per_1k"`
+ 	// LastSeen 最近一次观测时刻（过期即从台账消失，同 modelCostTTL 口径）。
+ 	LastSeen time.Time `json:"last_seen"`
+-	// Samples 累计观测次数（EMA 收敛度参考）。
++	// Samples 累计观测次数（诊断）。
+ 	Samples int `json:"samples,omitempty"`
+ }
+ 
+@@ -405,7 +410,7 @@ type stateAccount struct {
+ 	// ModelCosts 实测扣费账本（model → 单价观测，见 entry.modelCost）。持久化
+ 	// （P1-anti-monopoly）：重启后成本知识保留，限免/夜间免费的跨重启窗口不再
+ 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
+-	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
++	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/累计量、零 LastSeen 的结构破损条目）。
+ 	// 与运行态 modelCostEntry 字段一一对应（单一表示，内存与落盘同构不搞两套）。
+ 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
+ }
+@@ -419,12 +424,16 @@ type stateModelCooldown struct {
+ }
+ 
+ // stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
+-// 字段一一对应（CostPer1k/LastSeen/Samples），落盘/恢复往返无损（EMA 值随
+-// JSON 浮点原样保留，往返不引入漂移）。
++// 字段一一对应，落盘/恢复往返无损（累计量/诊断值随 JSON 浮点原样保留）。
++// TotalCredit/TotalRequests/TotalTokens 是 issue #491 新增的累计量；老 state.json
++// 没有它们（Requests=0），恢复侧按迁移语义沿用 CostPer1k，见 modelCostEntry.costPerReq。
+ type stateModelCost struct {
+-	CostPer1k float64   `json:"cost_per_1k"`
+-	LastSeen  time.Time `json:"last_seen"`
+-	Samples   int       `json:"samples,omitempty"`
++	CostPer1k     float64   `json:"cost_per_1k"`
++	LastSeen      time.Time `json:"last_seen"`
++	Samples       int       `json:"samples,omitempty"`
++	TotalCredit   float64   `json:"total_credit,omitempty"`
++	TotalRequests int64     `json:"total_requests,omitempty"`
++	TotalTokens   int64     `json:"total_tokens,omitempty"`
+ }
+ 
+ // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
+@@ -432,11 +441,82 @@ type stateModelCost struct {
+ // 白天会把已开始收费的号继续当成免费。
+ const modelCostTTL = 6 * time.Hour
+ 
++// modelCostMinTokens 成本观测的最小样本量（issue #491）。tokens 低于该值的请求
++// 不更新账本：一次 max_tokens=5 的短探测扣费几乎全部是固定底价，按 per-token
++// 折算会得到极端单价；EMA 再把它平滑进账本，一次探测能污染很久。2k 是
++// 「固定底价 vs token 成本」开始可分的最小量级（短于它的观测只扣余额，不记账）。
++const modelCostMinTokens = 2000
++
+ // modelCostEntry 运行时成本账本（持久化镜像 stateModelCost 与其字段一一对应）。
++//
++// issue #491：选号改用「每次请求平均扣费」TotalCredit/TotalRequests——credit 主要
++// 是每次请求的固定底价，几乎不随 token 增长；旧的 per1k 实际度量的是「这个号平均
++// 接到多长的请求」，跨账号能差 1300 倍。累计量只增不减，不做 EMA（一次短探测
++// 不会再长期污染账本）。
+ type modelCostEntry struct {
+-	CostPer1k float64
++	// CostPer1k 每千 token 单价诊断值（由累计量现算；老数据迁移时是旧 EMA 值）。
++	// 不参与选号排序。
++	CostPer1k float64 `json:"cost_per_1k,omitempty"`
+ 	LastSeen  time.Time
+ 	Samples   int
++	// TotalCredit / TotalRequests / TotalTokens 累计扣费、请求数、token 数。
++	TotalCredit   float64 `json:"total_credit,omitempty"`
++	TotalRequests int64   `json:"total_requests,omitempty"`
++	TotalTokens   int64   `json:"total_tokens,omitempty"`
++}
++
++// costPerReq 每次请求的平均扣费（选号分层的权威口径）。
++// TotalRequests==0 是老 state.json 的迁移形态：沿用旧 CostPer1k，绝不置 0——
++// 否则升级后全池瞬间按 0 成本挤进 tier 0。
++func (mc modelCostEntry) costPerReq() float64 {
++	if mc.TotalRequests > 0 {
++		return mc.TotalCredit / float64(mc.TotalRequests)
++	}
++	if mc.CostPer1k > 0 {
++		return mc.CostPer1k
++	}
++	return 0
++}
++
++// per1k 由累计量现算每千 token 单价（诊断值；不参与选号）。
++// TotalTokens==0 时返回持久化的旧值（迁移形态）。
++func (mc modelCostEntry) per1k() float64 {
++	if mc.TotalTokens > 0 {
++		return mc.TotalCredit / float64(mc.TotalTokens) * 1000
++	}
++	return mc.CostPer1k
++}
++
++// costTier 成本分层：
++//   - 0 = 已累计观测免费（TotalCredit==0 且至少 2 笔请求）
++//   - 1 = 无观测 / 单笔 0 未知（单笔 credit=0 可能只是短请求的固定底价豁免）
++//   - 2 = 已累计观测收费
++//
++// Requests==0 是老 state.json 迁移形态：保留旧的免费/收费结论（CostPer1k<=0 且
++// Samples>=2 视为旧免费观测；单笔旧 0 观测按未知处理，与新的「单笔 0 不判免费」一致）。
++func (mc modelCostEntry) costTier() int {
++	if mc.TotalRequests == 0 {
++		if mc.CostPer1k <= 0 {
++			if mc.Samples >= 2 {
++				return 0
++			}
++			return 1
++		}
++		return 2
++	}
++	if mc.TotalCredit == 0 {
++		if mc.TotalRequests >= 2 {
++			return 0
++		}
++		return 1
++	}
++	return 2
++}
++
++// knownFree 报告该条目在写入口是否已是「已确认免费」状态（用于限免结束日志）。
++// 老数据迁移形态沿用旧结论，判定口径与 costTier 一致。
++func (mc modelCostEntry) knownFree() bool {
++	return mc.costTier() == 0
+ }
+ 
+ // modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。**已持久化**（stateAccount.ModelCooldowns
+diff --git a/internal/pool/modelcost_persist_test.go b/internal/pool/modelcost_persist_test.go
+index 04a580a..ab81efc 100644
+--- a/internal/pool/modelcost_persist_test.go
++++ b/internal/pool/modelcost_persist_test.go
+@@ -35,9 +35,9 @@ func TestModelCostPersistRoundTrip(t *testing.T) {
+ 	fp := filepath.Join(dir, "state.json")
+ 	p := New(fp)
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.NoteModelCost("u1", "hy4-preview", 0, 1000)   // 免费（tier 0）
+-	p.NoteModelCost("u1", "glm-5.3", 2.0, 1000)     // 收费（tier 2）
+-	p.NoteModelCost("u1", "glm-5.3", 4.0, 1000)     // 二次观测（EMA + Samples）
++	noteFreeTier(p, "u1", "hy4-preview")                      // 两笔 0 → tier 0
++	p.NoteModelCost("u1", "glm-5.3", 2.0, modelCostMinTokens) // 收费（tier 2）
++	p.NoteModelCost("u1", "glm-5.3", 4.0, modelCostMinTokens) // 二次观测（累计量 + Samples）
+ 	p.Flush()
+ 
+ 	p2 := New(fp)
+@@ -47,9 +47,9 @@ func TestModelCostPersistRoundTrip(t *testing.T) {
+ 	if !ok || mc.CostPer1k != 0 {
+ 		t.Errorf("免费观测未恢复: ok=%v mc=%+v", ok, mc)
+ 	}
+-	// 收费观测恢复：EMA(α=0.3) 混两次观测（2.0、4.0），Samples=2。往返无损的
+-	// 权威断言是「恢复值 == 落盘前内存值」（JSON 浮点原样保留，不引入漂移），
+-	// 而非手算常数（浮点结合序会让 2.6 呈 2.599999…）。
++	// 收费观测恢复：累计 credit=6 / requests=2 / tokens=4000，per-req=3.0、
++	// per1k=1.5（诊断值）。往返无损的权威断言是「恢复值 == 落盘前内存值」
++	// （JSON 浮点原样保留，不引入漂移），而非手算常数。
+ 	mc, ok = modelCostSnapshot(p2, "u1", "glm-5.3")
+ 	if !ok {
+ 		t.Fatal("收费观测未恢复")
+@@ -57,6 +57,12 @@ func TestModelCostPersistRoundTrip(t *testing.T) {
+ 	if want, _ := modelCostSnapshot(p, "u1", "glm-5.3"); mc.CostPer1k != want.CostPer1k {
+ 		t.Errorf("CostPer1k 往返漂移: restored=%v in-memory=%v", mc.CostPer1k, want.CostPer1k)
+ 	}
++	if mc.TotalCredit != 6.0 || mc.TotalRequests != 2 || mc.TotalTokens != 4000 {
++		t.Errorf("累计量未恢复: %+v want credit=6 requests=2 tokens=4000", mc)
++	}
++	if got := mc.costPerReq(); got != 3.0 {
++		t.Errorf("CostPerReq=%v want 3.0", got)
++	}
+ 	if mc.Samples != 2 {
+ 		t.Errorf("Samples=%d want 2", mc.Samples)
+ 	}
+@@ -73,8 +79,8 @@ func TestModelCostPersistTTLExpiryFilter(t *testing.T) {
+ 	fp := filepath.Join(dir, "state.json")
+ 	p := New(fp)
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.NoteModelCost("u1", "stale", 0, 1000)
+-	p.NoteModelCost("u1", "fresh", 1.0, 1000)
++	noteFreeTier(p, "u1", "stale")
++	p.NoteModelCost("u1", "fresh", 1.0, modelCostMinTokens)
+ 	// 手工把 stale 做旧到 TTL 之外（fresh 保持新鲜）。
+ 	p.mu.Lock()
+ 	mc := p.byUID["u1"].modelCost["stale"]
+@@ -95,13 +101,13 @@ func TestModelCostPersistTTLExpiryFilter(t *testing.T) {
+ }
+ 
+ // TestModelCostPersistExpiryNotWritten 落盘侧惰性清理：已过期的条目不写出
+-//（落盘即清理，与恢复侧同口径），state.json 不残留陈旧价格。
++// （落盘即清理，与恢复侧同口径），state.json 不残留陈旧价格。
+ func TestModelCostPersistExpiryNotWritten(t *testing.T) {
+ 	dir := t.TempDir()
+ 	fp := filepath.Join(dir, "state.json")
+ 	p := New(fp)
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.NoteModelCost("u1", "old", 1.0, 1000)
++	p.NoteModelCost("u1", "old", 1.0, modelCostMinTokens)
+ 	p.mu.Lock()
+ 	mc := p.byUID["u1"].modelCost["old"]
+ 	mc.LastSeen = time.Now().Add(-2 * modelCostTTL)
+@@ -133,27 +139,32 @@ func TestModelCostFreeTierEndedLog(t *testing.T) {
+ 
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	// 免费 → 免费：不是「结束」，不打事件。
+-	p.NoteModelCost("u1", "m", 0, 1000)
++	// 单笔 0：未知层，不是「已确认免费」，不打事件。
++	p.NoteModelCost("u1", "m", 0, modelCostMinTokens)
++	if strings.Contains(buf.String(), "free tier ended") {
++		t.Errorf("单笔 credit=0 不应视为免费结束/开始: %s", buf.String())
++	}
++	// 第二笔 0：累计确认免费（tier 0），仍不是「结束」。
++	p.NoteModelCost("u1", "m", 0, modelCostMinTokens)
+ 	if strings.Contains(buf.String(), "free tier ended") {
+ 		t.Errorf("免费→免费不应触发限免结束事件: %s", buf.String())
+ 	}
+ 	// 免费 → 收费：打事件。
+-	p.NoteModelCost("u1", "m", 2.0, 1000)
++	p.NoteModelCost("u1", "m", 2.0, modelCostMinTokens)
+ 	if !strings.Contains(buf.String(), "free tier ended") {
+ 		t.Errorf("免费→收费应触发限免结束事件: %s", buf.String())
+ 	}
+-	if !strings.Contains(buf.String(), "model m on uid") || !strings.Contains(buf.String(), "credits/1k") {
++	if !strings.Contains(buf.String(), "model m on uid") || !strings.Contains(buf.String(), "credits/req") {
+ 		t.Errorf("事件应含模型/账号/单价上下文: %s", buf.String())
+ 	}
+ 	buf.Reset()
+ 	// 收费 → 收费：已不在 tier 0，不再打。
+-	p.NoteModelCost("u1", "m", 3.0, 1000)
++	p.NoteModelCost("u1", "m", 3.0, modelCostMinTokens)
+ 	if strings.Contains(buf.String(), "free tier ended") {
+ 		t.Errorf("收费→收费不应重复触发: %s", buf.String())
+ 	}
+ 	// 新模型直接收费：无覆盖前值，不打。
+-	p.NoteModelCost("u1", "m2", 1.0, 1000)
++	p.NoteModelCost("u1", "m2", 1.0, modelCostMinTokens)
+ 	if strings.Contains(buf.String(), "free tier ended") {
+ 		t.Errorf("无 tier0 前值不应触发: %s", buf.String())
+ 	}
+@@ -165,16 +176,21 @@ func TestModelCostFreeTierEndedLog(t *testing.T) {
+ func TestModelCostRestoreDropsInvalid(t *testing.T) {
+ 	dir := t.TempDir()
+ 	fp := filepath.Join(dir, "state.json")
+-	// 手工构造：合法条目 + 负单价 + 零 LastSeen（三种形态并存）。
++	// 手工构造：合法条目 + 负单价 + 负累计量 + 零 LastSeen（四种形态并存）。
+ 	negative := -0.5
++	now := time.Now().Format(time.RFC3339Nano)
+ 	state := map[string]any{
+ 		"accounts": map[string]any{
+ 			"u1": map[string]any{
+ 				"credits": 100,
+ 				"model_costs": map[string]any{
+-					"valid":   map[string]any{"cost_per_1k": 1.5, "last_seen": time.Now().Format(time.RFC3339Nano), "samples": 3},
+-					"neg":     map[string]any{"cost_per_1k": negative, "last_seen": time.Now().Format(time.RFC3339Nano)},
+-					"nolast":  map[string]any{"cost_per_1k": 2.0},
++					"valid": map[string]any{
++						"cost_per_1k": 1.5, "last_seen": now, "samples": 3,
++						"total_credit": 4.5, "total_requests": 3, "total_tokens": 3000,
++					},
++					"neg":    map[string]any{"cost_per_1k": negative, "last_seen": now},
++					"negcum": map[string]any{"cost_per_1k": 1.0, "last_seen": now, "total_credit": negative, "total_requests": 1, "total_tokens": 2000},
++					"nolast": map[string]any{"cost_per_1k": 2.0},
+ 				},
+ 			},
+ 		},
+@@ -185,17 +201,87 @@ func TestModelCostRestoreDropsInvalid(t *testing.T) {
+ 	}
+ 	p := New(fp)
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	if _, ok := modelCostSnapshot(p, "u1", "valid"); !ok {
++	valid, ok := modelCostSnapshot(p, "u1", "valid")
++	if !ok {
+ 		t.Error("合法条目应恢复")
++	} else if valid.TotalCredit != 4.5 || valid.TotalRequests != 3 || valid.TotalTokens != 3000 {
++		t.Errorf("累计量未恢复: %+v", valid)
+ 	}
+ 	if _, ok := modelCostSnapshot(p, "u1", "neg"); ok {
+ 		t.Error("负 per1k 条目应剔除（非法值不污染账本）")
+ 	}
++	if _, ok := modelCostSnapshot(p, "u1", "negcum"); ok {
++		t.Error("负累计量条目应剔除（非法值不污染账本）")
++	}
+ 	if _, ok := modelCostSnapshot(p, "u1", "nolast"); ok {
+ 		t.Error("零 LastSeen 条目应剔除（结构破损）")
+ 	}
+ }
+ 
++// TestModelCostRestoreLegacyPer1kNotZeroed 迁移（issue #491）：老 state.json 只有
++// cost_per_1k、没有累计量（TotalRequests==0）。CostPerReq 必须沿用旧 CostPer1k，
++// 不能置 0——否则升级后全池瞬间按 0 成本挤进 tier 0。
++func TestModelCostRestoreLegacyPer1kNotZeroed(t *testing.T) {
++	dir := t.TempDir()
++	fp := filepath.Join(dir, "state.json")
++	now := time.Now().Format(time.RFC3339Nano)
++	state := map[string]any{
++		"accounts": map[string]any{
++			"u1": map[string]any{
++				"credits": 100,
++				"model_costs": map[string]any{
++					"paid":  map[string]any{"cost_per_1k": 2.5, "last_seen": now, "samples": 3},
++					"free":  map[string]any{"cost_per_1k": 0.0, "last_seen": now, "samples": 4},
++					"probe": map[string]any{"cost_per_1k": 0.0, "last_seen": now, "samples": 1},
++				},
++			},
++		},
++	}
++	raw, _ := json.Marshal(state)
++	if err := os.WriteFile(fp, raw, 0o600); err != nil {
++		t.Fatal(err)
++	}
++	p := New(fp)
++	p.Add(&auth.Auth{UID: "u1"})
++	paid, ok := modelCostSnapshot(p, "u1", "paid")
++	if !ok {
++		t.Fatal("老格式条目应恢复")
++	}
++	if paid.TotalRequests != 0 || paid.TotalCredit != 0 || paid.TotalTokens != 0 {
++		t.Fatalf("老格式不应伪造累计量: %+v", paid)
++	}
++	if got := paid.costPerReq(); got != 2.5 {
++		t.Errorf("迁移 CostPerReq=%v want 2.5（沿用旧 CostPer1k，不能置 0）", got)
++	}
++	if got := paid.costTier(); got != 2 {
++		t.Errorf("迁移收费条目 tier=%d want 2（不能因累计量为 0 判免费）", got)
++	}
++	free, _ := modelCostSnapshot(p, "u1", "free")
++	if got := free.costTier(); got != 0 {
++		t.Errorf("多笔老免费观测 tier=%d want 0（保留旧免费知识）", got)
++	}
++	probe, _ := modelCostSnapshot(p, "u1", "probe")
++	if got := probe.costTier(); got != 1 {
++		t.Errorf("单笔老 0 观测 tier=%d want 1（与单笔 0 不判免费一致）", got)
++	}
++	st, _ := p.Status("u1")
++	var paidRow *ModelCostStatus
++	for i := range st.ModelCosts {
++		if st.ModelCosts[i].Model == "paid" {
++			paidRow = &st.ModelCosts[i]
++		}
++	}
++	if paidRow == nil {
++		t.Fatal("/status 缺少迁移条目")
++	}
++	if paidRow.CostPerReq != 2.5 {
++		t.Errorf("/status cost_per_req=%v want 2.5（不能是 0）", paidRow.CostPerReq)
++	}
++	if paidRow.CostPer1k != 2.5 {
++		t.Errorf("/status cost_per_1k=%v want 2.5（诊断值沿用旧值）", paidRow.CostPer1k)
++	}
++}
++
+ // TestModelCostCorruptFileDegrades 损坏降级不崩溃：state.json 非法 JSON →
+ // load() 静默跳过，池零状态启动（既有 load() 行为，台账路径复用同一通道）。
+ func TestModelCostCorruptFileDegrades(t *testing.T) {
+@@ -241,8 +327,8 @@ func TestModelCostConcurrentWriteAndFlush(t *testing.T) {
+ 				if n%2 == 1 {
+ 					credit = 1.0
+ 				}
+-				p.NoteModelCost(uid, "m", credit, 1000)
+-				p.NoteModelCost(uid, "m2", 2.0, 500)
++				p.NoteModelCost(uid, "m", credit, modelCostMinTokens)
++				p.NoteModelCost(uid, "m2", 2.0, modelCostMinTokens)
+ 			}
+ 		}(g)
+ 	}
+@@ -266,35 +352,48 @@ func TestModelCostConcurrentWriteAndFlush(t *testing.T) {
+ }
+ 
+ // TestStatusModelCostsLedger /status（Status.ModelCosts）透出成本台账：每模型
+-// 一行（per1k/last_seen/samples），TTL 内才展示、过期即消失、无观测为 nil。
++// 一行（cost_per_req + 诊断 cost_per_1k + last_seen + samples），TTL 内才展示、
++// 过期即消失、无观测为 nil。
+ func TestStatusModelCostsLedger(t *testing.T) {
+ 	p := New("")
+ 	p.Add(&auth.Auth{UID: "u1"})
+-	p.NoteModelCost("u1", "free-model", 0, 1000)
+-	p.NoteModelCost("u1", "paid-model", 2.0, 1000)
++	noteFreeTier(p, "u1", "free-model")
++	p.NoteModelCost("u1", "paid-model", 2.0, 2000) // per-req=2.0, per1k=1.0
++	p.NoteModelCost("u1", "stale-model", 3.0, 2000)
+ 	// 手工做旧一条：过期后应从台账消失。
+ 	p.mu.Lock()
+-	mc := p.byUID["u1"].modelCost["paid-model"]
++	mc := p.byUID["u1"].modelCost["stale-model"]
+ 	mc.LastSeen = time.Now().Add(-2 * modelCostTTL)
+-	p.byUID["u1"].modelCost["paid-model"] = mc
++	p.byUID["u1"].modelCost["stale-model"] = mc
+ 	p.mu.Unlock()
+ 
+ 	st, ok := p.Status("u1")
+ 	if !ok {
+ 		t.Fatal("u1 missing")
+ 	}
+-	if len(st.ModelCosts) != 1 {
+-		t.Fatalf("ModelCosts 行数=%d want 1（过期条目应消失）: %+v", len(st.ModelCosts), st.ModelCosts)
++	if len(st.ModelCosts) != 2 {
++		t.Fatalf("ModelCosts 行数=%d want 2（过期条目应消失）: %+v", len(st.ModelCosts), st.ModelCosts)
++	}
++	rows := make(map[string]ModelCostStatus, len(st.ModelCosts))
++	for _, row := range st.ModelCosts {
++		rows[row.Model] = row
++	}
++	free := rows["free-model"]
++	if free.CostPerReq != 0 || free.CostPer1k != 0 {
++		t.Errorf("免费行 cost_per_req=%v cost_per_1k=%v want 0/0", free.CostPerReq, free.CostPer1k)
++	}
++	if free.LastSeen.IsZero() || free.Samples != 2 {
++		t.Errorf("免费行 last_seen/samples 未透出: %+v", free)
+ 	}
+-	row := st.ModelCosts[0]
+-	if row.Model != "free-model" {
+-		t.Errorf("model=%q want free-model", row.Model)
++	paid := rows["paid-model"]
++	if paid.CostPerReq != 2.0 {
++		t.Errorf("收费行 cost_per_req=%v want 2.0（选号权威口径）", paid.CostPerReq)
+ 	}
+-	if row.CostPer1k != 0 {
+-		t.Errorf("cost_per_1k=%v want 0（免费）", row.CostPer1k)
++	if paid.CostPer1k != 1.0 {
++		t.Errorf("收费行 cost_per_1k=%v want 1.0（诊断值）", paid.CostPer1k)
+ 	}
+-	if row.LastSeen.IsZero() || row.Samples != 1 {
+-		t.Errorf("last_seen/samples 未透出: %+v", row)
++	if _, ok := rows["stale-model"]; ok {
++		t.Error("过期条目不应出现在 /status")
+ 	}
+ 
+ 	// 无观测账号 → nil（零回归）。
+diff --git a/internal/pool/persist.go b/internal/pool/persist.go
+index d0c3511..876df6d 100644
+--- a/internal/pool/persist.go
++++ b/internal/pool/persist.go
+@@ -217,22 +217,29 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+ 			}
+ 		}
+ 		// 恢复 modelCosts（P1-anti-monopoly）：按 modelCostTTL 惰性过滤（超 6h 的
+-		// 按过期处理，回 tier 1 不复活陈旧知识）+ 非法值剔除（负 per1k / 零
+-		// LastSeen 的结构破损条目不污染账本；state.json 手工脏数据防御）。
++		// 按过期处理，回 tier 1 不复活陈旧知识）+ 非法值剔除（负 per1k/累计量 /
++		// 零 LastSeen 的结构破损条目不污染账本；state.json 手工脏数据防御）。
++		// 老 state.json 只有 cost_per_1k（TotalRequests==0）：累计量保持 0，读取侧
++		// costPerReq/costTier 按迁移语义沿用旧值，绝不把 CostPerReq 置 0（否则
++		// 升级后全池瞬间挤进 tier 0）。
+ 		// 损坏更重的形态（整个文件非法 JSON）已在 load() 静默跳过，不崩溃。
+ 		if len(s.ModelCosts) > 0 {
+ 			e.modelCost = make(map[string]modelCostEntry, len(s.ModelCosts))
+ 			for m, smc := range s.ModelCosts {
+-				if smc.LastSeen.IsZero() || smc.CostPer1k < 0 {
++				if smc.LastSeen.IsZero() || smc.CostPer1k < 0 ||
++					smc.TotalCredit < 0 || smc.TotalRequests < 0 || smc.TotalTokens < 0 {
+ 					continue // 结构破损/非法值：剔除条目
+ 				}
+ 				if now.Sub(smc.LastSeen) > modelCostTTL {
+ 					continue // 过期：陈旧价格不复活（同落盘侧口径）
+ 				}
+ 				e.modelCost[m] = modelCostEntry{
+-					CostPer1k: smc.CostPer1k,
+-					LastSeen:  smc.LastSeen,
+-					Samples:   smc.Samples,
++					CostPer1k:     smc.CostPer1k,
++					LastSeen:      smc.LastSeen,
++					Samples:       smc.Samples,
++					TotalCredit:   smc.TotalCredit,
++					TotalRequests: smc.TotalRequests,
++					TotalTokens:   smc.TotalTokens,
+ 				}
+ 			}
+ 			if len(e.modelCost) == 0 {
+@@ -381,9 +388,12 @@ func (p *Pool) stateOverviewLocked() stateFile {
+ 					continue // 已过期/零值：不落盘（惰性清理）
+ 				}
+ 				mcosts[m] = stateModelCost{
+-					CostPer1k: mc.CostPer1k,
+-					LastSeen:  mc.LastSeen,
+-					Samples:   mc.Samples,
++					CostPer1k:     mc.per1k(),
++					LastSeen:      mc.LastSeen,
++					Samples:       mc.Samples,
++					TotalCredit:   mc.TotalCredit,
++					TotalRequests: mc.TotalRequests,
++					TotalTokens:   mc.TotalTokens,
+ 				}
+ 			}
+ 			if len(mcosts) == 0 {
+diff --git a/internal/pool/pick.go b/internal/pool/pick.go
+index 35af8e9..ab22fd9 100644
+--- a/internal/pool/pick.go
++++ b/internal/pool/pick.go
+@@ -96,13 +96,14 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 	}
+ 	// 权重与成本分层**各算一次、全程复用**（weighted 结构体定义见包级注释）：
+ 	// weightOf 每候选一次（预计算存入 ws.w），costTier/modelCostOf 同样每候选一次
+-	// （存入 ws.tier/ws.cost1k）——sort 比较器与 pickWeighted 都只读缓存字段，
++	// （存入 ws.tier/ws.costReq）——sort 比较器与 pickWeighted 都只读缓存字段，
+ 	// 不再现算。比较器内现算会翻成 O(n log n) 次冗余浮点/map 查找（46 账号约
+ 	// 500 次比较），旧实现在此翻过车。
+-	// 成本分层：reqModel 非空时，按该模型的实测扣费把候选分层，只保留最优层。
+-	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
+-	//   1 = 无观测（含观测过期）
+-	//   2 = 已实测收费
++	// 成本分层：reqModel 非空时，按该模型的**每次请求平均扣费**把候选分层，只保留
++	// 最优层（issue #491：per-req 才是账号真实成本；per1k 只反映请求长度）。
++	//   0 = 已累计确认免费（TotalCredit==0 且至少 2 笔；单笔 0 不算）
++	//   1 = 无观测（含观测过期）/ 单笔 0 未知
++	//   2 = 已累计收费
+ 	// 为什么"无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，
+ 	// 若已知收费的号恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
+ 	// 为什么用硬过滤而非仅排序：pickWeighted 会在候选内加权随机，只排序的话
+@@ -112,10 +113,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 		if !ok {
+ 			return 1, 0
+ 		}
+-		if mc.CostPer1k <= 0 {
+-			return 0, 0
++		ti := mc.costTier()
++		if ti != 2 {
++			return ti, 0
+ 		}
+-		return 2, mc.CostPer1k
++		return ti, mc.costPerReq()
+ 	}
+ 	bestTier := 2
+ 	hasTier1 := false
+@@ -155,7 +157,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 	for _, e := range cands {
+ 		ti, ci := costTier(e)
+ 		if ti == bestTier {
+-			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, cost1k: ci})
++			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, costReq: ci})
+ 		}
+ 	}
+ 	// 等权重洗牌：仅当存在权重并列（epsilon 比较，防浮点微差让洗牌静默失效）且
+@@ -179,10 +181,11 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 		}
+ 	}
+ 	sort.SliceStable(ws, func(i, j int) bool {
+-		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
+-		// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
+-		if ws[i].cost1k != ws[j].cost1k {
+-			return ws[i].cost1k < ws[j].cost1k // 收费层：单价低的在前
++		// costTier 硬过滤后 ws 全员同层，但仍按 costReq 升序排（tier 2 层内
++		// per-req 低者在前；tier 0/1 层 costReq 恒 0，本比较退化为权重比较）——
++		// 读缓存字段不现算。
++		if ws[i].costReq != ws[j].costReq {
++			return ws[i].costReq < ws[j].costReq // 收费层：per-req 低的在前
+ 		}
+ 		if ws[i].w != ws[j].w {
+ 			return ws[i].w > ws[j].w
+@@ -299,14 +302,14 @@ func (p *Pool) inFlightFull(e *entry) bool {
+ var minPickGap = 100 * time.Millisecond
+ 
+ // weighted 单个候选的选号预计算结果：权重（weightOf，每候选一次）+ 成本分层
+-// （tier/cost1k，每候选一次）。sort 比较器与 pickWeighted 抽签都只读缓存字段，
++// （tier/costReq，每候选一次）。sort 比较器与 pickWeighted 抽签都只读缓存字段，
+ // 任何一处现算（旧实现在比较器内重算 costTier、在 pickWeighted 内重算 weightOf）
+ // 都会翻成 O(n log n) 次冗余浮点/map 查找，且引入两阶段口径分裂。
+ type weighted struct {
+-	e      *entry
+-	w      float64
+-	tier   int     // costTier 结果缓存（0 免费 / 1 无观测 / 2 收费）
+-	cost1k float64 // CostPer1k 缓存（tier 2 排序用；tier 0/1 恒 0）
++	e       *entry
++	w       float64
++	tier    int     // costTier 结果缓存（0 免费 / 1 无观测 / 2 收费）
++	costReq float64 // CostPerReq 缓存（tier 2 排序用；tier 0/1 恒 0）
+ }
+ 
+ // expiringWeight 快过期积分占比的权重系数（三因子之一，issue:积分过期）。
+diff --git a/internal/pool/state.go b/internal/pool/state.go
+index 4f9952c..f5f1d9d 100644
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -155,8 +155,8 @@ func (p *Pool) NoteError(uid string) {
+ 	}
+ }
+ 
+-// ModelCost 读取账号在某模型上的实测扣费观测（CostPer1k 与是否存在有效观测）。
+-// DeptestOnly: 生产只写不读（NoteModelCost 有调用），读取侧仅
++// ModelCost 读取账号在某模型上的每千 token 单价诊断值（CostPer1k）与是否存在
++// 有效观测。DeptestOnly: 生产只写不读（NoteModelCost 有调用），读取侧仅
+ // handler_cost_test / global_e2e_test 断言账本内容（账本内容现经 state.json
+ // 持久化，但 /status 透出走 statusOf 的只读遍历，不经本方法）。跨包
+ // （internal/server）测试引用，迁 export_test.go 不可行（对包外不可见）。
+@@ -172,29 +172,32 @@ func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
+ 	if !ok {
+ 		return 0, false
+ 	}
+-	return mc.CostPer1k, true
++	return mc.per1k(), true
+ }
+ 
+-// NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本，并顺带
++// NoteModelCost 记录一次实测扣费观测，累加该 (账号, 模型) 的成本账本，并顺带
+ // 扣减账号余额（credits/creditsExpiring，见下方「P1-A」段）。credit 为上游
+ // usage.credit（本次真实扣费=消耗量），tokens 为本次请求的 token 总数
+-// （prompt+completion，用于折算单位成本）。tokens<=0 时不记录：无法折算单价，
+-// 记进去会污染账本。
++// （prompt+completion）。tokens<=0 时不记录：无法折算。
++//
++// issue #491 起改用累计量（TotalCredit/TotalRequests/TotalTokens），不再 EMA：
++//   - 选号口径是 per-req（每次请求平均扣费）：credit 主要是固定底价，几乎不随
++//     token 增长；per1k 实际度量「账号平均接到多长的请求」，跨账号可差 1300 倍。
++//   - tokens < modelCostMinTokens 的请求**不更新账本**（只扣余额）：短探测的
++//     per-token 折算没有统计意义，且旧 EMA 会让一次探测污染账本很久。
++//   - 累计量保留全部有效观测，后续修正不会被历史 EMA 权重放大。
+ //
+-// 用 EMA 平滑（alpha=0.3，约 5 次观测收敛）：单次异常值不主导选号决策。
+ // 账本持久化到 state.json（stateAccount.ModelCosts，P1-anti-monopoly）：重启后
+ // 成本知识保留，限免/夜间免费的跨重启窗口不再重新付学费探测；落盘/恢复均按
+ // modelCostTTL 惰性过滤——陈旧价格（时段性优惠）不跨 TTL 复活。
+-// 限免结束事件：tier 0 观测（per1k≤0）被 credit>0 观测覆盖时打一条明确日志
++// 限免结束事件：此前已累计确认为免费（tier 0）且本次 credit>0 时打一条明确日志
+ // （运维据此知道"免费午餐结束了"），判定在写入口做、只看覆盖前值。
+ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
+ 	if uid == "" || model == "" || tokens <= 0 {
+ 		return
+ 	}
+-	// 单价按每千 token 归一，消除请求长度差异。
+-	per1k := credit / float64(tokens) * 1000
+-	if per1k < 0 {
+-		per1k = 0
++	if credit < 0 {
++		credit = 0 // 防御：上游异常负扣费按 0 处理，不污染累计量
+ 	}
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+@@ -209,6 +212,8 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
+ 	// 高权重直到打空撞 402；global 账号不签到，credits 曾是终身冻结。
+ 	// 签到仍定期覆盖（ReenableIfCredits/SetCreditsDetailed 以 authoritative 余额
+ 	// 重置），扣减只是两次签到之间的内插估计；credit=0（免费请求）不动余额。
++	//
++	// 余额扣减与成本观测门槛无关：短请求也是真实消费，必须扣余额；只是不记账。
+ 	if credit > 0 {
+ 		d := int64(credit + 0.5) // 四舍五入，与测试口径一致（2.5 → 3）
+ 		if d > e.credits {
+@@ -222,27 +227,37 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
+ 			e.creditsExpiring -= d
+ 		}
+ 	}
++	if tokens < modelCostMinTokens {
++		// 观测门槛（issue #491）：短请求只扣余额，不更新成本账本（不创建条目、
++		// 不刷新 LastSeen），否则 max_tokens=5 探测会污染排序。
++		if credit > 0 {
++			p.dirty.Store(true)
++		}
++		return
++	}
+ 	if e.modelCost == nil {
+ 		e.modelCost = make(map[string]modelCostEntry)
+ 	}
+-	const alpha = 0.3
+ 	prev, seen := e.modelCost[model]
+-	if !seen {
+-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+-	} else {
+-		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
+-		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束，
+-		// EMA 混合后单价转正，下一轮选号即降 tier 2。打一条日志让运维看得见
+-		// 「免费午餐结束」这一关键状态迁移。
+-		if prev.CostPer1k <= 0 && per1k > 0 {
+-			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+-		}
+-		e.modelCost[model] = modelCostEntry{
+-			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
+-			LastSeen:  time.Now(),
+-			Samples:   prev.Samples + 1,
+-		}
+-	}
++	now := time.Now()
++	mc := modelCostEntry{
++		LastSeen:      now,
++		Samples:       prev.Samples + 1,
++		TotalCredit:   prev.TotalCredit + credit,
++		TotalRequests: prev.TotalRequests + 1,
++		TotalTokens:   prev.TotalTokens + int64(tokens),
++	}
++	// 诊断值由累计量现算；迁移条目（TotalRequests==0）在首笔新观测后即被新
++	// 累计量取代，旧 EMA 不再参与任何决策。
++	mc.CostPer1k = mc.per1k()
++	// 限免结束事件（判定在写入口，只看覆盖前值）：此前已累计确认免费（两笔以上
++	// credit=0）且本次实测收费——账号在该模型上的免费窗口结束，下一轮选号即降
++	// tier 2。打一条日志让运维看得见「免费午餐结束」这一关键状态迁移。
++	if seen && prev.knownFree() && credit > 0 {
++		log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k (%.3f credits/req)",
++			model, logfmt.UID8(uid), mc.per1k(), mc.costPerReq())
++	}
++	e.modelCost[model] = mc
+ 	p.dirty.Store(true) // 账本已持久化（P1-anti-monopoly）：写入口统一置脏
+ }
+ 
+@@ -597,7 +612,7 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
+ }
+ 
+ // modelCostsStatusLocked 构建单账号的成本台账行，从 modelCost 遍历输出——
+-// 每模型一行（单价/最近观测/样本数），仅 modelCostTTL 内的有效观测，过期即
++// 每模型一行（per-req 权威值 + 诊断 per1k/最近观测/样本数），仅 modelCostTTL 内的有效观测，过期即
+ // 消失（与 modelCostOf 读取口径一致；与 rateLimitedModelsLocked 同构）。
+ // 先排序模型名保证 /status 输出稳定（map 遍历无序）。无观测 → nil（零回归）。
+ // 调用方必须已持有 p.mu。
+@@ -620,10 +635,11 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
+ 	for _, m := range models {
+ 		mc := e.modelCost[m]
+ 		rows = append(rows, ModelCostStatus{
+-			Model:     m,
+-			CostPer1k: mc.CostPer1k,
+-			LastSeen:  mc.LastSeen,
+-			Samples:   mc.Samples,
++			Model:      m,
++			CostPerReq: mc.costPerReq(),
++			CostPer1k:  mc.per1k(),
++			LastSeen:   mc.LastSeen,
++			Samples:    mc.Samples,
+ 		})
+ 	}
+ 	return rows
+diff --git a/internal/server/global_e2e_test.go b/internal/server/global_e2e_test.go
+index de08419..5ccc27d 100644
+--- a/internal/server/global_e2e_test.go
++++ b/internal/server/global_e2e_test.go
+@@ -230,14 +230,31 @@ func TestGlobalE2ER9CreditIsomorphic(t *testing.T) {
+ 		t.Logf("R9 末帧 usage.credit 存在（与 CN 同构 ✓）")
+ 	}
+ 
+-	// NoteModelCost 被调用：账本应记录该 (uid, model) 观测，且为 tier0 免费（credit=0）。
++	// NoteModelCost 接线 + issue #491 观测门槛。本测试的 max_tokens=10 通常远低于
++	// 2000 token 门槛：此时账本**必须为空**（短探测不污染排序）；只有长请求才
++	// 断言观测存在且为 credit=0 的合法免费观测（单笔 0 仍属 tier 1 未知，不判免费，
++	// 免费层需要两笔累计 0——单元测试已覆盖）。
++	totalTokens := 0
++	for _, k := range []string{"prompt_tokens", "completion_tokens"} {
++		if v, ok := usage[k].(float64); ok {
++			totalTokens += int(v)
++		}
++	}
+ 	per1k, ok := p.ModelCost(a.UID, "deepseek-v4.1-flash")
++	if totalTokens < 2000 {
++		if ok {
++			t.Errorf("R9 短请求 tokens=%d (<2000) 不应写账本: per1k=%v", totalTokens, per1k)
++		} else {
++			t.Logf("R9 短请求 tokens=%d (<2000)：按 #491 门槛不写账本 ✓", totalTokens)
++		}
++		return
++	}
+ 	if !ok {
+ 		t.Errorf("R9 NoteModelCost 未被调用：pool.ModelCost(%s, deepseek-v4.1-flash) 无观测", logfmt.UID8(a.UID))
+ 	} else if per1k != 0 {
+-		t.Errorf("R9 账本 per1k=%.6f want 0（deepseek-v4.1-flash 应为 tier0 免费层）", per1k)
++		t.Errorf("R9 账本 per1k=%.6f want 0（credit=0 免费观测）", per1k)
+ 	} else {
+-		t.Logf("R9 NoteModelCost 已被调用：tier0 免费层（credit=0 → per1k=0）✓")
++		t.Logf("R9 NoteModelCost 已被调用：credit=0 → per1k=0（单笔 0 仍为 tier1 未知）✓")
+ 	}
+ }
+ 
+@@ -435,4 +452,4 @@ func min(a, b int) int {
+ 		return a
+ 	}
+ 	return b
+-}
+\ No newline at end of file
++}
+diff --git a/internal/server/handler_cost_explore_test.go b/internal/server/handler_cost_explore_test.go
+index f42f9cb..7b27410 100644
+--- a/internal/server/handler_cost_explore_test.go
++++ b/internal/server/handler_cost_explore_test.go
+@@ -19,7 +19,9 @@ func TestStatusCostExploreExposed(t *testing.T) {
+ 		&auth.Auth{UID: "unknown"},
+ 	)
+ 	p.SetCostExploreInterval(time.Hour)
+-	p.NoteModelCost("free", "m", 0, 1000)
++	// issue #491：单笔 credit=0 不再判免费，需两笔足量观测才进 tier 0。
++	p.NoteModelCost("free", "m", 0, 2000)
++	p.NoteModelCost("free", "m", 0, 2000)
+ 	h := NewHandler(Config{Pool: p})
+ 
+ 	// 触发一次探索（tier 0 垄断 + tier 1 存在 + 零值 timer）。
+diff --git a/internal/server/handler_cost_test.go b/internal/server/handler_cost_test.go
+index bb2a41b..86ca4be 100644
+--- a/internal/server/handler_cost_test.go
++++ b/internal/server/handler_cost_test.go
+@@ -18,7 +18,7 @@ const sseWithCredit = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\"
+ 
+ // sseFree 末帧 credit=0（限免模型）。
+ const sseFree = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"hy3\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n" +
+-	"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"hy3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":500,\"credit\":0}}\n\n" +
++	"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"hy3\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":1000,\"credit\":0}}\n\n" +
+ 	"data: [DONE]\n\n"
+ 
+ // sseUsageNoCredit 末帧带 usage 但**无 credit 字段**（R9(c) 分支：global SSE 末帧形态）。
+@@ -204,8 +204,8 @@ func TestRotationPreservesFullContext(t *testing.T) {
+ 
+ // TestStatusModelCostsLedger end-to-end（P1-anti-monopoly 可观测性）：成功请求
+ // 记入成本账本后，GET /status 的 accounts[].model_costs 透出台账——每模型一行
+-//（model/cost_per_1k/last_seen/samples），免费观测 per1k=0、收费观测 per1k>0，
+-// 无观测账号该字段为空。
++// （model/cost_per_req + 诊断 cost_per_1k/last_seen/samples）。issue #491：
++// cost_per_req 是选号权威口径，cost_per_1k 只作诊断。
+ func TestStatusModelCostsLedger(t *testing.T) {
+ 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+ 		if authz == "Bearer at-u2" {
+@@ -253,13 +253,16 @@ func TestStatusModelCostsLedger(t *testing.T) {
+ 			t.Errorf("u%s last_seen 未透出", st.UID)
+ 		}
+ 		switch st.UID {
+-		case "u1": // 收费：2.0 credit / 2000 token → per1k = 1.0
++		case "u1": // 收费：每笔 2.0 credit → per-req=2.0，per1k=1.0（2.0/2000×1000）
++			if row.CostPerReq != 2.0 {
++				t.Errorf("u1 cost_per_req=%v want 2.0（选号权威口径）", row.CostPerReq)
++			}
+ 			if row.CostPer1k != 1.0 {
+-				t.Errorf("u1 cost_per_1k=%v want 1.0", row.CostPer1k)
++				t.Errorf("u1 cost_per_1k=%v want 1.0（诊断值）", row.CostPer1k)
+ 			}
+ 		case "u2": // 免费（显式 credit:0）
+-			if row.CostPer1k != 0 {
+-				t.Errorf("u2 cost_per_1k=%v want 0", row.CostPer1k)
++			if row.CostPerReq != 0 || row.CostPer1k != 0 {
++				t.Errorf("u2 cost_per_req=%v cost_per_1k=%v want 0/0", row.CostPerReq, row.CostPer1k)
+ 			}
+ 		}
+ 	}
