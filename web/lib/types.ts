@@ -1766,6 +1766,49 @@ export interface PgSyncTestResult {
   server_version?: string;
 }
 
+/* ── 数据库维护（设置 → 数据备份，issue #492 第二步）──── */
+
+/** 服务端固定统计的几张主要表；不存在时后端返回 0。 */
+export interface DatabaseTableCounts {
+  request_logs: number;
+  tap_turns: number;
+  checkin_logs: number;
+  account_risk_events: number;
+  task_logs: number;
+}
+
+/**
+ * 最近一次维护结果。`kind='prune'` 是周期清理，`kind='compact'` 是手动压缩；
+ * `ok=false` 时带 `error`（原库未被替换）。
+ */
+export interface DatabaseMaintenanceLast {
+  kind: 'prune' | 'compact' | string;
+  at: number;
+  ok: boolean;
+  before_bytes?: number;
+  after_bytes?: number;
+  saved_bytes?: number;
+  duration_ms?: number;
+  removed?: number;
+  error?: string;
+}
+
+export interface DatabaseStatus {
+  db_bytes: number;
+  wal_bytes: number;
+  shm_bytes: number;
+  tables: DatabaseTableCounts;
+  last: DatabaseMaintenanceLast | null;
+}
+
+export interface DatabaseCompactResult {
+  ok: boolean;
+  before_bytes: number;
+  after_bytes: number;
+  saved_bytes: number;
+  duration_ms: number;
+}
+
 /* ── 页面监控（watchdog）──────────────────────────────── */
 /**
  * 监控目标。`kind` 决定「比什么」：

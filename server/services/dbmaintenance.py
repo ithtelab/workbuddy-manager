@@ -14,8 +14,8 @@
     一直很大。
 
 所以这里把清理从「写入侧顺带触发」改成**与抓包开关无关的周期任务**：启动时跑
-一次，之后每 6 小时跑一次。第一步只做「删旧 + checkpoint」，不做清空改分批、
-VACUUM INTO 或数据管理页（那些属于第二步）。
+一次，之后每 6 小时跑一次。第一步只做「删旧 + checkpoint」；第二步补上
+`VACUUM INTO` 压缩（删行不会缩文件）与设置页的数据维护卡片。
 
 ## 不变量
 
@@ -30,8 +30,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
+import sqlite3
 import threading
 import time
+from pathlib import Path
 
 from .. import config, db
 from . import tap
@@ -90,6 +94,202 @@ def _checkpoint() -> bool:
     return True
 
 
+# ── 第二步：VACUUM INTO 压缩（issue #492）──────────────────────────
+#
+# SQLite 的 DELETE 只把页放回 freelist，文件不会缩；`VACUUM INTO` 会按当前
+# 内容重建一份新库。流程刻意模仿 pgsync 的恢复：先在旁边写一份完整副本，校验
+# 通过后再用 `db.replace_database()` 原子替换。
+#
+# 与 pgsync 恢复的唯一差别是**这里不能丢写**：恢复的语义是「用镜像覆盖本地」，
+# 而压缩只是换一种存放方式，压缩期间发生的写入必须保留。所以整个「复制 + 替换」
+# 都在 `db._lock` 内完成 —— `_lock` 是 RLock，`replace_database()` 在同一线程
+# 里再次进入不会死锁。代价是压缩期间所有数据库操作（含读）排队；这是一次
+# 管理员显式触发的维护动作，界面会先给出二次确认。
+#
+# 注：`replace_database()` 的注释说「调用方不得持有 _lock」，那是针对 pgsync
+# 恢复这种「耗时写入 staging」的场景；这里的 staging 本身就是主库的完整副本，
+# 若在锁外复制，复制开始后提交的写入会在替换时被静默丢掉，因此必须持锁。
+_COMPACT_MIN_FREE_FACTOR = 1.2
+_TABLE_COUNTS = ('request_logs', 'tap_turns', 'checkin_logs',
+                 'account_risk_events', 'task_logs')
+_LAST_RESULT_KEY = 'db_maintenance_last'
+
+
+class MaintenanceBusy(RuntimeError):
+    """已有一轮维护 / 压缩在跑。"""
+
+
+class InsufficientDiskSpace(RuntimeError):
+    """临时磁盘空间不够放下压缩副本。"""
+
+
+class CompactError(RuntimeError):
+    """压缩失败（完整性校验不通过等），原库未被替换。"""
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def _readonly_uri(path: Path) -> str:
+    """SQLite 的只读 URI。
+
+    用 `Path.as_uri()` 而不是手拼 `file:{path}`：Windows 盘符与中文/空格路径
+    必须转成 `file:///D:/...` 并做百分号编码，手拼会在 `mode=ro` 打开时直接
+    报 `unable to open database file`。
+    """
+    return f'{path.resolve().as_uri()}?mode=ro'
+
+
+def _staging_path(target: Path) -> Path:
+    """与正式库同目录的唯一副本名。
+
+    同目录是硬性要求：替换走 `os.replace`，跨文件系统会抛 EXDEV。用 pid +
+    纳秒时间戳，避免上次异常退出留下的残骸被复用时 `VACUUM INTO` 因目标已存在
+    而失败。
+    """
+    return target.parent / f'{target.name}.compact-{os.getpid()}-{time.time_ns()}'
+
+
+def _remember_result(kind: str, payload: dict) -> None:
+    """把最近一次维护结果写进 settings，供 GET 接口展示。
+
+    旁路信息，写失败只记日志：维护本身已经完成，不能因为展示数据没落库而报错。
+    """
+    try:
+        db.set_setting(_LAST_RESULT_KEY, {
+            'kind': kind,
+            'at': int(time.time()),
+            **payload,
+        })
+    except Exception:  # noqa: BLE001 - 展示用元数据，失败不影响维护结果
+        logger.warning('数据库维护：记录最近一次结果失败', exc_info=True)
+
+
+def _table_count(table: str) -> int:
+    if not _table_exists(table):
+        return 0
+    row = db.query_one(f'SELECT COUNT(*) AS n FROM "{table}"')
+    return int(row['n']) if row else 0
+
+
+def database_status() -> dict:
+    """当前库/WAL 大小、主要表行数与最近一次维护结果（GET /api/maintenance/database）。"""
+    target = Path(config.DB_PATH)
+    last = db.get_setting(_LAST_RESULT_KEY)
+    if not isinstance(last, dict):
+        last = None
+    return {
+        'db_bytes': _file_size(target),
+        'wal_bytes': _file_size(Path(str(target) + '-wal')),
+        'shm_bytes': _file_size(Path(str(target) + '-shm')),
+        'tables': {name: _table_count(name) for name in _TABLE_COUNTS},
+        'last': last,
+    }
+
+
+def _integrity_ok(path: Path) -> tuple[bool, str]:
+    """对 staging 做 `PRAGMA integrity_check`；返回 (是否 ok, 详情)。"""
+    conn = sqlite3.connect(_readonly_uri(path), uri=True)
+    try:
+        rows = [str(r[0]) for r in conn.execute('PRAGMA integrity_check').fetchall()]
+    finally:
+        conn.close()
+    if rows == ['ok']:
+        return True, 'ok'
+    return False, '；'.join(rows[:5]) or '空结果'
+
+
+def compact_database() -> dict[str, int]:
+    """用 `VACUUM INTO` 重建数据库并原子替换，返回压缩前后字节数。
+
+    * 只读源连接 + 同目录 staging，替换走 `db.replace_database()`；
+    * 预检可用空间至少 `1.2 ×` 当前库（主库 + WAL）；
+    * staging 必须通过 `PRAGMA integrity_check` 才允许替换；
+    * 任何失败都会删掉 staging，原库保持不动。
+
+    数据库很小（<1MB）时也照常执行：`VACUUM INTO` 是幂等的，结果只是文件
+    几乎不变，不把「小」当错误。
+    """
+    if not _run_guard.acquire(blocking=False):
+        raise MaintenanceBusy('数据库维护任务正在运行，请稍后再试')
+
+    started = time.monotonic()
+    staging: Path | None = None
+    replaced = False
+    try:
+        config.ensure_dirs()
+        target = Path(config.DB_PATH)
+
+        # 先 checkpoint：把 WAL 里的已提交页并回主库，让「当前库大小」与
+        # VACUUM INTO 看到的快照一致，也顺带缩小替换时的 WAL 残留。
+        _checkpoint()
+
+        # 整个复制 + 替换期间持锁，挡住并发写入（见文件顶部注释）。
+        with db._lock:
+            db.connect()
+            before = _file_size(target)
+            wal_bytes = _file_size(Path(str(target) + '-wal'))
+            source_bytes = before + wal_bytes
+            need = int(source_bytes * _COMPACT_MIN_FREE_FACTOR)
+            free = int(shutil.disk_usage(target.parent).free)
+            if free < need:
+                raise InsufficientDiskSpace(
+                    f'磁盘空间不足：压缩至少需要 {need} 字节（当前库 {source_bytes} × '
+                    f'{_COMPACT_MIN_FREE_FACTOR:g}），可用 {free} 字节')
+
+            staging = _staging_path(target)
+            if staging.exists():  # 理论上不会命中；防御异常退出留下的同名文件
+                staging.unlink()
+
+            source = sqlite3.connect(_readonly_uri(target), uri=True,
+                                     isolation_level=None)
+            try:
+                source.execute('VACUUM INTO ?', (str(staging),))
+            except sqlite3.Error as exc:
+                raise CompactError(f'VACUUM INTO 失败：{exc}') from exc
+            finally:
+                source.close()
+
+            ok, detail = _integrity_ok(staging)
+            if not ok:
+                raise CompactError(f'压缩副本完整性检查未通过：{detail}')
+
+            # 这里仍持有 _lock；RLock 同线程重入，replace_database 内部的
+            # `with _lock` 不会死锁。
+            db.replace_database(staging)
+            replaced = True
+            after = _file_size(target)
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        result = {
+            'before_bytes': before,
+            'after_bytes': after,
+            'saved_bytes': before - after,
+            'duration_ms': duration_ms,
+        }
+        _remember_result('compact', {'ok': True, **result})
+        logger.info('数据库压缩完成：%d → %d 字节（%d ms）',
+                    before, after, duration_ms)
+        return result
+    except Exception as exc:
+        _remember_result('compact', {'ok': False, 'error': str(exc)[:300]})
+        raise
+    finally:
+        # 替换成功后 staging 已被 rename 走；失败时清掉副本，原库不动。
+        if staging is not None and not replaced:
+            try:
+                if staging.exists():
+                    staging.unlink()
+            except OSError:
+                logger.warning('数据库压缩：清理临时副本失败：%s', staging,
+                               exc_info=True)
+        _run_guard.release()
+
+
 def run_maintenance_once() -> dict[str, int]:
     """同步执行一轮维护，返回各项删除条数。
 
@@ -137,6 +337,8 @@ def run_maintenance_once() -> dict[str, int]:
                 result['tap_turns'], result['request_logs'], result['checkin_logs'],
                 result['account_risk_events'], 'ok' if result['checkpoint'] else 'busy',
             )
+        # 设置页要展示「最近一次维护」，周期任务与手动压缩共用同一个键。
+        _remember_result('prune', {'ok': True, 'removed': removed, **result})
         return result
     finally:
         _run_guard.release()

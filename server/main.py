@@ -18,7 +18,8 @@ from . import config, db, inflight, logsetup, redpacket, security
 from .iputil import client_ip
 from .stdio_utf8 import force_utf8_stdio
 from .routers import (
-    accounts, accountrisk as accountrisk_router, anthropic, auth, balance, gateway, keys, logs, models,
+    accounts, accountrisk as accountrisk_router, anthropic, auth, balance, gateway, keys, logs,
+    maintenance, models,
     playground,
     pgsync as pgsync_router, redpackets, responses, security as security_router,
     proxies, settings, stats, system, tap as tap_router, tokens, upstreams,
@@ -581,6 +582,8 @@ app.include_router(settings.router)
 app.include_router(proxies.router)
 # PostgreSQL 异地备份：把本地数据镜像出去、需要时拉回来（见 services/pgsync）
 app.include_router(pgsync_router.router)
+# 数据库维护（issue #492 第二步）：查看库/WAL 大小与行数、VACUUM INTO 压缩
+app.include_router(maintenance.router)
 app.include_router(watchdog_router.router)
 # 多上游（账号池分组）：密钥绑定上游 = 请求走那个池，见 upstreamsvc
 app.include_router(upstreams.router)

@@ -29,6 +29,8 @@ import type {
   CreatedRedPacket,
   CreditExpiry,
   CreditsMeta,
+  DatabaseCompactResult,
+  DatabaseStatus,
   DrawResult,
   AccountBackfillInfo,
   AutoUpdateConfig,
@@ -999,4 +1001,15 @@ export const pgSyncApi = {
   importData: () =>
     post<{ok: boolean; message: string; status: PgSyncStatus}>('/api/settings/pg-sync/import'),
   status: () => get<PgSyncStatus>('/api/settings/pg-sync/status'),
+};
+
+/* ── 数据库维护（issue #492 第二步）────────────────────── */
+export const maintenanceApi = {
+  database: () => get<DatabaseStatus>('/api/maintenance/database'),
+  /**
+   * 压缩数据库。3GB 级别的库在机械盘上可能要一两分钟，远超默认 60s 超时；
+   * 后端只在替换完成（或明确失败）后返回，所以这里单独放宽。
+   */
+  compact: async () => (await http.post<DatabaseCompactResult>(
+    '/api/maintenance/database/compact', {}, {timeout: 600000})).data,
 };

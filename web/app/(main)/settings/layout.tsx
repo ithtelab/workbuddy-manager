@@ -55,6 +55,7 @@ import {ResetPasswordDialog} from '@/components/common/settings/ResetPasswordDia
 import {useAuth} from '@/lib/auth-context';
 import {UpdatePanel} from '@/components/common/settings/UpdatePanel';
 import {PgSyncPanel} from '@/components/common/settings/PgSyncPanel';
+import {DatabaseMaintenancePanel} from '@/components/common/settings/DatabaseMaintenancePanel';
 import {GatewayCorsPanel} from '@/components/common/settings/GatewayCorsPanel';
 import {ProxyPanel} from '@/components/common/settings/ProxyPanel';
 import {TokensPanel} from '@/components/common/settings/TokensPanel';
@@ -2097,6 +2098,9 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
         {/* ═══ 数据备份 ═══ */}
         <TabsContent value="backup" className="mt-4 space-y-4">
           <PgSyncPanel />
+          {/* 数据库维护（issue #492）：与备份同属「这台机器上的数据安全」，
+              放在同一个 Tab 里；组件自己按 admin 角色决定是否渲染。 */}
+          <DatabaseMaintenancePanel />
         </TabsContent>
 
         {/* ═══ 更新日志 ═══ */}
