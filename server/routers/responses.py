@@ -1883,6 +1883,11 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
             defer_finish=True)
         error_text: str | None = None
         first_token_ms: int | None = None
+        # 首帧延迟：第一个**带负载的 `data:` 帧**到达时刻（不区分 role/推理/正文）。
+        # 与首字分开记，口径见 `gateway._has_data_frame` / `gateway._record`。
+        first_frame_ms: int | None = None
+        # chunk 边界可能把 `data:` 行切开，留一段残片跨块判定（见 gateway 同名注释）。
+        first_frame_buf = ''
         # 内容空闲看门狗（issue #485）：按「距上一个数据帧」计时，保活帧
         # （SSE 注释）不续命。按数据帧而不是按正文 delta，是为了别误杀
         # 长时间只有 tool_calls 增量的合法流。
@@ -1897,6 +1902,15 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                     break
                 piece = chunk.decode('utf-8', errors='ignore')
                 raw_stream.feed(piece)
+                # 首帧打点：只记一次；与 last_activity_at 是两个独立变量，
+                # 不存在互相覆盖（一个记首次到达，一个记最近活跃）。
+                if first_frame_ms is None:
+                    first_frame_buf += piece
+                    if gateway._has_data_frame(first_frame_buf):
+                        first_frame_ms = int((time.time() - started) * 1000)
+                        first_frame_buf = ''
+                    elif '\n' in first_frame_buf:
+                        first_frame_buf = first_frame_buf.rsplit('\n', 1)[1]
                 if 'data:' in piece:
                     last_activity_at = time.monotonic()
                 if idle_limit > 0 and time.monotonic() - last_activity_at > idle_limit:
@@ -1984,7 +1998,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 _as_int(usage.get('prompt_tokens')),
                 _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
-                usage=usage, first_token=first_token_ms, effort=effort,
+                usage=usage, first_token=first_token_ms, first_frame=first_frame_ms,
+                effort=effort,
             )
             tap_svc.capture(
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,

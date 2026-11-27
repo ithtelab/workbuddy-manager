@@ -599,7 +599,7 @@ def _account_expected_after_error(exc: Exception) -> bool:
     return not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
 
 
-def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, effort: str | None = None, account_expected: bool = True) -> None:
+def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, first_frame: int | None = None, usage: dict | None = None, effort: str | None = None, account_expected: bool = True) -> None:
     """记录调用日志与用量。
 
     credit 为上游返回的真实扣费（usage.credit）。None 表示上游没给，
@@ -612,6 +612,13 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
 
     first_token 为首字延迟（毫秒）。None 表示未采集到：非流式请求本来就没有
     中间过程，历史记录也没这个值，因此同样用 NULL 存，而不是 0。
+
+    first_frame 为首帧延迟（毫秒）：上游**第一个带负载的 `data:` 帧**到达时刻，
+    不区分 role / 推理 / 正文，与上游 TTFB 同口径。为什么单独一列——first_token
+    要等到第一个含正文或推理的 delta，`effort=max` 下推理阶段很长时两者能差上
+    百秒（2026-11-26 实测：上游 TTFB 1.48s，面板首字 125s）。只记 first_token
+    会把「上游多久开始回话」读成「模型想了多久」，排查排队/建连问题时得出相反
+    结论。保活注释帧与 `data: [DONE]` 不算首帧，见 `_has_data_frame`。
 
     注意：日志/统计属于旁路，任何异常都不能影响用户请求本身
     （曾因统计函数缺失导致流式响应在收尾阶段中断，客户端看到
@@ -654,6 +661,7 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             completion_tokens=ct,
             latency_ms=latency,
             first_token_ms=first_token,
+            first_frame_ms=first_frame,
             ua=db._clean(ua, 512),
             error=db._clean(error, 500),
             stream=1 if stream else 0,
@@ -913,6 +921,31 @@ def _scan_sse(pending: str, usage: dict) -> tuple[str, bool]:
                 ):
                     saw_content = True
     return pending, saw_content
+
+
+def _has_data_frame(text: str) -> bool:
+    """这段文本里是否已经出现「带负载的 `data:` 帧」。
+
+    取帧口径与 `_scan_sse` 一致（按行切、只看 `data:` 行、跳过空 payload 与
+    `[DONE]`），区别是本函数不解析 JSON：首帧关心的是**到达时刻**，哪怕这一帧
+    只有 role 字段、甚至 JSON 还没拼完整，它确实已经到了。
+
+    为什么要排除保活与 `[DONE]`：
+
+      · SSE 注释帧（`: keepalive`）是上游在排队期间心跳用的，把第一行注释当成
+        「首帧」会让首帧延迟退化成建连延迟 —— 比 `first_token_ms` 还小，也和
+        上游 TTFB 不是一回事，面板上反而更难判断。
+      · `data: [DONE]` 只是流结束标记，不代表上游产出过任何内容；只在
+        「空流 / 只有结束标记」的请求里它才会单独出现，那种情况应当记 NULL。
+    """
+    for raw_line in text.split('\n'):
+        line = raw_line.strip()
+        if not line.startswith('data:'):
+            continue
+        payload = line[5:].strip()
+        if payload and payload != '[DONE]':
+            return True
+    return False
 
 
 # ── 密钥自查用量（issue #137）─────────────────────────────
@@ -1484,6 +1517,13 @@ async def _chat(request: Request, upstream_path: str):
         # 首字延迟：只记一次，取「首个含正文的 delta」到达时刻。
         # 注意起点含建连 + 上游排队 + 模型开始思考，这正是「上游多久开始回话」。
         first_token_ms: int | None = None
+        # 首帧延迟：第一个**带负载的 `data:` 帧**到达时刻（不区分 role/推理/正文）。
+        # 与上面的首字分开记，见 `_record` 的注释。
+        first_frame_ms: int | None = None
+        # `aiter_bytes` 不保证按行/按帧切块，`data:` 可能被 chunk 边界切开，
+        # 所以留一段跨块残片再判定。判定成功后清空，不再累积；未成功时只保留
+        # 最后一行 —— 纯保活流会一直发 `: keepalive`，不能让缓冲无限长。
+        first_frame_buf = ''
         # 内容空闲看门狗（issue #485）：按「距上一个**数据帧**」计时，保活帧
         # （`: keepalive` 这类 SSE 注释）不续命。
         #
@@ -1503,6 +1543,17 @@ async def _chat(request: Request, upstream_path: str):
                     break
                 piece = chunk.decode('utf-8', errors='ignore')
                 raw_stream.feed(piece)
+                # 首帧打点：只记一次，且与下面的 `last_activity_at` 互不干扰
+                # （各自独立的变量，一个记「首次到达」，一个记「最近活跃」）。
+                # 顺序上放在活跃度判定之前：这一块若就是首帧，它的时刻要在
+                # 同一块内先落定，与看门狗是否续命无关。
+                if first_frame_ms is None:
+                    first_frame_buf += piece
+                    if _has_data_frame(first_frame_buf):
+                        first_frame_ms = int((time.time() - started) * 1000)
+                        first_frame_buf = ''
+                    elif '\n' in first_frame_buf:
+                        first_frame_buf = first_frame_buf.rsplit('\n', 1)[1]
                 if 'data:' in piece:
                     last_activity_at = time.monotonic()
                 if idle_limit > 0 and time.monotonic() - last_activity_at > idle_limit:
@@ -1541,7 +1592,7 @@ async def _chat(request: Request, upstream_path: str):
             _record(
                 key, ip, requested_model or '', mapped or '', status_code, pt, ct,
                 latency, ua, error_text, True, usage=usage,
-                first_token=first_token_ms, effort=effort,
+                first_token=first_token_ms, first_frame=first_frame_ms, effort=effort,
             )
             tap_svc.capture(
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,

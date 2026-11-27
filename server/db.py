@@ -170,6 +170,14 @@ CREATE TABLE IF NOT EXISTS request_logs (
   -- 无法反映上游响应速度；首字延迟才是「上游多久开始回话」。
   -- NULL = 未采集到（非流式请求，或该版本之前的历史记录）。
   first_token_ms    INTEGER,
+  -- 首帧延迟（毫秒）：上游第一个**带负载的 `data:` 帧**到达时刻，不区分
+  -- role/推理/正文。保活注释帧（`: keepalive`）与 `data: [DONE]` 都不算 ——
+  -- 把保活算进来会让这个数字退化成建连延迟（见 gateway._has_data_frame）。
+  -- 与 first_token_ms 的区别：后者要等到首个含正文或推理的 delta，max 档下
+  -- 推理阶段很长时两者能差上百秒。对齐上游 TTFB、判断「排队/建连」快慢要看
+  -- 这一列。NULL = 未采集（非流式、只有保活与 [DONE] 的空流，或本列上线前的
+  -- 历史记录）。
+  first_frame_ms    INTEGER,
   ua                TEXT,
   error             TEXT,
   stream            INTEGER DEFAULT 0,
@@ -778,6 +786,8 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ('usage_daily', 'credit', 'REAL NOT NULL DEFAULT 0'),
     # 首字延迟：可空（历史记录与非流式请求为 NULL）
     ('request_logs', 'first_token_ms', 'INTEGER'),
+    # 首帧延迟：可空（同上）。与 first_token_ms 分开存，见建表注释。
+    ('request_logs', 'first_frame_ms', 'INTEGER'),
     # 版本（cn / global）：界面按版本切换时日志与统计要跟着切。
     # 历史记录为 NULL —— 读的时候按 cn 归类（见 realm_of_model 的注释）。
     ('request_logs', 'realm', 'TEXT'),
@@ -1535,14 +1545,15 @@ def add_request_log(**fields: object) -> None:
                               fields.get('ts'))
     execute(
         'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '
-        'prompt_tokens, completion_tokens, latency_ms, first_token_ms, ua, error, '
+        'prompt_tokens, completion_tokens, latency_ms, first_token_ms, first_frame_ms, ua, error, '
         'stream, credit, realm, account, cache_hit_tokens, cache_miss_tokens, '
         'cache_write_tokens, effort, channel, cost, account_expected) '
-        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (fields.get('ts'), fields.get('key_id'), fields.get('ip'),
          fields.get('model'), fields.get('mapped_model'), fields.get('status'),
          fields.get('prompt_tokens'), fields.get('completion_tokens'),
-         fields.get('latency_ms'), fields.get('first_token_ms'), fields.get('ua'),
+         fields.get('latency_ms'), fields.get('first_token_ms'),
+         fields.get('first_frame_ms'), fields.get('ua'),
          fields.get('error'), fields.get('stream'), fields.get('credit'),
          fields.get('realm'), fields.get('account'), fields.get('cache_hit_tokens'),
          fields.get('cache_miss_tokens'), fields.get('cache_write_tokens'),

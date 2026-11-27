@@ -431,6 +431,7 @@ export default function LogsPage() {
               <TableHead className="text-[11px] text-muted-foreground">{t('nav.models')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colEffort')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
+              <TableHead className="text-[11px] text-muted-foreground">{t('logs.colFirstFrame')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colFirstToken')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colLatency')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">Token</TableHead>
@@ -493,6 +494,17 @@ export default function LogsPage() {
                     </Badge>
                   ) : (
                     <Badge variant="destructive" className="rounded-full">{l.status || 'ERR'}</Badge>
+                  )}
+                </TableCell>
+                {/* 首帧延迟（issue #493）：上游第一个带负载的 `data:` 帧到达时刻，
+                    不区分 role/推理/正文，与上游 TTFB 同口径。它比首字早得多，
+                    判断「建连/排队快慢」看这一列；非流式与空流没有帧，显示 —。
+                    注意用 != null 判断：0 是合法值（同一秒内就回帧）。 */}
+                <TableCell className="text-xs tabular-nums text-muted-foreground">
+                  {l.first_frame_ms != null ? (
+                    fmtLatency(l.first_frame_ms)
+                  ) : (
+                    <span className="text-muted-foreground/50">—</span>
                   )}
                 </TableCell>
                 {/* 首字延迟：反映「上游多久开始回话」。回答越长总耗时越大，
@@ -624,6 +636,13 @@ export default function LogsPage() {
                 ['model', t('logs.rowModel'), detail.model || '—'],
                 ['mapped', t('logs.rowMappedModel'), detail.mapped_model || '—'],
                 ['status', t('logs.rowStatus'), String(detail.status)],
+                [
+                  'firstFrame',
+                  t('logs.rowFirstFrame'),
+                  detail.first_frame_ms != null
+                    ? fmtLatency(detail.first_frame_ms)
+                    : t('logs.notCollected'),
+                ],
                 [
                   'firstToken',
                   t('logs.rowFirstToken'),

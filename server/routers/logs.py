@@ -102,6 +102,10 @@ def list_logs(
             'latency_ms': r['latency_ms'],
             # 首字延迟：NULL 表示未采集（非流式请求或旧记录）
             'first_token_ms': r['first_token_ms'],
+            # 首帧延迟：上游第一个带负载的 `data:` 帧到达时刻（issue #493）。
+            # 与首字不同口径（不区分 role/推理/正文），所以单独给读端一列；
+            # 同样是 NULL = 未采集（非流式、纯保活+[DONE] 的空流、旧记录）。
+            'first_frame_ms': r['first_frame_ms'],
             # 提示词缓存三段（issue #69）：NULL = 上游没给这三个字段（老上游），
             # 与「给了 0」不同 —— 界面据此显示「—」而不是 0%。
             'cache_hit_tokens': r['cache_hit_tokens'],
