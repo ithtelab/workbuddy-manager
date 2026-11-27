@@ -210,7 +210,7 @@ export default function DashboardPage() {
   const t = useT();
 
   /**
-   * 本页要的 4 份数据一次并发取回，成败逐项独立。
+   * 首屏的 3 份数据一次并发取回，成败逐项独立。
    *
    * 依赖是 realm：切换版本后**必须重取**——两个版本的账号池不同，credits 也
    * 不能混。useAsyncAll 在依赖变化时会连同旧数据一起清掉，否则会出现
@@ -225,6 +225,21 @@ export default function DashboardPage() {
     pool: () => loadPoolSnapshot(),
     summary: () => statsApi.summary(realm),
     daily: () => statsApi.daily(14, realm),
+  }, [realm]);
+
+  /**
+   * 实时积分单独一条取数线（issue #444）。
+   *
+   * 为什么**不**并进上面那份：`refresh-credits` 会按账号逐个问腾讯，196 个账号
+   * 时单这一项就要好几秒，而它只是首页 5 张卡片里 1 张的补充数据。并进去的话
+   * `isInitialLoading` 会一直等到积分回来，整页（账号数、在线数、趋势图、健康
+   * 快照）都被这一项拖住——这正是「打开仪表板要等好几秒」的来源。
+   *
+   * 拆开之后：账号总数 / 在线数 / 趋势图以 `pool` 到达为准立刻渲染，积分卡片
+   * 先显示骨架，实时值到了再补（`creditsPending`）。口径不变：卡片最终用的仍
+   * 优先是实时查询值，取不到才回退 `/status` 的快照值（与拆开前逐字一致）。
+   */
+  const creditsState = useAsyncAll({
     credits: () => loadGroupCredits(),
   }, [realm]);
 
@@ -299,25 +314,38 @@ export default function DashboardPage() {
 
   /** 实时积分（按 uid），叠加到 accounts 上；上游 /status 的 credits 可能滞后数小时 */
   const liveCredits = useMemo(() => {
-    const raw = values.credits?.credits;
+    const raw = creditsState.values.credits?.credits;
     if (!raw) return EMPTY_LIVE_CREDITS;
     return Object.fromEntries(
       Object.entries(raw).filter(([, v]) => typeof v === 'number') as [string, number][],
     );
-  }, [values.credits]);
+  }, [creditsState.values.credits]);
   /** 各账号的积分套餐到期时间（按 uid），与实时积分同一次查询返回 */
-  const creditsMeta: Record<string, CreditsMeta> = values.credits?.meta ?? EMPTY_CREDITS;
+  const creditsMeta: Record<string, CreditsMeta> =
+    creditsState.values.credits?.meta ?? EMPTY_CREDITS;
+  /**
+   * 实时积分还在首轮取数（issue #444）。
+   *
+   * 判据用 `isInitialLoading`（没有数据 + 请求在飞）而不是「请求在飞」：
+   * 心跳刷新时不能把已经显示出来的积分换成骨架，否则每 30 秒闪一次。
+   * 取不到时它为 false，卡片会照旧回退到 `/status` 的快照值 —— 与拆分前一致。
+   */
+  const creditsPending = creditsState.isInitialLoading;
 
   // 账号健康度与用量会持续变化，用心跳刷新避免展示陈旧数据。
   // 走 reload（刷新模式）：只把新数据换上去，**不**重走首屏流程——
   // 否则骨架会每 30 秒闪一次，用户以为页面在抽风。
   useHeartbeat(() => {
     reload();
+    creditsState.reload();
     flowState.reload();
   }, 30000);
 
   /** 有字段没刷新成功。此时至少还有一份数据在，用顶部提示如实说明，不清空内容 */
-  const partialFailed = Object.keys(errors).length > 0;
+  const partialFailed = Object.keys(errors).length > 0
+    || Object.keys(creditsState.errors).length > 0;
+  /** 已有数据、后台还在刷新（积分那条线单独算，用于 aria-busy） */
+  const refreshing = isRefreshing || creditsState.isRefreshing;
 
   /**
    * 各分组的账号，按当前版本过滤。
@@ -482,7 +510,7 @@ export default function DashboardPage() {
   }
 
   return (
-    <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
+    <div className="flex flex-col gap-4 md:gap-6" aria-busy={refreshing}>
       {header}
       <AccountRiskWarnings allGroups activeOnly hideLowPriority />
 
@@ -561,36 +589,51 @@ export default function DashboardPage() {
         <StatCard
           label={t('dashboard.availableCredits')}
           {...acctCard(
-            // 值里带上最近一笔到期：额度高但下周作废，比额度低更值得注意
+            // 值里带上最近一笔到期：额度高但下周作废，比额度低更值得注意。
+            // 首轮实时积分还没回来时给骨架（issue #444）：此时用 /status 的旧快照
+            // 顶上会让数字「先出现再跳」，而骨架与最终值同高，到位时不跳版。
             <span className="flex flex-col gap-1.5" title={t('dashboard.creditAvailabilityHint')}>
-              <span className="inline-flex flex-wrap items-baseline gap-1.5">
-                <span>{creditTotals.known ? fmtNumber(creditTotals.available) : '—'}</span>
-                <CreditCountdown expiries={expiryShown} />
-              </span>
-              <span className="text-xs font-medium tracking-normal text-muted-foreground">
-                {t('dashboard.unavailableCredits')}: {creditTotals.known ? fmtNumber(creditTotals.unavailable) : '—'}
-              </span>
-              {creditTotals.unknown > 0 && (
-                <span className="text-[11px] font-normal tracking-normal text-muted-foreground">
-                  {t('dashboard.creditsUnknown', {n: creditTotals.unknown})}
-                </span>
+              {creditsPending ? (
+                <>
+                  <SkeletonBar className="h-6 w-28" />
+                  <SkeletonBar className="h-2.5 w-36" />
+                </>
+              ) : (
+                <>
+                  <span className="inline-flex flex-wrap items-baseline gap-1.5">
+                    <span>{creditTotals.known ? fmtNumber(creditTotals.available) : '—'}</span>
+                    <CreditCountdown expiries={expiryShown} />
+                  </span>
+                  <span className="text-xs font-medium tracking-normal text-muted-foreground">
+                    {t('dashboard.unavailableCredits')}: {creditTotals.known ? fmtNumber(creditTotals.unavailable) : '—'}
+                  </span>
+                  {creditTotals.unknown > 0 && (
+                    <span className="text-[11px] font-normal tracking-normal text-muted-foreground">
+                      {t('dashboard.creditsUnknown', {n: creditTotals.unknown})}
+                    </span>
+                  )}
+                </>
               )}
             </span>,
             // 优先级：先报「余额快见底」（这是原有的告警，不能被新信息顶掉），
             // 其次报最近一笔到期（具体日期与金额，只有这里能看到），
             // 最后才是「N 个账号余额已知」这种平淡的状态说明。
-            !creditsKnown.length
+            creditsPending
               ? t('dashboard.waitingUpstream')
-              : creditsLow > 0
-                ? t('dashboard.creditsLow', {count: creditsLow, n: creditsLow})
-                : expiryShown.length
-                  ? t(dailyGroup ? 'dashboard.creditsExpiryDaily' : 'dashboard.creditsExpiry', {
-                      time: fmtDateTime(expiryShown[0].at),
-                      amount: fmtNumber(expiryShown[0].amount),
-                    })
-                  : t('dashboard.creditsCovered', {count: creditTotals.known, n: creditTotals.known}),
-            !creditsKnown.length ? 'neutral' : creditsLow > 0 || expiryUrgent ? 'warning' : 'accent',
-            creditsLow > 0 || expiryUrgent ? 'warning' : undefined,
+              : !creditsKnown.length
+                ? t('dashboard.waitingUpstream')
+                : creditsLow > 0
+                  ? t('dashboard.creditsLow', {count: creditsLow, n: creditsLow})
+                  : expiryShown.length
+                    ? t(dailyGroup ? 'dashboard.creditsExpiryDaily' : 'dashboard.creditsExpiry', {
+                        time: fmtDateTime(expiryShown[0].at),
+                        amount: fmtNumber(expiryShown[0].amount),
+                      })
+                    : t('dashboard.creditsCovered', {count: creditTotals.known, n: creditTotals.known}),
+            creditsPending
+              ? 'neutral'
+              : !creditsKnown.length ? 'neutral' : creditsLow > 0 || expiryUrgent ? 'warning' : 'accent',
+            creditsPending ? undefined : creditsLow > 0 || expiryUrgent ? 'warning' : undefined,
           )}
           icon={Coins}
           delay={0.15}

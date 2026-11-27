@@ -17,8 +17,8 @@ from fastapi.responses import StreamingResponse
 from .. import config, db, security, upstreamsvc
 from ..iputil import client_ip
 from ..services import (
-    accountorder, credits as creditsvc, dailyplan, modelcatalog, reload, renew,
-    speedhealth, tasklog, taskrun, tencent, wb2api,
+    accountcache, accountorder, credits as creditsvc, dailyplan, modelcatalog,
+    reload, renew, speedhealth, tasklog, taskrun, tencent, wb2api,
 )
 from ..services.realm import realm_of, supports_checkin
 from ..services import taskpacing
@@ -260,6 +260,10 @@ async def upload_accounts(
         security.audit(user, 'accounts.import', group['name'],
                        f'新增 {len(added)} / 覆盖 {len(overwritten)} / '
                        f'拒绝 {len(rejected)} / 失败 {len(failed)}；来源 {ip}', ip=ip)
+    if uploaded:
+        # 导入会新增 / 改写账号文件：目录 mtime 虽已变，仍显式失效（同秒内多次
+        # 导入时目录 mtime 可能不变，见 accountcache 的说明）。
+        _invalidate_account_cache(group)
     return {
         'ok': not failed and not rejected,
         'uploaded': uploaded,
@@ -430,6 +434,27 @@ def _group_dir(group: dict) -> Path | None:
     return Path(raw) if raw else None
 
 
+def _account_cache_key(group: dict, base_dir: Path | None) -> tuple:
+    """账号列表缓存的键：分组 + 目录 + **目录 mtime**（issue #444）。
+
+    mtime 放进键里是为了让「增删账号 / 改名禁用」这类文件动作自动换键，
+    不必依赖每条写路径都记得失效缓存——漏一条也只是多一次扫描，不会返回旧列表。
+    目录不存在（分组未配置账号目录）时用 0，缓存键仍按分组隔离。
+    """
+    stamp = 0
+    if base_dir is not None:
+        try:
+            stamp = base_dir.stat().st_mtime_ns
+        except OSError:
+            stamp = 0
+    return (group.get('id'), str(base_dir or ''), stamp)
+
+
+def _invalidate_account_cache(group: dict) -> None:
+    """本分组的账号列表缓存作废（写操作收尾统一走这里）。"""
+    accountcache.invalidate(group.get('id'))
+
+
 def _require_dir(group: dict) -> Path:
     """要求该分组可管理账号：没有本地账号目录就明确拒绝。
 
@@ -480,6 +505,7 @@ async def account_set_proxy(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail='账号文件不存在') from exc
     creditsvc.invalidate()
+    _invalidate_account_cache(group)
     scheduled = reload.request_restart(_reload_target(group))
     return {'ok': True, **result, 'reload_triggered': scheduled}
 
@@ -512,6 +538,7 @@ async def account_set_weight(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail='账号文件不存在') from exc
     security.audit(user, 'update_account_weight', filename, f"weight={result['weight']}")
+    _invalidate_account_cache(group)
     scheduled = reload.request_restart(_reload_target(group))
     return {'ok': True, **result, 'reload_triggered': scheduled}
 
@@ -633,6 +660,8 @@ async def account_speed_health_apply(
                     security.audit(user, 'restore_account_weight',
                                    str(item.get('file') or ''),
                                    f"{item.get('demoted_to')}->{item.get('original_weight')}")
+        # 权重写进了账号文件（列表里带 weight 字段），作废本组缓存。
+        _invalidate_account_cache(_group(upstream_id))
     return out
 
 
@@ -650,6 +679,13 @@ async def list_accounts(upstream_id: int | None = Query(None),
     """
     group = _group(upstream_id)
     base_dir = _group_dir(group)
+    # 短 TTL 缓存（issue #444）：196 个账号时一次完整扫描 + 上游 /status 往返
+    # 要几百毫秒到数秒；仪表板首屏与页面切换会重复触发同一份。4 秒内命中直接
+    # 返回上一次的响应，数字口径完全一致（见 services/accountcache 的说明）。
+    cache_key = _account_cache_key(group, base_dir)
+    cached = accountcache.get(cache_key)
+    if cached is not None:
+        return cached
     # 没有本地目录的分组**不能**去读默认目录：那会把默认池的账号显示成这个
     # 分组的账号——与「移动时落错目录」是同一类串组错误。列表给空，由
     # manageable 标记让界面说明「该分组未配置本地账号目录」。
@@ -673,7 +709,7 @@ async def list_accounts(upstream_id: int | None = Query(None),
         a['added_at'] = added_times.get(uid)
         a['checkin_today'] = done_today.get(uid)
     synced = sum(1 for a in accounts if a.get('credits') is not None)
-    return {
+    payload = {
         'total': len(accounts),
         'accounts': accounts,
         'pool_synced': synced,
@@ -688,6 +724,8 @@ async def list_accounts(upstream_id: int | None = Query(None),
         'auth_dir': str(base_dir or ''),
         'manageable': base_dir is not None,
     }
+    accountcache.put(cache_key, payload)
+    return payload
 
 
 @router.get('/accounts/order')
@@ -1350,6 +1388,8 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
 
     if not existed:
         db.record_account_added(str(result['uid']), auth_dir)
+    # 新账号已落盘 / 旧账号凭证已换：账号列表缓存必须立刻作废（issue #444）。
+    _invalidate_account_cache(group)
 
     # 重登成功：清掉「登录态失效」标记（issue #490）。否则这个账号会一直带着
     # 「需重登」徽章，直到下一次积分查询成功才消失 —— 用户刚登完就看到旧告警。
@@ -1429,7 +1469,8 @@ def _load(filename: str, auth_dir: Path | None = None) -> dict:
 @router.post('/accounts/{filename}/checkin')
 async def account_checkin(filename: str, upstream_id: int | None = Query(None),
                           user: dict = Depends(security.require_admin)) -> dict:
-    base_dir = _require_dir(_group(upstream_id))
+    group = _group(upstream_id)
+    base_dir = _require_dir(group)
     raw = _load(filename, base_dir)
     acct = raw.get('account') or {}
     auth = raw.get('auth') or {}
@@ -1479,6 +1520,8 @@ async def account_checkin(filename: str, upstream_id: int | None = Query(None),
     if ok:
         # 签到会改变余额，先失效缓存再查实时值
         creditsvc.invalidate(uid)
+        # 列表里的「今日已签到」随之变化（issue #444 的缓存要立刻作废）。
+        _invalidate_account_cache(group)
         _, credits, _, _, _, expiries = await creditsvc.get_credits(
             _auth_dict(raw, base_dir), nickname=str(acct.get('nickname') or ''),
         )
@@ -1805,6 +1848,9 @@ async def checkin_all(upstream_id: int | None = Query(None),
     already = [r for r in applicable if r.get('already')]
     attempted = [r for r in applicable if not r.get('already')]
     succeeded = sum(1 for r in attempted if r['ok'])
+    if succeeded or already:
+        # 有账号的「今日已签到」变化了：列表缓存作废（issue #444）。
+        _invalidate_account_cache(_group(upstream_id))
     return {
         'total': len(attempted),
         'succeeded': succeeded,
@@ -2193,6 +2239,8 @@ async def task_run_start(
         # 前置拒绝（脚本缺失/已有任务在跑/参数不合法）用 409 表达「状态冲突」，
         # 与「请求本身有错」（400）区分开。
         raise HTTPException(status_code=409, detail=msg)
+    # 任务会改写账号的积分 / 冷却 / 签到状态：列表缓存作废（issue #444）。
+    _invalidate_account_cache(group)
     return {'ok': True, 'message': msg}
 
 
@@ -2494,6 +2542,8 @@ async def account_refresh(filename: str, upstream_id: int | None = Query(None),
     # 非空元组恒为真，从而在重载失败时仍报「已重载生效」（且 reload_triggered
     # 会变成数组、与前端声明的 boolean 不符）。
     reloaded, reload_error = await reload.restart_now(upstream=_reload_target(group))
+    # 令牌已换发：列表里的有效期 / 签发时间都变了，缓存立刻作废。
+    _invalidate_account_cache(group)
     return {
         'ok': True,
         'message': result['message'] + _refresh_reload_tail(group, reloaded, reload_error),
@@ -2546,6 +2596,8 @@ async def refresh_all_tokens(upstream_id: int | None = Query(None),
     reloaded, reload_error = False, ''
     if succeeded > 0:
         reloaded, reload_error = await reload.restart_now(upstream=_reload_target(group))
+        # 有账号换发了令牌：列表缓存作废（issue #444）。
+        _invalidate_account_cache(group)
 
     return {
         'total': len(results),
@@ -2599,6 +2651,8 @@ async def run_refresh_plan_now(user: dict = Depends(security.require_admin)) -> 
     """
     stats = await renew.refresh_all(force=True)
     renew.mark_plan_ran()
+    # 全量刷新会遍历**所有分组**的账号，缓存整表清空（issue #444）。
+    accountcache.clear()
     plan = renew.get_plan()
     return {**stats, 'last_run': plan['last_run'],
             'next_run': renew.plan_next_run(plan)}
@@ -2823,6 +2877,8 @@ async def run_daily_task_now(body: dict = Body(...),
                             detail='task 只能是 ' + ' / '.join(dailyplan.TASKS))
     ok, message = await dailyplan.run_task(task)
     plan = dailyplan.mark_ran(task)
+    # 任务可能覆盖多个分组（签到 / 领取 / 点亮），整体清缓存最稳（issue #444）。
+    accountcache.clear()
     return {'ok': ok, 'message': message, 'task': task, 'plan': plan}
 
 
@@ -2857,6 +2913,9 @@ async def account_clear_cooling(
         raise HTTPException(status_code=400, detail='该账号文件缺少 uid，无法定位上游状态')
 
     ok, message, detail = await wb2api.force_clear_account_cooling(uid)
+    if ok:
+        # 冷却 / 限流状态变了：列表缓存作废，否则界面还显示「冷却中」（issue #444）。
+        _invalidate_account_cache(group)
     return {'ok': ok, 'message': message, **(detail or {})}
 
 
@@ -2931,6 +2990,8 @@ async def account_force_cooling(
     ok, message, detail = await wb2api.force_set_account_cooling(uid, until_formatted, reason)
     if not ok:
         raise HTTPException(status_code=400, detail=message)
+    # 冷却状态变了：列表缓存作废（issue #444）。
+    _invalidate_account_cache(group)
     return {'ok': ok, 'message': message, 'until': until_formatted, **(detail or {})}
 
 
@@ -2951,9 +3012,9 @@ async def account_set_note(
 
     空串 = 删除备注（不留空行）。
     """
+    group = _group(upstream_id)
     try:
-        raw = wb2api.read_account_file_any(
-            filename, _require_dir(_group(upstream_id)))
+        raw = wb2api.read_account_file_any(filename, _require_dir(group))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail='账号文件不存在') from exc
     uid = str((raw.get('account') or {}).get('uid') or '').strip()
@@ -2971,6 +3032,8 @@ async def account_set_note(
         db.set_account_note(uid, note)
     else:
         db.delete_account_note(uid)
+    # 备注随列表一起下发，改了就要让缓存作废（issue #444）。
+    _invalidate_account_cache(group)
     return {'ok': True, 'uid': uid, 'note': note}
 
 
@@ -2994,6 +3057,7 @@ async def account_delete(filename: str, upstream_id: int | None = Query(None),
         raise HTTPException(status_code=404, detail='账号文件不存在')
     if uid:
         creditsvc.forget(uid)
+    _invalidate_account_cache(group)
     reload.request_restart(upstream=_reload_target(group))
     return {'success': True}
 
@@ -3069,6 +3133,9 @@ async def account_move(
     except Exception:  # noqa: BLE001 —— 读不出 uid 不影响移动，只是少了重载收尾
         uid = ''
     db.move_account_added(uid, src_dir, dst_dir)
+    # 源分组少一个、目标分组多一个：两份列表缓存都要作废（issue #444）。
+    _invalidate_account_cache(src)
+    _invalidate_account_cache(dst)
     reload.request_reload_or_restart(uid, upstream=_reload_target(dst))
     return {
         'ok': True,
@@ -3084,6 +3151,9 @@ async def restart(upstream_id: int | None = Query(None),
                   user: dict = Depends(security.require_session_admin)) -> dict:
     group = _group(upstream_id)
     ok, message = await reload.restart_now(upstream=_reload_target(group))
+    if ok:
+        # 重启后池状态会重建（加载失败的账号、冷却、在途等全是新的）。
+        _invalidate_account_cache(group)
     return {'ok': ok, 'message': message}
 
 
@@ -3182,6 +3252,7 @@ async def account_set_disabled(
                 uid, True, reason, base_url=group['base_url'],
                 api_key=upstreamsvc.forward_api_key(group))
             if ok:
+                _invalidate_account_cache(group)
                 return {
                     'ok': True,
                     'file': filename,
@@ -3195,6 +3266,8 @@ async def account_set_disabled(
             result = wb2api.set_account_disabled(filename, True, base_dir)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # 改名属文件动作（`disabled_by_panel` 会出现在列表里），直接失效缓存。
+        _invalidate_account_cache(group)
         if result['changed'] and body.get('reload', True) is not False:
             reloaded = reload.request_restart(upstream=_reload_target(group))
     else:
@@ -3206,6 +3279,9 @@ async def account_set_disabled(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         renamed_back = bool(result['changed'])
+        # 改名回退路径改了 `disabled_by_panel`；状态位路径改了 `manual_disabled`。
+        # 两条都让列表缓存作废，后面所有返回分支共用这一处（issue #444）。
+        _invalidate_account_cache(group)
         if renamed_back and body.get('reload', True) is not False:
             reloaded = reload.request_restart(upstream=_reload_target(group))
         if uid:

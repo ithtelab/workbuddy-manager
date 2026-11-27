@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from .. import security, upstreamsvc
 from ..iputil import client_ip
-from ..services import wb2api
+from ..services import accountcache, wb2api
 
 router = APIRouter(prefix='/api/upstreams', tags=['upstreams'])
 
@@ -88,6 +88,8 @@ def create_upstream(body: UpstreamIn, request: Request,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     security.audit(user, 'create_upstream', created['name'],
                    f"id={created['id']}；地址={created['base_url']}；来源 {client_ip(request)}")
+    # 分组清单变了：账号列表缓存里的分组上下文（名称 / 目录 / 地址）可能已过时。
+    accountcache.clear()
     return _serialize([created])[0]
 
 
@@ -105,6 +107,8 @@ def update_upstream(upstream_id: int, body: UpstreamPatch, request: Request,
     security.audit(user, 'update_upstream', updated['name'],
                    f"id={updated['id']}；字段={','.join(sorted(patch)) or '无'}；"
                    f'来源 {client_ip(request)}')
+    # 地址 / 目录 / 名称都可能变，缓存整表清空（分组数量很少，代价可忽略）。
+    accountcache.clear()
     return _serialize([updated])[0]
 
 
@@ -139,6 +143,7 @@ def delete_upstream(upstream_id: int, request: Request,
             )
         raise HTTPException(status_code=404, detail='上游不存在')
     security.audit(user, 'delete_upstream', str(upstream_id), f'来源 {client_ip(request)}')
+    accountcache.clear()
     return {'ok': True}
 
 
