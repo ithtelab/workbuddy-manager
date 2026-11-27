@@ -46,8 +46,8 @@ from server.services.wb2api import _sanitize_section  # noqa: E402
 class PromptFileTest(unittest.TestCase):
     """`prompt.file` 是文件路径，不是提示词正文（issue #62）。"""
 
-    def test_empty_means_builtin_default(self) -> None:
-        """留空 = 用上游内置默认提示词，必须放行。"""
+    def test_empty_means_neutral_fallback(self) -> None:
+        """留空 = 上游回落到中性兜底提示词（issue #498 起不再有人设），字段本身放行。"""
         self.assertEqual(_sanitize_section('prompt', {'file': ''})['file'], '')
 
     def test_container_path_passes(self) -> None:
@@ -215,6 +215,47 @@ class SavePathTest(unittest.TestCase):
         prompt = self._read()['prompt']
         self.assertEqual(prompt['mode'], 'custom')
         self.assertEqual(prompt['file'], '/app/data/my-prompt.txt')
+
+    def test_custom_or_append_without_file_is_rejected(self) -> None:
+        """issue #498：选了 custom/append 却没给文件 → 拒绝保存。
+
+        上游已移除内置人设，这种组合只会让每条请求的 system 被换成一句通用
+        提示词；用户多半是漏填，保存时就该被挡住，而不是等他用起来才发现。
+        """
+        from server.services import wb2api
+        for mode in ('custom', 'append'):
+            with self.subTest(mode=mode):
+                with self.assertRaises(ValueError) as ctx:
+                    wb2api.save_upstream_config({'prompt': {'mode': mode}})
+                self.assertIn('自定义提示词文件', str(ctx.exception))
+        self.assertEqual(self._read()['prompt']['mode'], 'passthrough')
+
+    def test_clearing_file_while_custom_is_rejected(self) -> None:
+        """单独清空文件、模式仍是 custom → 拒绝（按合并后的落盘状态判，不是只看本次 patch）。"""
+        from server.services import wb2api
+        wb2api.save_upstream_config({'prompt': {'mode': 'custom', 'file': '/app/x.txt'}})
+        with self.assertRaises(ValueError):
+            wb2api.save_upstream_config({'prompt': {'file': '   '}})
+        self.assertEqual(self._read()['prompt']['file'], '/app/x.txt')
+
+    def test_passthrough_allows_empty_file(self) -> None:
+        """passthrough 不加载提示词文件，留空是正常状态。"""
+        from server.services import wb2api
+        wb2api.save_upstream_config({'prompt': {'mode': 'passthrough', 'file': ''}})
+        prompt = self._read()['prompt']
+        self.assertEqual(prompt['mode'], 'passthrough')
+        self.assertEqual(prompt['file'], '')
+
+    def test_unrelated_save_not_blocked_by_legacy_prompt(self) -> None:
+        """老配置停在 custom + 空文件时，改别的设置不该被 prompt 校验拦住。"""
+        import json
+        from server.services import wb2api
+        self.path.write_text(json.dumps({'prompt': {'mode': 'custom', 'file': ''}},
+                                        ensure_ascii=False), encoding='utf-8')
+        wb2api.save_upstream_config({'pool': {'cost_explore_interval': '30m'}})
+        cfg = self._read()
+        self.assertEqual(cfg['prompt'], {'mode': 'custom', 'file': ''})
+        self.assertEqual(cfg['pool']['cost_explore_interval'], '30m')
 
     def test_sibling_keys_survive(self) -> None:
         """拒绝一个坏值时，同一次请求里的**合法**键也不该被写进去（要么全拒、要么全收）。"""

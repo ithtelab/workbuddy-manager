@@ -240,12 +240,17 @@ class UpstreamConfigRoundTrip(unittest.TestCase):
         （上游 normalizePrompt 对非法值是 fail fast），表现为「保存成功然后上游挂了」。
         """
         for mode in ('passthrough', 'custom', 'append'):
-            write_cfg(self.cfg_path, {'prompt': {'mode': 'passthrough'}})
-            wb2api.save_upstream_config({'prompt': {'mode': mode}})
+            write_cfg(self.cfg_path, {'prompt': {'mode': 'passthrough', 'file': ''}})
+            # issue #498：custom/append 必须同时给提示词文件（上游已无内置人设）。
+            payload = {'mode': mode}
+            if mode != 'passthrough':
+                payload['file'] = '/app/data/prompt.txt'
+            wb2api.save_upstream_config({'prompt': payload})
             self.assertEqual(read_cfg(self.cfg_path)['prompt']['mode'], mode)
         # 大小写/空白仍归一化
-        write_cfg(self.cfg_path, {'prompt': {'mode': 'passthrough'}})
-        wb2api.save_upstream_config({'prompt': {'mode': ' Append '}})
+        write_cfg(self.cfg_path, {'prompt': {'mode': 'passthrough', 'file': ''}})
+        wb2api.save_upstream_config(
+            {'prompt': {'mode': ' Append ', 'file': '/app/data/prompt.txt'}})
         self.assertEqual(read_cfg(self.cfg_path)['prompt']['mode'], 'append')
 
     def test_prompt_mode_whitelist_matches_upstream(self) -> None:
@@ -256,8 +261,12 @@ class UpstreamConfigRoundTrip(unittest.TestCase):
         """
         upstream_values = {'', 'passthrough', 'custom', 'append'}  # 空串 = 缺省 passthrough
         for value in sorted(upstream_values - {''}):
-            write_cfg(self.cfg_path, {'prompt': {'mode': 'passthrough'}})
-            wb2api.save_upstream_config({'prompt': {'mode': value}})  # 不抛错即通过
+            write_cfg(self.cfg_path, {'prompt': {'mode': 'passthrough', 'file': ''}})
+            # issue #498：custom/append 必须同时给提示词文件，否则会被联动校验拒掉。
+            payload = {'mode': value}
+            if value in ('custom', 'append'):
+                payload['file'] = '/app/data/prompt.txt'
+            wb2api.save_upstream_config({'prompt': payload})  # 不抛错即通过
         for bogus in ('replace', 'degraded', 'none', 'appendx'):
             with self.assertRaises(ValueError, msg=bogus):
                 wb2api.save_upstream_config({'prompt': {'mode': bogus}})

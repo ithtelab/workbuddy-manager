@@ -393,9 +393,9 @@ const PROMPT_FIELDS: Field[] = [
     key: 'file',
     kind: 'text',
     label: '自定义提示词文件',
-    desc: '在 custom 与 append 模式下生效。留空使用内置默认提示词',
-    caution: '路径必须存在于上游容器内且可读；写错会导致上游启动失败、反代不可用。不确定就留空。',
-    placeholder: '留空 = 使用内置默认',
+    desc: '在 custom 与 append 模式下生效，必须填写上游容器内可读的提示词文件路径',
+    caution: '路径必须存在于上游容器内且可读；留空会使用极短的中性兜底提示词。写错会导致上游启动失败、反代不可用。',
+    placeholder: '/app/data/prompt-custom.txt',
     def: '',
   },
 ];

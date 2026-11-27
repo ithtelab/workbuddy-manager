@@ -2071,9 +2071,6 @@
     "passthrough（透传客户端 system，默认）": "passthrough (forward client system, default)",
     "custom（替换为网关提示词）": "custom (replace with the gateway prompt)",
     "自定义提示词文件": "Custom prompt file",
-    "在 custom 与 append 模式下生效。留空使用内置默认提示词": "Applies in both custom and append modes. Empty uses the built-in default prompt",
-    "路径必须存在于上游容器内且可读；写错会导致上游启动失败、反代不可用。不确定就留空。": "The path must exist and be readable inside the upstream container; a wrong value makes upstream fail to start and the gateway unavailable. Leave it empty if unsure.",
-    "留空 = 使用内置默认": "empty = use the built-in default",
     "请求体上限": "Max request body",
     "单个请求体最大体积，超过返回 413。反代网关也按此值限制入站请求，调大可容纳更长的上下文": "Largest single request body; anything above returns 413. The gateway applies the same limit to inbound requests, so raising it allows longer contexts",
     "出站 User-Agent": "Outbound User-Agent",
@@ -2187,7 +2184,10 @@
     "秒": "sec",
     "分钟": "min",
     "请求上限（旧版上游）": "Request limit (legacy upstream)",
-    "自定义密钥形态未启用：请设置环境变量 WB_KEY_CUSTOM_ENABLED=1 后重启": "Custom key format is disabled: set the WB_KEY_CUSTOM_ENABLED=1 environment variable and restart"
+    "自定义密钥形态未启用：请设置环境变量 WB_KEY_CUSTOM_ENABLED=1 后重启": "Custom key format is disabled: set the WB_KEY_CUSTOM_ENABLED=1 environment variable and restart",
+    "在 custom 与 append 模式下生效，必须填写上游容器内可读的提示词文件路径": "Applies in custom and append modes; a readable prompt file path inside the upstream container is required",
+    "路径必须存在于上游容器内且可读；留空会使用极短的中性兜底提示词。写错会导致上游启动失败、反代不可用。": "The path must exist and be readable inside the upstream container; an empty value uses a very short neutral fallback prompt. A wrong path makes upstream fail to start and the gateway unavailable.",
+    "/app/data/prompt-custom.txt": "/app/data/prompt-custom.txt"
   },
   "redPacket": {
     "title": "Red packets",

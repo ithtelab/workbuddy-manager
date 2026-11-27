@@ -1,0 +1,220 @@
+diff --git a/README.md b/README.md
+index e8e9e57..8826881 100644
+--- a/README.md
++++ b/README.md
+@@ -73,8 +73,8 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
+ - **系统提示词三模式**（`prompt.mode`，缺省 `passthrough`） —
+   - `passthrough`（缺省）：透传客户端原始 system，遇内容拦截自动降级中性提示词重试
+   - `custom`：网关用自有提示词**替换**客户端 system/developer（从源头消除模板句误报；不参与降级）
+-  - `append`：**两者并用**——开头连续 system/developer 块之后插入网关自有提示词，客户端项目规范/工具约定与网关人格共存（issue #129）；降级期与拦截首遇重试时退化为 `custom` 语义（换中性提示词，原文 system 移除）
+-  - `prompt.file`（custom/append 生效）指向自定义提示词文件，空 = 内置默认
++  - `append`：**两者并用**——开头连续 system/developer 块之后插入网关自有提示词，客户端项目规范/工具约定与网关提示词共存（issue #129）；降级期与拦截首遇重试时退化为 `custom` 语义（换中性提示词，原文 system 移除）
++  - `prompt.file`（custom/append 生效）指向自定义提示词文件，**留空回落到中性兜底提示词**（启动日志会打 WARN；不再内置任何人设文本，issue #498）
+ - **会话头族注入** — 出站携带官方客户端会话头族（`X-Conversation-Request-ID` 聚合主键 · `X-Conversation-ID` 透传 · B3 链路），轮转 / 重试 / 路径回退复用同键，后台按对话轮聚合不再碎片化（issue #35）
+ - **指纹脱敏** — 出站请求体黑名单指纹字段清洗（可开关），与提示词体系两层叠加
+ 
+@@ -109,7 +109,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
+ - 手动签到：`./signin.sh`（批量、幂等不重复计）
+ - 账号停用 / 恢复：`./acct.sh list | disable <uid> [原因] | enable <uid> | revive <uid>`（需 `admin.enabled`，走网关管理端点）
+ - 领养联动 / 任务查询：`scripts/task_runner.py`（成长任务一体机，默认 dry-run）
+-- 个性化提示词：`prompt.file` 指向自定义提示词文件即整体替换内置默认（`custom`/`append` 模式生效）
++- 个性化提示词：`prompt.file` 指向自定义提示词文件，由该文件提供系统提示词（`custom`/`append` 模式生效）；留空时使用极短的中性兜底文本
+ 
+ ## 架构总览
+ 
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index 8fbed19..ba52136 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -4,6 +4,7 @@ package main
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"log"
+ 	"net/url"
+ 	"os"
+ 	"strconv"
+@@ -144,8 +145,8 @@ type Config struct {
+ 		// custom = 网关用自有系统提示词替换客户端 system/developer（显式配置仍可覆盖回替换）；
+ 		// append = 两者并用：开头连续 system/developer 块后插网关 system，既有消息逐字不动（issue #129）。
+ 		Mode string `json:"mode"` // "custom" / "append" / "passthrough"
+-		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
+-		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
++		// File 提示词文件路径；空 = 中性兜底 prompt.Degraded（issue #498 起不再内置人设）；
++		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到兜底文本）。
+ 		File string `json:"file"`
+ 	} `json:"prompt"`
+ 
+@@ -581,8 +582,8 @@ func (c *Config) normalize() error {
+ // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
+ //
+ // mode 非法（非 custom/append/passthrough）启动报错，避免静默回落到某一分支；
+-// custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
+-// （两模式共用同一加载路径，PromptText 均非空）。
++// custom/append 模式下 file 非空但不可读 → 报错（fail fast）；file 空 → 回落到
++// prompt.Degraded 中性兜底（issue #498：不再有随二进制分发的人设文本）。
+ // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+ func (c *Config) normalizePrompt() error {
+ 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
+@@ -600,6 +601,10 @@ func (c *Config) normalizePrompt() error {
+ 		if err != nil {
+ 			return err
+ 		}
++		if strings.TrimSpace(c.Prompt.File) == "" {
++			// 不静默：issue #498 的抱怨之一就是「回落到内置文本却没有任何日志」。
++			log.Printf("[WARN] prompt.mode=%s 但 prompt.file 为空，使用中性兜底提示词（不再内置人设）", c.Prompt.Mode)
++		}
+ 		c.PromptText = text
+ 	}
+ 	return nil
+diff --git a/cmd/server/config_test.go b/cmd/server/config_test.go
+index 3b38c8a..1b82387 100644
+--- a/cmd/server/config_test.go
++++ b/cmd/server/config_test.go
+@@ -5,6 +5,8 @@ import (
+ 	"path/filepath"
+ 	"strings"
+ 	"testing"
++
++	"workbuddy2api/internal/prompt"
+ )
+ 
+ func TestDefault(t *testing.T) {
+@@ -583,7 +585,7 @@ func TestPromptFileMissing(t *testing.T) {
+ 	}
+ }
+ 
+-// TestPromptFileOverride 自定义 file 覆盖内置默认。
++// TestPromptFileOverride 自定义 file 覆盖兜底文本。
+ func TestPromptFileOverride(t *testing.T) {
+ 	dir := t.TempDir()
+ 	pf := filepath.Join(dir, "my.md")
+@@ -602,6 +604,25 @@ func TestPromptFileOverride(t *testing.T) {
+ 	}
+ }
+ 
++// TestPromptEmptyFileFallsBackToDegraded issue #498：custom/append 未配 file 时
++// 不再加载随二进制分发的人设，而是极短的中性兜底（并打 WARN，不静默）。
++func TestPromptEmptyFileFallsBackToDegraded(t *testing.T) {
++	for _, mode := range []string{"custom", "append"} {
++		dir := t.TempDir()
++		fp := filepath.Join(dir, "c.json")
++		if err := os.WriteFile(fp, []byte(`{"prompt":{"mode":"`+mode+`"}}`), 0o600); err != nil {
++			t.Fatal(err)
++		}
++		c, err := Load(fp)
++		if err != nil {
++			t.Fatalf("mode=%s: %v", mode, err)
++		}
++		if c.PromptText != prompt.Degraded {
++			t.Errorf("mode=%s: PromptText len=%d want Degraded", mode, len(c.PromptText))
++		}
++	}
++}
++
+ // TestPromptEnvOverride env 覆盖 prompt.mode 与 prompt.file。
+ func TestPromptEnvOverride(t *testing.T) {
+ 	t.Setenv("WB2A_PROMPT_MODE", "passthrough")
+@@ -727,8 +748,8 @@ func TestUpstreamUserAgentConfig(t *testing.T) {
+ 
+ // ---- prompt.mode=append（issue #129 三模式） ----
+ 
+-// TestPromptAppendModeAccepted B1：append 新值合法，PromptText 非空（内置默认，
+-// 与 custom 同加载路径）。
++// TestPromptAppendModeAccepted B1：append 新值合法，PromptText 非空（空 file 走
++// 中性兜底，与 custom 同加载路径）。
+ func TestPromptAppendModeAccepted(t *testing.T) {
+ 	dir := t.TempDir()
+ 	fp := filepath.Join(dir, "c.json")
+diff --git a/internal/prompt/prompt.go b/internal/prompt/prompt.go
+index 4bc5293..8f2125d 100644
+--- a/internal/prompt/prompt.go
++++ b/internal/prompt/prompt.go
+@@ -1,39 +1,42 @@
+-// Package prompt 提供网关自有系统提示词：内置默认 + 文件覆盖 + 降级中性提示词。
++// Package prompt 提供网关自有系统提示词：文件加载 + 中性兜底提示词。
+ //
+ // 背景：客户端（Claude Code/Codex 等 CLI）在 system prompt 注入固定模板句，
+ // 上游内容审核按逐字精确匹配误杀合法流量（issue #36/PR39 的 11128）。
+ // 方案：网关在出站前用自有系统提示词替换客户端 system/developer 消息，
+ // 从源头消灭 system 来源的指纹误报（用户/assistant 消息里的指纹串仍由
+ // internal/upstream/sanitize.go 清洗，两层叠加、互不替代）。
++//
++// 不再内置任何人设文本（issue #498）：custom/append 模式的提示词一律由使用者
++// 通过 prompt.file 提供；file 留空时只回落到中性兜底 Degraded，且该常量极短，
++// 不会给每条请求打上新的、比客户端原文更独特的指纹。
+ package prompt
+ 
+ import (
+-	_ "embed"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+ 	"strings"
+ )
+ 
+-//go:embed defaultprompt.md
+-var defaultPrompt string
+-
+ // Degraded 降级提示词：误报处理用，刻意极简中性。
+ //
+ // 触发场景：passthrough 模式下请求被上游内容策略拦截（HTTP 400 + 审核文案），
+ // 判定为指纹误报后换最小中性提示词重试一次。非对抗框架——只用于绕开
+ // system 来源的误报，不改变用户指令的合法性语义。
++//
++// custom/append 模式未配置 prompt.file 时也回落到这段文本（issue #498：
++// 以前回落到内置的 15 KB 人设，既不中性、又随二进制分发）。
+ const Degraded = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
+ 
+ // Load 按 mode 与 file 加载系统提示词文本。
+ //   - file 非空 → 读文件（不存在/读失败返回 error，调用方 fail fast）；
+-//   - file 空 → 返回内置 defaultPrompt。
++//   - file 空 → 返回中性兜底 Degraded（不再有内置人设文本，issue #498）。
+ //
+ // mode 在此仅做透传记录（实际 custom/passthrough 路由由调用方决定），
+ // Load 只负责"拿到一段提示词文本"，不关心路由语义。
+ func Load(mode, file string) (string, error) {
+-	if file == "" {
+-		return defaultPrompt, nil
++	if strings.TrimSpace(file) == "" {
++		return Degraded, nil
+ 	}
+ 	raw, err := os.ReadFile(file)
+ 	if err != nil {
+diff --git a/internal/prompt/prompt_test.go b/internal/prompt/prompt_test.go
+index 1134ef2..c97e291 100644
+--- a/internal/prompt/prompt_test.go
++++ b/internal/prompt/prompt_test.go
+@@ -190,16 +190,23 @@ func TestRewriteEmptyPromptReturnedAsIs(t *testing.T) {
+ 	}
+ }
+ 
+-func TestLoadDefaultWhenFileEmpty(t *testing.T) {
+-	got, err := Load("custom", "")
+-	if err != nil {
+-		t.Fatal(err)
+-	}
+-	if got != defaultPrompt {
+-		t.Errorf("Load() returned non-default prompt (len=%d vs %d)", len(got), len(defaultPrompt))
++// TestLoadNeutralFallbackWhenFileEmpty 空 file 只回落中性兜底（issue #498）：
++// 以前回落到随二进制分发的 15 KB 人设，既是隐私问题、又给每条请求打上更强指纹。
++func TestLoadNeutralFallbackWhenFileEmpty(t *testing.T) {
++	for _, mode := range []string{"custom", "append"} {
++		for _, file := range []string{"", "   ", "\t\n"} {
++			got, err := Load(mode, file)
++			if err != nil {
++				t.Fatalf("mode=%q file=%q: %v", mode, file, err)
++			}
++			if got != Degraded {
++				t.Errorf("mode=%q file=%q: want Degraded fallback, got len=%d", mode, file, len(got))
++			}
++		}
+ 	}
+-	if len(got) == 0 {
+-		t.Error("default prompt is empty")
++	// 兜底文本必须是极短中性句：不能因为将来误改又变成长人设。
++	if len(Degraded) > 512 {
++		t.Errorf("Degraded should stay short and neutral, got %d bytes", len(Degraded))
+ 	}
+ }
+ 

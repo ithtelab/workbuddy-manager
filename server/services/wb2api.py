@@ -2023,24 +2023,6 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             out[key] = _check_int(key, raw)
         elif key in _FLOAT_RANGES:
             out[key] = _check_float(key, raw)
-        elif section == 'prompt' and key == 'mode':
-            mode = str(raw or '').strip().lower()
-            # 取值必须与上游 `normalizePrompt` 的白名单**保持一致**：上游对非法值
-            # 是**启动即报错**（fail fast），所以这里拦不住的话，用户会存进一份让
-            # 上游起不来的配置——表现为「保存成功，然后上游挂了」，比当场报错难查得多。
-            # `append` 是上游 2026-09-17 新增（issue #129）：开头连续 system/developer
-            # 块后插网关 system，既有消息逐字不动。我们此前只认 custom/passthrough，
-            # 会把用户填的合法值拒掉（上游支持、面板说不合法）。
-            if mode not in ('custom', 'append', 'passthrough'):
-                raise ValueError('prompt.mode 只能是 custom、append 或 passthrough')
-            out[key] = mode
-        elif section == 'prompt' and key == 'file':
-            # 路径非空但不可读会让上游启动直接失败（fail fast），
-            # 因此这里做基础合法性检查，并明确提示风险
-            path = str(raw or '').strip()
-            if _has_control_chars(path):
-                raise ValueError('prompt.file 不能包含换行或控制字符')
-            out[key] = path
         elif section == 'admin' and key == 'enabled':
             # 上游对这组配置有 **fail-fast**：`admin.enabled=true` 且 `api_key`
             # 为空时 normalize() 直接返回错误、拒绝启动（其 config.go 原话：
@@ -2135,6 +2117,26 @@ def save_upstream_config(patch: dict) -> dict:
             if clean.pop('__delete__', False):
                 cfg[field].pop('device_token', None)
             cfg[field].update(clean)
+
+    # 提示词段联动校验（issue #498）：custom/append 必须配 prompt.file。
+    # 上游已移除内置人设，file 留空只会回落到一句中性兜底——用户显式选了
+    # custom/append 却没给文件，多半是漏填；静默接受的结果是每条请求的
+    # system 都被换成通用提示词，很难发现。按**落盘后的实际状态**判：
+    # 前端只提交改动字段，单独改 mode 时 file 可能还是旧值，必须合并后再看。
+    #
+    # 只在本次 patch **确实带了 prompt 段**时校验：老配置可能正停在
+    # custom + 空文件（升级前留下的），用户改签到时不该被一个他没碰的字段拦住。
+    if isinstance(patch.get('prompt'), dict):
+        prompt_cfg = cfg.get('prompt')
+        if isinstance(prompt_cfg, dict):
+            mode = str(prompt_cfg.get('mode') or 'passthrough').strip().lower()
+            prompt_file = str(prompt_cfg.get('file') or '').strip()
+            if mode in ('custom', 'append') and not prompt_file:
+                raise ValueError(
+                    f'系统提示词模式选了 {mode}，但「自定义提示词文件」为空：请填写上游容器内'
+                    '可读的文件路径（例如 /app/data/prompt-custom.txt）；不需要自定义提示词'
+                    '请先把模式改回 passthrough'
+                )
 
     # 顶层布尔开关：思考通道兜底（reasoning_as_content）。
     # 它不是任何配置段的成员，所以不能走上面的段循环 —— 塞进段里会写到

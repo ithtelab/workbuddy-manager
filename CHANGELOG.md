@@ -86,6 +86,13 @@
   `WorkBuddy/5.11.3`（国际版 `WorkBuddy AI/5.11.3`），`X-IDE-Version` 同步；
   需要 CLI 形态时可在上游配置里设 `upstream.ua_style: cli`（或 `WB2A_UA_STYLE=cli`）
   恢复三段式。管理端直连腾讯的签到 / 积分 / 探测请求同步使用新默认值。
+- **系统提示词在没配文件时回落到一段内置人设（#498）**：`prompt.mode` 设为
+  `custom` / `append` 但 `prompt.file` 为空时，网关会静默用一段约 15 KB 的内置
+  人设文本替换或追加 system —— 既不中性，又让每条请求多付数千 token，这段文本
+  还随程序一起分发、任何拿到程序的人都能提取。现在该文本已从程序中移除：
+  `prompt.file` 留空只回落到一句极短的中性提示词（启动日志会打 WARN）；
+  设置页在 `custom` / `append` 模式下文件为空时会直接拒绝保存并提示。
+  需要自定义提示词，请把正文写进文件、把路径填到 `prompt.file`。
 
 ### 改进
 
