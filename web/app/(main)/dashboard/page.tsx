@@ -619,7 +619,7 @@ export default function DashboardPage() {
             // 其次报最近一笔到期（具体日期与金额，只有这里能看到），
             // 最后才是「N 个账号余额已知」这种平淡的状态说明。
             creditsPending
-              ? t('dashboard.waitingUpstream')
+              ? t('dashboard.creditsLoading')
               : !creditsKnown.length
                 ? t('dashboard.waitingUpstream')
                 : creditsLow > 0

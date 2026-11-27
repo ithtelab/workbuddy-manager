@@ -274,7 +274,8 @@
     "failedRequests": "失敗請求",
     "todayFailed": "今天 {n} 次失敗",
     "weekFailed": "近 7 天 {n} 次失敗 · {realm}",
-    "creditsExpiryDaily": "最近一天（{time}）共 {amount} 積分到期"
+    "creditsExpiryDaily": "最近一天（{time}）共 {amount} 積分到期",
+    "creditsLoading": "正在查詢即時積分…"
   },
   "stats": {
     "realtimeClientInflight": "用戶端在途 {n}",

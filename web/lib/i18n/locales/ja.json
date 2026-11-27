@@ -274,7 +274,8 @@
     "failedRequests": "失敗リクエスト",
     "todayFailed": "本日 {n} 件失敗",
     "weekFailed": "直近 7 日 {n} 件失敗 · {realm}",
-    "creditsExpiryDaily": "直近の期限日（{time}）に {amount} ポイントが失効"
+    "creditsExpiryDaily": "直近の期限日（{time}）に {amount} ポイントが失効",
+    "creditsLoading": "リアルタイム積分を取得中…"
   },
   "stats": {
     "realtimeClientInflight": "クライアント実行中 {n}",

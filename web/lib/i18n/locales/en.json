@@ -301,7 +301,8 @@
     "failedRequests": "Failed requests",
     "todayFailed": "{n} failed today",
     "weekFailed": "{n} failed in 7 days · {realm}",
-    "creditsExpiryDaily": "{amount} credits expire on the nearest day ({time})"
+    "creditsExpiryDaily": "{amount} credits expire on the nearest day ({time})",
+    "creditsLoading": "Loading live credits…"
   },
   "stats": {
     "realtimeClientInflight": "Client in flight {n}",

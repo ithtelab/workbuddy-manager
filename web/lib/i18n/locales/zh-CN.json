@@ -274,7 +274,8 @@
     "failedRequests": "失败请求",
     "todayFailed": "今天 {n} 次失败",
     "weekFailed": "近 7 天 {n} 次失败 · {realm}",
-    "creditsExpiryDaily": "最近一天（{time}）共 {amount} 积分到期"
+    "creditsExpiryDaily": "最近一天（{time}）共 {amount} 积分到期",
+    "creditsLoading": "正在查询实时积分…"
   },
   "stats": {
     "realtimeClientInflight": "客户端在途 {n}",

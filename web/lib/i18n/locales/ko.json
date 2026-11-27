@@ -274,7 +274,8 @@
     "failedRequests": "실패 요청",
     "todayFailed": "오늘 {n}건 실패",
     "weekFailed": "최근 7일 {n}건 실패 · {realm}",
-    "creditsExpiryDaily": "가장 가까운 만료일({time})에 {amount} 포인트 만료"
+    "creditsExpiryDaily": "가장 가까운 만료일({time})에 {amount} 포인트 만료",
+    "creditsLoading": "실시간 크레딧 조회 중…"
   },
   "stats": {
     "realtimeClientInflight": "클라이언트 처리 중 {n}",
