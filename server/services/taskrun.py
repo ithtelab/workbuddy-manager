@@ -84,6 +84,10 @@ _MAX_LOG_LINES = 400
 # 账号标识：uid 前缀（16 进制）或字面量 ALL。做白名单式字符校验，
 # 因为它会作为独立 argv 传进子进程。
 _ACCOUNT_RE = re.compile(r'^[0-9a-zA-Z_-]{1,64}$')
+# 账号文件名（workbuddy*.json）：上游脚本的 load_auth 接受这个形态，用于
+# 「ALL 但需要剔除 skip_tasks 账号」时把过滤后的名单显式传进去（issue #437）。
+# 只放行字母/数字/下划线/点/连字符，不含路径分隔符。
+_AUTH_FILE_RE = re.compile(r'^workbuddy[A-Za-z0-9_.-]*\.json$')
 
 _state: dict = {
     'running': False,
@@ -366,22 +370,39 @@ def status() -> dict:
     return snap
 
 
-def build_command(mode: str, target: str) -> list[str]:
-    """构造 argv（不经过 shell，因此不做任何转义）。"""
+def build_command(mode: str, target: str,
+                  accounts: list[str] | None = None) -> list[str]:
+    """构造 argv（不经过 shell，因此不做任何转义）。
+
+    `accounts` 非空时用它作为脚本的账号列表（替代单个 `target`）：上游
+    `task_runner.py` 的 `accounts` 是 `nargs="+"`，可以一次收多个 uid 前缀或
+    文件名。只有「ALL 且需要剔除 skip_tasks 账号」的路径会走到这里（issue #437）。
+    """
     if mode not in _MODE_ARGS:
         raise ValueError(f'不支持的模式：{mode}')
-    if not _ACCOUNT_RE.match(target or ''):
-        raise ValueError('账号标识不合法（只允许 uid 前缀或 ALL）')
+    if accounts is not None:
+        if not accounts:
+            raise ValueError('没有可执行的账号')
+        for account in accounts:
+            if not (_ACCOUNT_RE.match(account or '')
+                    or _AUTH_FILE_RE.match(account or '')):
+                raise ValueError(f'账号标识不合法：{account!r}')
+        targets = list(accounts)
+    else:
+        if not _ACCOUNT_RE.match(target or ''):
+            raise ValueError('账号标识不合法（只允许 uid 前缀或 ALL）')
+        targets = [target]
     # `-u` 必须加：非交互（管道）时 Python 的 stdout 是**块缓冲**，攒满 8KB 才刷。
     # 脚本每行约 80 字节，于是一次全量要跑满约 100 行才会吐出第一批输出——
     # 用户看到的就是「点了做任务，卡半天没有任何输出，然后突然冒出一大段」
     # （线上实测）。加 -u 后每行实时可见，面板才真的能当进度看。
-    return [_python(), '-u', str(_script_path()), target, *_MODE_ARGS[mode],
+    return [_python(), '-u', str(_script_path()), *targets, *_MODE_ARGS[mode],
             *(taskpacing.script_args() if mode in ('claim', 'full') else [])]
 
 
 def _prepare(mode: str, target: str, auth_dir: Path | str | None = None,
-             group_name: str = '') -> tuple[bool, object]:
+             group_name: str = '',
+             exclude_skip_tasks: bool = True) -> tuple[bool, object]:
     """启动前的**阻塞**准备：校验可用性 + 构造 argv。
 
     返回 (ok, payload)：ok 为 False 时 payload 是给用户的原因说明，否则是
@@ -401,8 +422,22 @@ def _prepare(mode: str, target: str, auth_dir: Path | str | None = None,
         return False, why
     if _state['running']:
         return False, f'已有任务正在执行（{_state["mode"]} / {_state["target"]}），请等它结束'
+    accounts: list[str] | None = None
+    if target == 'ALL' and exclude_skip_tasks:
+        # 账号级「不参与定时任务」（issue #437）：上游脚本只会按名单逐个加载，
+        # 自己不认 skip_tasks。于是这里把过滤后的**文件名**显式传给它。
+        #
+        # 只有目录里确实有账号时才替换 ALL：空目录（测试/镜像未配账号）保持
+        # 原来的行为，交给脚本自己报「无可用账号」，不改变既有错误路径。
+        from . import wb2api  # noqa: PLC0415 —— 避免顶层循环依赖
+        base = Path(auth_dir) if auth_dir else config.AUTH_DIR
+        rows = wb2api.list_auth_accounts(base)
+        if rows:
+            accounts = wb2api.task_account_files(base)
+            if not accounts:
+                return False, '所有账号都设置了不参与定时任务（或已被停用），没有可执行的账号'
     try:
-        argv = build_command(mode, target)
+        argv = build_command(mode, target, accounts=accounts)
     except ValueError as exc:
         return False, str(exc)
     return True, {
@@ -442,7 +477,8 @@ def _launch(payload: dict, mode: str, target: str, loop) -> tuple[bool, str]:
 
 async def start_async(mode: str, target: str = 'ALL',
                       auth_dir: Path | str | None = None,
-                      group_name: str = '') -> tuple[bool, str]:
+                      group_name: str = '',
+                      exclude_skip_tasks: bool = True) -> tuple[bool, str]:
     """启动一次执行（**不阻塞事件循环**的版本）。
 
     定时领奖循环与启动任务的 async 接口都走这里：把阻塞的准备丢进线程池，
@@ -454,7 +490,8 @@ async def start_async(mode: str, target: str = 'ALL',
     paused = await accountrisk.paused_targets(auth_dir)
     if paused and (target == 'ALL' or any(uid.startswith(target) for uid in paused)):
         return False, '账号存在保护性暂停；请改选正常账号单独执行，或检查预警后手动恢复'
-    ok, payload = await asyncio.to_thread(_prepare, mode, target, auth_dir, group_name)
+    ok, payload = await asyncio.to_thread(_prepare, mode, target, auth_dir, group_name,
+                                          exclude_skip_tasks)
     if not ok:
         return False, payload  # type: ignore[return-value]
     return _launch(payload, mode, target, asyncio.get_running_loop())  # type: ignore[arg-type]
@@ -462,14 +499,15 @@ async def start_async(mode: str, target: str = 'ALL',
 
 def start(mode: str, target: str = 'ALL',
           auth_dir: Path | str | None = None,
-          group_name: str = '') -> tuple[bool, str]:
+          group_name: str = '',
+          exclude_skip_tasks: bool = True) -> tuple[bool, str]:
     """启动一次执行（同步版）。返回 (是否已启动, 说明)。
 
     要求**当前线程有运行中的事件循环**（要 create_task），且会阻塞它 ——
     所以事件循环里的调用方请用 `start_async()`。保留同步版是为了命令行/测试
     这类「本来就在 loop 线程里、且不在意短暂阻塞」的场景。
     """
-    ok, payload = _prepare(mode, target, auth_dir, group_name)
+    ok, payload = _prepare(mode, target, auth_dir, group_name, exclude_skip_tasks)
     if not ok:
         return False, payload  # type: ignore[return-value]
     try:

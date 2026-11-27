@@ -1,0 +1,485 @@
+diff --git a/internal/auth/auth.go b/internal/auth/auth.go
+index 0e46487..0f728d3 100644
+--- a/internal/auth/auth.go
++++ b/internal/auth/auth.go
+@@ -61,6 +61,15 @@ type Auth struct {
+ 	// 那会让低权重的号一直闲置，积分用不完就过期（正是 #187 另一半诉求要避免的）。
+ 	// 硬门槛（冷却 / 熔断 / 禁用 / 在途占满）与成本分层不受本字段影响。
+ 	Weight float64
++
++	// SkipTasks 账号级「只转发、不跑定时任务」开关（issue #437），来源 auth 文件
++	// 顶层 `skip_tasks`。true 时账号仍在池里、照常参与选号转发，但 scheduler 的
++	// 签到 / 保活 / 旅行 / 活跃 / 开学季 / 夜猫子等任务逐号跳过它。
++	//
++	// 为什么需要：企业账号没有个人成长体系，签到端点恒返回 400 code=10001；
++	// 面板的「临时停用」会把账号摘出池子、连转发也停掉，不满足「只是别跑任务」。
++	// 本字段只在 Parse 时写入、之后不变（热加载整体替换 *Auth），读侧无需加锁。
++	SkipTasks bool
+ }
+ 
+ // 手写权重的取值区间：低于 MinWeight 等于「几乎不用」（但仍留一丝机会，与
+@@ -305,6 +314,8 @@ func Parse(raw []byte) (*Auth, error) {
+ 			Proxy string `json:"proxy"`
+ 			// Weight 顶层 weight（手写权重，面板写入；见 Auth.Weight）。
+ 			Weight float64 `json:"weight"`
++			// SkipTasks 顶层 skip_tasks（不参与定时任务，面板写入；见 Auth.SkipTasks）。
++			SkipTasks bool `json:"skip_tasks"`
+ 		}
+ 		if err := json.Unmarshal(raw, &n); err != nil {
+ 			return nil, fmt.Errorf("storage_parse_error: %w", err)
+@@ -321,6 +332,7 @@ func Parse(raw []byte) (*Auth, error) {
+ 			DeviceToken:  n.DeviceToken,
+ 			ProxyName:    strings.TrimSpace(n.Proxy),
+ 			Weight:       sanitizeWeight(n.Weight),
++			SkipTasks:    n.SkipTasks,
+ 		}
+ 	} else {
+ 		var f struct {
+@@ -339,6 +351,8 @@ func Parse(raw []byte) (*Auth, error) {
+ 			// 单独成组（上方空行）是为了不改动既有字段的对齐 —— 补丁切片只描述
+ 			// 自己的增量，gofmt 顺手重排别人的行会让前一个补丁的「已应用」判定失效。
+ 			Weight float64 `json:"weight"`
++			// SkipTasks 顶层 skip_tasks（不参与定时任务，面板写入；见 Auth.SkipTasks）。
++			SkipTasks bool `json:"skip_tasks"`
+ 		}
+ 		if err := json.Unmarshal(raw, &f); err != nil {
+ 			return nil, fmt.Errorf("storage_parse_error: %w", err)
+@@ -355,6 +369,7 @@ func Parse(raw []byte) (*Auth, error) {
+ 			DeviceToken:  f.DeviceToken,
+ 			ProxyName:    strings.TrimSpace(f.Proxy),
+ 			Weight:       sanitizeWeight(f.Weight),
++			SkipTasks:    f.SkipTasks,
+ 		}
+ 	}
+ 	if strings.TrimSpace(a.AccessToken) == "" {
+@@ -406,6 +421,12 @@ func (a *Auth) SaveAtomic() error {
+ 	if a.Weight != 0 {
+ 		doc["weight"] = a.Weight
+ 	}
++	// SkipTasks 只在 true 时写回：false / 缺省不落键，老文件不会被加上噪音键。
++	// 刷新 token 会整份重建文件，不保留就等于把「不参与定时任务」静默清掉
++	// （企业账号随即又开始在签到上白打 400/10001）。
++	if a.SkipTasks {
++		doc["skip_tasks"] = true
++	}
+ 	raw, err := json.MarshalIndent(doc, "", "  ")
+ 	if err != nil {
+ 		return err
+diff --git a/internal/auth/skip_tasks_test.go b/internal/auth/skip_tasks_test.go
+new file mode 100644
+index 0000000..96e8acc
+--- /dev/null
++++ b/internal/auth/skip_tasks_test.go
+@@ -0,0 +1,94 @@
++package auth
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++// TestParseSkipTasks 两种磁盘形态都要读到顶层 skip_tasks（issue #437）。
++// 字段落在 auth/account 之外：手写与插件输出共用同一层级，避免两套 schema。
++func TestParseSkipTasks(t *testing.T) {
++	cases := []struct {
++		name string
++		raw  string
++		want bool
++	}{
++		{
++			name: "nested true",
++			raw:  `{"auth":{"accessToken":"at"},"account":{"uid":"u1"},"skip_tasks":true}`,
++			want: true,
++		},
++		{
++			name: "nested absent",
++			raw:  `{"auth":{"accessToken":"at"},"account":{"uid":"u1"}}`,
++			want: false,
++		},
++		{
++			name: "nested false",
++			raw:  `{"auth":{"accessToken":"at"},"account":{"uid":"u1"},"skip_tasks":false}`,
++			want: false,
++		},
++		{
++			name: "flat true",
++			raw:  `{"accessToken":"at","uid":"u1","skip_tasks":true}`,
++			want: true,
++		},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			a, err := Parse([]byte(c.raw))
++			if err != nil {
++				t.Fatalf("parse: %v", err)
++			}
++			if a.SkipTasks != c.want {
++				t.Errorf("SkipTasks=%v want %v", a.SkipTasks, c.want)
++			}
++		})
++	}
++}
++
++// TestSaveAtomicPreservesSkipTasks 刷新 token 会整份重建账号文件；不保留该键
++// 就等于把「不参与定时任务」静默清掉，企业账号随即又开始在签到上白打 400。
++func TestSaveAtomicPreservesSkipTasks(t *testing.T) {
++	dir := t.TempDir()
++	fp := filepath.Join(dir, "workbuddy-u1.json")
++	a := &Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1,
++		UID: "u1", FilePath: fp, SkipTasks: true}
++	if err := a.SaveAtomic(); err != nil {
++		t.Fatalf("save: %v", err)
++	}
++	raw, err := os.ReadFile(fp)
++	if err != nil {
++		t.Fatalf("read: %v", err)
++	}
++	if !strings.Contains(string(raw), `"skip_tasks": true`) {
++		t.Fatalf("save 丢了 skip_tasks：\n%s", raw)
++	}
++	b, err := Parse(raw)
++	if err != nil {
++		t.Fatalf("reparse: %v", err)
++	}
++	if !b.SkipTasks {
++		t.Error("roundtrip SkipTasks=false want true")
++	}
++}
++
++// TestSaveAtomicOmitsFalseSkipTasks false/缺省不落键：老文件不该被加上噪音键，
++// 面板用「键不存在 = false」作默认值。
++func TestSaveAtomicOmitsFalseSkipTasks(t *testing.T) {
++	dir := t.TempDir()
++	fp := filepath.Join(dir, "workbuddy-u2.json")
++	a := &Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1, UID: "u2", FilePath: fp}
++	if err := a.SaveAtomic(); err != nil {
++		t.Fatalf("save: %v", err)
++	}
++	raw, err := os.ReadFile(fp)
++	if err != nil {
++		t.Fatalf("read: %v", err)
++	}
++	if strings.Contains(string(raw), "skip_tasks") {
++		t.Fatalf("false 不应写键：\n%s", raw)
++	}
++}
+diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
+index 991e78b..d88610f 100644
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -520,6 +520,14 @@ func (s *Scheduler) checkinAll(ctx context.Context) ([]CheckinOutcome, error) {
+ 			out = append(out, oc)
+ 			continue
+ 		}
++		// 账号级「不参与任务」（issue #437）：企业账号没有个人成长体系，签到恒
++		// 400/10001；它在池里照常转发，但任何定时任务都不该再打它。
++		if a.SkipTasks {
++			oc.Status, oc.Detail = CheckinSkipped, "skip_tasks"
++			skipN++
++			out = append(out, oc)
++			continue
++		}
+ 		// D4 门控：realm=global 账号无签到体系/任务中心，直接跳过（不发起任何上游调用，避免风控）。
+ 		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
+ 		// 按 CN 处理——这是 D5 逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
+@@ -665,6 +673,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
+ 		if a == nil || a.AccessTokenValue() == "" {
+ 			continue
+ 		}
++		if a.SkipTasks {
++			continue // 账号级「只转发、不跑任务」（issue #437）
++		}
+ 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
+ 		// 点亮连登）；realmBase 路由/头由 upstream.billingJSON/BillingHeaders 按 realm 切。
+ 		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
+@@ -1000,6 +1011,10 @@ func (s *Scheduler) runKeepalive(ctx context.Context) {
+ 			skipped++
+ 			continue
+ 		}
++		if a.SkipTasks {
++			skipped++ // 账号级「不参与任务」：保活也不跑（issue #437）
++			continue
++		}
+ 		// 按需刷新：临近到期 / 到期未知且久未刷 / 久未轮换（见 keepaliveRefreshDue）。
+ 		if !keepaliveRefreshDue(a, time.Now()) {
+ 			skipped++
+diff --git a/internal/scheduler/school.go b/internal/scheduler/school.go
+index 0f2c13a..85e2969 100644
+--- a/internal/scheduler/school.go
++++ b/internal/scheduler/school.go
+@@ -102,7 +102,38 @@ func runScriptContext(ctx context.Context, name, root string, commands [][]strin
+ 	}
+ }
+ 
+-// RunSchoolNow 立即执行开学季任务：school_open_day_2026.py ALL --run --yes。
++// taskAccountFiles 返回脚本类任务（开学季 / 夜猫子）应当处理的账号文件名。
++//
++// 脚本原本以「ALL」扫 auths 目录，自己看不到账号级 skip_tasks（issue #437）。
++// 这里由调度器先把「不参与任务」的账号剔除，再把剩余账号的文件名显式传给脚本：
++// 两个脚本的 load_auth 都接受 `workbuddy*.json` 文件名，因此过滤逻辑只存在于
++// 一处，也不需要改脚本本身。
++//
++// 取号池**全量**（含冷却 / 自动禁用）而不是 healthy 子集：脚本此前的覆盖范围是
++// 「auths 目录里的每个账号」，换实现不能顺手把冷却中的号排除掉 —— 那会让
++// 「不参与任务」这个开关悄悄改变其它语义。
++//
++// Pool 为空（仅测试构造）时返回 nil，调用方保持原来的 ALL 行为。
++func (s *Scheduler) taskAccountFiles() []string {
++	if s.cfg.Pool == nil {
++		return nil
++	}
++	var out []string
++	for _, st := range s.cfg.Pool.List() {
++		a := s.cfg.Pool.AuthByUID(st.UID)
++		if a == nil || a.SkipTasks {
++			continue
++		}
++		name := strings.TrimSpace(a.FilePath)
++		if name == "" {
++			continue
++		}
++		out = append(out, filepath.Base(name))
++	}
++	return out
++}
++
++// RunSchoolNow 立即执行开学季任务：school_open_day_2026.py <accounts> --run --yes。
+ // 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
+ // 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
+ func (s *Scheduler) RunSchoolNow() { s.runSchool(context.Background()) }
+@@ -117,9 +148,17 @@ func (s *Scheduler) runSchool(ctx context.Context) {
+ 		}
+ 	}
+ 	root := repoRoot()
+-	runScriptContext(ctx, "school", root, [][]string{
+-		s.accountScriptArgs(ctx, []string{pythonCmd(), "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"}),
+-	})
++	targets := s.taskAccountFiles()
++	if s.cfg.Pool != nil && len(targets) == 0 {
++		log.Printf("scheduled school skipped: no account to run (all skip_tasks)")
++		return
++	}
++	if len(targets) == 0 {
++		targets = []string{"ALL"} // Pool 未注入（测试构造）：保持原有全量行为
++	}
++	args := append([]string{pythonCmd(), "scripts/school_open_day_2026.py"}, targets...)
++	args = append(args, "--run", "--yes")
++	runScriptContext(ctx, "school", root, [][]string{s.accountScriptArgs(ctx, args)})
+ }
+ 
+ // RunCatNow 立即执行夜猫子任务：task_runner.py ALL --yes --only black_cat。
+@@ -137,7 +176,15 @@ func (s *Scheduler) runCat(ctx context.Context) {
+ 		}
+ 	}
+ 	root := repoRoot()
+-	runScriptContext(ctx, "cat", root, [][]string{
+-		s.accountScriptArgs(ctx, []string{pythonCmd(), "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"}),
+-	})
++	targets := s.taskAccountFiles()
++	if s.cfg.Pool != nil && len(targets) == 0 {
++		log.Printf("scheduled cat skipped: no account to run (all skip_tasks)")
++		return
++	}
++	if len(targets) == 0 {
++		targets = []string{"ALL"} // Pool 未注入（测试构造）：保持原有全量行为
++	}
++	args := append([]string{pythonCmd(), "scripts/task_runner.py"}, targets...)
++	args = append(args, "--yes", "--only", "black_cat")
++	runScriptContext(ctx, "cat", root, [][]string{s.accountScriptArgs(ctx, args)})
+ }
+diff --git a/internal/scheduler/skip_tasks_test.go b/internal/scheduler/skip_tasks_test.go
+new file mode 100644
+index 0000000..db603d9
+--- /dev/null
++++ b/internal/scheduler/skip_tasks_test.go
+@@ -0,0 +1,174 @@
++package scheduler
++
++// skip_tasks（账号级「只转发、不跑定时任务」, issue #437）回归：
++//   · 账号被标记后**仍在号池里**，选号照常能选中它（转发不受影响）；
++//   · 签到 / 保活两类任务逐号跳过，不向上游发任何请求；
++//   · 开学季 / 夜猫子这类脚本任务只把未被标记的账号传给脚本；
++//   · 缺省 / false 时行为与引入前逐字一致（由既有全量测试覆盖）。
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/pool"
++	"workbuddy2api/internal/upstream"
++)
++
++// TestSkipTasksAccountRemainsSelectable 号池选号**不看**这个字段：
++// 标记只影响定时任务，转发必须照常。池里只有这一个号时 Pick 必须选中它。
++func TestSkipTasksAccountRemainsSelectable(t *testing.T) {
++	p := pool.New("")
++	p.Add(&auth.Auth{
++		UID: "skip-only", AccessToken: "at", RefreshToken: "rt",
++		ExpiresAt: time.Now().Add(24 * time.Hour).Unix(), SkipTasks: true,
++	})
++	picked := p.Pick("")
++	if picked == nil {
++		t.Fatal("skip_tasks 账号被选号排除：转发会受影响")
++	}
++	if picked.UID != "skip-only" {
++		t.Fatalf("picked=%q want skip-only", picked.UID)
++	}
++}
++
++// TestSkipTasksAccountSkippedByCheckin 签到循环跳过标记账号：它不进
++// /daily-checkin，也不做余额查询；正常账号仍照常签到。
++func TestSkipTasksAccountSkippedByCheckin(t *testing.T) {
++	var checkins atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if strings.HasSuffix(r.URL.Path, "/daily-checkin") {
++			checkins.Add(1)
++			_, _ = io.WriteString(w, `{"code":0}`)
++			return
++		}
++		// 余额查询（只读）正常返回，避免 404 触发 fallback 的第二次请求。
++		// 外层信封必须带 code=0：doJSON 解信封后只把 data 交给调用方。
++		_, _ = io.WriteString(w, `{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CapacityRemain":100}]}}}}`)
++	}))
++	defer srv.Close()
++
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "normal", AccessToken: "at", RefreshToken: "rt",
++		ExpiresAt: time.Now().Add(24 * time.Hour).Unix()})
++	p.Add(&auth.Auth{UID: "skip", AccessToken: "at", RefreshToken: "rt",
++		ExpiresAt: time.Now().Add(24 * time.Hour).Unix(), SkipTasks: true})
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++
++	out, err := s.CheckinAll()
++	if err != nil {
++		t.Fatalf("CheckinAll: %v", err)
++	}
++	byUID := map[string]CheckinOutcome{}
++	for _, row := range out {
++		byUID[row.UID] = row
++	}
++	if row, ok := byUID["skip"]; !ok {
++		t.Fatal("skip 账号没有出现在签到回执里（手动触发时用户看不到它被跳过）")
++	} else if row.Status != CheckinSkipped || row.Detail != "skip_tasks" {
++		t.Errorf("skip row=%+v want status=skipped detail=skip_tasks", row)
++	}
++	if row, ok := byUID["normal"]; !ok || row.Status != CheckinOK {
++		t.Errorf("normal row=%+v want status=ok", row)
++	}
++	if n := checkins.Load(); n != 1 {
++		t.Errorf("daily-checkin calls=%d want 1（只有 normal 账号）", n)
++	}
++}
++
++// TestSkipTasksAccountSkippedByKeepalive 保活循环同样跳过：即使令牌已临近
++// 过期、按需刷新判定会命中，也不得对标记账号发起 /token/refresh。
++func TestSkipTasksAccountSkippedByKeepalive(t *testing.T) {
++	var refreshes atomic.Int32
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if strings.HasSuffix(r.URL.Path, "/token/refresh") {
++			refreshes.Add(1)
++			_, _ = io.WriteString(w, `{"code":0,"data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":3600}}`)
++			return
++		}
++		_, _ = io.WriteString(w, `{}`)
++	}))
++	defer srv.Close()
++
++	dir := t.TempDir()
++	normalPath := filepath.Join(dir, "workbuddy-normal.json")
++	skipPath := filepath.Join(dir, "workbuddy-skip.json")
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "normal", AccessToken: "at", RefreshToken: "rt",
++		ExpiresAt: time.Now().Add(time.Minute).Unix(), FilePath: normalPath})
++	p.Add(&auth.Auth{UID: "skip", AccessToken: "at", RefreshToken: "rt",
++		ExpiresAt: time.Now().Add(time.Minute).Unix(), FilePath: skipPath, SkipTasks: true})
++	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
++	s := New(Config{Pool: p, Upstream: up})
++
++	s.RunKeepaliveNow()
++
++	if n := refreshes.Load(); n != 1 {
++		t.Errorf("token refresh calls=%d want 1（只有 normal 账号）", n)
++	}
++	if _, err := os.Stat(normalPath); err != nil {
++		t.Errorf("normal 账号刷新后应写回文件: %v", err)
++	}
++	if _, err := os.Stat(skipPath); !os.IsNotExist(err) {
++		t.Errorf("skip 账号不应被刷新/写回（文件不应存在），err=%v", err)
++	}
++}
++
++// TestScriptTasksPassOnlyTaskAccounts 开学季 / 夜猫子不再以 ALL 扫目录，而是
++// 把过滤后的账号文件名显式传给脚本 —— 两个脚本的 load_auth 都接受该形态。
++func TestScriptTasksPassOnlyTaskAccounts(t *testing.T) {
++	t.Setenv("WB2A_PYTHON", "")
++	f := installFakeExec(t)
++	dir := t.TempDir()
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "keep", AccessToken: "at", RefreshToken: "rt",
++		ExpiresAt: time.Now().Add(time.Hour).Unix(),
++		FilePath:  filepath.Join(dir, "workbuddy-keep.json")})
++	p.Add(&auth.Auth{UID: "skip", AccessToken: "at", RefreshToken: "rt",
++		ExpiresAt: time.Now().Add(time.Hour).Unix(),
++		FilePath:  filepath.Join(dir, "workbuddy-skip.json"), SkipTasks: true})
++	s := New(Config{Pool: p})
++
++	s.RunSchoolNow()
++	wantSchool := []string{"scripts/school_open_day_2026.py", "workbuddy-keep.json", "--run", "--yes"}
++	if !equalArgs(f.lastArgs, wantSchool) {
++		t.Errorf("school args=%v want %v", f.lastArgs, wantSchool)
++	}
++
++	s.RunCatNow()
++	wantCat := []string{"scripts/task_runner.py", "workbuddy-keep.json", "--yes", "--only", "black_cat"}
++	if !equalArgs(f.lastArgs, wantCat) {
++		t.Errorf("cat args=%v want %v", f.lastArgs, wantCat)
++	}
++	if f.runN != 2 {
++		t.Errorf("script runs=%d want 2", f.runN)
++	}
++}
++
++// TestScriptTasksSkipEntirelyWhenAllSkip 全部账号都标记 skip_tasks 时不再拉起
++// 脚本（否则脚本拿到空账号列表会以非零码退出并刷 WARN）。
++func TestScriptTasksSkipEntirelyWhenAllSkip(t *testing.T) {
++	t.Setenv("WB2A_PYTHON", "")
++	f := installFakeExec(t)
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "skip", AccessToken: "at", RefreshToken: "rt",
++		ExpiresAt: time.Now().Add(time.Hour).Unix(),
++		FilePath:  filepath.Join(t.TempDir(), "workbuddy-skip.json"), SkipTasks: true})
++	s := New(Config{Pool: p})
++
++	s.RunSchoolNow()
++	s.RunCatNow()
++	if f.runN != 0 {
++		t.Errorf("全部 skip_tasks 仍拉起了脚本（runN=%d）", f.runN)
++	}
++}
+diff --git a/internal/scheduler/travel.go b/internal/scheduler/travel.go
+index 4010139..42dcbe4 100644
+--- a/internal/scheduler/travel.go
++++ b/internal/scheduler/travel.go
+@@ -79,6 +79,9 @@ func (s *Scheduler) runTravel(ctx context.Context) {
+ 		if a == nil || a.RefreshTokenValue() == "" {
+ 			continue
+ 		}
++		if a.SkipTasks {
++			continue // 账号级「只转发、不跑任务」（issue #437）
++		}
+ 		if a.IsGlobal() {
+ 			continue // D4 门控：global 无猫猫旅行体系，不发起任何上游调用
+ 		}

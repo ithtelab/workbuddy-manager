@@ -252,6 +252,20 @@ export const accountApi = {
     put<{ok: boolean; weight: number; reload_triggered: boolean}>(
       `/api/accounts/${encodeURIComponent(filename)}/weight` + groupQs(upstreamId), {weight}),
   /**
+   * 设置 / 清除账号级「不参与定时任务」（issue #437）。
+   *
+   * 写的是上游 auth 文件顶层 `skip_tasks`（不是本端库）：任务挑选发生在上游，
+   * 它必须能读到。`true` 只是让定时任务跳过该账号，**转发不受影响**——
+   * 与「临时停用」把账号摘出池子是两回事。
+   *
+   * 走 POST body 而不是 query：`enabled` 是布尔值，放 query 容易出现字符串
+   * "false" 被当成真值的静默错绑（见 server/tests/test_request_binding.py）。
+   */
+  setSkipTasks: (file: string, enabled: boolean, upstreamId?: number | null) =>
+    post<{ok: boolean; file: string; uid: string; skip_tasks: boolean;
+          changed: boolean; reload_triggered: boolean}>(
+      '/api/accounts/skip-tasks', {file, enabled, upstream_id: upstreamId ?? undefined}),
+  /**
    * 某分组的账号列表。upstreamId 省略 / null = 默认分组。
    *
    * 「分组」= 一套上游实例（账号池）：账号文件读该分组的目录、运行状态问该
@@ -401,6 +415,8 @@ export const accountApi = {
       already: number;
       /** 不适用的账号数（国际版没有签到体系）。它既不算成功也不算失败 */
       skipped: number;
+      /** 已设置「不参与定时任务」而跳过的账号数（issue #437，单列） */
+      skip_tasks: number;
       results: {
         nickname: string; ok: boolean; message: string;
         code?: number; skipped?: boolean; already?: boolean;

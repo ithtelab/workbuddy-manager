@@ -140,6 +140,75 @@ def set_account_weight(filename: str, weight: float,
     return {'file': filename, 'weight': value}
 
 
+def set_account_skip_tasks(filename: str = '', enabled: bool = True,
+                           auth_dir: Path | None = None,
+                           uid: str = '') -> dict:
+    """设置 / 清除账号级「不参与定时任务」开关（issue #437）。
+
+    写入上游 auth 文件顶层 `skip_tasks`（JSON bool）。语义：
+      · true  = 账号仍在号池里照常参与转发，但上游 scheduler 的签到 / 保活 /
+                旅行 / 活跃 / 开学季 / 夜猫子等任务逐号跳过它；
+      · false = 删除该键（缺省 = 参与，与老文件逐字一致）。
+
+    为什么写上游文件而不是本端库：任务挑选发生在上游进程里，它读的是 auth 文件；
+    只存本端库的话上游根本看不到（同权重 / 出口线路的机制）。
+
+    读取—修改—原子写全程加锁（file_lock）：只动 `skip_tasks` 一个键，**其余字段
+    与未知键原样保留**（device_token / proxy / weight / realm 等都不能丢）。
+    文件可以是 `.json` 或面板停用后的 `.json.disabled`；也可只给 uid，由
+    `find_auth_file_for_uid` 找到该账号现有的那份文件。
+    """
+    from .tencent import _atomic_write_json, find_auth_file_for_uid
+
+    if not isinstance(enabled, bool):
+        raise ValueError('enabled 必须是布尔值')
+    base = auth_dir or config.AUTH_DIR
+    name = str(filename or '').strip()
+    wanted_uid = str(uid or '').strip()
+    if name:
+        path = _safe_file(name, base)
+    elif wanted_uid:
+        found = find_auth_file_for_uid(wanted_uid, base)
+        if found is None:
+            raise FileNotFoundError(f'账号不存在：{wanted_uid}')
+        path = found
+    else:
+        raise ValueError('必须提供 file 或 uid')
+    if path.is_symlink():
+        raise ValueError('账号文件不能是符号链接')
+    with file_lock(path):
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(raw, dict):
+            raise ValueError('账号文件格式异常')
+        current = raw.get('skip_tasks') is True
+        changed = current != enabled
+        if changed:
+            if enabled:
+                raw['skip_tasks'] = True
+            else:
+                raw.pop('skip_tasks', None)
+            _atomic_write_json(path, raw)
+    account = raw.get('account') if isinstance(raw.get('account'), dict) else {}
+    return {
+        'file': path.name,
+        'uid': str((account or {}).get('uid') or ''),
+        'skip_tasks': enabled,
+        'changed': changed,
+    }
+
+
+def task_account_files(auth_dir: Path | None = None) -> list[str]:
+    """参与本端定时任务的账号文件名（剔除 skip_tasks 与面板停用）。
+
+    供 taskrun（claim / full 脚本）在「ALL」时构造显式账号列表：上游脚本只会
+    按文件名逐个加载，自己不认 skip_tasks。面板停用的账号（`.json.disabled`）
+    本来就不在上游池里，一并排除。
+    """
+    return [str(a.get('file') or '') for a in list_auth_accounts(auth_dir)
+            if not a.get('skip_tasks') and not a.get('disabled_by_panel')
+            and str(a.get('file') or '').strip()]
+
+
 def _jwt_times(access_token: str) -> tuple[int, int] | None:
     """从 accessToken（JWT）里读出 (iat, exp)。解不出返回 None。
 
@@ -291,6 +360,11 @@ def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
                 # 原样给出，不做钳制——界面要按文件里的真实值回显，
                 # 钳制与默认值只在选号时生效（上游 auth.PickWeight）。
                 'weight': _weight_of(raw),
+                # 账号级「只转发、不跑定时任务」（issue #437）：写在上游 auth 文件
+                # 顶层 skip_tasks。上游 scheduler 的签到/保活/旅行/活跃/开学季/夜猫
+                # 等任务逐号跳过它，但**号池选号不看这个字段**——转发照常。
+                # 只认 JSON true：字符串/数字等非法值不算开启（上游 Parse 也不会认）。
+                'skip_tasks': raw.get('skip_tasks') is True,
                 # 该版本是否支持签到体系（国际版没有，调用方据此跳过而不是打 4xx）
                 # 企业账号（enterpriseId 非空）没有个人成长体系：签到端点恒返回
                 # 400 code=10001「企业账号不支持该操作」（实测 2026-10-18）。

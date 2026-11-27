@@ -82,7 +82,7 @@ def _uploaded_account(raw: object, filename: str) -> dict:
     if expires_at < 0:
         raise ValueError('expiresAt 必须是非负数字')
 
-    return {
+    result = {
         'uid': uid,
         'access_token': access_token,
         'refresh_token': str(value('refreshToken', 'refresh_token') or ''),
@@ -95,6 +95,11 @@ def _uploaded_account(raw: object, filename: str) -> dict:
         'proxy': str(value('proxy') or ''),
         '_filename': filename,
     }
+    # 账号级「不参与定时任务」（issue #437）：导出包里有这个键才透传；缺省
+    # **不写**，由 write_auth_file 沿用旧文件的值（覆盖导入不该静默清掉它）。
+    if 'skip_tasks' in raw:
+        result['skip_tasks'] = raw.get('skip_tasks') is True
+    return result
 
 
 def _uploaded_entries(raw: object) -> list[object]:
@@ -540,6 +545,57 @@ async def account_set_weight(
     security.audit(user, 'update_account_weight', filename, f"weight={result['weight']}")
     _invalidate_account_cache(group)
     scheduled = reload.request_restart(_reload_target(group))
+    return {'ok': True, **result, 'reload_triggered': scheduled}
+
+
+@router.post('/accounts/skip-tasks')
+async def account_set_skip_tasks(
+    body: dict = Body(...),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    """设置 / 清除账号级「不参与定时任务」开关（issue #437）。
+
+    语义是**只转发、不跑任务**：账号仍在号池里、照常被选号转发，但上游 scheduler
+    的签到 / 保活 / 旅行 / 活跃 / 开学季 / 夜猫子等任务逐号跳过它。企业账号没有
+    个人成长体系（签到恒 400 code=10001），此前只能整号停用（连转发一起停掉），
+    这个开关补的正是中间那档。
+
+    body: `{file?, uid?, enabled: bool, upstream_id?, reload?}` —— `file` 与 `uid`
+    二选一，都传时以 `file` 为准；`enabled` 必须是布尔值（不接受 "true"/1 这类
+    弱类型，避免把非 JSON bool 写进上游文件——上游 auth.Parse 对 bool 字段是
+    严格解析的）。分组也走 body（本端点的写参数一律 JSON body，见
+    test_request_binding 的 query 审计）。
+    写的是 auth 文件顶层 `skip_tasks`，读—改—原子写，**其余字段与未知键原样保留**。
+
+    与「临时停用」的区别：停用（改名 / manual_disabled）会改变转发行为；本开关
+    **不影响转发**，只影响任务。
+    """
+    if not isinstance(body.get('enabled'), bool):
+        raise HTTPException(status_code=400, detail='enabled 必须是布尔值')
+    filename = str(body.get('file') or '').strip()
+    uid = str(body.get('uid') or '').strip()
+    if not filename and not uid:
+        raise HTTPException(status_code=400, detail='必须提供 file 或 uid')
+    raw_upstream = body.get('upstream_id')
+    upstream_id: int | None = None
+    if raw_upstream not in (None, '', 0, '0'):
+        try:
+            upstream_id = int(raw_upstream)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail='upstream_id 不合法') from None
+    group = _group(upstream_id)
+    try:
+        result = wb2api.set_account_skip_tasks(
+            filename, bool(body['enabled']), _require_dir(group), uid=uid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail='账号文件不存在') from exc
+    security.audit(user, 'update_account_skip_tasks',
+                   result['file'], f"skip_tasks={result['skip_tasks']}")
+    scheduled = False
+    if result['changed'] and body.get('reload', True) is not False:
+        scheduled = reload.request_restart(_reload_target(group))
     return {'ok': True, **result, 'reload_triggered': scheduled}
 
 
@@ -1785,6 +1841,12 @@ async def checkin_all(upstream_id: int | None = Query(None),
         filename = acc['file']
         uid = acc.get('uid', '')
         nickname = acc.get('nickname', '')
+        # 账号级「不参与定时任务」（issue #437）：批量签到也跳过它（上游调度已
+        # 跳过；面板这条批量路径若不跳过，企业账号仍会在这里白打 400/10001）。
+        # 这是用户显式设置，不是失败：以 skipped 回执，不计入 total 分母。
+        if acc.get('skip_tasks'):
+            return {'nickname': nickname, 'ok': False, 'skipped': True,
+                    'skip_tasks': True, 'message': '已设置不参与定时任务，已跳过'}
         try:
             raw = wb2api.read_account_file(filename, base_dir)
             auth = raw.get('auth') or {}
@@ -1835,6 +1897,7 @@ async def checkin_all(upstream_id: int | None = Query(None),
         'checkin', accounts, one,
         needs_request=lambda a: (a.get('uid') not in done_today
                                  and a.get('checkin_supported') is not False
+                                 and not a.get('skip_tasks')
                                  and not a.get('invalid_reason')),
     )
     # 两类账号都不进 `total` 分母，各自单独报数：
@@ -1851,11 +1914,15 @@ async def checkin_all(upstream_id: int | None = Query(None),
     if succeeded or already:
         # 有账号的「今日已签到」变化了：列表缓存作废（issue #444）。
         _invalidate_account_cache(_group(upstream_id))
+    # 「不参与定时任务」是用户显式设置，不是「国际版不适用」：单列一项，
+    # 否则界面那句「另有 N 个账号不适用：国际版无签到体系」会把它们算进去。
+    skip_tasks_n = sum(1 for r in results if r.get('skip_tasks'))
     return {
         'total': len(attempted),
         'succeeded': succeeded,
         'already': len(already),
-        'skipped': len(results) - len(applicable),
+        'skipped': len(results) - len(applicable) - skip_tasks_n,
+        'skip_tasks': skip_tasks_n,
         'results': list(results),
     }
 
@@ -2686,6 +2753,10 @@ async def claim_compensation_all(upstream_id: int | None = Query(None),
         filename = acc['file']
         uid = acc.get('uid', '')
         nickname = acc.get('nickname', '')
+        # 账号级「不参与定时任务」（issue #437）：批量领取补偿同样跳过。
+        if acc.get('skip_tasks'):
+            return {'nickname': nickname, 'status': 'skipped', 'credit': 0,
+                    'message': '已设置不参与定时任务，已跳过'}
         try:
             raw = wb2api.read_account_file(filename, base_dir)
             auth = raw.get('auth') or {}
@@ -2718,7 +2789,9 @@ async def claim_compensation_all(upstream_id: int | None = Query(None),
 
     results = await taskpacing.run_accounts(
         'compensation', accounts, one,
-        needs_request=lambda a: supports_checkin(realm_of(a)) and not a.get('invalid_reason'),
+        needs_request=lambda a: (supports_checkin(realm_of(a))
+                                 and not a.get('skip_tasks')
+                                 and not a.get('invalid_reason')),
     )
     # 分母只算**真的发了请求**的账号：already / skipped 既不是成功也不是失败，
     # 算进 total 会让界面显示成「5/6 成功」，用户以为有个号没领到（与签到同口径）。
