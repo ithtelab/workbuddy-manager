@@ -199,6 +199,31 @@ TAP_RETENTION_DAYS = max(1, _env_int('WB_TAP_RETENTION_DAYS', 7))
 # 会话数上限：按天清理之外再加一道「条数」闸门 —— 一个高频客户端能在一天
 # 里刷出上千个会话，只按时间清理挡不住它。
 TAP_MAX_SESSIONS = max(10, _env_int('WB_TAP_MAX_SESSIONS', 300))
+
+# ── 数据库维护与保留期（issue #492）─────────────────────────────────
+#
+# 独立维护任务在启动时跑一次、之后每 6 小时跑一次（见 services/dbmaintenance.py）：
+#   · tap_turns / tap_sessions 按抓包自己的保留期清理（与抓包开关无关）；
+#   · request_logs / checkin_logs / account_risk_events 按下面的保留期清理；
+#   · 清理后做一次 WAL TRUNCATE checkpoint，让 `-wal` 不再占着空间。
+#
+# **0 = 永久保留**（只跳过时间清理；条数上限、checkpoint 等其它维护照常）。
+# 各表可单独覆盖，未设置时跟随 WB_RETENTION_DAYS。
+DB_RETENTION_DAYS = 90
+RETENTION_DAYS = max(0, _env_int('WB_RETENTION_DAYS', DB_RETENTION_DAYS))
+REQUEST_LOG_RETENTION_DAYS = max(
+    0, _env_int('WB_REQUEST_LOG_RETENTION_DAYS', RETENTION_DAYS))
+CHECKIN_LOG_RETENTION_DAYS = max(
+    0, _env_int('WB_CHECKIN_LOG_RETENTION_DAYS', RETENTION_DAYS))
+RISK_EVENT_RETENTION_DAYS = max(
+    0, _env_int('WB_RISK_EVENT_RETENTION_DAYS', RETENTION_DAYS))
+# 维护间隔（小时）：默认 6，改小只影响清理频率，不改变保留期。
+DB_MAINTENANCE_INTERVAL_HOURS = max(1, _env_int('WB_DB_MAINTENANCE_INTERVAL_HOURS', 6))
+# WAL 文件大小上限（字节）：超过后 SQLite 会在 checkpoint 时截断 `-wal`。
+# 默认 256 MiB；0 = 不限制。**不启用 auto_vacuum**：它需要一次全量 VACUUM
+# 才生效，那属于第二步（压缩/重建）的范围。
+JOURNAL_SIZE_LIMIT = max(0, _env_int('WB_JOURNAL_SIZE_LIMIT', 256 * 1024 * 1024))
+
 # 会话**总时长**上限（天）：登录后最多维持这么久，到点必须重新登录。
 #
 # 下限钳到 1 天：0（或负数）会让 cookie 的 exp 等于签发时刻，即「登录成功但

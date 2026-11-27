@@ -25,8 +25,8 @@ from .routers import (
     watchdog as watchdog_router,
 )
 from .services import (
-    accountlog, accountrisk, autoupdate, cooling, dailyplan, gatewaycors, modelrecovery, pgsync,
-    renew, speedhealth, tasklog, taskrun, watchdog,
+    accountlog, accountrisk, autoupdate, cooling, dailyplan, dbmaintenance, gatewaycors,
+    modelrecovery, pgsync, renew, speedhealth, tasklog, taskrun, watchdog,
 )
 
 # 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
@@ -79,6 +79,10 @@ def _start_services() -> None:
     tasklog.start_collector()
     accountrisk.initialize()
     accountrisk.start()
+    # 数据库周期维护（issue #492）：启动跑一次、之后每 6 小时跑一次。放在
+    # accountrisk.initialize() 之后，确保 account_risk_events 已建表、首轮就能
+    # 清理到它；清理与抓包开关无关，WAL 也会在清理后 TRUNCATE。
+    dbmaintenance.start_scheduler()
     # 定时领奖（成长任务里幂等的那一半）：只把已完成任务的奖励领回来，不伪造
     # 任何活跃上报，因此可以安全地到点自动跑。点亮那半只允许手动（见 taskrun）
     taskrun.start_scheduler()
@@ -108,6 +112,7 @@ def _start_services() -> None:
 
 
 async def _stop_services() -> None:
+    dbmaintenance.stop_scheduler()
     tasklog.stop_collector()
     accountrisk.stop()
     taskrun.stop_scheduler()

@@ -645,6 +645,11 @@ def connect() -> sqlite3.Connection:
             _conn.row_factory = sqlite3.Row
             _conn.execute('PRAGMA journal_mode=WAL')
             _conn.execute('PRAGMA synchronous=NORMAL')
+            # WAL 单文件上限（issue #492）：大 DELETE 后不会自动缩文件，但 checkpoint
+            # 时超过这个上限的 `-wal` 会被截断，避免长期运行后伴生文件无限增长。
+            # 用拼接而不是参数绑定：SQLite 的 PRAGMA 不接受占位符；此处值来自
+            # config 的整数解析，不可能是外部字符串。
+            _conn.execute(f'PRAGMA journal_size_limit={int(config.JOURNAL_SIZE_LIMIT)}')
             _conn.executescript(SCHEMA)
             _migrate(_conn)
         except sqlite3.OperationalError as exc:
@@ -1461,7 +1466,8 @@ _ip_log_writes = 0
 # 每天 1400+ 行。此前没有任何清理机制——`ip_access_logs` 有行数上限，它没有。
 # 按当前速率一年约 50 万行、上百 MB，`/api/logs` 的查询与页面都会越来越慢。
 #
-# 取 90 天：统计页最长的展示窗口是 30 天（`_DAYS_MAX` 之外的实际用法），
+# 取 90 天（部署层可用 WB_REQUEST_LOG_RETENTION_DAYS 覆盖，0 = 永久保留）：
+# 统计页最长的展示窗口是 30 天（`_DAYS_MAX` 之外的实际用法），
 # 「修复统计 / 重建统计」也只需覆盖到用量表还有意义的时段；再久的明细对用户
 # 没有用途，而按月归档属于另一件事（真要长期留存应导出，不是留在大表里）。
 #
@@ -1469,6 +1475,43 @@ _ip_log_writes = 0
 # 删掉 90 天前的日志后，那段时期的用量统计**不能再重建**（现有数据不受影响，
 # 只是无法重算）。这是刻意的：90 天前的用量早已定稿，不值得为它永久保留明细。
 _REQUEST_LOG_RETAIN_DAYS = 90
+# 实际取值以 config 为准（issue #492）：环境变量可在部署层覆盖，0 = 永久保留。
+# 保留上面的常量作为兼容/测试默认值，不在 import 时把环境值冻结进 db 模块。
+def _request_log_retention_days() -> int:
+    days = getattr(config, 'REQUEST_LOG_RETENTION_DAYS', _REQUEST_LOG_RETAIN_DAYS)
+    try:
+        return max(0, int(days))
+    except (TypeError, ValueError):
+        return _REQUEST_LOG_RETAIN_DAYS
+
+
+# 允许维护任务按 ts 清理的表。表名无法用占位符绑定，所以必须白名单；
+# 新增一张表的保留策略时，这里也要显式加一行。
+_PRUNE_TARGETS = frozenset({'request_logs', 'checkin_logs', 'account_risk_events'})
+
+
+def prune_older_than(table: str, cutoff: int) -> int:
+    """删除 ``table`` 中 ``ts < cutoff`` 的行，返回删除条数（issue #492）。
+
+    与 `execute()` 不同，它返回 rowcount：维护任务需要把「清了多少」写进日志，
+    而 `execute()` 返回的是 lastrowid（DELETE 恒为 0）。
+    """
+    if table not in _PRUNE_TARGETS:
+        raise ValueError(f'不允许清理的表：{table}')
+    with _lock:
+        conn = connect()
+        try:
+            cur = conn.execute(f'DELETE FROM {table} WHERE ts < ?', (int(cutoff),))
+        except Exception:
+            # 同 execute()：失败必须回滚，否则写锁会一直挂在共享连接上。
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        conn.commit()
+        return int(cur.rowcount)
+
 
 # 清理间隔：按行数触发（每 2000 次写入检查一次），与 ip 日志同款思路——
 # 不必每次写入都查一次。检查本身用索引列 ts，成本可忽略。
@@ -1496,33 +1539,44 @@ def _prune_side_tables() -> None:
     hourly_cutoff = time.strftime('%Y-%m-%d',
                                   time.localtime(now - _HOURLY_RETAIN_DAYS * 86400))
     task_cutoff = now - _TASK_LOG_RETAIN_DAYS * 86400
-    for sql, args in (
+    targets = [
         ('DELETE FROM usage_hourly WHERE day < ?', (hourly_cutoff,)),
         ('DELETE FROM task_logs WHERE ts < ?', (task_cutoff,)),
-        ('DELETE FROM request_account_matches WHERE ts < ?',
-         (now - _REQUEST_LOG_RETAIN_DAYS * 86400,)),
         # 保留最新 N 行：删除 id <= 第 N+1 新那行的 id；不足 N 行时子查询为 NULL，
         # `id <= NULL` 不成立，什么都不会删。
         ('DELETE FROM audit_logs WHERE id <= (SELECT id FROM audit_logs '
          'ORDER BY id DESC LIMIT 1 OFFSET ?)', (_AUDIT_LOG_MAX_ROWS,)),
-    ):
+    ]
+    # request_account_matches 跟随请求日志的保留期；请求日志设为「永久」时
+    # 匹配消费记录也不能先被清掉（否则同一上游事件可能被重新分配）。
+    req_days = _request_log_retention_days()
+    if req_days > 0:
+        targets.insert(2, ('DELETE FROM request_account_matches WHERE ts < ?',
+                           (now - req_days * 86400,)))
+    for sql, args in targets:
         try:
             execute(sql, args)
         except Exception:  # noqa: BLE001
             pass
 
 
-def _prune_request_logs() -> None:
+def _prune_request_logs(retention_days: int | None = None) -> int:
     """按保留期清理请求日志（滚动删除最旧的），顺手清理侧表。
 
     旁路操作：任何失败都不能影响写入本身（更不能影响转发）。
+    返回真正删除的行数；``0 = 永久保留`` 时跳过时间清理，但侧表上限照常执行。
     """
-    cutoff = int(time.time()) - _REQUEST_LOG_RETAIN_DAYS * 86400
-    try:
-        execute('DELETE FROM request_logs WHERE ts < ?', (cutoff,))
-    except Exception:  # noqa: BLE001
-        pass
+    days = (_request_log_retention_days() if retention_days is None
+            else max(0, int(retention_days)))
+    removed = 0
+    if days > 0:
+        try:
+            removed = prune_older_than(
+                'request_logs', int(time.time()) - days * 86400)
+        except Exception:  # noqa: BLE001
+            pass
     _prune_side_tables()
+    return removed
 
 
 def add_request_log(**fields: object) -> None:
