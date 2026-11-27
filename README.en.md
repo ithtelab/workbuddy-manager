@@ -22,11 +22,9 @@ A web console for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)
   <strong>⚠️ Intended use:</strong> this project is only for managing accounts that <strong>you or your family members have voluntarily authorized</strong>. Bulk registration, account trading, registration-on-behalf, SMS-code farming, account theft, bypassing platform risk controls, resale, or any for-profit use are prohibited. By using this project you agree to the <a href="#intended-use--disclaimer">full disclaimer</a>.
 </p>
 
-<a href="https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme_en"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane (sponsor)" width="100%" /></a>
+<img src="docs/images/sponsor-slot-en.svg" alt="Sponsor slot available" width="100%" />
 
-**Sponsor**: [ProxyLane](https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme_en) residential proxies in 195 countries, 95%+ of IPs rated low risk by Scamalytics. Put the country, city and a session name in the `WB_HTTP_PROXY` username: each instance gets one residential IP for up to 72 hours, and a replacement IP stays in the same city.
-
-New customers get 30% off the first purchase with code `WORKBUDDY30`.
+**Sponsor slot available**: put your product at the top of this README, in front of WorkBuddy / CodeBuddy users. For rates and placement, email [ithtelab@gmail.com](mailto:ithtelab@gmail.com) with “Sponsor” in the subject.
 
 <img src="docs/images/dashboard.png" alt="WorkBuddy Manager dashboard" width="100%" />
 
