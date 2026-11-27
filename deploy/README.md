@@ -859,6 +859,18 @@ WB2API_STOP_SCRIPT=C:/path/to/workbuddy2api/stop-workbuddy2api.cmd
 WB2API_LOG_FILE=C:/path/to/workbuddy2api/data/server.err.log
 ```
 
+> **两路日志别配混**：上游把日志分成两路，面板也分别读取，所以「某个页面没数据」
+> 先看是不是指错了变量：
+>
+> | 变量 | 内容 | 谁在读 | 默认 |
+> | --- | --- | --- | --- |
+> | `WB2API_CHAT_LOG_FILE` | **逐单对话行**（每请求一行：账号、模型、TTFB、tok） | 账号回填、请求日志的账号列 | `data/server.out.log` |
+> | `WB2API_LOG_FILE` | 业务/任务日志（Go `log` → stderr） | 「任务记录」页 | `data/server.err.log` |
+>
+> 原生启动脚本用 `>>` 把 stdout/stderr 分别重定向到这两个文件；容器部署里两路都进
+> `docker logs`，不落文件。所以把 `WB2API_LOG_FILE` 指向某个文件后只在里面找对话行，
+> 是找不到的 —— 它在 `WB2API_CHAT_LOG_FILE`。
+
 安装依赖、构建前端并后台启动：
 
 ```powershell
