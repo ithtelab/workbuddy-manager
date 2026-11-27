@@ -1,0 +1,873 @@
+diff --git a/scripts/task_runner.py b/scripts/task_runner.py
+index 53777c8..4de1aba 100644
+--- a/scripts/task_runner.py
++++ b/scripts/task_runner.py
+@@ -29,6 +29,8 @@
+     automation_1         automated_task_create_suc          1  （rrule 虚拟对象）
+     playbook_prompt      playbook_prompt_send               1  （案例 id: static registry.json）
+     Expert_lighthouse    expert_actual_use                  1  （轻量云 ex_ id: 关键词过滤）
++    expert_use_*         专家真实使用链（召唤→真实对话→LOCAL） 1  （固定 ex_ id，issue #429）
++    skill_share          skill_share_channel_action          1  （市场技能→Open Platform 分享渠道）
+     Hp_Appearance        appearance_skin_apply              1  （theme resourceKey: appearance/resources）
+     chat_5               chat_request_send                  5  （5 条独立 conversation）
+     Model_chat_GLM5.2    chat_request_send(glm-5.2)         1
+@@ -61,8 +63,10 @@
+                         chat_request_send + requestModelId=glm-5.2——比 Tasks_1 多
+                         模型上下文这一条判据；营地上线 2026-09-25 00:00 CST 前
+                         locked，accept 被服务端拒绝）                          100c+5e
+-  仍不可伪造：
+-    Expert_Philanthropy   真实捐款动作(M8)
++  仍不可伪造 / 暂无可用接口（日志会显式写 unsupported / 需人工，不混进「跳过」）：
++    Expert_Philanthropy          真实捐款动作(M8)，需人工
++    wb_wechat_oa_subscribe_task  微信内关注公众号（真人扫码，24h 才计），需人工
++    WorkBuddy_Valorant           专家召唤参数未在本仓验证，需抓包确认后再接入
+ 
+ 领奖端点（M15 突破，勿用旧端点）
+   POST {chat}/activity/growth/tasks/{task_code}/claim   —— 路径含 task_code、无 body（M15 实测）。
+@@ -86,6 +90,7 @@ linguo2625469/workbuddy2api-panel（autotask.go/desktop.go/report.go/tasks.go 
+   - 日志前缀 [task_runner]，行为 action ∈ query/accept/report/claim，汇总行 task_runner done: ...
+ """
+ import sys, os, json, time, argparse, glob, re, urllib.request, urllib.error
++import urllib.parse
+ 
+ # Windows 中文区域的 stdout 默认按 ANSI 代码页（cp936）编码：账号昵称里带 emoji
+ # （🏅）时，打印昵称的那一行会抛 UnicodeEncodeError，整个脚本就死在那儿
+@@ -106,6 +111,57 @@ import task_common as tc
+ # 唯一事实源；import 消耗为零（模块级只有常量定义，main() 有 __main__ 门）。
+ import school_open_day_2026 as school
+ 
++# --------------------------------------------------------------------------
++# 活动专家任务（issue #429）：与 Expert_lighthouse 同一条「固定专家 + 真实对话」链，
++# 判据也相同（召唤三连 → 真实对话 → 带 has_expert 的桌面六连 →
++# expert_actual_use(LOCAL)），只是专家 id/版本不同。静态 id 来自多份公开实现的
++# 交叉核对（L0NE-6/WorkBuddy-Daily、niyouqianma/workbuddy2api-hub、
++# maiphucgiang/codebuddy2api 等同一组 ex_ id 一致）；任务列表 jump_url 里带
++# 专家 id 时以 jump_url 为准（见 expert_local_spec）。
++# --------------------------------------------------------------------------
++EXPERT_LOCAL_SPECS = {
++    "expert_use_maidehao": {
++        "id": "ex_GDl31WahyIH0", "name": "卖得好",
++        "profession": "中国电商运营专家", "version": "1.0.1"},
++    "expert_use_douyinyin": {
++        "id": "ex_FbY5nlWTqDod", "name": "斗音音",
++        "profession": "抖音策略师", "version": "1.0.2"},
++    "expert_use_shangjia_xuanchuan": {
++        "id": "ex_Weo3x2EZuSDm", "name": "商家宣传设计师",
++        "profession": "商家宣传页与海报设计师", "version": "1.6.0"},
++    "expert_use_bowangwang": {
++        "id": "ex_WZY136wV5aMt", "name": "播旺旺",
++        "profession": "直播电商教练", "version": "1.0.2"},
++}
++_EXPERT_ID_RE = re.compile(r"^ex_[A-Za-z0-9]{6,64}$")
++_TRUSTED_JUMP_HOST_SUFFIXES = ("workbuddy.cn", "codebuddy.cn", "tencent.com")
++
++# 已知但当前不能自动完成的任务码（与「脚本不认识」严格区分）：
++#   manual  —— 必须真人完成（微信关注 / 学生认证）
++#   capture —— 参数或接口尚未在本仓验证：不盲发请求，等抓包确认
++UNSUPPORTED_TASKS = {
++    "wb_wechat_oa_subscribe_task": {
++        "reason_kind": "manual",
++        "reason": "需人工完成：在微信内关注公众号（真人扫码，关注满 24h 才计）",
++    },
++    "WorkBuddy_Valorant": {
++        "reason_kind": "capture",
++        "reason": "暂无已确认的专家召唤参数，需抓包确认后再接入",
++    },
++    "task_student_verify": {
++        "reason_kind": "manual",
++        "reason": "需人工完成：学生身份认证",
++    },
++}
++
++# skill_share：在 Open Platform 创建真实分享渠道，再上报渠道动作事件（issue #429）。
++# asset_ref 必须是 JSON 字符串且键名为 asset_id（snake_case）；对象形式会被上游
++# 拒为「请求参数不合法」。字段形状照 5.9.3 客户端与多份公开实现交叉核对
++# （L0NE-6/WorkBuddy-Daily、deltrivx/Auto2API、xu20060420fan-cell/...-panel 一致）。
++SKILL_SHARE_BASE = "https://open.workbuddy.cn"
++SKILL_SHARE_CHANNEL_PATH = "/api/v2/open-platform/asset-shares/c2c/channels"
++SKILL_SHARE_PREFERRED_ID = "skill_2096525080079265792"
++
+ # --------------------------------------------------------------------------
+ # 任务映射表（task_code -> 完成定义）
+ #   kind     事件构建器类型（build_event/ids_for 分派）
+@@ -115,10 +171,19 @@ import school_open_day_2026 as school
+ # --------------------------------------------------------------------------
+ MAPPING = {
+     "create_canvas":          {"kind": "canvas",     "target": 1, "src": "自造 wb-<ms>"},
++    # 活动专家任务（issue #429）：与 Expert_lighthouse 同链路，专家 id 见 EXPERT_LOCAL_SPECS；
++    # 未列出的 expert_use_* 由 resolve_task_spec 按 jump_url 动态解析。
++    "expert_use_maidehao":    {"kind": "expertlocal", "target": 1, "src": "卖得好 ex_GDl31WahyIH0"},
++    "expert_use_douyinyin":   {"kind": "expertlocal", "target": 1, "src": "斗音音 ex_FbY5nlWTqDod"},
++    "expert_use_shangjia_xuanchuan": {"kind": "expertlocal", "target": 1,
++                                      "src": "商家宣传设计师 ex_Weo3x2EZuSDm"},
++    "expert_use_bowangwang":  {"kind": "expertlocal", "target": 1, "src": "播旺旺 ex_WZY136wV5aMt"},
+     "template_5":             {"kind": "template",   "target": 5, "src": "scenes 场景 id"},
+     "expert_5":               {"kind": "expert",     "target": 5, "src": "专家市场 ex_ id"},
+     "Expert_team_use_3":      {"kind": "team",       "target": 3, "src": "团队 id"},
+     "skill_1":                {"kind": "skill",      "target": 1, "src": "skillId"},
++    # 分享技能（issue #429）：市场技能 → Open Platform 创建真实分享渠道 → 渠道事件
++    "skill_share":            {"kind": "skillshare", "target": 1, "src": "市场技能+分享渠道"},
+     "automation_1":           {"kind": "automation", "target": 1, "src": "rrule 虚拟对象"},
+     "playbook_prompt":        {"kind": "playbook",   "target": 1, "src": "playbook 案例 id"},
+     "Expert_lighthouse":      {"kind": "lighthouse", "target": 1, "src": "轻量云专家 id"},
+@@ -165,6 +230,140 @@ MAPPING = {
+     "Expert_Philanthropy":    {"unforgeable": True, "reason": "真实捐款动作(M8)"},
+ }
+ 
++
++def _parse_expert_deeplink(value):
++    """只接受 workbuddy://experts?expertId=ex_xxx 这一种专家深链（纯函数）。"""
++    if not isinstance(value, str) or not value.strip():
++        return ""
++    try:
++        parsed = urllib.parse.urlparse(value.strip())
++        if parsed.scheme.lower() != "workbuddy":
++            return ""
++        if parsed.netloc.lower() != "experts" or parsed.path not in ("", "/"):
++            return ""
++        if parsed.fragment:
++            return ""
++        ids = urllib.parse.parse_qs(parsed.query, keep_blank_values=True).get("expertId", [])
++        unique = {item.strip() for item in ids if item.strip()}
++        if len(ids) != 1 or len(unique) != 1:
++            return ""
++        expert_id = unique.pop()
++        return expert_id if _EXPERT_ID_RE.fullmatch(expert_id) else ""
++    except (TypeError, ValueError):
++        return ""
++
++
++def _expert_id_from_jump_url(jump_url):
++    """从任务 jump_url 的 deeplink 参数提取专家 id（纯函数）。
++
++    只接受可信域名的外层 URL，且内层必须是 workbuddy://experts 深链——
++    不把任意 URL 里的 ex_ 片段当专家 id，避免任务数据被污染时发错对象。
++    """
++    if not isinstance(jump_url, str):
++        return ""
++    raw = jump_url.strip()
++    if not raw:
++        return ""
++    direct = _parse_expert_deeplink(raw)
++    if direct:
++        return direct
++    if raw.lower().startswith("deeplink="):
++        deeplinks = urllib.parse.parse_qs(raw, keep_blank_values=True).get("deeplink", [])
++        return _parse_expert_deeplink(deeplinks[0]) if len(deeplinks) == 1 else ""
++    try:
++        outer = urllib.parse.urlparse(raw)
++        if outer.scheme.lower() not in ("http", "https") or outer.fragment:
++            return ""
++        host = (outer.hostname or "").rstrip(".").lower()
++        if not any(host == suffix or host.endswith("." + suffix)
++                   for suffix in _TRUSTED_JUMP_HOST_SUFFIXES):
++            return ""
++        deeplinks = urllib.parse.parse_qs(outer.query, keep_blank_values=True).get("deeplink", [])
++        return _parse_expert_deeplink(deeplinks[0]) if len(deeplinks) == 1 else ""
++    except (TypeError, ValueError):
++        return ""
++
++
++def expert_local_spec(code, task=None):
++    """expert_use_* 任务 -> 固定专家定义（纯函数）。
++
++    静态表命中的四个任务直接返回；未列出的新 slug 只在任务 jump_url 带合法
++    专家 id 时才返回。返回 None 表示「不知道用哪个专家」——调用方应明确报
++    unsupported(capture)，不要拿市场第一个专家盲发（服务端按 (eventCode, id)
++    归账，发错专家不会点亮还可能污染风控面）。
++    """
++    base = EXPERT_LOCAL_SPECS.get(code)
++    if base is None and not str(code).startswith("expert_use_"):
++        return None
++    spec = dict(base or {})
++    dynamic_id = _expert_id_from_jump_url((task or {}).get("jump_url"))
++    if dynamic_id:
++        spec["id"] = dynamic_id
++    if not spec.get("id"):
++        return None
++    spec.setdefault("name", spec.get("profession") or code)
++    spec.setdefault("profession", spec.get("name") or code)
++    spec.setdefault("version", "")
++    spec.setdefault("expertType", "agent")
++    spec.setdefault("category", spec.get("profession") or "")
++    return spec
++
++
++def resolve_task_spec(code, task=None):
++    """任务码 -> 动作 spec（纯函数；单测与运行期共用同一个判定入口）。
++
++    - MAPPING 精确命中：返回副本（旧任务码行为不变）；expertlocal 额外挂上
++      `expert` 专家定义。
++    - expert_use_* 家族：未列入 MAPPING 的新 slug 也尝试从 jump_url 解析，
++      解析成功按 expertlocal 处理。
++    - UNSUPPORTED_TASKS：返回带 `unsupported` + `reason` 的 spec。
++    - 其余：None —— 脚本不认识这个任务码（能力缺口，不是「这次没得做」）。
++    """
++    spec = MAPPING.get(code)
++    if spec is not None:
++        out = dict(spec)
++        if out.get("kind") == "expertlocal":
++            out["expert"] = expert_local_spec(code, task)
++        return out
++    if code in UNSUPPORTED_TASKS:
++        return dict(UNSUPPORTED_TASKS[code], unsupported=True)
++    if str(code).startswith("expert_use_"):
++        expert = expert_local_spec(code, task)
++        if expert:
++            return {"kind": "expertlocal", "target": 1,
++                    "src": "专家 %s" % expert["id"], "expert": expert}
++        return {"kind": "expertlocal", "target": 1, "expert": None,
++                "unsupported": True, "reason_kind": "capture",
++                "reason": "未知 expert_use 任务码，且任务未下发专家 id，需抓包确认"}
++    return None
++
++
++def describe_task_code(code, spec):
++    """把任务码分类成一条可读结论（纯函数；日志与单测共用）。
++
++    关键区分：
++      - spec is None            -> unknown：脚本不认识这个码（能力缺口）
++      - spec.unsupported        -> unsupported：认识，但当前不能自动完成（附原因）
++      - 其余                    -> 空串：可处理
++    """
++    if spec is None:
++        return ("unknown task code: %s"
++                "（脚本不认识该任务码，尚未实现；如需适配请附 query 状态反馈）" % code)
++    if spec.get("unsupported"):
++        return "unsupported task code: %s（%s）" % (
++            code, spec.get("reason") or "暂不支持自动完成")
++    return ""
++
++
++def describe_missing_task(code, spec):
++    """任务码已知、但服务端本次未下发时的结论（纯函数）。"""
++    notice = describe_task_code(code, spec)
++    if notice:
++        return notice
++    return ("known task code: %s（服务端未下发该任务，可能已下线或不在活动期；"
++            "本次无动作）" % code)
++
++
+ # 夜猫时段（CST）23:00 - 次日 08:00
+ def within_night_window():
+     try:
+@@ -400,6 +599,114 @@ def _fetch_skills(auth):
+     return out
+ 
+ 
++def _fetch_share_skill(auth):
++    """从市场技能列表取一个可分享技能 -> {"id","name","description"}；失败 None。
++
++    skill_share 的判据是「真实创建过分享渠道」，所以这里**不回落内置技能表**：
++    市场列表拿不到时宁可本轮不动作，也不拿旧快照里的 id 去换一个无法确认的渠道。
++    """
++    try:
++        st, r = tc.do_post(auth, tc.chat_base(auth),
++                           "/v2/operation-platform/market/skill/list",
++                           {"page": 1, "page_size": 20})
++    except Exception as ex:
++        print(f"  [warn] 技能市场拉取失败({ex})")
++        return None
++    if st != 200 or not isinstance(r, dict) or r.get("code") not in (0, 200, "0", "200"):
++        return None
++    cands = []
++    for s in ((r.get("data") or {}).get("skills") or []):
++        if not isinstance(s, dict):
++            continue
++        sid = str(s.get("skill_id") or s.get("id") or "").strip()
++        name = str(s.get("display_name_zh") or s.get("name")
++                   or s.get("display_name_en") or "").strip()
++        if not sid or not name:
++            continue
++        desc = str(s.get("description_zh") or s.get("description")
++                   or s.get("description_en") or "").strip()[:60]
++        cands.append({"id": sid, "name": name, "description": desc})
++    if not cands:
++        return None
++    return next((c for c in cands if c["id"] == SKILL_SHARE_PREFERRED_ID), cands[0])
++
++
++def build_skill_share_channel_body(skill):
++    """构造 Open Platform 创建分享渠道的请求体（纯函数，单测钉字段形状）。
++
++    asset_ref 必须是 JSON **字符串**且键名是 asset_id（snake_case）——对象形式
++    或 assetId 会被上游拒为「请求参数不合法」。
++    """
++    sid = str(skill.get("id") or "").strip()
++    return {
++        "asset_kind": "skill",
++        "asset_source": "market",
++        "asset_ref": json.dumps({"asset_id": sid}, separators=(",", ":")),
++        "ways": ["link", "wxacode", "wxapath"],
++        "extra": {
++            "name": skill.get("name") or "技能",
++            "description": skill.get("description") or "",
++            "shareKey": sid,
++            "marketplaceSource": "builtin-market",
++        },
++    }
++
++
++def _create_skill_share_channel(auth, skill):
++    """创建真实技能分享渠道；返回 {ok, channel_id, share_code, ...}。"""
++    body = build_skill_share_channel_body(skill)
++    headers = {
++        "Accept": "application/json, text/plain, */*",
++        "User-Agent": DESKTOP_UA,
++        "X-User-Id": auth["uid"],
++        "X-Domain": tc.chat_base(auth),
++        "X-Product": "SaaS",
++        # tc._headers 默认带 codebuddy 的 Origin/Referer；分享接口在 open 域，
++        # 覆盖成同域，避免跨域来源被判异常。
++        "Origin": SKILL_SHARE_BASE,
++        "Referer": SKILL_SHARE_BASE + "/",
++    }
++    try:
++        st, r = tc.do_post(auth, SKILL_SHARE_BASE, SKILL_SHARE_CHANNEL_PATH, body,
++                           headers=headers)
++    except Exception as ex:
++        return {"ok": False, "status": -1, "msg": repr(ex)[:160]}
++    code = r.get("code") if isinstance(r, dict) else None
++    if st != 200 or code not in (0, 200, "0", "200"):
++        msg = r.get("msg") if isinstance(r, dict) else ""
++        return {"ok": False, "status": st, "code": code, "msg": str(msg or "")[:160]}
++    data = r.get("data") or {}
++    channel_id = str(data.get("channel_id") or "").strip()
++    share_code = str(data.get("share_code") or "").strip()
++    link = ""
++    for way in data.get("ways") or []:
++        if isinstance(way, dict) and way.get("share_way") == "link":
++            link = str(way.get("resource_ref") or "").strip()
++            break
++    if not channel_id or not share_code or not link:
++        return {"ok": False, "status": st, "code": code,
++                "msg": "分享接口缺少 channel_id/share_code/link"}
++    return {"ok": True, "channel_id": channel_id, "share_code": share_code}
++
++
++def build_skill_share_event(skill, channel_id):
++    """构造 skill_share 判据事件（纯函数）。
++
++    实测只认 action=wechat + panelAction=success；panelAction=click 不计分。
++    id 必须是分享接口返回的 channel_id。
++    """
++    return {
++        "eventCode": "skill_share_channel_action",
++        "skillId": str(skill.get("id") or ""),
++        "skillName": skill.get("name") or "",
++        "skillType": "market", "skillSource": "market",
++        "action": "wechat", "panelAction": "success",
++        "panelType": "mini_program_card", "isSuccessful": True, "cost": 0,
++        "id": channel_id, "actionAt": int(time.time() * 1000),
++        "entry": "skill_detail", "status": "safe", "actionSuccessful": True,
++    }
++
++
+ def _fetch_playbook_cases():
+     """只读拉灵感案例注册表 -> [(case_id, meta)]。失败回落内置表。"""
+     out = []
+@@ -485,8 +792,14 @@ SCHOOL_REPORT_KIND = {
+ MP_PLATFORM_HEADER = {"X-Client-Platform": "miniprogram"}
+ 
+ 
+-def ids_for(kind, auth, need, offset=0):
+-    """返回需要上报的对象 id 列表 [(obj_id, meta)]（按源顺序，偏移 cur 避免复用）。"""
++def ids_for(spec, auth, need, offset=0):
++    """返回需要上报的对象 id 列表 [(obj_id, meta)]（按源顺序，偏移 cur 避免复用）。
++
++    spec 可以是 kind 字符串（旧调用）或 resolve_task_spec() 返回的 dict：
++    只有 dict 才能带上 expertlocal 的固定专家定义（静态 id / jump_url 解析结果）。
++    """
++    kind = spec if isinstance(spec, str) else (spec or {}).get("kind")
++    expert = spec.get("expert") if isinstance(spec, dict) else None
+     if need <= 0:
+         return []
+     if kind == "canvas":
+@@ -504,6 +817,15 @@ def ids_for(kind, auth, need, offset=0):
+         return _dedup_slice(_fetch_playbook_cases(), offset, need)
+     if kind == "lighthouse":
+         return _dedup_slice(_fetch_lighthouse(auth), offset, need)
++    if kind == "expertlocal":
++        # 固定专家任务：进度语义是「用这个专家一次」，没有可轮换的对象池；
++        # 解析不到专家定义时返回空（调用方按 unsupported 明确报错，不盲发）。
++        if offset > 0 or not expert or not expert.get("id"):
++            return []
++        return [(expert["id"], expert)]
++    if kind == "skillshare":
++        # 分享任务每次创建一条新渠道，对象 id 在 light_up 内生成（channel_id）。
++        return [("", {}) for _ in range(need)]
+     if kind == "skin":
+         return _dedup_slice(_fetch_pe_theme(auth), offset, need)
+     if kind in ("chat", "glmchat", "automation", "cat"):
+@@ -1103,7 +1425,12 @@ def process_school_task(auth, code, t, st_tasks, uid8, opts, stats):
+ 
+     report_kind = SCHOOL_REPORT_KIND.get(code)
+     if report_kind is None:
+-        print(f"[task_runner] {uid8} {code}: query {status} -> school 未映射(人工/未知)，skip")
++        spec = resolve_task_spec(code, t)
++        notice = describe_task_code(code, spec)
++        if not notice:
++            notice = ("unknown school task code: %s"
++                      "（脚本不认识该任务码，尚未实现）" % code)
++        print(f"[task_runner] {uid8} {code}: query {status} -> {notice}，skip")
+         stats["skip"] += 1
+         return
+ 
+@@ -1347,9 +1674,10 @@ def process_minichat_task(auth, code, opts, stats, uid8):
+ # --------------------------------------------------------------------------
+ def process_task(auth, code, t, opts, stats):
+     uid8 = auth["uid"][:8]
+-    spec = MAPPING.get(code)
+-    if spec is None:
+-        print(f"[task_runner] {uid8} {code}: query 非映射任务，skip")
++    spec = resolve_task_spec(code, t)
++    if spec is None or spec.get("unsupported"):
++        print(f"[task_runner] {uid8} {code}: query {t.get('accept_status')} -> "
++              f"{describe_task_code(code, spec)}，skip")
+         stats["total"] += 1
+         stats["skip"] += 1
+         return
+@@ -1359,9 +1687,10 @@ def process_task(auth, code, t, opts, stats):
+     target = prog.get("target") or spec.get("target") or 1
+     stats["total"] += 1
+ 
+-    # 不可伪造任务：跳过并如实标注
++    # 不可伪造任务：跳过并如实标注为「需人工」，不再用「非映射」这种含糊措辞
+     if spec.get("unforgeable"):
+-        print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 不可伪造({spec['reason']})，skip")
++        print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> "
++              f"需人工完成（{spec['reason']}；脚本不可伪造），skip")
+         stats["skip"] += 1
+         return
+ 
+@@ -1421,7 +1750,7 @@ def process_task(auth, code, t, opts, stats):
+         return
+ 
+     if not opts.yes:
+-        ids = ids_for(spec["kind"], auth, need, offset=cur)
++        ids = ids_for(spec, auth, need, offset=cur)
+         shown = [i for i, _ in ids][:6]
+         print(f"[task_runner] {uid8} {code}: query {ast}({cur}/{target}) -> 可点亮 need={need} "
+               f"id源={spec['src']} ids={shown}，dry-run 跳过")
+@@ -1514,11 +1843,13 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
+             if i < need - 1:
+                 time.sleep(opts.gap)
+         time.sleep(2.0)  # 服务端归账可能异步
+-    elif spec["kind"] == "lighthouse":
+-        # 轻量云专家：召唤三连 → 真实桌面对话（取服务端 requestId）→ 带
+-        # has_expert 的六连 → expert_actual_use(LOCAL)。不能沿用通用分支：
+-        # 自造 requestId 服务端不计数（issue #221，进度恒 0/1）。
+-        ids = ids_for("lighthouse", auth, need, offset=cur)
++    elif spec["kind"] in ("lighthouse", "expertlocal"):
++        # 固定专家任务（Expert_lighthouse 与 issue #429 的活动专家）：召唤三连 →
++        # 真实桌面对话（取服务端 requestId）→ 带 has_expert 的六连 →
++        # expert_actual_use(LOCAL)。不能沿用通用分支：自造 requestId 服务端不计数
++        # （issue #221，进度恒 0/1）。expertlocal 的专家定义由 resolve_task_spec
++        # 从静态表或任务 jump_url 解析，不发市场第一个专家。
++        ids = ids_for(spec, auth, need, offset=cur)
+         if not ids:
+             print(f"[task_runner] {uid8} {code}: report 无可用对象 id，skip")
+             stats["fail"] += 1
+@@ -1544,10 +1875,33 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
+             events.append(desktop_expert_actual_use_local(expert, conv, req_id))
+             st_r, sc = report_desktop_events(auth, events)
+             print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} "
+-                  f"code={sc} lighthouse req={req_id}")
++                  f"code={sc} {spec['kind']} req={req_id}")
+             if i < len(ids) - 1:
+                 time.sleep(opts.gap)
+         time.sleep(2.0)  # 服务端归账可能异步
++    elif spec["kind"] == "skillshare":
++        # 分享技能：市场真实技能 → Open Platform 创建分享渠道 → 渠道动作事件。
++        # 只有 channel_id/share_code/link 齐全才上报；任何一步失败都不伪造、不领奖。
++        for i in range(need):
++            skill = _fetch_share_skill(auth)
++            if skill is None:
++                print(f"[task_runner] {uid8} {code}: 市场未返回可分享技能，本轮不伪造分享")
++                stats["fail"] += 1
++                return
++            channel = _create_skill_share_channel(auth, skill)
++            if not channel.get("ok"):
++                print(f"[task_runner] {uid8} {code}: 创建分享渠道失败 "
++                      f"HTTP={channel.get('status', '?')} code={channel.get('code', '?')} "
++                      f"{channel.get('msg', '')}")
++                stats["fail"] += 1
++                return
++            ev = build_skill_share_event(skill, channel["channel_id"])
++            st_r, sc = report_desktop_events(auth, [ev])
++            print(f"[task_runner] {uid8} {code}: report {i + 1}/{need} {st_r} code={sc} "
++                  f"skill_share channel={channel['channel_id']}")
++            if i < need - 1:
++                time.sleep(opts.gap)
++        time.sleep(2.0)  # 服务端归账可能异步
+     elif spec["kind"] == "buddy5":
+         # 五连「进入 Buddy 应用」事件（fork DesktopBuddyAppSequence，两账号实测点亮）；
+         # 上报失败（非 200 / code!=0）降级为单发 buddyapp_enter_click（旧形状兜底）。
+@@ -1581,7 +1935,7 @@ def light_up(auth, code, spec, cur, target, uid8, opts, stats, cap=0):
+                 time.sleep(opts.gap)
+         time.sleep(2.0)  # 服务端归账可能异步
+     else:
+-        ids = ids_for(spec["kind"], auth, need, offset=cur)
++        ids = ids_for(spec, auth, need, offset=cur)
+         if not ids:
+             print(f"[task_runner] {uid8} {code}: report 无可用对象 id，skip")
+             stats["fail"] += 1
+@@ -1638,6 +1992,14 @@ def process_account(auth, opts, stats):
+                       if MAPPING[c].get("kind") in ("minichat", "schoolseason", "miniexpert",
+                                                     "miniautomation", "miniglmchat")]
+     special = set(school_in_map) | set(minichat_in_map)
++    # 任务列表里出现、但不在 MAPPING 的码：先按 resolve_task_spec 分类一次。
++    # expert_use_* 且能从静态表/jump_url 解析到专家 id 的，加入本轮 codes；
++    # 其余（需人工 / 需抓包 / 完全不认识）只做分类展示，不猜动作。
++    dynamic_specs = {}
++    for t in tasks:
++        c = t.get("task_code")
++        if c and c not in MAPPING and c not in dynamic_specs:
++            dynamic_specs[c] = resolve_task_spec(c, t)
+     if opts.only_codes:
+         codes = [c for c in opts.only_codes if c not in special]
+         process_school = bool(set(opts.only_codes) & set(school_in_map))
+@@ -1647,26 +2009,33 @@ def process_account(auth, opts, stats):
+                  if MAPPING[c].get("kind") not in ("school", "minichat", "schoolseason",
+                                                    "miniexpert", "miniautomation",
+                                                    "miniglmchat")]
++        # expert_use_* 家族的新 slug（不在 MAPPING）走 process_task，用同一套专家链
++        for c, spec in dynamic_specs.items():
++            if spec is not None and not spec.get("unsupported") and c not in codes:
++                codes.append(c)
+         process_school = True
+         process_minichat = True
+-        # 未在映射表但存在于任务列表的（如 Expert_Philanthropy）——只计数展示
+-        for t in tasks:
+-            c = t.get("task_code")
+-            if c and c not in MAPPING:
+-                ast = t.get("accept_status")
+-                if ast == "claimed":
+-                    print(f"[task_runner] {uid8} {c}: query claimed -> 已领，跳过(非映射任务)")
+-                    stats["total"] += 1
+-                    stats["already"] += 1
+-                else:
+-                    print(f"[task_runner] {uid8} {c}: query {ast} -> 非映射任务，skip")
+-                    stats["total"] += 1
+-                    stats["skip"] += 1
++        # 其余未映射任务：按分类给出明确结论（不认识 / 需人工 / 需抓包），
++        # 不再统一写成「非映射任务」——那会把能力缺口伪装成「这次没什么可做」。
++        for c, spec in dynamic_specs.items():
++            if spec is not None and not spec.get("unsupported"):
++                continue  # 已加入 codes，由 process_task 处理
++            ast = by_code.get(c, {}).get("accept_status")
++            stats["total"] += 1
++            if ast == "claimed":
++                print(f"[task_runner] {uid8} {c}: query claimed -> 已领，跳过"
++                      f"（{describe_task_code(c, spec) or '已领取'}）")
++                stats["already"] += 1
++            else:
++                print(f"[task_runner] {uid8} {c}: query {ast} -> "
++                      f"{describe_task_code(c, spec)}，skip")
++                stats["skip"] += 1
+ 
+     for code in codes:
+         t = by_code.get(code)
+         if t is None:
+-            print(f"[task_runner] {uid8} {code}: query 任务不存在")
++            spec = resolve_task_spec(code)
++            print(f"[task_runner] {uid8} {code}: query -> {describe_missing_task(code, spec)}")
+             stats["total"] += 1
+             stats["skip"] += 1
+             continue
+diff --git a/scripts/test_task_new_codes.py b/scripts/test_task_new_codes.py
+new file mode 100644
+index 0000000..9a12e35
+--- /dev/null
++++ b/scripts/test_task_new_codes.py
+@@ -0,0 +1,290 @@
++"""issue #429：新任务码映射与「明确报错」措辞的回归测试。
++
++覆盖：
++  - expert_use_* 家族命中 expertlocal（静态专家 id / jump_url 动态 id）
++  - skill_share 命中 skillshare，分享渠道请求体与事件字段
++  - 原有任务码（create_canvas / chat_5 / expert_5 / expert_use / lighthouse）行为不变
++  - 未知码 -> unknown task code；需人工 / 需抓包 -> unsupported task code
++  - process_task 对未知码/不支持码立即返回，不发起任何网络请求
++
++运行：cd scripts && python -S -m unittest test_task_new_codes -v
++"""
++import io
++import json
++import unittest
++from contextlib import redirect_stdout
++from types import SimpleNamespace
++
++import task_runner as runner
++
++
++class ResolveTaskSpecTest(unittest.TestCase):
++    def test_known_expert_campaign_codes_map_to_expertlocal(self):
++        expected = {
++            "expert_use_maidehao": ("ex_GDl31WahyIH0", "卖得好", "1.0.1"),
++            "expert_use_douyinyin": ("ex_FbY5nlWTqDod", "斗音音", "1.0.2"),
++            "expert_use_shangjia_xuanchuan": ("ex_Weo3x2EZuSDm", "商家宣传设计师", "1.6.0"),
++            "expert_use_bowangwang": ("ex_WZY136wV5aMt", "播旺旺", "1.0.2"),
++        }
++        for code, (eid, name, version) in expected.items():
++            with self.subTest(code=code):
++                spec = runner.resolve_task_spec(code)
++                self.assertEqual(spec["kind"], "expertlocal")
++                self.assertEqual(spec["expert"]["id"], eid)
++                self.assertEqual(spec["expert"]["name"], name)
++                self.assertEqual(spec["expert"]["version"], version)
++                self.assertFalse(spec.get("unsupported"))
++
++    def test_unknown_expert_slug_uses_jump_url_expert_id(self):
++        task = {"jump_url": "workbuddy://experts?expertId=ex_FbY5nlWTqDod"}
++        spec = runner.resolve_task_spec("expert_use_douyinjin", task)
++        self.assertEqual(spec["kind"], "expertlocal")
++        self.assertEqual(spec["expert"]["id"], "ex_FbY5nlWTqDod")
++
++    def test_unknown_expert_slug_without_id_is_explicit_unsupported(self):
++        code = "expert_use_future_slug"
++        spec = runner.resolve_task_spec(code)
++        self.assertTrue(spec["unsupported"])
++        self.assertEqual(spec["reason_kind"], "capture")
++        notice = runner.describe_task_code(code, spec)
++        self.assertIn("unsupported task code", notice)
++        self.assertIn("抓包", notice)
++
++    def test_skill_share_maps_to_skillshare(self):
++        spec = runner.resolve_task_spec("skill_share")
++        self.assertEqual(spec["kind"], "skillshare")
++        self.assertEqual(spec["target"], 1)
++
++    def test_legacy_codes_unchanged(self):
++        self.assertEqual(runner.resolve_task_spec("create_canvas")["kind"], "canvas")
++        self.assertEqual(runner.resolve_task_spec("chat_5")["kind"], "chat")
++        self.assertEqual(runner.resolve_task_spec("chat_5")["target"], 5)
++        self.assertEqual(runner.resolve_task_spec("expert_5")["kind"], "expert")
++        self.assertEqual(runner.resolve_task_spec("Expert_lighthouse")["kind"], "lighthouse")
++        # 开学季的 expert_use 是 school 域，不能被 expert_use_ 前缀家族误吞
++        self.assertEqual(runner.resolve_task_spec("expert_use")["kind"], "school")
++        self.assertTrue(runner.resolve_task_spec("Expert_Philanthropy")["unforgeable"])
++
++    def test_unknown_code_is_unknown_not_unsupported(self):
++        self.assertIsNone(runner.resolve_task_spec("totally_new_task"))
++        notice = runner.describe_task_code("totally_new_task", None)
++        self.assertIn("unknown task code", notice)
++        self.assertIn("不认识", notice)
++        self.assertNotIn("unsupported", notice)
++
++    def test_manual_and_capture_codes_are_explicit(self):
++        wechat = runner.describe_task_code(
++            "wb_wechat_oa_subscribe_task",
++            runner.resolve_task_spec("wb_wechat_oa_subscribe_task"))
++        self.assertIn("unsupported task code", wechat)
++        self.assertIn("需人工", wechat)
++        valorant = runner.describe_task_code(
++            "WorkBuddy_Valorant", runner.resolve_task_spec("WorkBuddy_Valorant"))
++        self.assertIn("unsupported task code", valorant)
++        self.assertIn("抓包", valorant)
++
++    def test_missing_known_task_says_not_issued(self):
++        notice = runner.describe_missing_task(
++            "create_canvas", runner.resolve_task_spec("create_canvas"))
++        self.assertIn("服务端未下发", notice)
++        self.assertNotIn("unknown task code", notice)
++
++
++class JumpUrlTest(unittest.TestCase):
++    def test_direct_deeplink(self):
++        self.assertEqual(
++            runner._expert_id_from_jump_url("workbuddy://experts?expertId=ex_GDl31WahyIH0"),
++            "ex_GDl31WahyIH0")
++
++    def test_trusted_http_wrapper(self):
++        url = ("https://www.workbuddy.cn/launch/?deeplink="
++               "workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_GDl31WahyIH0")
++        self.assertEqual(runner._expert_id_from_jump_url(url), "ex_GDl31WahyIH0")
++
++    def test_untrusted_host_rejected(self):
++        url = ("https://evil.example/launch/?deeplink="
++               "workbuddy%3A%2F%2Fexperts%3FexpertId%3Dex_GDl31WahyIH0")
++        self.assertEqual(runner._expert_id_from_jump_url(url), "")
++
++    def test_malformed_expert_id_rejected(self):
++        self.assertEqual(
++            runner._expert_id_from_jump_url("workbuddy://experts?expertId=ContentCreator"), "")
++
++
++class SkillShareShapeTest(unittest.TestCase):
++    def test_channel_body_uses_json_string_asset_ref(self):
++        body = runner.build_skill_share_channel_body(
++            {"id": "skill_x", "name": "PPT", "description": "desc"})
++        self.assertEqual(body["asset_kind"], "skill")
++        self.assertEqual(body["asset_source"], "market")
++        self.assertIsInstance(body["asset_ref"], str)
++        self.assertEqual(json.loads(body["asset_ref"]), {"asset_id": "skill_x"})
++        self.assertEqual(body["ways"], ["link", "wxacode", "wxapath"])
++        self.assertEqual(body["extra"]["shareKey"], "skill_x")
++        self.assertEqual(body["extra"]["marketplaceSource"], "builtin-market")
++
++    def test_event_shape(self):
++        ev = runner.build_skill_share_event({"id": "skill_x", "name": "PPT"}, "ch_1")
++        self.assertEqual(ev["eventCode"], "skill_share_channel_action")
++        self.assertEqual(ev["action"], "wechat")
++        self.assertEqual(ev["panelAction"], "success")
++        self.assertEqual(ev["id"], "ch_1")
++        self.assertEqual(ev["skillId"], "skill_x")
++        self.assertEqual(ev["skillType"], "market")
++
++
++class IdsForTest(unittest.TestCase):
++    def test_expertlocal_returns_fixed_expert(self):
++        spec = runner.resolve_task_spec("expert_use_maidehao")
++        ids = runner.ids_for(spec, {"uid": "u"}, 1)
++        self.assertEqual(ids[0][0], "ex_GDl31WahyIH0")
++        self.assertEqual(ids[0][1]["name"], "卖得好")
++
++    def test_expertlocal_unknown_returns_empty(self):
++        self.assertEqual(
++            runner.ids_for({"kind": "expertlocal", "expert": None}, {"uid": "u"}, 1), [])
++
++    def test_skillshare_returns_placeholder(self):
++        self.assertEqual(
++            runner.ids_for({"kind": "skillshare"}, {"uid": "u"}, 2),
++            [("", {}), ("", {})])
++
++    def test_legacy_kind_string_still_supported(self):
++        self.assertEqual(
++            runner.ids_for("chat", {"uid": "u"}, 2), [("", {}), ("", {})])
++
++
++class ProcessTaskMessageTest(unittest.TestCase):
++    def _run(self, code):
++        stats = {"total": 0, "skip": 0, "pending": 0, "already": 0, "fail": 0, "ok": 0}
++        opts = SimpleNamespace(only_claim=False, yes=False, gap=1.0)
++        buf = io.StringIO()
++        with redirect_stdout(buf):
++            runner.process_task(
++                {"uid": "u12345678"}, code,
++                {"accept_status": "not_accepted",
++                 "progress": {"current": 0, "target": 1}},
++                opts, stats)
++        return buf.getvalue(), stats
++
++    def test_unknown_code_prints_unknown_even_in_process_task(self):
++        out, stats = self._run("totally_new_task")
++        self.assertIn("unknown task code: totally_new_task", out)
++        self.assertEqual(stats["skip"], 1)
++
++    def test_manual_code_prints_unsupported(self):
++        out, stats = self._run("wb_wechat_oa_subscribe_task")
++        self.assertIn("unsupported task code: wb_wechat_oa_subscribe_task", out)
++        self.assertIn("需人工", out)
++        self.assertEqual(stats["skip"], 1)
++
++
++class ProcessAccountDiscoveryTest(unittest.TestCase):
++    def test_dynamic_expert_family_is_dispatched_and_others_are_classified(self):
++        tasks = [
++            {"task_code": "expert_use_douyinjin", "accept_status": "not_accepted",
++             "progress": {"current": 0, "target": 1},
++             "jump_url": "workbuddy://experts?expertId=ex_FbY5nlWTqDod"},
++            {"task_code": "WorkBuddy_Valorant", "accept_status": "not_accepted"},
++            {"task_code": "totally_new_task", "accept_status": "not_accepted"},
++        ]
++        stats = {"accounts": 1, "total": 0, "skip": 0, "pending": 0,
++                 "already": 0, "fail": 0, "ok": 0}
++        opts = SimpleNamespace(only_codes=None, only_claim=False, yes=False, gap=1.0)
++        buf = io.StringIO()
++        from unittest import mock
++        with mock.patch.object(runner.tc, "do_get", return_value=(-1, {})), \
++             mock.patch.object(runner.tc, "list_tasks", return_value=tasks), \
++             mock.patch.object(runner, "_mp_task_status", return_value=None), \
++             mock.patch.object(runner, "process_minichat_task"), \
++             mock.patch.object(runner, "process_school_tasks"), \
++             mock.patch.object(runner, "process_task") as process, \
++             redirect_stdout(buf):
++            runner.process_account({"uid": "u12345678", "nick": "n"}, opts, stats)
++        out = buf.getvalue()
++        # 动态 expert_use_* 走 process_task（不是只展示）
++        self.assertEqual([call.args[1] for call in process.call_args_list],
++                         ["expert_use_douyinjin"])
++        # 需抓包 / 不认识的任务码各自有明确措辞
++        self.assertIn("unsupported task code: WorkBuddy_Valorant", out)
++        self.assertIn("unknown task code: totally_new_task", out)
++        self.assertNotIn("非映射任务", out)
++
++
++class LightUpWiringTest(unittest.TestCase):
++    def _opts(self):
++        return SimpleNamespace(yes=True, gap=1.0, only_claim=False)
++
++    def _stats(self):
++        return {"total": 0, "skip": 0, "pending": 0, "already": 0, "fail": 0, "ok": 0}
++
++    def test_skillshare_creates_channel_then_reports_event(self):
++        from unittest import mock
++        spec = runner.resolve_task_spec("skill_share")
++        auth = {"uid": "u12345678", "token": "t"}
++        states = [{"accept_status": "accepted"},
++                  {"accept_status": "accepted", "progress": {"current": 0, "target": 1}},
++                  {"accept_status": "completed", "progress": {"current": 1, "target": 1}}]
++        with mock.patch.object(runner.tc, "task_status", side_effect=states), \
++             mock.patch.object(runner, "_fetch_share_skill",
++                              return_value={"id": "skill_x", "name": "PPT",
++                                            "description": "d"}), \
++             mock.patch.object(runner, "_create_skill_share_channel",
++                              return_value={"ok": True, "channel_id": "ch_1",
++                                            "share_code": "sc"}), \
++             mock.patch.object(runner, "report_desktop_events",
++                              return_value=(200, 0)) as report, \
++             mock.patch.object(runner, "claim_one") as claim, \
++             mock.patch.object(runner.time, "sleep"):
++            runner.light_up(auth, "skill_share", spec, 0, 1, "u1234567",
++                            self._opts(), self._stats())
++        events = report.call_args_list[0].args[1]
++        self.assertEqual(events[0]["eventCode"], "skill_share_channel_action")
++        self.assertEqual(events[0]["id"], "ch_1")
++        claim.assert_called_once()
++
++    def test_expertlocal_uses_fixed_expert_chain(self):
++        from unittest import mock
++        spec = runner.resolve_task_spec("expert_use_maidehao")
++        auth = {"uid": "u12345678", "token": "t", "nick": "n"}
++        rid = "cmb-" + "a1" * 16
++        states = [{"accept_status": "accepted"},
++                  {"accept_status": "accepted", "progress": {"current": 0, "target": 1}},
++                  {"accept_status": "completed", "progress": {"current": 1, "target": 1}}]
++        with mock.patch.object(runner.tc, "task_status", side_effect=states), \
++             mock.patch.object(runner, "_lighthouse_real_chat",
++                              return_value=("conv-1", rid, "")), \
++             mock.patch.object(runner, "report_desktop_events",
++                              return_value=(200, 0)) as report, \
++             mock.patch.object(runner, "claim_one") as claim, \
++             mock.patch.object(runner.time, "sleep"):
++            runner.light_up(auth, "expert_use_maidehao", spec, 0, 1, "u1234567",
++                            self._opts(), self._stats())
++        # 第一次上报召唤三连，第二次上报六连 + expert_actual_use
++        self.assertEqual(report.call_count, 2)
++        chain = report.call_args_list[1].args[1]
++        use = [e for e in chain if e.get("eventCode") == "expert_actual_use"][-1]
++        self.assertEqual(use["id"], "ex_GDl31WahyIH0")
++        self.assertEqual(use["mode"], "LOCAL")
++        self.assertEqual(use["requestId"], rid)
++        claim.assert_called_once()
++
++    def test_create_skill_share_channel_hits_open_platform(self):
++        from unittest import mock
++        payload = {"code": 0, "data": {
++            "channel_id": "ch_1", "share_code": "sc",
++            "ways": [{"share_way": "link", "resource_ref": "https://x"}]}}
++        with mock.patch.object(runner.tc, "do_post",
++                               return_value=(200, payload)) as post:
++            got = runner._create_skill_share_channel(
++                {"uid": "u1", "token": "t"}, {"id": "skill_x", "name": "PPT"})
++        self.assertTrue(got["ok"])
++        self.assertEqual(got["channel_id"], "ch_1")
++        args = post.call_args.args
++        self.assertEqual(args[1], runner.SKILL_SHARE_BASE)
++        self.assertEqual(args[2], runner.SKILL_SHARE_CHANNEL_PATH)
++        self.assertEqual(post.call_args.kwargs["headers"]["X-User-Id"], "u1")
++
++
++if __name__ == "__main__":
++    unittest.main()
