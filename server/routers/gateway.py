@@ -599,7 +599,7 @@ def _account_expected_after_error(exc: Exception) -> bool:
     return not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
 
 
-def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None, effort: str | None = None, account_expected: bool = True) -> None:
+def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, first_frame: int | None = None, usage: dict | None = None, effort: str | None = None, account_expected: bool = True) -> None:
     """记录调用日志与用量。
 
     credit 为上游返回的真实扣费（usage.credit）。None 表示上游没给，
@@ -654,6 +654,7 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             completion_tokens=ct,
             latency_ms=latency,
             first_token_ms=first_token,
+            first_frame_ms=first_frame,
             ua=db._clean(ua, 512),
             error=db._clean(error, 500),
             stream=1 if stream else 0,
@@ -877,6 +878,28 @@ def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
         # 是哪个分组、该启用还是改绑）。
         return None, _oai_error(str(exc), 503, 'api_error', 'upstream_unavailable')
 
+
+def _carries_data_frame(piece: str) -> bool:
+    """chunk 里是否有「可用的 data: 帧」。
+
+    用来判断首帧延迟，口径与 #485 的空闲看门狗一致：只认 `data:` 行，
+    跳过 SSE 注释保活（`: keepalive`）、空行、空 payload 与 `[DONE]`。
+    不这么做的话，上游开保活时 `: keepalive` 会比真正的第一帧更早到，
+    记出来的「首帧」比上游 TTFB 还小，两边不可比。
+
+    注意：这里对**单个 chunk** 判断，假设一帧不被拆到两个 chunk 里 ——
+    与 #485 的 `'data:' in piece` 是同一个前提（上游按帧 flush，实测成立）。
+    """
+    if 'data:' not in piece:
+        return False
+    for line in piece.splitlines():
+        line = line.strip()
+        if not line.startswith('data:'):
+            continue
+        payload = line[5:].strip()
+        if payload and payload != '[DONE]':
+            return True
+    return False
 
 def _scan_sse(pending: str, usage: dict) -> tuple[str, bool]:
     """扫描 SSE 文本片段：提取 usage，并判断是否已出现首个正文。
@@ -1484,6 +1507,10 @@ async def _chat(request: Request, upstream_path: str):
         # 首字延迟：只记一次，取「首个含正文的 delta」到达时刻。
         # 注意起点含建连 + 上游排队 + 模型开始思考，这正是「上游多久开始回话」。
         first_token_ms: int | None = None
+        # 首帧延迟：第一个**可用 data: 帧**到达时刻（跳过保活注释与 [DONE]），
+        # 与上游 TTFB 同口径。与 first_token_ms 分开记：后者要等到首个含正文
+        # 或推理的 delta，max 档下推理阶段很长时两者能差上百秒。
+        first_frame_ms: int | None = None
         # 内容空闲看门狗（issue #485）：按「距上一个**数据帧**」计时，保活帧
         # （`: keepalive` 这类 SSE 注释）不续命。
         #
@@ -1505,6 +1532,8 @@ async def _chat(request: Request, upstream_path: str):
                 raw_stream.feed(piece)
                 if 'data:' in piece:
                     last_activity_at = time.monotonic()
+                if first_frame_ms is None and _carries_data_frame(piece):
+                    first_frame_ms = int((time.time() - started) * 1000)
                 if idle_limit > 0 and time.monotonic() - last_activity_at > idle_limit:
                     # 连接还活着、保活帧还在来，但正文/工具调用已经停了这么久。
                     # 继续挂着只会一直占住上游并发名额，客户端那边也只会表现为
@@ -1541,7 +1570,7 @@ async def _chat(request: Request, upstream_path: str):
             _record(
                 key, ip, requested_model or '', mapped or '', status_code, pt, ct,
                 latency, ua, error_text, True, usage=usage,
-                first_token=first_token_ms, effort=effort,
+                first_token=first_token_ms, first_frame=first_frame_ms, effort=effort,
             )
             tap_svc.capture(
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,

@@ -1883,6 +1883,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
             defer_finish=True)
         error_text: str | None = None
         first_token_ms: int | None = None
+        # 首帧延迟：第一个可用 data: 帧（跳过保活注释与 [DONE]），见 gateway._carries_data_frame。
+        first_frame_ms: int | None = None
         # 内容空闲看门狗（issue #485）：按「距上一个数据帧」计时，保活帧
         # （SSE 注释）不续命。按数据帧而不是按正文 delta，是为了别误杀
         # 长时间只有 tool_calls 增量的合法流。
@@ -1895,6 +1897,9 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 if await request.is_disconnected():
                     error_text = 'client disconnected'
                     break
+                if first_frame_ms is None and gateway._carries_data_frame(
+                        chunk.decode('utf-8', errors='ignore')):
+                    first_frame_ms = int((time.time() - started) * 1000)
                 piece = chunk.decode('utf-8', errors='ignore')
                 raw_stream.feed(piece)
                 if 'data:' in piece:
@@ -1984,7 +1989,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 _as_int(usage.get('prompt_tokens')),
                 _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
-                usage=usage, first_token=first_token_ms, effort=effort,
+                usage=usage, first_token=first_token_ms, first_frame=first_frame_ms,
+                effort=effort,
             )
             tap_svc.capture(
                 body=client_body, headers=request.headers.items(), key=key, ua=ua,

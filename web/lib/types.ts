@@ -699,6 +699,12 @@ export interface RequestLog {
    */
   first_token_ms: number | null;
   /**
+   * 首帧延迟（毫秒）：第一个**可用 data: 帧**到达时刻，与上游 TTFB 同口径。
+   * 与 first_token_ms 不同：后者等首个含正文/推理的 delta，max 档下两者能差上百秒。
+   * null = 未采集（非流式或旧记录）；判断时请用 `!= null`，0 是合法值。
+   */
+  first_frame_ms?: number | null;
+  /**
    * 提示词缓存的三段 token（issue #69）：上游（腾讯）在流式末帧 usage 里给。
    * **null = 上游没给这三个字段**（老上游），与「给了 0」不是一回事——
    * 后者代表这次请求确实没命中缓存。界面据此显示「—」而不是 0%。
@@ -2074,6 +2080,7 @@ export interface TapTurnBrief {
   stream: boolean;
   latency_ms: number | null;
   first_token_ms: number | null;
+  first_frame_ms?: number | null;
   model: string | null;
   mapped_model: string | null;
   prompt_tokens: number | null;
