@@ -46,6 +46,7 @@ class AccountRiskTest(unittest.TestCase):
         self.status_patch = mock.patch.object(wb2api, 'get_status', new=mock.AsyncMock(side_effect=lambda **kw: self.pool))
         self.status_patch.start()
         accountrisk.initialize()
+        accountrisk._clear_warnings_cache()
         db.set_setting('account_risk_enabled_at', self.now)
 
     def tearDown(self):
@@ -69,6 +70,11 @@ class AccountRiskTest(unittest.TestCase):
         self.pool['accounts'][0]['refresh_risk'] = self.risk(until=self.now+wait)
         return True, '', 'ok', {'uid':uid, 'refresh_risk':self.pool['accounts'][0]['refresh_risk']}
 
+    def warnings(self, **kwargs):
+        """既有用例默认绕过 20 秒缓存，避免测试里外部改动 pool 后读到旧快照。"""
+        accountrisk._clear_warnings_cache()
+        return asyncio.run(accountrisk.warnings(**kwargs))
+
     def test_429_pauses_one_account_without_manual_state_or_restart(self):
         with mock.patch.object(wb2api, 'set_refresh_risk', new=mock.AsyncMock(side_effect=self.apply_pause)) as action, \
              mock.patch.object(wb2api, 'set_manual_disabled') as manual, mock.patch.object(wb2api, 'restart_container') as restart:
@@ -76,7 +82,7 @@ class AccountRiskTest(unittest.TestCase):
             asyncio.run(accountrisk.handle_tasks([self.event()]))
             action.assert_awaited_once()
             manual.assert_not_called(); restart.assert_not_called()
-        self.assertTrue(asyncio.run(accountrisk.warnings())['items'][0]['paused'])
+        self.assertTrue(self.warnings()['items'][0]['paused'])
 
     def test_native_callback_is_not_applied_again_from_logs(self):
         self.pool['accounts'][0]['refresh_risk'] = self.risk()
@@ -95,19 +101,19 @@ class AccountRiskTest(unittest.TestCase):
         with mock.patch.object(wb2api, 'set_refresh_risk', new=mock.AsyncMock()) as action:
             asyncio.run(accountrisk.handle_tasks([self.event(ts=self.now-86400)]))
             action.assert_not_awaited()
-        self.assertTrue(asyncio.run(accountrisk.warnings())['items'][0]['historical'])
+        self.assertTrue(self.warnings()['items'][0]['historical'])
 
     def test_model_quota_and_500_only_warn(self):
         with mock.patch.object(wb2api, 'set_refresh_risk', new=mock.AsyncMock()) as action:
             asyncio.run(accountrisk.handle_tasks([self.event(kind='checkin', message='http 429 quota'),
                 self.event(kind='travel', message='http 500 grant credits failed')]))
             action.assert_not_awaited()
-        self.assertEqual(len(asyncio.run(accountrisk.warnings())['items']), 2)
+        self.assertEqual(len(self.warnings()['items']), 2)
 
     def test_prefix_is_not_risk_state(self):
         self.pool['accounts'][0].update(manual_disabled=True, manual_reason='account-risk: arbitrary operator reason')
         self.assertFalse(asyncio.run(accountrisk.paused(self.uid, config.AUTH_DIR)))
-        self.assertEqual(asyncio.run(accountrisk.warnings())['items'], [])
+        self.assertEqual(self.warnings()['items'], [])
 
     def test_cached_pause_expires_during_status_outage(self):
         self.pool['accounts'][0]['refresh_risk'] = self.risk()
@@ -124,12 +130,12 @@ class AccountRiskTest(unittest.TestCase):
 
     def test_acknowledge_does_not_resume_and_history_is_readable(self):
         self.pool['accounts'][0]['refresh_risk'] = self.risk()
-        item = asyncio.run(accountrisk.warnings())['items'][0]
+        item = self.warnings()['items'][0]
         self.assertTrue(accountrisk.acknowledge(item['id']))
-        self.assertTrue(asyncio.run(accountrisk.warnings())['items'][0]['paused'])
+        self.assertTrue(self.warnings()['items'][0]['paused'])
         self.pool['accounts'][0]['refresh_risk']['until'] = self.now-1
-        self.assertEqual(asyncio.run(accountrisk.warnings())['items'], [])
-        self.assertEqual(asyncio.run(accountrisk.warnings(include_acknowledged=True))['items'][0]['id'], item['id'])
+        self.assertEqual(self.warnings()['items'], [])
+        self.assertEqual(self.warnings(include_acknowledged=True)['items'][0]['id'], item['id'])
 
     def test_missing_route_warns_without_permanent_file_fallback(self):
         with mock.patch.object(wb2api, 'set_refresh_risk', new=mock.AsyncMock(return_value=(False, '', 'no_route', {}))), \
@@ -137,7 +143,7 @@ class AccountRiskTest(unittest.TestCase):
             self.assertFalse(asyncio.run(accountrisk.pause_refresh(self.uid, config.AUTH_DIR)))
             rename.assert_not_called()
         self.assertTrue((config.AUTH_DIR/self.filename).exists())
-        self.assertEqual(asyncio.run(accountrisk.warnings())['items'][0]['action_error'], 'no_route')
+        self.assertEqual(self.warnings()['items'][0]['action_error'], 'no_route')
 
     def test_retry_after_boundaries(self):
         import httpx
@@ -149,16 +155,16 @@ class AccountRiskTest(unittest.TestCase):
         with mock.patch.object(accountrisk.time, 'time', return_value=self.now), \
              mock.patch.object(wb2api, 'set_refresh_risk', new=mock.AsyncMock(side_effect=self.apply_pause)) as action:
             asyncio.run(accountrisk.pause_refresh(self.uid,config.AUTH_DIR))
-            item=asyncio.run(accountrisk.warnings())['items'][0]
+            item=self.warnings()['items'][0]
             accountrisk.acknowledge(item['id'])
             self.pool['accounts'][0]['refresh_risk'] = self.risk(until=0,failures=0)
             asyncio.run(accountrisk.pause_refresh(self.uid,config.AUTH_DIR))
             self.assertEqual(action.await_count,2)
-            self.assertFalse(asyncio.run(accountrisk.warnings())['items'][0]['acknowledged'])
+            self.assertFalse(self.warnings()['items'][0]['acknowledged'])
 
     def test_review_recovery_uses_dedicated_api_only(self):
         self.pool['accounts'][0].update(refresh_risk=self.risk(needs_review=True,failures=3),manual_disabled=True,disabled=True)
-        item=asyncio.run(accountrisk.warnings())['items'][0]
+        item=self.warnings()['items'][0]
         with mock.patch.object(wb2api, 'clear_refresh_risk', new=mock.AsyncMock(return_value=(True,'','ok',{'refresh_risk':self.risk(until=0,needs_review=False,failures=0),'manual_disabled':True,'disabled':True}))) as clear, \
              mock.patch.object(wb2api, 'set_manual_disabled') as manual, mock.patch.object(wb2api, 'revive_account') as revive:
             self.assertTrue(asyncio.run(accountrisk.resume(item['id']))[0])
@@ -169,7 +175,7 @@ class AccountRiskTest(unittest.TestCase):
         other={**upstreamsvc.default_upstream(),'id':9,'name':'other','auth_dir':str(self.root/'other')}
         Path(other['auth_dir']).mkdir()
         with mock.patch.object(upstreamsvc,'get_upstream',return_value=other):
-            self.assertEqual(asyncio.run(accountrisk.warnings(group_id=9))['items'],[])
+            self.assertEqual(self.warnings(group_id=9)['items'],[])
 
     def test_refresh_guard_prevents_network(self):
         payload={'uid':self.uid,'refresh_token':'rt','_risk_auth_dir':str(config.AUTH_DIR)}
@@ -194,3 +200,131 @@ class AccountRiskTest(unittest.TestCase):
         from server.services import tasklog
         event=tasklog.parse_line('2026-11-01T01:00:00Z keepalive done: checked=49 ok=35 failed=14 skipped=0')
         self.assertIn('尝试 49，成功 35，失败 14',event['message'])
+
+    def test_warnings_include_account_note_task_and_backfilled_detail(self):
+        db.set_account_note(self.uid, '传说中的小菜叶')
+        raw_msg = 'claim record=63955533: upstream server (http 500): {"code":500,"msg":"grant credits failed"}'
+        db.add_task_logs([{
+            'ts': self.now,
+            'uid': self.uid[:8],
+            'kind': 'travel',
+            'level': 'error',
+            'credits': 0,
+            'message': raw_msg,
+            'dedup_key': 'travel-err-1',
+        }])
+        # Simulate a legacy row created before `detail` existed (empty detail)
+        accountrisk.record(config.AUTH_DIR, {'uid': self.uid, 'nickname': '134****4653', 'realm': 'cn'},
+                           'travel', 500, self.now)
+        items = self.warnings()['items']
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['note'], '传说中的小菜叶')
+        self.assertEqual(items[0]['operation'], 'travel')
+        self.assertIn('grant credits failed', items[0]['detail'])
+        self.assertIn('领奖失败', items[0]['detail_cn'])
+
+    def test_school_and_cat_errors_are_classified(self):
+        asyncio.run(accountrisk.handle_tasks([
+            self.event(kind='school', message='http 502 bad gateway'),
+            self.event(kind='cat', message='http 429 rate limited'),
+        ]))
+        ops = {(it['operation'], it['http_status']) for it in self.warnings()['items']}
+        self.assertEqual(ops, {('school', 502), ('cat', 429)})
+
+    def test_multi_group_collector_routes_events_to_secondary_group_scope(self):
+        from server.services import tasklog
+        sec_dir = self.root / 'auths-group-b'
+        sec_dir.mkdir()
+        sec_uid = 'feedbeef-0000-0000-0000-000000000002'
+        (sec_dir / 'workbuddy-sec.json').write_text(json.dumps({
+            'account': {'uid': sec_uid, 'nickname': '138****9999'},
+            'auth': {'accessToken': 'at2', 'refreshToken': 'rt2', 'expiresAt': self.now + 86400,
+                     'realm': 'cn', 'domain': 'copilot.tencent.com'},
+        }), encoding='utf-8')
+        db.set_account_note(sec_uid, '二组备用号')
+        sec_group = {
+            'id': 2, 'name': '分组二', 'base_url': 'http://127.0.0.1:17863',
+            'api_key': '', 'container': 'wb2api-group-b',
+            'auth_dir': str(sec_dir), 'enabled': True, 'is_default': False,
+        }
+        default_group = upstreamsvc.default_upstream()
+        log_line = f'2026-11-21T01:00:01Z travel {sec_uid[:8]}: claim record=1: upstream server (http 500): grant credits failed'
+
+        async def fake_read_logs(name, limit):
+            return [log_line] if name == 'wb2api-group-b' else []
+
+        with mock.patch.object(upstreamsvc, 'list_upstreams', side_effect=lambda include_default=True: (
+                [default_group, sec_group] if include_default else [sec_group])), \
+             mock.patch.object(upstreamsvc, 'get_upstream', return_value=sec_group), \
+             mock.patch.object(tasklog, '_read_logs', side_effect=fake_read_logs):
+            parsed, added = asyncio.run(tasklog._collect_once())
+            self.assertEqual((parsed, added), (1, 1))
+            # Default group must NOT get a bogus account_not_found warning
+            self.assertEqual(self.warnings()['items'], [])
+            sec_items = self.warnings(group_id=2)['items']
+            self.assertEqual(len(sec_items), 1)
+            self.assertEqual(sec_items[0]['uid'], sec_uid)
+            self.assertEqual(sec_items[0]['action_error'], '')
+            self.assertEqual(sec_items[0]['note'], '二组备用号')
+
+    def test_warnings_cache_hit_skips_status_refresh(self):
+        first = asyncio.run(accountrisk.warnings())
+        self.assertEqual(wb2api.get_status.await_count, 1)
+        second = asyncio.run(accountrisk.warnings())
+        self.assertEqual(wb2api.get_status.await_count, 1, '第二次调用应命中 20 秒缓存')
+        self.assertEqual(second, first)
+        # 缓存失效后必须重新拉取分组状态，证明上面命中的是 TTL 缓存而不是别的原因。
+        accountrisk._clear_warnings_cache()
+        asyncio.run(accountrisk.warnings())
+        self.assertEqual(wb2api.get_status.await_count, 2)
+
+    def test_active_only_filters_acknowledged_and_historical_in_sql(self):
+        account = {'uid': self.uid, 'nickname': 'risk-test', 'realm': 'cn'}
+        recent_id, _ = accountrisk.record(config.AUTH_DIR, account, 'travel', 500, self.now,
+                                          detail='recent unhandled')
+        acked_id, _ = accountrisk.record(config.AUTH_DIR, account, 'school', 502, self.now - 10,
+                                         detail='acknowledged')
+        self.assertTrue(accountrisk.acknowledge(acked_id))
+        accountrisk.record(config.AUTH_DIR, account, 'cat', 503, self.now - 20,
+                           historical=True, detail='historical')
+        accountrisk._clear_warnings_cache()
+        with mock.patch.object(db, 'query', wraps=db.query) as query:
+            active = asyncio.run(accountrisk.warnings(active_only=True))
+        sql = [call.args[0] for call in query.call_args_list if 'account_risk_events' in call.args[0]]
+        self.assertTrue(any('acknowledged=0' in text for text in sql), 'active_only 必须在 SQL 层过滤')
+        self.assertEqual([item['id'] for item in active['items']], [recent_id])
+        self.assertEqual(active['total'], 1)
+        # 完整视图仍保留「未确认的历史回填」；已确认且未暂停的记录只在 history 里。
+        self.assertEqual(len(self.warnings(include_acknowledged=True)['items']), 3)
+
+    def test_backfill_details_uses_one_batch_query(self):
+        raw = 'claim record=63955533: upstream server (http 500): {"msg":"grant credits failed"}'
+        db.add_task_logs([
+            {'ts': self.now, 'uid': self.uid[:8], 'kind': 'travel', 'level': 'error',
+             'credits': 0, 'message': raw, 'dedup_key': 'batch-travel'},
+            {'ts': self.now - 1, 'uid': self.uid[:8], 'kind': 'school', 'level': 'error',
+             'credits': 0, 'message': 'school run (http 502): bad gateway', 'dedup_key': 'batch-school'},
+        ])
+        account = {'uid': self.uid, 'nickname': 'risk-test', 'realm': 'cn'}
+        travel_id, _ = accountrisk.record(config.AUTH_DIR, account, 'travel', 500, self.now)
+        school_id, _ = accountrisk.record(config.AUTH_DIR, account, 'school', 502, self.now - 1)
+        rows = db.query('SELECT * FROM account_risk_events WHERE scope=? ORDER BY ts DESC',
+                        (accountrisk.scope_of(config.AUTH_DIR),))
+        self.assertEqual(len(rows), 2)
+        with mock.patch.object(db, 'query', wraps=db.query) as query, \
+             mock.patch.object(db, 'query_one', side_effect=AssertionError('不应逐行查询')):
+            details = accountrisk._backfill_details(rows)
+        self.assertEqual(query.call_count, 1, '两条候选记录应合并成一次 SELECT')
+        self.assertIn('grant credits failed', details[travel_id])
+        self.assertIn('bad gateway', details[school_id])
+        self.assertEqual(db.query_one('SELECT detail FROM account_risk_events WHERE id=?',
+                                      (travel_id,))['detail'], details[travel_id])
+
+    def test_taskrun_5xx_is_info_severity(self):
+        account = {'uid': self.uid, 'nickname': 'risk-test', 'realm': 'cn'}
+        accountrisk.record(config.AUTH_DIR, account, 'taskrun', 500, self.now)
+        accountrisk.record(config.AUTH_DIR, account, 'travel', 500, self.now - 1)
+        items = {item['operation']: item for item in self.warnings()['items']}
+        self.assertEqual(items['taskrun']['severity'], 'info')
+        self.assertEqual(items['travel']['severity'], 'warning')
+        self.assertEqual(accountrisk._warning_severity('token_refresh', 429, True), 'critical')

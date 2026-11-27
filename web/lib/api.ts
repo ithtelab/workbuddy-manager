@@ -192,16 +192,21 @@ const groupQs = (upstreamId?: number | null): string =>
   upstreamId == null ? '' : `?upstream_id=${encodeURIComponent(String(upstreamId))}`;
 
 export interface AccountRiskEvent {
-  id: string; uid: string; nickname: string; group: string; realm: string;
+  id: string; uid: string; nickname: string; note?: string; group: string; realm: string;
   operation: string; http_status: number; ts: number; historical: boolean;
   acknowledged: boolean; paused: boolean | null; action_error: string;
   pause_until: number; needs_review: boolean; failures: number;
+  detail?: string; detail_cn?: string;
+  /** `info` = 一键执行等低频任务 5xx，仪表盘默认不展示；账号页仍保留。 */
+  severity?: 'critical' | 'warning' | 'info';
 }
 
 export const accountRiskApi = {
-  list: (realm: string, upstreamId: number | null = null, allGroups = false, includeAcknowledged = false) =>
+  list: (realm: string, upstreamId: number | null = null, allGroups = false, includeAcknowledged = false,
+         activeOnly = false) =>
     get<{items: AccountRiskEvent[]; failed_groups: string[]; total: number}>('/api/account-risk',
-      {realm, upstream_id: upstreamId ?? undefined, all_groups: allGroups, include_acknowledged: includeAcknowledged}),
+      {realm, upstream_id: upstreamId ?? undefined, all_groups: allGroups,
+       include_acknowledged: includeAcknowledged, active_only: activeOnly}),
   resume: (id: string) => post<{ok: boolean}>(`/api/account-risk/${encodeURIComponent(id)}/resume`),
   acknowledge: (id: string) => post<{ok: boolean}>(`/api/account-risk/${encodeURIComponent(id)}/acknowledge`),
 };

@@ -83,6 +83,7 @@ import {AccountModelLimitsDialog} from '@/components/common/accounts/AccountMode
 import {AccountTaskDialog} from '@/components/common/accounts/AccountTaskDialog';
 import {ReloginQueueDialog} from '@/components/common/accounts/ReloginQueue';
 import {ModelProbeDialog} from '@/components/common/accounts/ModelProbeDialog';
+import {AccountRiskWarnings} from '@/components/common/accounts/AccountRiskWarnings';
 import {useAuth} from '@/lib/auth-context';
 import {useRealm} from '@/lib/realm-context';
 import {useT} from '@/lib/i18n/provider';
@@ -1596,6 +1597,7 @@ export default function AccountsPage() {
           从右边跳到左边，看起来像按钮错位（issue #337）。
           本页没有早返回的整页守卫（取不到账号时只在下面给错误态）。 */}
       <PageSectionTabs />
+      <AccountRiskWarnings upstreamId={groupId} activeOnly />
 
       <div className="flex flex-wrap items-center gap-2">
           <Button

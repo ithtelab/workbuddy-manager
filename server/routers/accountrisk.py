@@ -7,8 +7,10 @@ router = APIRouter(prefix='/api/account-risk', tags=['accounts'])
 
 @router.get('')
 async def warnings(upstream_id: int | None = None, all_groups: bool = False,
-                   realm: str | None = None, include_acknowledged: bool = False, user: dict = Depends(security.current_user)) -> dict:
-    return await accountrisk.warnings(group_id=upstream_id, all_groups=all_groups, realm=realm, include_acknowledged=include_acknowledged)
+                   realm: str | None = None, include_acknowledged: bool = False,
+                   active_only: bool = False, user: dict = Depends(security.current_user)) -> dict:
+    return await accountrisk.warnings(group_id=upstream_id, all_groups=all_groups, realm=realm,
+                                      include_acknowledged=include_acknowledged, active_only=active_only)
 
 
 @router.post('/{ident}/acknowledge')
