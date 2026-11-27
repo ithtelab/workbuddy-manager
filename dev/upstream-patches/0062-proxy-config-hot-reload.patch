@@ -1,0 +1,310 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index d92ca1f..a185d80 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -26,7 +26,7 @@ type Config struct {
+ 	// 面板会给账号绑一条线路（auths/*.json 顶层 `proxy` 写的是**线路名**），这个名字
+ 	// 在这里解析成地址；线路名查不到时上游**明确报错、不静默直连**（静默直连等于
+ 	// 「以为隔离了其实没隔离」，见 upstream.TransportFor）。
+-	Proxies map[string]string `json:"proxies"`
++	Proxies ProxyTable `json:"proxies"`
+ 
+ 	// ReasoningAsContent 思考通道兜底（issue #135）：国际版 deepseek 思考模式下
+ 	// 答案只出现在 reasoning_content、content 恒空，只看 content 的客户端会看到
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index e325de9..75943f7 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -163,6 +163,11 @@ func main() {
+ 		stopSanitizeWatch := make(chan struct{})
+ 		defer close(stopSanitizeWatch)
+ 		go watchSanitizeConfig(*cfgPath, stopSanitizeWatch)
++		// 出口线路表同样随 config.json 热重载（issue #379）：面板加/改线路后
++		// 不必重启上游，聊天请求立刻按新线路出站。
++		stopProxyWatch := make(chan struct{})
++		defer close(stopProxyWatch)
++		go watchProxyConfig(*cfgPath, stopProxyWatch)
+ 	}
+ 	if n := len(cfg.Features.SanitizeExtraFeatures); n > 0 {
+ 		log.Printf("净化额外特征词表已加载：%d 条（config.json features.sanitize_extra_features）", n)
+diff --git a/cmd/server/proxies_json.go b/cmd/server/proxies_json.go
+new file mode 100644
+index 0000000..167b4fb
+--- /dev/null
++++ b/cmd/server/proxies_json.go
+@@ -0,0 +1,42 @@
++package main
++
++// 线路表的 JSON 兼容：值可以是地址字符串，也可以是面板「设置 → 代理」写出的
++// {url, weight, enabled} 对象（issue #379）。
++//
++// 面板侧的 weight / enabled 是**池**的调度参数，只有面板自己用；上游只认地址。
++// 但面板在权重非 100 或停用线路时会写成对象形，上游原来的 map[string]string
++// 解析会直接失败：整份 config.json 读不进来，启动时上游起不来，热重载时也只能
++// 跳过。这里兼容两种写法：对象只取 url，其余键忽略。
++
++import (
++	"encoding/json"
++	"fmt"
++	"strings"
++)
++
++// ProxyTable 线路名 → 地址；JSON 值兼容字符串与 {url,...} 对象。
++type ProxyTable map[string]string
++
++func (t *ProxyTable) UnmarshalJSON(raw []byte) error {
++	var table map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &table); err != nil {
++		return err
++	}
++	out := make(ProxyTable, len(table))
++	for name, value := range table {
++		var text string
++		if err := json.Unmarshal(value, &text); err == nil {
++			out[name] = strings.TrimSpace(text)
++			continue
++		}
++		var obj struct {
++			URL string `json:"url"`
++		}
++		if err := json.Unmarshal(value, &obj); err != nil {
++			return fmt.Errorf("proxies[%s]: %w", name, err)
++		}
++		out[name] = strings.TrimSpace(obj.URL)
++	}
++	*t = out
++	return nil
++}
+diff --git a/cmd/server/proxy_reload.go b/cmd/server/proxy_reload.go
+new file mode 100644
+index 0000000..70612c4
+--- /dev/null
++++ b/cmd/server/proxy_reload.go
+@@ -0,0 +1,76 @@
++package main
++
++// config.json 的 proxies 段热重载（issue #379）。
++//
++// 面板「设置 → 代理」把线路表写进上游 config.json；上游此前只在启动时
++// ConfigureProxies 一次。于是「加线路 → 点测试（面板发出）→ 请求模型」这条最常见的
++// 操作里，测试是通的、聊天却报错：线路名不在启动快照里，上游按设计明确失败
++// （不静默直连），而错误路径几乎不留日志。重启容器能解决，但每改一次线路都要求
++// 用户记得重启，不该是配置的默认成本。
++//
++// 这里与 sanitize_reload.go 同一套做法：轮询 config.json 的 mtime+size，变了就
++// 重新 Load 并整体替换线路表（ConfigureProxies 幂等，并会清空按线路缓存的连接池，
++// 地址改了不会复用旧代理连接）。解析失败只记 WARN、保留旧表——一次手误不能把
++// 正在服务的出口打空。
++
++import (
++	"log"
++	"os"
++	"time"
++
++	"workbuddy2api/internal/upstream"
++)
++
++// proxyWatchInterval 线路表轮询间隔：面板保存后最多这么久生效。与 auths 热加载
++// （5s）同量级；这段时间旧表仍在服务，不会因为等待热加载而中断在途请求。
++const proxyWatchInterval = 5 * time.Second
++
++// reloadProxyConfig 读一次配置并注入线路表；返回是否成功。
++func reloadProxyConfig(path string) bool {
++	cfg, err := Load(path)
++	if err != nil {
++		log.Printf("WARN: 出口线路表热重载跳过（配置读取失败）：%v", err)
++		return false
++	}
++	upstream.ConfigureProxies(cfg.Proxies)
++	names := upstream.RouteNames()
++	if len(names) > 0 {
++		log.Printf("出口线路表已热重载：%d 条（%v）", len(names), names)
++	} else {
++		log.Printf("出口线路表已热重载：未配置线路（config.json 的 proxies 段）")
++	}
++	return true
++}
++
++// watchProxyConfig 后台轮询配置文件；stop 关闭时退出。
++func watchProxyConfig(path string, stop <-chan struct{}) {
++	if path == "" {
++		return
++	}
++	stamp := func() (int64, int64) {
++		st, err := os.Stat(path)
++		if err != nil {
++			return 0, 0
++		}
++		return st.ModTime().UnixNano(), st.Size()
++	}
++	lastMod, lastSize := stamp()
++	ticker := time.NewTicker(proxyWatchInterval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-stop:
++			return
++		case <-ticker.C:
++			mod, size := stamp()
++			if mod == 0 {
++				continue // 原子替换的间隙：下轮再看
++			}
++			if mod == lastMod && size == lastSize {
++				continue
++			}
++			lastMod, lastSize = mod, size
++			reloadProxyConfig(path)
++		}
++	}
++}
+diff --git a/cmd/server/proxy_reload_test.go b/cmd/server/proxy_reload_test.go
+new file mode 100644
+index 0000000..7496f83
+--- /dev/null
++++ b/cmd/server/proxy_reload_test.go
+@@ -0,0 +1,85 @@
++package main
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"workbuddy2api/internal/upstream"
++)
++
++// issue #379：面板改 config.json 的 proxies 段后，上游不重启也要能解析新线路；
++// 解析失败时保留旧表。
++func TestReloadProxyConfig(t *testing.T) {
++	upstream.ConfigureProxies(nil)
++	t.Cleanup(func() { upstream.ConfigureProxies(nil) })
++
++	dir := t.TempDir()
++	path := filepath.Join(dir, "config.json")
++	write := func(s string) {
++		t.Helper()
++		if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	write(`{"proxies":{"route-a":"socks5h://user:pass@a.example:1080"}}`)
++	if !reloadProxyConfig(path) {
++		t.Fatal("首次热重载失败")
++	}
++	if names := upstream.RouteNames(); len(names) != 1 || names[0] != "route-a" {
++		t.Fatalf("线路表不对：%v", names)
++	}
++	tr, err := upstream.TransportFor("route-a")
++	if err != nil {
++		t.Fatal(err)
++	}
++	u, err := tr.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "api.example"}})
++	if err != nil || u == nil || u.Host != "a.example:1080" {
++		t.Fatalf("route-a 代理不对：%v %v", u, err)
++	}
++
++	// 改地址：必须重建 transport，不能复用旧代理连接池。
++	write(`{"proxies":{"route-a":"http://b.example:8080"}}`)
++	if !reloadProxyConfig(path) {
++		t.Fatal("第二次热重载失败")
++	}
++	tr2, err := upstream.TransportFor("route-a")
++	if err != nil {
++		t.Fatal(err)
++	}
++	u2, err := tr2.Proxy(&http.Request{URL: &url.URL{Scheme: "https", Host: "api.example"}})
++	if err != nil || u2 == nil || u2.Host != "b.example:8080" {
++		t.Fatalf("改地址后代理没更新：%v %v", u2, err)
++	}
++
++	// 坏配置：返回失败，旧线路仍在（不能把正在服务的表清空）。
++	write(`{"proxies":`)
++	if reloadProxyConfig(path) {
++		t.Fatal("坏配置应返回 false")
++	}
++	if names := upstream.RouteNames(); len(names) != 1 || names[0] != "route-a" {
++		t.Fatalf("坏配置把旧线路表清空了：%v", names)
++	}
++}
++
++// 面板在权重非 100 / 停用线路时会写对象形；上游必须也能读，否则整份配置解析失败。
++func TestProxyTableAcceptsObjectAndString(t *testing.T) {
++	var cfg struct {
++		Proxies ProxyTable `json:"proxies"`
++	}
++	raw := `{"proxies":{"a":"http://a.example:8080",` +
++		`"b":{"url":"socks5h://user:pass@b.example:1080","weight":30,"enabled":false}}}`
++	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
++		t.Fatalf("对象形线路表解析失败：%v", err)
++	}
++	if got := cfg.Proxies["a"]; got != "http://a.example:8080" {
++		t.Errorf("字符串形地址不对：%q", got)
++	}
++	if got := cfg.Proxies["b"]; got != "socks5h://user:pass@b.example:1080" {
++		t.Errorf("对象形地址不对：%q", got)
++	}
++}
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index affc4d7..47a6b94 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -1312,6 +1312,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 	if cerr != nil {
+ 		// 线路配置错误：立刻失败、**不进轮转**（换多少个号都一样），也不喂熔断 ——
+ 		// 这是配置问题，不是账号问题（见 clientFor 的注释）。
++		logRouteConfigError(a, cerr)
+ 		return nil, 0, nil, cerr
+ 	}
+ 	paths := c.chatPaths(a)
+diff --git a/internal/upstream/proxy_error_log.go b/internal/upstream/proxy_error_log.go
+new file mode 100644
+index 0000000..34b3c26
+--- /dev/null
++++ b/internal/upstream/proxy_error_log.go
+@@ -0,0 +1,42 @@
++package upstream
++
++// 出口线路配置错误的可见性（issue #379）。
++//
++// 账号绑定的线路名在上游线路表里查不到时，ChatStreamContext 会在发请求**之前**
++// 直接返回错误（设计上不静默直连）。handler 把这种无信封错误当传输层抖动处理，
++// 只换号、不打印——整池都绑同一条错线路时，用户看到的是 503，容器日志里却
++// 一条 ERROR 都没有。这里补一条去重后的日志：同一个错误只打一次，避免整池
++// 轮转刷屏，又能让排障的人一眼看到「线路名没解析出来」。
++
++import (
++	"log"
++	"sync"
++
++	"workbuddy2api/internal/auth"
++	"workbuddy2api/internal/logfmt"
++)
++
++var routeErrLog struct {
++	mu   sync.Mutex
++	last string
++}
++
++// logRouteConfigError 记录一次出口线路配置错误（同一错误文本只记一次）。
++func logRouteConfigError(a *auth.Auth, err error) {
++	if err == nil {
++		return
++	}
++	key := err.Error()
++	routeErrLog.mu.Lock()
++	if routeErrLog.last == key {
++		routeErrLog.mu.Unlock()
++		return
++	}
++	routeErrLog.last = key
++	routeErrLog.mu.Unlock()
++	label := ""
++	if a != nil {
++		label = logfmt.Label(a.UID, a.Nickname) + " "
++	}
++	log.Printf("ERR: [upstream] 出口线路配置错误，本次请求未发出 acct=%s: %v", label, err)
++}
