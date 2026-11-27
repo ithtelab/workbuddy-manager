@@ -1411,6 +1411,30 @@ def add_task_logs(entries: list[dict]) -> int:
         return conn.total_changes - before
 
 
+def existing_task_log_keys(keys: list[str]) -> set[str]:
+    """返回 `keys` 中**已经存在**于 task_logs 的 dedup_key 集合。
+
+    采集器需要区分「这一批里哪些是新增行」：只有新增行才该交给预警分类器
+    （issue #405 —— 容器日志尾部 3000 行里的历史失败行如果每 30 秒重放一次，
+    用户确认/删除后预警都会「复活」）。dedup_key 是 UNIQUE，按批 IN 查询很轻。
+    """
+    wanted = [str(k) for k in keys if str(k or '')]
+    if not wanted:
+        return set()
+    out: set[str] = set()
+    with _lock:
+        conn = connect()
+        for i in range(0, len(wanted), 500):
+            chunk = wanted[i:i + 500]
+            placeholders = ','.join('?' * len(chunk))
+            rows = conn.execute(
+                f'SELECT dedup_key FROM task_logs WHERE dedup_key IN ({placeholders})',
+                chunk,
+            ).fetchall()
+            out.update(str(r[0]) for r in rows)
+    return out
+
+
 def _clean(text: object, limit: int = 500) -> str:
     """把外部文本清成单行：去控制字符并截断。
 

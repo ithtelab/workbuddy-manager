@@ -601,10 +601,19 @@ async def _collect_once(limit: int = TAIL_LINES) -> tuple[int, int]:
             events.extend(parsed)
     if not events:
         return 0, 0
+    # 先算出「这一批里哪些是新增行」，只把新增行交给预警分类器（issue #405）：
+    # 否则容器日志尾部 3000 行里的历史失败/重试行每 30 秒被重放一次，
+    # 用户确认或删除记录后，下一轮又会原样重建。
+    keys = [str(e.get('dedup_key') or '') for e in events]
+    known = await asyncio.to_thread(db.existing_task_log_keys, keys)
+    fresh_keys = {k for k in keys if k and k not in known}
     added = await asyncio.to_thread(db.add_task_logs, events)
     from . import accountrisk
     for auth_dir, parsed in grouped_events:
-        await accountrisk.handle_tasks(parsed, directory=auth_dir)
+        fresh = [e for e in parsed
+                 if str(e.get('dedup_key') or '') in fresh_keys]
+        if fresh:
+            await accountrisk.handle_tasks(fresh, directory=auth_dir)
     return len(events), added
 
 
