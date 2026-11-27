@@ -22,7 +22,7 @@ A web console for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)
   <strong>⚠️ Intended use:</strong> this project is only for managing accounts that <strong>you or your family members have voluntarily authorized</strong>. Bulk registration, account trading, registration-on-behalf, SMS-code farming, account theft, bypassing platform risk controls, resale, or any for-profit use are prohibited. By using this project you agree to the <a href="#intended-use--disclaimer">full disclaimer</a>.
 </p>
 
-<img src="docs/images/sponsor-slot-en.svg" alt="Sponsor slot available" width="100%" />
+<img src="docs/images/sponsor-slot.svg" alt="Sponsor slot available" width="100%" />
 
 **Sponsor slot available**: put your product at the top of this README, in front of WorkBuddy / CodeBuddy users. For rates and placement, email [ithtelab@gmail.com](mailto:ithtelab@gmail.com) with “Sponsor” in the subject.
 

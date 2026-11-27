@@ -1,12 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="140" viewBox="0 0 1200 140" role="img" aria-label="赞助位虚位以待">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="140" viewBox="0 0 1200 140" role="img" aria-label="赞助位虚位以待 / Sponsor slot available">
   <rect x="8" y="8" width="1184" height="124" rx="16" fill="#ffffff" stroke="#8b949e" stroke-width="2" stroke-dasharray="10 8"/>
   <text x="600" y="60" text-anchor="middle"
         font-family="system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif"
-        font-size="26" font-weight="600" fill="#24292f">赞助位虚位以待</text>
+        font-size="25" font-weight="600" fill="#24292f">赞助位虚位以待 · Sponsor slot available</text>
   <text x="600" y="92" text-anchor="middle"
         font-family="system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif"
-        font-size="14" fill="#57606a">面向 WorkBuddy / CodeBuddy 用户 · README 首屏展示</text>
+        font-size="14" fill="#57606a">面向 WorkBuddy / CodeBuddy 用户 · README 首屏展示 · Reach them from the top of this README</text>
   <text x="600" y="116" text-anchor="middle"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
-        font-size="13" fill="#57606a">合作请联系 ithtelab@gmail.com</text>
+        font-size="13" fill="#57606a">合作请联系 / Contact: ithtelab@gmail.com</text>
 </svg>

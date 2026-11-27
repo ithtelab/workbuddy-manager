@@ -22,7 +22,7 @@
   <strong>⚠️ 使用边界：</strong>本项目只用于管理<strong>本人及亲属自愿授权</strong>的账号；禁止批量注册、账号交易、代注册、接码、盗号、绕过平台风控，以及任何商业转售或盈利性用途。使用即表示你已阅读并同意<a href="#使用边界与免责声明">完整免责声明</a>。
 </p>
 
-<img src="docs/images/sponsor-slot-zh.svg" alt="赞助位虚位以待" width="100%" />
+<img src="docs/images/sponsor-slot.svg" alt="赞助位虚位以待" width="100%" />
 
 **赞助位招租**：这里可以放你的产品 —— README 首屏、面向 WorkBuddy / CodeBuddy 用户。合作与报价请邮件联系 [ithtelab@gmail.com](mailto:ithtelab@gmail.com)，标题注明「赞助」。
 
