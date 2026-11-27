@@ -1,0 +1,559 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index d92ca1f..cf0c2db 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -83,18 +83,23 @@ type Config struct {
+ 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
+ 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
+ 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+-		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
++		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于 ua_style）。
+ 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
+ 		// issue #42 深挖：官网「使用端」列基于出站请求 UA 的服务端归因，官方 WorkBuddy
+-		// 桌面 UA 为 `WorkBuddy/<version>`。默认值已对齐官方（A 段变更），用户仍可配完全
++		// 桌面 UA 为单段 `WorkBuddy/<version>`。默认值已对齐官方桌面端，用户仍可配完全
+ 		// 自定义值改写。
+ 		UserAgent string `json:"user_agent"`
++		// UAStyle 默认 UA 形态："desktop"（缺省）= 官方桌面端单段式
++		// `WorkBuddy/<ver>`（global 为 `WorkBuddy AI/<ver>`）；"cli" = 官方 CLI
++		// 三段式 `WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>`（issue #497）。
++		// 仅影响默认 UA；显式 user_agent 仍最高优先，billing/checkin 恒单段。
++		UAStyle string `json:"ua_style"`
+ 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与白名单
+-		// 头组 X-IDE-Version 的取值）。空 = 内置默认（对齐官方 5.5.4 分发包）；
++		// 头组 X-IDE-Version 的取值）。空 = 内置默认（对齐官方 5.11.3 分发包）；
+ 		// 显式配置（如升级后的桌面包版本）则随配置走。
+ 		ClientVersion string `json:"client_version"`
+ 		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 内置默认（对齐官方内置 CLI
+-		// 2.137.1）；显式配置则随配置走。
++		// 2.63.2）；仅在 ua_style=cli 时使用，显式配置则随配置走。
+ 		CliVersion string `json:"cli_version"`
+ 
+ 		// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底。
+@@ -233,10 +238,12 @@ func Default() *Config {
+ 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
+ 	// ChatBase/BillingBase 缺省空（回落内置默认）。
+ 	c.Global.Enabled = true
+-	// 出站指纹默认伪造官方 WorkBuddy 桌面端：UA 三段式 + X-IDE-* 头组
++	// 出站指纹默认伪造官方 WorkBuddy 桌面端：UA 单段式 + X-IDE-* 头组
+ 	// （upstream.Client 的 attributionClientName 空值也回落 WorkBuddy，双保险）；
+ 	// 显式 client_name="SaaS" 还原旧行为。
+ 	c.Upstream.ClientName = "WorkBuddy"
++	// UA 形态默认 desktop（官方桌面端单段式）；显式 "cli" 才回退三段式。
++	c.Upstream.UAStyle = "desktop"
+ 	// 大请求体压缩默认开：省的是本机出口带宽（issue #297 实测 1Mbps 出口下 3MB 差 20s+）。
+ 	c.Upstream.GzipBody = true
+ 	c.Features.SanitizeBlacklistFingerprints = true
+@@ -335,6 +342,9 @@ func applyEnv(c *Config) {
+ 	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
+ 		c.Upstream.UserAgent = v
+ 	}
++	if v := os.Getenv("WB2A_UA_STYLE"); v != "" {
++		c.Upstream.UAStyle = v
++	}
+ 	if v := os.Getenv("WB2A_DEVICE_TOKEN"); v != "" {
+ 		c.Upstream.DeviceToken = v
+ 	}
+@@ -539,6 +549,17 @@ func (c *Config) normalize() error {
+ 	if c.Upstream.IdleTimeoutSeconds <= 0 {
+ 		c.Upstream.IdleTimeoutSeconds = 300
+ 	}
++	// UA 形态（issue #497）：缺省/desktop = 官方桌面端单段式；cli = 旧三段式。
++	// 与 prompt.mode 同样采用 fail-fast：拼错的值不静默回落，避免用户以为切到了
++	// CLI 形态却仍发桌面 UA。
++	switch style := strings.ToLower(strings.TrimSpace(c.Upstream.UAStyle)); style {
++	case "", "desktop":
++		c.Upstream.UAStyle = "desktop"
++	case "cli":
++		c.Upstream.UAStyle = "cli"
++	default:
++		return fmt.Errorf("upstream.ua_style: %q 不是合法值（desktop / cli）", c.Upstream.UAStyle)
++	}
+ 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
+ 		c.Listen = ":" + c.Listen
+ 	}
+diff --git a/cmd/server/config_test.go b/cmd/server/config_test.go
+index a3a75b3..3b38c8a 100644
+--- a/cmd/server/config_test.go
++++ b/cmd/server/config_test.go
+@@ -660,6 +660,42 @@ func TestUpstreamVersionConfig(t *testing.T) {
+ 	}
+ }
+ 
++// TestUpstreamUAStyleConfig upstream.ua_style：缺省归一为 desktop（官方桌面端
++// 单段式），显式 cli 保留三段式；env WB2A_UA_STYLE 同样生效；非法值 fail-fast。
++func TestUpstreamUAStyleConfig(t *testing.T) {
++	dir := t.TempDir()
++	fp := filepath.Join(dir, "c.json")
++	os.WriteFile(fp, []byte(`{"upstream":{"ua_style":"cli"}}`), 0o600)
++	c, err := Load(fp)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c.Upstream.UAStyle != "cli" {
++		t.Errorf("ua_style=%q want cli", c.Upstream.UAStyle)
++	}
++	// 缺省（未配置）= desktop。
++	if c2, err := Load(""); err != nil || c2.Upstream.UAStyle != "desktop" {
++		t.Errorf("default ua_style=%q want desktop (err=%v)", c2.Upstream.UAStyle, err)
++	}
++	// env 覆盖（大小写/空白归一）。
++	t.Setenv("WB2A_UA_STYLE", "  CLI  ")
++	c3, err := Load("")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c3.Upstream.UAStyle != "cli" {
++		t.Errorf("env ua_style=%q want cli", c3.Upstream.UAStyle)
++	}
++	// 非法值拒绝启动（避免拼错后静默发成桌面 UA）。
++	// 先清空上一条 env 覆盖，否则它仍会盖过文件里的非法值。
++	t.Setenv("WB2A_UA_STYLE", "")
++	fp2 := filepath.Join(dir, "bad.json")
++	os.WriteFile(fp2, []byte(`{"upstream":{"ua_style":"browser"}}`), 0o600)
++	if _, err := Load(fp2); err == nil {
++		t.Error("invalid ua_style accepted, want error")
++	}
++}
++
+ // TestUpstreamUserAgentConfig 配置 upstream.user_agent 与 env WB2A_USER_AGENT 均生效，
+ // 缺省空串保持现状（headers 层回落到 clientUA）。
+ func TestUpstreamUserAgentConfig(t *testing.T) {
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index e325de9..b96bc3e 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -167,9 +167,12 @@ func main() {
+ 	if n := len(cfg.Features.SanitizeExtraFeatures); n > 0 {
+ 		log.Printf("净化额外特征词表已加载：%d 条（config.json features.sanitize_extra_features）", n)
+ 	}
+-	// 出站 UA（A 段）：非空才做显式覆盖，空 = 默认 WorkBuddy 三段式
+-	// `WorkBuddy/<client_version> WorkBuddy/<client_version> CLI/<cli_version>`。
++	// 出站 UA：非空才做显式覆盖（最高优先）；空 = 按 ua_style 走默认形态。
++	// desktop（缺省）= 官方桌面端单段式 `WorkBuddy/<client_version>`（global 为
++	// `WorkBuddy AI/<client_version>`）；cli = 三段式
++	// `WorkBuddy/<ver> <platform>/<ver> CLI/<cli_version>`。
+ 	up.UserAgent = cfg.Upstream.UserAgent
++	up.UAStyle = cfg.Upstream.UAStyle
+ 	// 版本段（upstream.client_version / cli_version）：空 = 各走内置默认。
+ 	up.ClientVersion = cfg.Upstream.ClientVersion
+ 	up.CliVersion = cfg.Upstream.CliVersion
+diff --git a/internal/upstream/agenttool_search.go b/internal/upstream/agenttool_search.go
+index 49eb10b..765c7bb 100644
+--- a/internal/upstream/agenttool_search.go
++++ b/internal/upstream/agenttool_search.go
+@@ -82,8 +82,9 @@ func (c *Client) agentToolSearchBase(a *auth.Auth) string {
+ // 15001 等由调用方按 IsQuotaExhausted 处置）。
+ //
+ // 头体系与官方 CLI WebSearchTool.performWebSearch 对齐（04 文档 §2 头表）：
+-//   - CommonHeaders：UA 三段式 / Origin/Referer / X-Requested-With /
+-//     X-CodeBuddy-Request / Accept-Language / X-Machine-ID / X-Session-ID
++//   - CommonHeaders：UA（ua_style 默认桌面单段式）/ Origin/Referer /
++//     X-Requested-With / X-CodeBuddy-Request / Accept-Language /
++//     X-Machine-ID / X-Session-ID
+ //   - injectAttribution：X-Agent-Purpose / X-Product / X-IDE-*（用量归因）
+ //   - Authorization: Bearer accessToken（搜索是账号业务面，非匿名接口）
+ //   - X-User-Id / 企业与域头：与 ChatHeaders 同款（账号维度必发）
+diff --git a/internal/upstream/attribution_test.go b/internal/upstream/attribution_test.go
+index d434832..a60735d 100644
+--- a/internal/upstream/attribution_test.go
++++ b/internal/upstream/attribution_test.go
+@@ -78,11 +78,11 @@ func TestAttributionIncludesIDEVersion(t *testing.T) {
+ 			t.Errorf("%s = %q want %q", tc.header, got, tc.want)
+ 		}
+ 	}
+-	// X-IDE-Version 缺省（client_version 空）= 内置默认 5.5.4，且四头齐全。
++	// X-IDE-Version 缺省（client_version 空）= 内置默认 5.11.3，且四头齐全。
+ 	c2 := &Client{ClientName: "WorkBuddy"}
+ 	h2 := chatHeadersReq(t, c2, a, "")
+-	if got := h2.Get("X-IDE-Version"); got != "5.5.4" {
+-		t.Errorf("X-IDE-Version = %q want %q (default)", got, "5.5.4")
++	if got := h2.Get("X-IDE-Version"); got != "5.11.3" {
++		t.Errorf("X-IDE-Version = %q want %q (default)", got, "5.11.3")
+ 	}
+ 	// 显式 ClientName="SaaS" 时 X-IDE-Version 不设（还原旧行为：只有 X-Product=SaaS）。
+ 	c3 := &Client{ClientName: "SaaS"}
+@@ -102,7 +102,7 @@ func TestProductDefaultWorkBuddyFingerprint(t *testing.T) {
+ 		"X-Product":       "WorkBuddy",
+ 		"X-IDE-Name":      "WorkBuddy",
+ 		"X-IDE-Type":      "WorkBuddy",
+-		"X-IDE-Version":   "5.5.4",
++		"X-IDE-Version":   "5.11.3",
+ 		"X-Agent-Purpose": "conversation",
+ 	} {
+ 		if got := h.Get(hdr); got != want {
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index affc4d7..bbc7414 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -797,15 +797,24 @@ type Client struct {
+ 	channelBlockedMu sync.Mutex
+ 	channelBlocked   map[string]time.Time
+ 
+-	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
+-	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
+-	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
+-	// （仅当 client_name 非空，见 billingUA）。
++	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于 ua_style 形态
++	// 与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
++	// `WorkBuddy/<ver>`（global 为 `WorkBuddy AI/<ver>`）；billing/checkin 走
++	// `WorkBuddy/<ver>`（仅当 client_name 非空，见 billingUA）。
+ 	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
+-	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUAFor。默认值已对齐官方（A 段变更），
+-	// 用户仍可显式配置完全自定义的 UA。
++	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUAFor。用户仍可显式配置完全
++	// 自定义的 UA。
+ 	UserAgent string
+ 
++	// UAStyle 默认 UA 形态（config upstream.ua_style）：
++	//   - 空 / "desktop"（默认）：官方桌面端单段式 `WorkBuddy/<ver>`，
++	//     global 为 `WorkBuddy AI/<ver>`（issue #497）；
++	//   - "cli"：旧版官方 CLI 三段式
++	//     `WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>`。
++	// 仅影响 chat/refresh/FetchModels 的默认 UA；billing/checkin 恒为单段。
++	// 显式 UserAgent 仍最高优先。
++	UAStyle string
++
+ 	// DeviceToken 设备风控 Token（X-Device-Token 头）兜底来源：config upstream.device_token。
+ 	// 仅当 auth.Auth.DeviceToken 为空时才取此值；两者皆空则不注入该头。
+ 	// 容器内无桌面端 Turing SDK，这是把外部（宿主/桌面端）生成的 token 注入的入口。
+@@ -824,12 +833,13 @@ type Client struct {
+ 	ClientName string
+ 
+ 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + B 段的
+-	// X-IDE-Version）。空 = 内置默认 defaultClientVersion（对齐官方 5.5.4 分发包）。
++	// X-IDE-Version）。空 = 内置默认 defaultClientVersion（对齐官方 5.11.3 分发包）。
+ 	// config upstream.client_version 覆盖。
+ 	ClientVersion string
+ 
+ 	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认 defaultCliVersion
+-	// （对齐官方内置 CLI 2.137.1）。config upstream.cli_version 覆盖。
++	// （对齐官方内置 CLI 2.63.2）。仅在 ua_style=cli 时使用；config
++	// upstream.cli_version 覆盖。
+ 	CliVersion string
+ 
+ 	// PassthroughIP 是否透传客户端 IP 给上游（X-Forwarded-For/X-Real-IP 首段）。
+@@ -1680,9 +1690,10 @@ func (m dynModelEntry) modelInfo() ModelInfo {
+ // global 走 /v2/enterprises/personal/models（PR #20 实测 /console 500、/v2 200 含
+ // credits 倍率的完整模型表）。modelsPath 按 globalOn 分发。
+ // v3ConfigPath 是 CN/global 双域通用的 /v3/config 模型目录端点（v3 系客户端权威
+-// 目录；UA 门禁：仅三段式 CLI UA 可过，CommonHeaders 即满足，见
++// 目录；历史上三段式 CLI UA 实测可过其 UA 门禁，见
+ // .claude/reports/global-models-missing.md）：v3 为主、企业端点补缺（任务书
+-// v3-config-merge）。
++// v3-config-merge）。issue #497 起默认 UA 改为桌面单段式；若现场该门禁返回
++// 400 code 12403，可配 upstream.ua_style=cli 回退三段式。
+ const (
+ 	cnModelsPath     = "/console/enterprises/personal/models"
+ 	globalModelsPath = "/v2/enterprises/personal/models"
+@@ -1898,8 +1909,9 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	// CommonHeaders 三段式 CLI UA 实测可通过 /v3/config 的 UA 门禁
+-	// （Bearer + web UA → 400 code 12403，见 global-models-missing.md）。
++	// CommonHeaders 当前默认桌面单段式 UA；历史上三段式 CLI UA 已实测可通过
++	// /v3/config 的 UA 门禁（Bearer + web UA → 400 code 12403，见
++	// global-models-missing.md）。若桌面形态被拒，可用 upstream.ua_style=cli 回退。
+ 	c.CommonHeaders(req, a)
+ 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+ 	resp, err := c.HTTP.Do(req)
+diff --git a/internal/upstream/global_e2e_test.go b/internal/upstream/global_e2e_test.go
+index 024b661..ca52612 100644
+--- a/internal/upstream/global_e2e_test.go
++++ b/internal/upstream/global_e2e_test.go
+@@ -277,7 +277,7 @@ func TestGlobalE2EProbeChatVariants(t *testing.T) {
+ 			r.Header.Set("X-Agent-Purpose", "conversation")
+ 			r.Header.Set("X-IDE-Name", "WorkBuddy")
+ 			r.Header.Set("X-IDE-Type", "WorkBuddy")
+-			r.Header.Set("X-IDE-Version", "5.5.4")
++			r.Header.Set("X-IDE-Version", "5.11.3")
+ 			r.Header.Set("X-Product", "WorkBuddy")
+ 		}},
+ 		{"no-content-type", "gpt-5.4", func(r *http.Request) { r.Header.Del("Content-Type") }},
+diff --git a/internal/upstream/headers.go b/internal/upstream/headers.go
+index 1fee48b..47e0a8d 100644
+--- a/internal/upstream/headers.go
++++ b/internal/upstream/headers.go
+@@ -15,15 +15,21 @@ import (
+ const (
+ 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
+ 	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
+-	// （/tmp/wb-ua-fp/step1-fingerprint.md §1.2：WORKBUDDY_CLIENT_VERSION = 桌面端
+-	// package.json version，5.5.4 分发包即 5.5.4）。config upstream.client_version
+-	// 可覆盖（空 = 内置默认）。
+-	defaultClientVersion = "5.5.4"
++	// （issue #497：桌面端 5.11.3 实测请求头为单段 `WorkBuddy/5.11.3`）。
++	// config upstream.client_version 可覆盖（空 = 内置默认）。
++	defaultClientVersion = "5.11.3"
+ 	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI
+-	// （step1 §1.4：cli/package.json publishConfig.customPackage version = 2.137.1
+-	// → resolveBundledCliUserAgent() 返回 CLI/2.137.1）。config upstream.cli_version
++	// （issue #497：官方 CLI 实测为 `CLI/2.63.2 CodeBuddy/2.63.2`）。
++	// 仅在 upstream.ua_style=cli 的三段式形态中使用；config upstream.cli_version
+ 	// 可覆盖（空 = 内置默认）。
+-	defaultCliVersion = "2.137.1"
++	defaultCliVersion = "2.63.2"
++
++	// uaStyleDesktop 官方桌面端 UA 形态（默认）：单段 `WorkBuddy/<ver>`（global
++	// 为平台段 `WorkBuddy AI/<ver>`），与桌面端 5.11.3 的实际请求头一致。
++	uaStyleDesktop = "desktop"
++	// uaStyleCLI 旧版 CLI 三段式 UA 形态：`WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>`。
++	// 仅通过 config upstream.ua_style=cli 显式启用。
++	uaStyleCLI = "cli"
+ 
+ 	originRefererCN     = "https://www.codebuddy.cn"
+ 	originRefererGlobal = "https://www.workbuddy.ai"
+@@ -55,27 +61,48 @@ func (c *Client) cliVersion() string {
+ 	return defaultCliVersion
+ }
+ 
+-// defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
+-// `WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`
+-// （step1 §1.3：applicationName/version + platform/version + CLI/<cliVersion>）。
+-// 平台段（第二段）品牌按 realm 切换——CN 用 applicationName 同值 `WorkBuddy`，
+-// global 用官方国际版 productName `WorkBuddy AI`（intl 项目逆向证据
+-// ANALYSIS-global-chat-solutions.md：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`）。
+-// global 账号送错平台段（`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code 11140
+-// "request illegal" 风控。官方无任何 UA 随机化（step1 §4），故默认确定性。
++// defaultWorkBuddyUAFor 组装默认客户端出站 UA。
++//
++// 默认（ua_style 空/desktop）对齐官方 WorkBuddy 桌面端的单段式：
++//
++//	CN:     `WorkBuddy/<clientVersion>`
++//	global: `WorkBuddy AI/<clientVersion>`（保留平台段品牌语义）
++//
++// ua_style=cli 时保留旧版三段式（官方 CLI 形态）：
++//
++//	`WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`
++//
++// global 账号送错平台段（`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code
++// 11140 "request illegal" 风控。官方无任何 UA 随机化，故默认确定性。
+ // realm 判定委托 auth.Realm()（含全局开关逃生门）。
+ func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
+ 	platform := "WorkBuddy"
+ 	if a != nil && a.IsGlobal() {
+ 		platform = "WorkBuddy AI"
+ 	}
+-	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
++	if c.uaStyle() == uaStyleCLI {
++		return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
++	}
++	return platform + "/" + c.clientVersion()
++}
++
++// uaStyle 生效的 UA 形态：空/未知值回落 desktop（安全默认），仅显式 cli 走三段式。
++// 配置层 normalize 已把合法值归一为 desktop/cli；这里再做一次容错，保证直接构造
++// Client（测试、库调用）时行为确定。
++func (c *Client) uaStyle() string {
++	if c == nil {
++		return uaStyleDesktop
++	}
++	if strings.EqualFold(strings.TrimSpace(c.UAStyle), uaStyleCLI) {
++		return uaStyleCLI
++	}
++	return uaStyleDesktop
+ }
+ 
+ // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
+-// 优先级：Client.UserAgent（config user_agent）显式覆盖 > 按账号 realm 的默认 WorkBuddy 三段式。
+-// 显式覆盖兼容既有覆盖逻辑：用户配了即以用户值为准（自定义品牌/版本），
+-// 未配则走官方桌面端默认形态（global 换 `WorkBuddy AI` 平台段）。
++// 优先级：Client.UserAgent（config user_agent）显式覆盖 > ua_style 形态
++// （desktop 单段式 / cli 三段式）。未配 ua_style 时走官方桌面端默认单段式
++// （global 为 `WorkBuddy AI/<ver>`）。
+ func (c *Client) userAgent(a *auth.Auth) string {
+ 	if c != nil && c.UserAgent != "" {
+ 		return c.UserAgent
+@@ -89,6 +116,8 @@ func (c *Client) userAgent(a *auth.Auth) string {
+ // 为 `WorkBuddy/<pkgVer>`，RestOperations 层的 CLI 扩展段被业务层固化覆盖掉）。
+ // 默认（client_name 空）即生效（伪造官方桌面端指纹）；
+ // 显式 client_name="SaaS" 则不设 UA（还原旧行为，Go 默认 UA）。
++// 该路径固定单段式，不受 upstream.ua_style 影响（官方桌面端与 CLI 在
++// billing/checkin 白名单接口都覆写成单段）。
+ func (c *Client) billingUA() string {
+ 	if c == nil || c.attributionClientName() == "SaaS" {
+ 		return ""
+diff --git a/internal/upstream/headers_global_test.go b/internal/upstream/headers_global_test.go
+index 70c402e..96ef2c0 100644
+--- a/internal/upstream/headers_global_test.go
++++ b/internal/upstream/headers_global_test.go
+@@ -8,10 +8,9 @@ import (
+ 	"workbuddy2api/internal/auth"
+ )
+ 
+-// globalUAString global realm 默认出站 UA：第二段 platform 品牌为官方国际版
+-// `WorkBuddy AI`（intl 项目逆向证据：WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2），
+-// 版本段保持现有 clientVersion/cliVersion（本仓库 5.5.4/2.137.1），只切品牌段。
+-const globalUAString = "WorkBuddy/5.5.4 WorkBuddy AI/5.5.4 CLI/2.137.1"
++// globalUAString global realm 默认出站 UA：官方桌面端单段式，品牌为国际版
++// `WorkBuddy AI`（issue #497：保留平台段语义，去掉重复 WorkBuddy 段与 CLI 段）。
++const globalUAString = "WorkBuddy AI/5.11.3"
+ 
+ // TestChatHeadersGlobalRealm global 账号的 chat 请求头对齐 intl 三件套：
+ //  1. UA 含 `WorkBuddy AI/<v>` 平台段（非 CN 的 `WorkBuddy/<v>`）；
+@@ -127,7 +126,8 @@ func TestChatHeadersCNNoEnterpriseZeroRegression(t *testing.T) {
+ }
+ 
+ // TestDefaultWorkBuddyUAForGlobal UA 品牌段按 realm 切换的单元级断言：
+-// global → 第二段 `WorkBuddy AI`；CN → 第二段 `WorkBuddy`。
++// desktop 默认下 global → `WorkBuddy AI/<ver>`，CN → `WorkBuddy/<ver>`；
++// ua_style=cli 时恢复三段式且仍按 realm 切平台段。
+ func TestDefaultWorkBuddyUAForGlobal(t *testing.T) {
+ 	c := &Client{}
+ 	if got := c.defaultWorkBuddyUAFor(&auth.Auth{}); got != defaultUAString {
+@@ -138,9 +138,14 @@ func TestDefaultWorkBuddyUAForGlobal(t *testing.T) {
+ 	}
+ 	// version 覆盖仍生效：global 平台段跟随 clientVersion。
+ 	c2 := &Client{ClientVersion: "6.0.0"}
+-	if got := c2.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 WorkBuddy AI/6.0.0 CLI/2.137.1" {
++	if got := c2.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy AI/6.0.0" {
+ 		t.Errorf("defaultWorkBuddyUAFor(global, v6) = %q", got)
+ 	}
++	// ua_style=cli：global 三段式（平台段 WorkBuddy AI），CLI 段用 cliVersion。
++	c3 := &Client{UAStyle: "cli", ClientVersion: "6.0.0", CliVersion: "9.9.9"}
++	if got := c3.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 WorkBuddy AI/6.0.0 CLI/9.9.9" {
++		t.Errorf("defaultWorkBuddyUAFor(global, cli) = %q", got)
++	}
+ }
+ 
+ // mustRequest 构造一个无 body 的 POST 请求（测试 ChatHeaders 用）。
+@@ -151,4 +156,4 @@ func mustRequest(t *testing.T) *http.Request {
+ 		t.Fatalf("new request: %v", err)
+ 	}
+ 	return req
+-}
+\ No newline at end of file
++}
+diff --git a/internal/upstream/useragent_test.go b/internal/upstream/useragent_test.go
+index 7122bd5..d517f39 100644
+--- a/internal/upstream/useragent_test.go
++++ b/internal/upstream/useragent_test.go
+@@ -20,7 +20,7 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+ }
+ 
+ // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent 未配）行为：
+-// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
++// chat/refresh 路径 UA=官方桌面端单段式；billing 路径（report/travel/balance）
+ // UA=单段 `WorkBuddy/<clientVersion>`（client_name 缺省即伪造官方桌面端指纹）。
+ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
+ 	for _, tc := range []struct {
+@@ -151,19 +151,22 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
+ 	}
+ }
+ 
+-// --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
++// --- UA 对齐官方 WorkBuddy 桌面端（issue #497）---
+ 
+ const (
+-	defaultUAString      = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
++	defaultUAString      = "WorkBuddy/5.11.3"
++	defaultCLIUAString   = "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.63.2"
+ 	explicitString       = "MyCustomAgent/3.1"
+-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.137.1"
+-	billingUAWorkBuddy   = "WorkBuddy/5.5.4"
++	clientVerUAString    = "WorkBuddy/6.0.0"
++	clientVerCLIUAString = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.63.2"
++	billingUAWorkBuddy   = "WorkBuddy/5.11.3"
+ 	billingUACustomVer   = "WorkBuddy/6.0.0"
+ 	billingUAAgentString = "BillingAgent/1"
+ )
+ 
+ // TestUserAgentDefaultWorkBuddyShape 默认（无任何配置）聊天/刷新出站 UA =
+-// 官方 WorkBuddy 三段式，旧值 `CLI/2.63.2 CodeBuddy/2.63.2` 已被对齐替换。
++// 官方桌面端单段式 `WorkBuddy/5.11.3`（issue #497 实测形态）；旧三段式与
++// 旧版本 5.5.4/2.137.1 已替换。
+ func TestUserAgentDefaultWorkBuddyShape(t *testing.T) {
+ 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+ 	c := &Client{
+@@ -192,7 +195,8 @@ func (c *Client) chatLastUA() string {
+ 	return ""
+ }
+ 
+-// TestUserAgentExplicitOverride config user_agent 非空时以用户显式值为准（兼容旧覆盖逻辑）。
++// TestUserAgentExplicitOverride config user_agent 非空时以用户显式值为准，
++// 且优先于 ua_style=cli（显式覆盖最高优先）。
+ func TestUserAgentExplicitOverride(t *testing.T) {
+ 	a := &auth.Auth{AccessToken: "at", UID: "u1", RefreshToken: "rt"}
+ 	c := &Client{
+@@ -206,6 +210,7 @@ func TestUserAgentExplicitOverride(t *testing.T) {
+ 		ChatBaseCN:    "https://chat.example",
+ 		BillingBaseCN: "https://billing.example",
+ 		UserAgent:     explicitString,
++		UAStyle:       "cli", // 显式 UA 仍最高优先
+ 	}
+ 	if rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{}); status != 200 || err != nil {
+ 		t.Errorf("chat: status=%d err=%v", status, err)
+@@ -220,8 +225,8 @@ func TestUserAgentExplicitOverride(t *testing.T) {
+ 	}
+ }
+ 
+-// TestUserAgentClientVersionOverride config client_version 生效：UA 的 WorkBuddy 段跟随
+-// 且成对相同（platform 段 = applicationName 段），CLI 段保持默认。
++// TestUserAgentClientVersionOverride config client_version 生效：desktop 单段式下
++// UA 版本跟随（不含 CLI 段）。
+ func TestUserAgentClientVersionOverride(t *testing.T) {
+ 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+ 	c := &Client{
+@@ -243,11 +248,47 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
+ 	}
+ }
+ 
++// TestUserAgentCLIStyleOverride config ua_style=cli 恢复官方 CLI 三段式：
++// `WorkBuddy/<clientVersion> WorkBuddy/<clientVersion> CLI/<cliVersion>`；
++// client_version / cli_version 两个版本段各自生效。
++func TestUserAgentCLIStyleOverride(t *testing.T) {
++	for _, tc := range []struct {
++		name          string
++		clientVersion string
++		wantUA        string
++	}{
++		{name: "defaults", wantUA: defaultCLIUAString},
++		{name: "client_version", clientVersion: "6.0.0", wantUA: clientVerCLIUAString},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			a := &auth.Auth{AccessToken: "at", UID: "u1"}
++			c := &Client{
++				HTTP:          &http.Client{Transport: uaCaptureTransport{ua: new(string)}},
++				ChatHTTP:      &http.Client{Transport: uaCaptureTransport{ua: new(string)}},
++				ChatBaseCN:    "https://chat.example",
++				BillingBaseCN: "https://billing.example",
++				UAStyle:       "cli",
++				ClientVersion: tc.clientVersion,
++			}
++			rc, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
++			if status != 200 || err != nil {
++				t.Fatalf("chat: status=%d err=%v", status, err)
++			}
++			if got := c.chatLastUA(); got != tc.wantUA {
++				t.Errorf("UA = %q want %q", got, tc.wantUA)
++			}
++			if rc != nil {
++				rc.Close()
++			}
++		})
++	}
++}
++
+ // TestBillingUA_WhenClientNameSet billing/checkin 路径：client_name 非空时用单段
+ // `WorkBuddy/<clientVersion>`（不带 CLI 段，对齐官方 banner/check-in 显式头组）。
+ func TestBillingUA_WhenClientNameSet(t *testing.T) {
+ 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+-	// 默认 client_version → WorkBuddy/5.5.4
++	// 默认 client_version → WorkBuddy/5.11.3
+ 	c := &Client{
+ 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+ 			if got := r.Header.Get("User-Agent"); got != billingUAWorkBuddy {
+diff --git a/internal/upstream/v3_merge_e2e_test.go b/internal/upstream/v3_merge_e2e_test.go
+index 38108e3..717fe99 100644
+--- a/internal/upstream/v3_merge_e2e_test.go
++++ b/internal/upstream/v3_merge_e2e_test.go
+@@ -80,7 +80,7 @@ func TestV3MergeE2EGlobal(t *testing.T) {
+ }
+ 
+ // TestV3MergeE2EEndpointsReachable 独立 curl 等价验证：两端点经 CommonHeaders
+-// （三段式 CLI UA）+ Bearer 均 200（任务书验收 4：实测确认仍 200）。
++// （当前默认 UA 形态）+ Bearer 均 200（任务书验收 4：实测确认仍 200）。
+ func TestV3MergeE2EEndpointsReachable(t *testing.T) {
+ 	a := loadGlobalAcct(t)
+ 	c := &Client{
