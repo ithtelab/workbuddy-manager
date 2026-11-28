@@ -228,5 +228,65 @@ class MaintenanceApiTest(_TempDbCase):
         self.assertIn('压缩未开始', row['detail'])
 
 
+class CompactSafetyTest(_TempDbCase):
+    """安全审查 2026-11-28 的两条数据安全不变量。"""
+
+    def test_write_during_compaction_aborts_and_keeps_data(self) -> None:
+        """快照期间有新提交 → 放弃替换，而不是把新写入丢掉。"""
+        self._insert_request_logs(80)
+        dbmaintenance._checkpoint()
+        real_integrity = dbmaintenance._integrity_ok
+
+        def integrity_then_write(path):
+            db.execute(
+                'INSERT INTO checkin_logs(ts, uid, kind) VALUES(?, ?, ?)',
+                (self.now, 'racer', 'checkin'))
+            return real_integrity(path)
+
+        with mock.patch.object(dbmaintenance, '_integrity_ok',
+                               side_effect=integrity_then_write):
+            with self.assertRaises(dbmaintenance.MaintenanceBusy):
+                dbmaintenance.compact_database()
+
+        self.assertEqual(self._count('request_logs'), 80)
+        self.assertEqual(self._count('checkin_logs'), 1, '压缩期间的写入不能丢')
+        self.assertEqual(self._staging_files(), [], '放弃后也要清掉临时副本')
+
+    def test_startup_recovers_interrupted_swap(self) -> None:
+        """两次 rename 之间崩溃：启动时必须把 .swap-old 放回正式库。"""
+        db.execute('INSERT INTO checkin_logs(ts, uid, kind) VALUES(?, ?, ?)',
+                   (self.now, 'survivor', 'checkin'))
+        dbmaintenance._checkpoint()
+        with db._lock:
+            db._close_connection_locked()
+        target = Path(config.DB_PATH)
+        old = Path(str(target) + '.swap-old')
+        os.replace(target, old)
+        for suffix in ('-wal', '-shm'):
+            try:
+                Path(str(target) + suffix).unlink()
+            except FileNotFoundError:
+                pass
+        db._conn = None
+
+        db.connect()
+
+        self.assertEqual(self._count('checkin_logs'), 1, '旧库数据必须被恢复')
+        self.assertFalse(old.exists(), '恢复成功且新连接可用后残骸应清理')
+
+    def test_stale_staging_cleanup(self) -> None:
+        target = Path(config.DB_PATH)
+        old = Path(str(target) + '.compact-1-old')
+        fresh = Path(str(target) + '.compact-2-fresh')
+        for p in (old, fresh):
+            p.write_bytes(b'x')
+        past = time.time() - 7200
+        os.utime(old, (past, past))
+        removed = dbmaintenance._cleanup_stale_staging(target)
+        self.assertEqual(removed, 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists(), '新副本可能是另一个进程正在写的，不能删')
+
+
 if __name__ == '__main__':
     unittest.main()

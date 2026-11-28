@@ -79,6 +79,11 @@ def _already_applied(patch: Path, source: Path) -> bool:
 # 清单会随资产一起打包，所以每个发布出去的 upstream-src 都自带它的补丁 ancestry。
 MANIFEST_NAME = '.wb2a-patches.json'
 
+# 0064 从上游移除了内置人设文本。删除动作**不写成 diff**：删除补丁的 `-` 行会
+# 把被删内容原样带进公开仓库（以及 GitHub 为 tag 自动生成的源码归档）。这里按
+# 文件名清理，补丁只保留代码改动。对已删过的树是幂等的。
+REMOVED_UPSTREAM_FILES = ('internal/prompt/defaultprompt.md',)
+
 
 def _patch_sha(patch: Path) -> str:
     return hashlib.sha256(patch.read_bytes()).hexdigest()
@@ -157,6 +162,11 @@ def apply_patches(source: Path, patch_dir: Path) -> list[str]:
         results.append(f'applied: {patch.name}')
         manifest[patch.name] = sha
         manifest_dirty = True
+    # 已知的移除文件：补丁不携带其内容，统一在这里清理。
+    for rel in REMOVED_UPSTREAM_FILES:
+        target = source / rel
+        if target.is_file():
+            target.unlink()
     if manifest_dirty:
         _save_manifest(source, manifest)
     return results

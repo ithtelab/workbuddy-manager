@@ -1,0 +1,65 @@
+diff --git a/internal/upstream/proxy_error_log.go b/internal/upstream/proxy_error_log.go
+index 34b3c26..2697a69 100644
+--- a/internal/upstream/proxy_error_log.go
++++ b/internal/upstream/proxy_error_log.go
+@@ -10,6 +10,7 @@ package upstream
+ 
+ import (
+ 	"log"
++	"regexp"
+ 	"sync"
+ 
+ 	"workbuddy2api/internal/auth"
+@@ -21,12 +22,21 @@ var routeErrLog struct {
+ 	last string
+ }
+ 
++// proxyUserInfoRe 匹配 URL 里的 userinfo：`://user:pass@` / `://user@`。
++// 线路地址可能带住宅代理凭据，错误文本原样打日志等于把密码写进容器日志。
++var proxyUserInfoRe = regexp.MustCompile(`(://)[^/\s@]+@`)
++
++// redactProxyError 去掉错误文本里的代理凭据（保留 scheme 与主机）。
++func redactProxyError(msg string) string {
++	return proxyUserInfoRe.ReplaceAllString(msg, "${1}***@")
++}
++
+ // logRouteConfigError 记录一次出口线路配置错误（同一错误文本只记一次）。
+ func logRouteConfigError(a *auth.Auth, err error) {
+ 	if err == nil {
+ 		return
+ 	}
+-	key := err.Error()
++	key := redactProxyError(err.Error())
+ 	routeErrLog.mu.Lock()
+ 	if routeErrLog.last == key {
+ 		routeErrLog.mu.Unlock()
+@@ -38,5 +48,5 @@ func logRouteConfigError(a *auth.Auth, err error) {
+ 	if a != nil {
+ 		label = logfmt.Label(a.UID, a.Nickname) + " "
+ 	}
+-	log.Printf("ERR: [upstream] 出口线路配置错误，本次请求未发出 acct=%s: %v", label, err)
++	log.Printf("ERR: [upstream] 出口线路配置错误，本次请求未发出 acct=%s: %s", label, key)
+ }
+diff --git a/internal/upstream/proxy_error_log_test.go b/internal/upstream/proxy_error_log_test.go
+new file mode 100644
+index 0000000..be72c8d
+--- /dev/null
++++ b/internal/upstream/proxy_error_log_test.go
+@@ -0,0 +1,17 @@
++package upstream
++
++import "testing"
++
++// TestRedactProxyError 代理地址里的用户/密码不能进日志（2026-11-28 审查）。
++func TestRedactProxyError(t *testing.T) {
++	cases := map[string]string{
++		`proxy address has no host: "http://user:secret@": missing host`: `proxy address has no host: "http://***@": missing host`,
++		`invalid proxy address: parse "socks5://u:p@host:1080": bad`:     `invalid proxy address: parse "socks5://***@host:1080": bad`,
++		`proxy address has no host: "http://host:8080"`:                  `proxy address has no host: "http://host:8080"`,
++	}
++	for in, want := range cases {
++		if got := redactProxyError(in); got != want {
++			t.Errorf("redactProxyError(%q) = %q want %q", in, got, want)
++		}
++	}
++}

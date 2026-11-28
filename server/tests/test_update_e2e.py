@@ -534,17 +534,27 @@ class UpdateEndToEndTest(unittest.TestCase):
         mod.update_manager(rep)   # 不应抛
         self.assertIn('当前已是最新版本', rep.text())
 
-    def test_fallback_path_installs_but_says_it_could_not_compare(self) -> None:
-        """拿不到发布页摘要（免 API 的回退路径）时：照装，但**如实说没比对**。
+    def test_fallback_path_refuses_without_digest(self) -> None:
+        """拿不到发布页摘要（免 API 的回退路径）时默认拒绝安装。
 
-        这条是刻意的取舍：回退路径存在的意义就是「GitHub API 被限流时还能更新」，
-        所以不能因为拿不到摘要就拒绝更新；但也不能假装校验过 —— 状态记成 none，
-        日志里打出本地 sha256 让人能自己比对。
+        回退路径没有防篡改能力；更新器以 root 运行，不能把「HTTPS 可用」当成
+        唯一门槛（2026-11-28 安全审查）。实例目录必须一个字节都不变。
         """
         inst = self._make_install('nodigest')
         pkg, _ = self._make_release('nodigest')
         mod = self._load(inst)
         ok, rep = self._run_update(mod, pkg, None)
+        self.assertFalse(ok, rep.text())
+        self.assertIn('拒绝自动安装', rep.text())
+        self.assertIn('# OLD', (inst / 'server' / 'main.py').read_text(encoding='utf-8'))
+
+    def test_fallback_path_opt_in_installs_with_warning(self) -> None:
+        """显式设置 WB_ALLOW_UNVERIFIED_UPDATE=1 才继续，并如实标注未比对。"""
+        inst = self._make_install('nodigest')
+        pkg, _ = self._make_release('nodigest')
+        mod = self._load(inst)
+        with mock.patch.dict(os.environ, {'WB_ALLOW_UNVERIFIED_UPDATE': '1'}):
+            ok, rep = self._run_update(mod, pkg, None)
         self.assertTrue(ok, rep.text())
         self.assertIn('# NEW', (inst / 'server' / 'main.py').read_text(encoding='utf-8'))
         self.assertEqual(rep.integrity['status'], 'none')

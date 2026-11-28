@@ -584,13 +584,19 @@ async def account_set_skip_tasks(
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail='upstream_id 不合法') from None
     group = _group(upstream_id)
+    auth_dir = _require_dir(group)
     try:
-        result = wb2api.set_account_skip_tasks(
-            filename, bool(body['enabled']), _require_dir(group), uid=uid)
+        # 读整份 JSON + fsync + 原子替换：放到线程里，别在事件循环上做磁盘 I/O。
+        result = await asyncio.to_thread(
+            wb2api.set_account_skip_tasks,
+            filename, bool(body['enabled']), auth_dir, uid=uid)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail='账号文件不存在') from exc
+    if result['changed']:
+        # 与其他写路径一致显式失效：网络/共享文件系统上目录 mtime 可能不够细。
+        _invalidate_account_cache(group)
     security.audit(user, 'update_account_skip_tasks',
                    result['file'], f"skip_tasks={result['skip_tasks']}")
     scheduled = False

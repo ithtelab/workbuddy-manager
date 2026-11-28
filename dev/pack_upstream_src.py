@@ -50,7 +50,9 @@ TOP = 'workbuddy2api'
 # 虚拟环境里全是凭据与运行时垃圾（2026-10-18 审计：旧清单只排除了 config.json /
 # auths / data，`.env`、`*.db`、`logs/` 会被原样打进公开资产）。
 EXCLUDE_DIRS = {'.git', '__pycache__', 'node_modules', '.venv', '.runtime',
-                'logs', 'tmp', 'data', 'auths'}
+                'logs', 'tmp', 'data', 'auths',
+                # 密钥/凭据类文件：哪怕出现在源码目录也绝不进公开资产
+                '*.pem', '*.key', '*.p12', '*.pfx', 'id_rsa*', '.env*'}
 EXCLUDE_SUFFIX = {'.pyc', '.pyo', '.log', '.db', '.db-wal', '.db-shm',
                   '.sqlite', '.sqlite3'}
 EXCLUDE_NAMES = {'config.json', 'auths', 'data', 'users.json',

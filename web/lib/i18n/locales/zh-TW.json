@@ -455,7 +455,7 @@
     "weightSaved": "權重已儲存：×{weight}",
     "weightCleared": "已恢復預設權重（1）",
     "skipTasksBadge": "不參與任務",
-    "skipTasksBadgeTitle": "該帳號不參與簽到、保活、旅行、活躍、開學季、夜貓等定時任務；轉發不受影響（帳號仍在號池裡）。",
+    "skipTasksBadgeTitle": "該帳號不參與簽到、旅行、活躍、開學季、夜貓等定時任務；token 保活／續期照常，轉發不受影響（帳號仍在號池裡）。",
     "skipTasksEnable": "設定為不參與定時任務（保留轉發）",
     "skipTasksDisable": "恢復參與定時任務",
     "skipTasksSavedOn": "已設定該帳號不參與定時任務（轉發照常）",
@@ -1282,7 +1282,8 @@
     "viewRaw": "原文",
     "addHour": "新增時刻",
     "removeHour": "移除時刻",
-    "reportCountOutOfRange": "後端允許 {min}-{max} 條，目前值超出範圍，請重新選擇"
+    "reportCountOutOfRange": "後端允許 {min}-{max} 條，目前值超出範圍，請重新選擇",
+    "schedulerKeepNote": "「只保留上游」會重新開啟上游的簽到與活躍上報；「只保留面板」會關閉它們。"
   },
   "addAccount": {
     "title": "新增騰訊帳號 · {realm}",

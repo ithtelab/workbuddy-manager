@@ -522,7 +522,10 @@ function DailyTasksSection({onRan}: {onRan?: () => void}) {
       patchUp('checkin_enabled', next);
     } else {
       patchPanel('checkin', {enabled: next});
-      if (next && upReady && upDraft.checkin_enabled) {
+      if (upReady && upDraft.checkin_enabled) {
+        // 关闭时也要把上游侧一起关：两侧同时开着时只看面板会「关掉又自己打开」
+        // （保存后侧别按面板 off + 上游 on 重新判定，开关回弹）。
+        // 打开时同理，保持「只有一侧在跑」。
         patchUp('checkin_enabled', false);
       }
     }
@@ -701,6 +704,7 @@ function DailyTasksSection({onRan}: {onRan?: () => void}) {
                 {t('tasks.schedulerKeepPanel')}
               </Button>
             </div>
+            <div className="mt-1 text-[10px] opacity-80">{t('tasks.schedulerKeepNote')}</div>
           </div>
         )}
 

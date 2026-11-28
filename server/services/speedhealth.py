@@ -345,7 +345,9 @@ def _pending_restores(auth_dir: Path, index: dict[str, dict],
             continue
         restores.append({
             'uid': uid,
-            'file': str(record.get('file') or acc.get('file') or ''),
+            # 优先用**当前** index 里的文件名：账号停用/启用会把
+            # `x.json` 与 `x.json.disabled` 互换，记录里的旧名字可能已不存在。
+            'file': str(acc.get('file') or record.get('file') or ''),
             'nickname': str(acc.get('nickname') or ''),
             'original_weight': float(record.get('original_weight') or 0),
             'demoted_to': demoted_to,
@@ -400,7 +402,11 @@ def apply(changes: list[dict], auth_dir: Path, *,
     """
     now = time.time() if now is None else now
     results: list[dict] = []
+    pending: list[tuple[dict, str, str]] = []
     records: dict | None = None
+    # 先落降权记录、再写账号文件：记录写失败时文件一个都不动；文件写失败时
+    # 记录还在，下次评估会因「文件权重 != demoted_to」判成 stale 并清掉，
+    # 不会留下「已降权但永远恢复不了」的状态（安全审查 2026-11-28）。
     for item in changes or []:
         filename = item.get('file')
         if not filename:
@@ -409,13 +415,8 @@ def apply(changes: list[dict], auth_dir: Path, *,
         if dry_run:
             results.append({**item, 'ok': True, 'dry_run': True})
             continue
-        try:
-            wb2api.set_account_weight(filename, item['to'], auth_dir)
-        except Exception as exc:  # noqa: BLE001 —— 单个账号失败不影响其余
-            results.append({**item, 'ok': False, 'error': str(exc)})
-            continue
-        results.append({**item, 'ok': True, 'dry_run': False})
         uid = str(item.get('uid') or '')
+        pending.append((item, filename, uid))
         if not uid:
             continue
         if records is None:
@@ -442,6 +443,26 @@ def apply(changes: list[dict], auth_dir: Path, *,
         }
     if records is not None:
         _save_demotions(records)
+    failed_uids: list[str] = []
+    for item, filename, uid in pending:
+        try:
+            wb2api.set_account_weight(filename, item['to'], auth_dir)
+        except Exception as exc:  # noqa: BLE001 —— 单个账号失败不影响其余
+            results.append({**item, 'ok': False, 'error': str(exc)})
+            if uid:
+                failed_uids.append(uid)
+            continue
+        results.append({**item, 'ok': True, 'dry_run': False})
+    if failed_uids and records is not None:
+        # 写失败的账号没有真正降权：把它们刚建的记录撤掉，避免下次误恢复。
+        bucket = records.get(_group_key(auth_dir))
+        if isinstance(bucket, dict):
+            for uid in failed_uids:
+                bucket.pop(uid, None)
+        try:
+            _save_demotions(records)
+        except Exception:  # noqa: BLE001 —— 清理失败不回滚已完成的结果
+            logger.warning('降权记录清理失败（写权重失败的账号）', exc_info=True)
     return results
 
 
@@ -451,6 +472,10 @@ def apply(changes: list[dict], auth_dir: Path, *,
 def _evaluate_with_index(auth_dir: Path, window_seconds: int, realm: str | None,
                          index: dict[str, dict], collisions: list[dict], *,
                          now: float) -> dict:
+    # 评估只用本 realm 的账号；但降权/恢复记录的全集检查必须用**未过滤**的
+    # index——否则混合 realm 分组里，另一个 realm 的有效记录会被判成
+    # 「账号已不在」而删除，权重永久停在下限（安全审查 2026-11-28）。
+    all_index = index
     if realm is not None:
         index = {uid: acc for uid, acc in index.items()
                  if _realm_of_account(acc) == realm}
@@ -471,7 +496,7 @@ def _evaluate_with_index(auth_dir: Path, window_seconds: int, realm: str | None,
     stats = [s for s in collect(window_seconds, realm=realm, now=now)
              if s.get('uid') in index]
     result = plan(stats, current_weight=weights)
-    restores, stale = _pending_restores(auth_dir, index, result['rows'], now=now)
+    restores, stale = _pending_restores(auth_dir, all_index, result['rows'], now=now)
     restore_uids = {item['uid'] for item in restores}
     changes = [c for c in result['changes']
                if c['uid'] in index and c['uid'] not in restore_uids]
@@ -709,7 +734,7 @@ def _run_once_sync(now: float | None) -> dict:
                     'group': name,
                     'realm': realm,
                     'pool_median': result['pool_median'],
-                    'reason': result['reason'],
+                    'reason': result.get('note', ''),
                     'collisions': result['collisions'],
                     'restored': restored_items,
                     'changes': applied,
@@ -763,7 +788,7 @@ def _apply_sync(auth_dir: Path, window_seconds: int, dry_run: bool,
         out.append({
             'realm': result['realm'],
             'pool_median': result['pool_median'],
-            'reason': result['reason'],
+            'reason': result.get('note', ''),
             'note': result.get('note', ''),
             'collisions': result['collisions'],
             'restored': restored_items,

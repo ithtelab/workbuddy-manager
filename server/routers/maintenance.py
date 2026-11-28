@@ -1,6 +1,7 @@
 """数据库维护接口（issue #492 第二步）。
 
-两个端点都只允许管理员（`security.require_admin`）：
+两个端点都只允许**会话管理员**（`security.require_session_admin`）：
+压缩会重建数据库，和 pgsync 恢复 / 一键更新同级——不接受 API Token 调用：
 
   · `GET  /api/maintenance/database`         当前库/WAL 大小、主要表行数、最近一次结果
   · `POST /api/maintenance/database/compact` 执行 `VACUUM INTO` 压缩并原子替换
@@ -20,14 +21,14 @@ router = APIRouter(prefix='/api/maintenance', tags=['maintenance'])
 
 
 @router.get('/database')
-def get_database(user: dict = Depends(security.require_admin)) -> dict:
+def get_database(user: dict = Depends(security.require_session_admin)) -> dict:
     """数据库概况。不放任何 query 参数：前端只发一次裸 GET。"""
     return dbmaintenance.database_status()
 
 
 @router.post('/database/compact')
 def compact_database(request: Request,
-                     user: dict = Depends(security.require_admin)) -> dict:
+                     user: dict = Depends(security.require_session_admin)) -> dict:
     """压缩数据库。
 
     不声明 body / query 参数：前端 `post()` 会带一个空 JSON 对象，FastAPI 对

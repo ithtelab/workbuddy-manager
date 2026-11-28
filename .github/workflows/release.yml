@@ -34,6 +34,12 @@ permissions:
   # （实测报错：denied: installation not allowed to Create organization package）。
   packages: write
 
+# 同一 tag 只允许一个发版作业在跑：并发重跑会互相覆盖 Release 资产与
+# `:latest`/版本镜像 tag（2026-11-28 审查 H3）。不取消进行中的那一次。
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -169,6 +175,9 @@ jobs:
           echo "${TAG}" > "$STAGE/.version"
           # 不含运行时数据与凭据
           find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          # 测试可能留下 device token 临时目录（test_outbound_alignment 会写
+          # server/tests/_dt_tmp）；发布包不能带任何测试残留（2026-11-28 审查 M2）。
+          rm -rf "$STAGE/server/tests/_dt_tmp" "$STAGE/server/.pytest_cache" 2>/dev/null || true
           echo "stage=$STAGE" >> $GITHUB_OUTPUT
           # ── 可复现打包 ─────────────────────────────────────────────
           # 发布说明把 sha256 当作对用户的承诺。普通 `tar czf` 会把文件的
@@ -236,6 +245,27 @@ jobs:
             echo "::error::随包上游的补丁数不符：已应用 $GOT / 共 $N"
             exit 1
           fi
+          # 数量相同还不够：资产可能多带一个仓库已删除的旧补丁，或 manifest
+          # 声称的哈希与仓库补丁字节不一致。逐条比对键集合与 sha256
+          # （2026-11-28 审查 H5）。
+          python3 - "$TMP" <<'PY'
+          import glob, hashlib, json, os, sys
+          src = sys.argv[1]
+          with open(os.path.join(src, '.wb2a-patches.json'), encoding='utf-8') as fh:
+              manifest = json.load(fh)
+          want = {}
+          for path in glob.glob('dev/upstream-patches/*.patch'):
+              with open(path, 'rb') as fh:
+                  want[os.path.basename(path)] = hashlib.sha256(fh.read()).hexdigest()
+          extra = sorted(set(manifest) - set(want))
+          missing = sorted(set(want) - set(manifest))
+          if extra or missing:
+              raise SystemExit(f'manifest 与仓库补丁集合不一致：extra={extra} missing={missing}')
+          bad = [k for k, v in want.items() if manifest.get(k) != v]
+          if bad:
+              raise SystemExit(f'manifest 哈希与仓库补丁不一致：{bad}')
+          print(f'manifest 与仓库补丁逐条一致（{len(want)} 条）')
+          PY
 
           ( cd "$TMP" && go build ./... )
           ( cd "$TMP" && go test ./... )
@@ -331,8 +361,11 @@ jobs:
           STAGE="${{ steps.pack.outputs.stage }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "true" ]; then
-              echo "Release $TAG 还是草稿，覆盖产物"
+              echo "Release $TAG 还是草稿，覆盖产物并同步发布说明"
               gh release upload "$TAG" "${STAGE}.tar.gz" "${STAGE}.zip" --clobber
+              # 产物重建后字节/摘要都变了：发布说明里印的 sha256 与 upstream-id
+              # 必须同步刷新，否则用户手核对必然失败（2026-11-28 审查 H4）。
+              gh release edit "$TAG" --notes-file RELEASE_NOTES.md
             else
               # **已发布的 Release 绝不覆盖产物**：发布说明里印着 sha256，用户侧的
               # 更新器就是拿它核对的 —— 换掉字节流等于让所有人的更新校验失败

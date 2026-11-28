@@ -1,0 +1,96 @@
+diff --git a/internal/pool/entry.go b/internal/pool/entry.go
+index f18b719..fd04bc2 100644
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -466,15 +466,15 @@ type modelCostEntry struct {
+ }
+ 
+ // costPerReq 每次请求的平均扣费（选号分层的权威口径）。
+-// TotalRequests==0 是老 state.json 的迁移形态：沿用旧 CostPer1k，绝不置 0——
+-// 否则升级后全池瞬间按 0 成本挤进 tier 0。
++//
++// TotalRequests==0 是老 state.json 的迁移形态：旧 CostPer1k 是「每千 token 单价」，
++// 与 per-request 量纲不同，**不能**直接当成每次请求成本参与排序（2026-11-28
++// 审查：长请求时代旧值会小几十倍，收费号会被误判成最便宜优先选中）。迁移期按
++// 未知处理，等第一笔新观测写入后再参与成本排序。
+ func (mc modelCostEntry) costPerReq() float64 {
+ 	if mc.TotalRequests > 0 {
+ 		return mc.TotalCredit / float64(mc.TotalRequests)
+ 	}
+-	if mc.CostPer1k > 0 {
+-		return mc.CostPer1k
+-	}
+ 	return 0
+ }
+ 
+@@ -492,17 +492,15 @@ func (mc modelCostEntry) per1k() float64 {
+ //   - 1 = 无观测 / 单笔 0 未知（单笔 credit=0 可能只是短请求的固定底价豁免）
+ //   - 2 = 已累计观测收费
+ //
+-// Requests==0 是老 state.json 迁移形态：保留旧的免费/收费结论（CostPer1k<=0 且
+-// Samples>=2 视为旧免费观测；单笔旧 0 观测按未知处理，与新的「单笔 0 不判免费」一致）。
++// Requests==0 是老 state.json 迁移形态：只保留**免费**这个可用旧结论
++// （CostPer1k<=0 且 Samples>=2）；旧收费观测的单位不可比，按未知（tier 1）处理，
++// 等新样本落账再分层。
+ func (mc modelCostEntry) costTier() int {
+ 	if mc.TotalRequests == 0 {
+-		if mc.CostPer1k <= 0 {
+-			if mc.Samples >= 2 {
+-				return 0
+-			}
+-			return 1
++		if mc.CostPer1k <= 0 && mc.Samples >= 2 {
++			return 0
+ 		}
+-		return 2
++		return 1
+ 	}
+ 	if mc.TotalCredit == 0 {
+ 		if mc.TotalRequests >= 2 {
+diff --git a/internal/pool/modelcost_persist_test.go b/internal/pool/modelcost_persist_test.go
+index ab81efc..a99bd06 100644
+--- a/internal/pool/modelcost_persist_test.go
++++ b/internal/pool/modelcost_persist_test.go
+@@ -218,10 +218,11 @@ func TestModelCostRestoreDropsInvalid(t *testing.T) {
+ 	}
+ }
+ 
+-// TestModelCostRestoreLegacyPer1kNotZeroed 迁移（issue #491）：老 state.json 只有
+-// cost_per_1k、没有累计量（TotalRequests==0）。CostPerReq 必须沿用旧 CostPer1k，
+-// 不能置 0——否则升级后全池瞬间按 0 成本挤进 tier 0。
+-func TestModelCostRestoreLegacyPer1kNotZeroed(t *testing.T) {
++// TestModelCostRestoreLegacyPer1kIsUnknown 迁移（issue #491 + 2026-11-28 审查）：
++// 老 state.json 只有 cost_per_1k、没有累计量（TotalRequests==0）。旧值是「每千
++// token 单价」，与 per-request 量纲不同，不能直接参与选号排序；迁移期按未知
++// （tier 1）处理，等第一笔新观测写入。
++func TestModelCostRestoreLegacyPer1kIsUnknown(t *testing.T) {
+ 	dir := t.TempDir()
+ 	fp := filepath.Join(dir, "state.json")
+ 	now := time.Now().Format(time.RFC3339Nano)
+@@ -250,11 +251,11 @@ func TestModelCostRestoreLegacyPer1kNotZeroed(t *testing.T) {
+ 	if paid.TotalRequests != 0 || paid.TotalCredit != 0 || paid.TotalTokens != 0 {
+ 		t.Fatalf("老格式不应伪造累计量: %+v", paid)
+ 	}
+-	if got := paid.costPerReq(); got != 2.5 {
+-		t.Errorf("迁移 CostPerReq=%v want 2.5（沿用旧 CostPer1k，不能置 0）", got)
++	if got := paid.costPerReq(); got != 0 {
++		t.Errorf("迁移 CostPerReq=%v want 0（旧 per-1k 不能当 per-request 用）", got)
+ 	}
+-	if got := paid.costTier(); got != 2 {
+-		t.Errorf("迁移收费条目 tier=%d want 2（不能因累计量为 0 判免费）", got)
++	if got := paid.costTier(); got != 1 {
++		t.Errorf("迁移收费条目 tier=%d want 1（单位不可比，按未知处理）", got)
+ 	}
+ 	free, _ := modelCostSnapshot(p, "u1", "free")
+ 	if got := free.costTier(); got != 0 {
+@@ -274,8 +275,8 @@ func TestModelCostRestoreLegacyPer1kNotZeroed(t *testing.T) {
+ 	if paidRow == nil {
+ 		t.Fatal("/status 缺少迁移条目")
+ 	}
+-	if paidRow.CostPerReq != 2.5 {
+-		t.Errorf("/status cost_per_req=%v want 2.5（不能是 0）", paidRow.CostPerReq)
++	if paidRow.CostPerReq != 0 {
++		t.Errorf("/status cost_per_req=%v want 0（未知，不是旧 per-1k 原值）", paidRow.CostPerReq)
+ 	}
+ 	if paidRow.CostPer1k != 2.5 {
+ 		t.Errorf("/status cost_per_1k=%v want 2.5（诊断值沿用旧值）", paidRow.CostPer1k)

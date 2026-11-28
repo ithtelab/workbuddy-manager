@@ -923,6 +923,11 @@ def _scan_sse(pending: str, usage: dict) -> tuple[str, bool]:
     return pending, saw_content
 
 
+# 首帧探测缓冲上限：正常 SSE 帧远小于它；异常上游持续发无换行大块时，
+# 超过就只保留尾部（见响应循环里的注释）。
+_FIRST_FRAME_BUF_MAX = 1 << 20
+
+
 def _has_data_frame(text: str) -> bool:
     """这段文本里是否已经出现「带负载的 `data:` 帧」。
 
@@ -1554,6 +1559,10 @@ async def _chat(request: Request, upstream_path: str):
                         first_frame_buf = ''
                     elif '\n' in first_frame_buf:
                         first_frame_buf = first_frame_buf.rsplit('\n', 1)[1]
+                    elif len(first_frame_buf) > _FIRST_FRAME_BUF_MAX:
+                        # 异常上游持续发无换行的大块：别让缓冲区无限增长，
+                        # 也别每块都全量重扫（O(n²)）。保留尾部仍有机会命中。
+                        first_frame_buf = first_frame_buf[-4096:]
                 if 'data:' in piece:
                     last_activity_at = time.monotonic()
                 if idle_limit > 0 and time.monotonic() - last_activity_at > idle_limit:

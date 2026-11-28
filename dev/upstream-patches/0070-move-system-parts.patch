@@ -1,0 +1,80 @@
+diff --git a/internal/prompt/move_test.go b/internal/prompt/move_test.go
+index ecb5cc5..ac799ce 100644
+--- a/internal/prompt/move_test.go
++++ b/internal/prompt/move_test.go
+@@ -54,6 +54,9 @@ func TestMoveSystemToUserBails(t *testing.T) {
+ 		// TestMoveSystemToUserSupportsContentParts 覆盖。
+ 		"user content 为 null": `{"messages":[{"role":"system","content":"s"},` +
+ 			`{"role":"user","content":null}]}`,
++		"system 数组无 text part": `{"messages":[{"role":"system","content":[` +
++			`{"type":"image_url","image_url":{"url":"x"}}]},` +
++			`{"role":"user","content":"hi"}]}`,
+ 	}
+ 	for name, body := range cases {
+ 		if _, ok := MoveSystemToUser([]byte(body)); ok {
+@@ -62,6 +65,35 @@ func TestMoveSystemToUserBails(t *testing.T) {
+ 	}
+ }
+ 
++// TestMoveSystemToUserSupportsSystemContentParts system 侧也可能是 parts 数组：
++// 只取 text part 拼接，不能让整次抢救因类型断言失败而放弃。
++func TestMoveSystemToUserSupportsSystemContentParts(t *testing.T) {
++	body := []byte(`{"messages":[` +
++		`{"role":"system","content":[{"type":"text","text":"PERSONA-A"},` +
++		`{"type":"image_url","image_url":{"url":"x"}}]},` +
++		`{"role":"user","content":"hello"}]}`)
++	out, ok := MoveSystemToUser(body)
++	if !ok {
++		t.Fatal("system content parts 数组也应能搬运")
++	}
++	var req struct {
++		Messages []struct {
++			Role    string `json:"role"`
++			Content any    `json:"content"`
++		} `json:"messages"`
++	}
++	if err := json.Unmarshal(out, &req); err != nil {
++		t.Fatalf("输出不是合法 JSON: %v", err)
++	}
++	if req.Messages[0].Role != "system" || req.Messages[0].Content != Degraded {
++		t.Fatalf("首条应换成中性提示词，got %+v", req.Messages[0])
++	}
++	if s, _ := req.Messages[1].Content.(string); !strings.Contains(s, "PERSONA-A") ||
++		!strings.HasSuffix(s, "hello") {
++		t.Fatalf("system text part 应搬到 user 前部，got %q", req.Messages[1].Content)
++	}
++}
++
+ // TestMoveSystemToUserSupportsContentParts issue #479：Codex / 多模态客户端的
+ // user content 是 content parts 数组，旧的字符串断言会让 11128 抢救整条失效。
+ func TestMoveSystemToUserSupportsContentParts(t *testing.T) {
+diff --git a/internal/prompt/prompt.go b/internal/prompt/prompt.go
+index 821908a..0d885fe 100644
+--- a/internal/prompt/prompt.go
++++ b/internal/prompt/prompt.go
+@@ -187,8 +187,23 @@ func MoveSystemToUser(body []byte) ([]byte, bool) {
+ 		role, _ := mm["role"].(string)
+ 		switch role {
+ 		case "system", "developer":
+-			if s, ok := mm["content"].(string); ok && s != "" {
+-				sysTexts = append(sysTexts, s)
++			switch content := mm["content"].(type) {
++			case string:
++				if content != "" {
++					sysTexts = append(sysTexts, content)
++				}
++			case []any:
++				// system 也可能是 content parts 数组（部分客户端把 system 写成
++				// `[{type:"text"...}]`）：只取 text part，其它 part 忽略。
++				for _, part := range content {
++					pm, ok := part.(map[string]any)
++					if !ok || pm["type"] != "text" {
++						continue
++					}
++					if text, ok := pm["text"].(string); ok && text != "" {
++						sysTexts = append(sysTexts, text)
++					}
++				}
+ 			}
+ 		case "user":
+ 			if firstUser < 0 {

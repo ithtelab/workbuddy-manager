@@ -561,6 +561,17 @@ class ChatUaDesktopAlignmentTest(unittest.TestCase):
             with mock.patch.object(realm, '_read_upstream_sec', return_value={}):
                 self.assertIn('CLI/', realm._ua(realm.CN))
 
+    def test_v3_config_forces_cli_ua(self) -> None:
+        """`/v3/config` 的 UA 门禁只放行三段式：默认桌面形态下也必须强制 CLI。
+
+        2026-11-28 审查：默认 UA 改成单段后，模型目录会静默丢模型。
+        """
+        with mock.patch.object(realm, '_read_upstream_sec', return_value={}):
+            self.assertEqual(realm.cli_ua(realm.CN),
+                             'WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.63.2')
+            self.assertEqual(realm.cli_ua(realm.GLOBAL),
+                             'WorkBuddy/5.11.3 WorkBuddy AI/5.11.3 CLI/2.63.2')
+
     def test_explicit_versions_still_override(self) -> None:
         with mock.patch.object(realm, '_read_upstream_sec', return_value={}),              mock.patch.object(realm, 'client_version', return_value='6.0.0'),              mock.patch.object(realm, 'cli_version', return_value='3.0.0'):
             self.assertEqual(realm._ua(realm.CN), 'WorkBuddy/6.0.0')

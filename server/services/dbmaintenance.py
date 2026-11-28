@@ -154,6 +154,28 @@ def _staging_path(target: Path) -> Path:
     return target.parent / f'{target.name}.compact-{os.getpid()}-{time.time_ns()}'
 
 
+def _cleanup_stale_staging(target: Path, *, older_than: float = 3600) -> int:
+    """删掉异常退出留下的整库副本（`*.compact-*`）。
+
+    只删一小时前的：另一个进程可能正在压缩，它的 staging 是新的。
+    这些文件是完整数据库副本（含请求日志、密钥哈希、审计），不能长期留在盘上。
+    """
+    removed = 0
+    try:
+        candidates = list(target.parent.glob(target.name + '.compact-*'))
+    except OSError:
+        return 0
+    for path in candidates:
+        try:
+            if time.time() - path.stat().st_mtime < older_than:
+                continue
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def _remember_result(kind: str, payload: dict) -> None:
     """把最近一次维护结果写进 settings，供 GET 接口展示。
 
@@ -220,46 +242,66 @@ def compact_database() -> dict[str, int]:
     started = time.monotonic()
     staging: Path | None = None
     replaced = False
+    probe: sqlite3.Connection | None = None
     try:
         config.ensure_dirs()
         target = Path(config.DB_PATH)
+        _cleanup_stale_staging(target)
 
         # 先 checkpoint：把 WAL 里的已提交页并回主库，让「当前库大小」与
         # VACUUM INTO 看到的快照一致，也顺带缩小替换时的 WAL 残留。
         _checkpoint()
 
-        # 整个复制 + 替换期间持锁，挡住并发写入（见文件顶部注释）。
+        before = _file_size(target)
+        wal_bytes = _file_size(Path(str(target) + '-wal'))
+        source_bytes = before + wal_bytes
+        need = int(source_bytes * _COMPACT_MIN_FREE_FACTOR)
+        free = int(shutil.disk_usage(target.parent).free)
+        if free < need:
+            raise InsufficientDiskSpace(
+                f'磁盘空间不足：压缩至少需要 {need} 字节（当前库 {source_bytes} × '
+                f'{_COMPACT_MIN_FREE_FACTOR:g}），可用 {free} 字节')
+
+        staging = _staging_path(target)
+        if staging.exists():  # 理论上不会命中；防御异常退出留下的同名文件
+            staging.unlink()
+
+        # 长耗时部分（快照 + 完整性检查）**不持 db._lock**：VACUUM INTO 读的是
+        # 一致性快照，期间网关的读写照常进行；用另一条常驻只读连接记录
+        # data_version，替换前若发现期间有提交就放弃本次（下次再压）。
+        #
+        # 不能读 db 共享连接上的 data_version：同一连接上的提交不会改变它。
+        probe = sqlite3.connect(_readonly_uri(target), uri=True)
+        version = int(probe.execute('PRAGMA data_version').fetchone()[0])
+        source = sqlite3.connect(_readonly_uri(target), uri=True,
+                                 isolation_level=None)
+        try:
+            source.execute('VACUUM INTO ?', (str(staging),))
+        except sqlite3.Error as exc:
+            raise CompactError(f'VACUUM INTO 失败：{exc}') from exc
+        finally:
+            source.close()
+
+        # staging 是整库副本：先收紧权限，避免同机其它用户读到请求日志/密钥哈希。
+        try:
+            os.chmod(staging, 0o600)
+        except OSError:
+            pass
+
+        ok, detail = _integrity_ok(staging)
+        if not ok:
+            raise CompactError(f'压缩副本完整性检查未通过：{detail}')
+
+        # 只把「校验版本 + 两次 rename」放进锁内（毫秒级）。锁一旦拿到，
+        # 本进程的写入都被挡住；probe 必须在 rename 前关闭（Windows 上打开着
+        # 的句柄会让 os.replace 失败）。
         with db._lock:
-            db.connect()
-            before = _file_size(target)
-            wal_bytes = _file_size(Path(str(target) + '-wal'))
-            source_bytes = before + wal_bytes
-            need = int(source_bytes * _COMPACT_MIN_FREE_FACTOR)
-            free = int(shutil.disk_usage(target.parent).free)
-            if free < need:
-                raise InsufficientDiskSpace(
-                    f'磁盘空间不足：压缩至少需要 {need} 字节（当前库 {source_bytes} × '
-                    f'{_COMPACT_MIN_FREE_FACTOR:g}），可用 {free} 字节')
-
-            staging = _staging_path(target)
-            if staging.exists():  # 理论上不会命中；防御异常退出留下的同名文件
-                staging.unlink()
-
-            source = sqlite3.connect(_readonly_uri(target), uri=True,
-                                     isolation_level=None)
-            try:
-                source.execute('VACUUM INTO ?', (str(staging),))
-            except sqlite3.Error as exc:
-                raise CompactError(f'VACUUM INTO 失败：{exc}') from exc
-            finally:
-                source.close()
-
-            ok, detail = _integrity_ok(staging)
-            if not ok:
-                raise CompactError(f'压缩副本完整性检查未通过：{detail}')
-
-            # 这里仍持有 _lock；RLock 同线程重入，replace_database 内部的
-            # `with _lock` 不会死锁。
+            current = int(probe.execute('PRAGMA data_version').fetchone()[0])
+            probe.close()
+            probe = None
+            if current != version:
+                raise MaintenanceBusy(
+                    '压缩期间有新的写入，已放弃本次压缩；请稍后重试')
             db.replace_database(staging)
             replaced = True
             after = _file_size(target)
@@ -279,6 +321,11 @@ def compact_database() -> dict[str, int]:
         _remember_result('compact', {'ok': False, 'error': str(exc)[:300]})
         raise
     finally:
+        if probe is not None:
+            try:
+                probe.close()
+            except sqlite3.Error:
+                pass
         # 替换成功后 staging 已被 rename 走；失败时清掉副本，原库不动。
         if staging is not None and not replaced:
             try:

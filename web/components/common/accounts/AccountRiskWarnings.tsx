@@ -79,10 +79,13 @@ export function AccountRiskWarnings({
   const rawItems = data?.items ?? [];
   const items = hideLowPriority ? rawItems.filter((x) => x.severity !== 'info') : rawItems;
   const pausedCount = new Set(items.filter((x) => x.paused === true).map((x) => `${x.group}:${x.uid}`)).size;
-  if (activeOnly ? !items.length : (!items.length && !data?.total && !failed)) return null;
+  // 接口失败时必须显示出来（带重试），不能因为 items 为空就把整条预警栏隐藏——
+  // 用户会以为「当前没有任何预警」，而实际上只是没取到。
+  if (!items.length && !data?.total && !failed) return null;
   /** 没被暂停时默认收起：列表里多为非暂停类异常记录（旅行领奖 500、签到 429…），
-   *  默认一行顶栏即可提醒运维处理或确认；真有账号被暂停才默认展开。 */
-  const fold = foldPref === null ? pausedCount === 0 : foldPref === '1';
+   *  默认一行顶栏即可提醒运维处理或确认；真有账号被暂停才默认展开。
+   *  加载失败时强制展开，否则错误行藏在折叠区里看不见。 */
+  const fold = failed ? false : (foldPref === null ? pausedCount === 0 : foldPref === '1');
   function toggleFold() {
     const next = !fold;
     setFoldPref(next ? '1' : '0');

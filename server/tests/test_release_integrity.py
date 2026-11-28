@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
 import tarfile
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -108,10 +110,19 @@ class DownloadIntegrityTest(unittest.TestCase):
         self.assertIn('大小不符', msg)
         self.assertIn('再点一次更新', msg)
 
-    def test_missing_digest_installs_but_says_not_compared(self) -> None:
-        """回退路径拿不到摘要：照装（否则 API 被限流就没法更新），但如实标注。"""
+    def test_missing_digest_is_refused_by_default(self) -> None:
+        """回退路径拿不到摘要 = 没有防篡改能力：默认 fail-closed（2026-11-28 审查）。"""
         rep = _Rep()
-        self.mod.verify_download(self.pkg, {'pkg_size': None, 'pkg_digest': ''}, rep)
+        with self.assertRaises(RuntimeError) as ctx:
+            self.mod.verify_download(self.pkg, {'pkg_size': None, 'pkg_digest': ''}, rep)
+        self.assertIn('拒绝自动安装', str(ctx.exception))
+        self.assertIsNone(rep.integrity, '拒绝时不该记成任何校验状态')
+
+    def test_missing_digest_opt_in_installs_with_warning(self) -> None:
+        """显式接受风险（WB_ALLOW_UNVERIFIED_UPDATE=1）才允许继续，并如实标注。"""
+        rep = _Rep()
+        with mock.patch.dict(os.environ, {'WB_ALLOW_UNVERIFIED_UPDATE': '1'}):
+            self.mod.verify_download(self.pkg, {'pkg_size': None, 'pkg_digest': ''}, rep)
         self.assertEqual(rep.integrity['status'], 'none')
         self.assertTrue(rep.warned(), '没比对摘要却不当回事 —— 应该告警')
         self.assertIn('未比对发布页摘要', rep.text())

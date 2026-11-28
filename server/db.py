@@ -636,10 +636,35 @@ def _explain_db_open_failure(exc: Exception) -> str:
     return '\n'.join(lines)
 
 
+def _recover_interrupted_swap() -> None:
+    """启动时恢复「替换数据库」中断留下的现场。
+
+    `replace_database()` 是两次 rename：`target → .swap-old`、`staging → target`。
+    进程在两步之间被 kill / OOM / 断电时，`target` 不存在而 `.swap-old` 是最后
+    一份完整数据。以前只有再次调用 `replace_database()` 才会走恢复分支；正常
+    启动的 `connect()` 会直接建一个空库，用户看到「数据全没了」。
+
+    这里在打开连接前把 `.swap-old` 放回正式位置。若两者都在，说明第二次
+    rename 已完成，旧文件只是没来得及删，留给 connect() 成功后再清理。
+    """
+    target = Path(config.DB_PATH)
+    old = Path(str(target) + '.swap-old')
+    try:
+        if not target.exists() and old.exists():
+            os.replace(old, target)
+    except OSError:
+        # 恢复失败时不要阻断启动：下面 sqlite3.connect 会给出更具体的错误。
+        pass
+
+
 def connect() -> sqlite3.Connection:
     global _conn
     if _conn is None:
         config.ensure_dirs()
+        # 上次替换在「旧库改名 → 新库就位」之间崩溃时，正式库文件不存在，
+        # 最后一份完整数据在 .swap-old。这里必须先恢复，否则 sqlite3.connect
+        # 会新建一个空库，原数据静默留在残骸里（安全审查 2026-11-28）。
+        _recover_interrupted_swap()
         try:
             _conn = sqlite3.connect(str(config.DB_PATH), check_same_thread=False)
             _conn.row_factory = sqlite3.Row
@@ -671,6 +696,14 @@ def connect() -> sqlite3.Connection:
         ensure_hourly_today()
         # 启动时也清一次侧表：低流量部署可能很久攒不够触发周期清理的写入量。
         _prune_side_tables()
+        # 新库已确认可打开：上一次替换留下的 .swap-old 只是没删掉的旧副本。
+        # 放在所有初始化成功之后才删——中途失败时它还是唯一的回滚副本。
+        try:
+            Path(str(config.DB_PATH) + '.swap-old').unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
     return _conn
 
 

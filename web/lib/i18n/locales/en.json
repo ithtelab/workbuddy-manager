@@ -482,7 +482,7 @@
     "weightSaved": "Weight saved: ×{weight}",
     "weightCleared": "Weight reset to default (1)",
     "skipTasksBadge": "No tasks",
-    "skipTasksBadgeTitle": "This account is excluded from scheduled tasks (check-in, token keep-alive, travel, activity, school, night cat). Forwarding is unaffected: the account stays in the pool.",
+    "skipTasksBadgeTitle": "This account is excluded from scheduled tasks (check-in, travel, activity, school, night cat). Token keep-alive/renewal still runs, and forwarding is unaffected: the account stays in the pool.",
     "skipTasksEnable": "Exclude from scheduled tasks (keep forwarding)",
     "skipTasksDisable": "Include in scheduled tasks again",
     "skipTasksSavedOn": "This account no longer runs scheduled tasks (forwarding stays active)",
@@ -1309,7 +1309,8 @@
     "viewRaw": "Raw log",
     "addHour": "Add hour",
     "removeHour": "Remove hour",
-    "reportCountOutOfRange": "The backend accepts {min}-{max} reports; the current value is out of range — pick a valid one"
+    "reportCountOutOfRange": "The backend accepts {min}-{max} reports; the current value is out of range — pick a valid one",
+    "schedulerKeepNote": "Keep upstream re-enables upstream check-in and activity reporting; keep panel turns them off."
   },
   "addAccount": {
     "title": "Add Tencent account · {realm}",

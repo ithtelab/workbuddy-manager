@@ -400,9 +400,14 @@ export default function DashboardPage() {
    *     处理完了（两种机制同属这一类，只是实现不同）。
    */
   const unusable = availability.notLoaded + availability.disabled
-    + availability.neverSucceeded + availability.cooling;
+    + availability.neverSucceeded + availability.cooling
+    + availability.needsRelogin;
 
-  const valid = scoped.filter((a) => !a.is_expired).length;
+  // 「需重登」的 JWT 往往还没过期，但账号实际已不可用：不能算进有效账号，
+  // 否则卡片会显示「全部正常」而同一页快照标着「需重登」。
+  const valid = scoped.filter(
+    (a) => !a.is_expired && availabilityOf(a) !== 'needsRelogin',
+  ).length;
   const expiring = scoped.filter((a) => a.remain_seconds > 0 && a.remain_seconds < 3600).length;
   // 积分余额合计（仅统计已同步到的账号）
   // 优先用实时查询到的积分，其次上游 /status 的（可能滞后的）值
@@ -538,7 +543,12 @@ export default function DashboardPage() {
                 ? t('dashboard.groupsPartial', {n: failedGroups.length})
                 : t('state.partialFailed')
           }
-          onRetry={reload}
+          onRetry={() => {
+            // 积分是独立取数线：只 reload 主 hook 不会清掉 creditsState.errors，
+            // 横幅会一直挂着（直到下一次 30 秒心跳）而用户以为重试没生效。
+            reload();
+            creditsState.reload();
+          }}
         />
       )}
 
@@ -946,7 +956,7 @@ export default function DashboardPage() {
           <span className="text-sm font-medium">{t('dashboard.healthSnapshot')}</span>
           {/* 各档汇总：一眼看清「有几个能真用」。文案与账号页共用同一套键，
               两页不会出现「一个叫在线、一个叫正常」这种漂移。 */}
-          {(['online', 'notLoaded', 'cooling', 'neverSucceeded', 'disabled', 'expired', 'unknown'] as AvailabilityTier[])
+          {(['online', 'notLoaded', 'cooling', 'neverSucceeded', 'needsRelogin', 'disabled', 'expired', 'unknown'] as AvailabilityTier[])
             .filter((tier) => availability[tier] > 0)
             .map((tier) => (
               <span

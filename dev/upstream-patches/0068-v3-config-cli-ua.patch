@@ -1,0 +1,64 @@
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index df8d7b2..1b11ca3 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -1910,10 +1910,13 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	// CommonHeaders 当前默认桌面单段式 UA；历史上三段式 CLI UA 已实测可通过
+-	// /v3/config 的 UA 门禁（Bearer + web UA → 400 code 12403，见
+-	// global-models-missing.md）。若桌面形态被拒，可用 upstream.ua_style=cli 回退。
++	// /v3/config 的 UA 门禁只放行三段式 CLI UA（Bearer + 单段/网页 UA → 400
++	// code 12403，见 global-models-missing.md）。默认 UA 改成桌面单段后，这里
++	// 必须显式覆写回 CLI 形态；用户显式配了 user_agent 则尊重其选择。
+ 	c.CommonHeaders(req, a)
++	if c.UserAgent == "" {
++		req.Header.Set("User-Agent", c.legacyCLIUA(a))
++	}
+ 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+ 	resp, err := c.HTTP.Do(req)
+ 	if err != nil {
+diff --git a/internal/upstream/headers.go b/internal/upstream/headers.go
+index 47e0a8d..023e50b 100644
+--- a/internal/upstream/headers.go
++++ b/internal/upstream/headers.go
+@@ -110,6 +110,19 @@ func (c *Client) userAgent(a *auth.Auth) string {
+ 	return c.defaultWorkBuddyUAFor(a)
+ }
+ 
++// legacyCLIUA 强制三段式 CLI UA（`WorkBuddy/<ver> <platform>/<ver> CLI/<cliVer>`）。
++//
++// 只给有 UA 门禁的端点用（`/v3/config`：历史上只有三段式能过，单段/网页 UA 被
++// 400 code 12403 拒）。不受 upstream.ua_style 影响——默认改成桌面单段后，这个端点
++// 仍然必须发 CLI 形态，否则模型目录会静默缺模型（2026-11-28 审查）。
++func (c *Client) legacyCLIUA(a *auth.Auth) string {
++	platform := "WorkBuddy"
++	if a != nil && a.IsGlobal() {
++		platform = "WorkBuddy AI"
++	}
++	return "WorkBuddy/" + c.clientVersion() + " " + platform + "/" + c.clientVersion() + " CLI/" + c.cliVersion()
++}
++
+ // billingUA 白名单类（billing/checkin/banner）出站 UA。
+ // 语义对齐官方 application-manifest.js:27590-27601（banner 白名单接口显式头组）：
+ // 这类接口用单段 `WorkBuddy/<clientVersion>`（不带 CLI 段——官方 banner 显式覆写 UA
+diff --git a/internal/upstream/headers_global_test.go b/internal/upstream/headers_global_test.go
+index 96ef2c0..9c02677 100644
+--- a/internal/upstream/headers_global_test.go
++++ b/internal/upstream/headers_global_test.go
+@@ -146,6 +146,14 @@ func TestDefaultWorkBuddyUAForGlobal(t *testing.T) {
+ 	if got := c3.defaultWorkBuddyUAFor(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 WorkBuddy AI/6.0.0 CLI/9.9.9" {
+ 		t.Errorf("defaultWorkBuddyUAFor(global, cli) = %q", got)
+ 	}
++	// legacyCLIUA 与 ua_style 无关：/v3/config 的 UA 门禁只认三段式。
++	c4 := &Client{ClientVersion: "6.0.0", CliVersion: "9.9.9"} // 默认 desktop
++	if got := c4.legacyCLIUA(&auth.Auth{}); got != "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/9.9.9" {
++		t.Errorf("legacyCLIUA(cn) = %q", got)
++	}
++	if got := c4.legacyCLIUA(&auth.Auth{Domain: "www.workbuddy.ai"}); got != "WorkBuddy/6.0.0 WorkBuddy AI/6.0.0 CLI/9.9.9" {
++		t.Errorf("legacyCLIUA(global) = %q", got)
++	}
+ }
+ 
+ // mustRequest 构造一个无 body 的 POST 请求（测试 ChatHeaders 用）。

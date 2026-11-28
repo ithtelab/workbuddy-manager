@@ -371,5 +371,50 @@ class ApplyTest(unittest.TestCase):
         self.assertIn('账号文件', out[0]['error'])
 
 
+class MixedRealmDemotionTest(unittest.TestCase):
+    """混合 realm 分组：评估 cn 时不能把 global 的有效降权记录判成失效。
+
+    安全审查 2026-11-28：`_evaluate_with_index` 先把 index 过滤成单 realm，
+    再交给 `_pending_restores`，另一个 realm 的账号必然「不在 index 里」→
+    stale → 被 prune 删除，权重永久停在下限。
+    """
+
+    def test_other_realm_record_is_not_stale(self) -> None:
+        auth_dir = Path('auth')
+        index = {
+            'aaaa1111': {'uid': 'aaaa1111', 'file': 'workbuddy-a.json',
+                         'realm': 'cn', 'weight': 0.15},
+            'bbbb2222': {'uid': 'bbbb2222', 'file': 'workbuddy-b.json',
+                         'realm': 'global', 'weight': 0.15},
+        }
+        record = {'uid': 'bbbb2222', 'file': 'workbuddy-b.json',
+                  'original_weight': 0, 'demoted_to': 0.15,
+                  'expires_at': 10_000_000, 'applied_at': 1}
+        with mock.patch.object(S, 'collect', return_value=[]), \
+                mock.patch.object(S, 'demotions', return_value={'bbbb2222': record}):
+            result = S._evaluate_with_index(auth_dir, 900, 'cn', index, [], now=1000)
+        self.assertEqual(result['stale_demotions'], [],
+                         'global 的记录不能在 cn 评估时被判失效')
+        self.assertEqual(result['restores'], [], '未到期的记录也不该提前恢复')
+
+    def test_apply_sync_does_not_require_reason_key(self) -> None:
+        """`evaluate_group` 的真实返回没有 `reason` 键；`_apply_sync` 必须能跑完。
+
+        旧代码直接 `result['reason']` → KeyError：手动 apply 与自动调度都会 500，
+        而单测用 mock 塞了 reason，所以一直绿。
+        """
+        realm_result = {
+            'realm': 'cn', 'pool_median': None, 'rows': [], 'changes': [],
+            'restores': [], 'stale_demotions': [], 'collisions': [],
+            'note': '样本不足（可用账号少于 2 个）',
+        }
+        grouped = {'conflicts': [], 'realms': [realm_result]}
+        with mock.patch.object(S, 'evaluate_group', return_value=grouped), \
+                mock.patch.object(S, 'prune_demotions'):
+            out = S._apply_sync(Path('auth'), 900, True, None)
+        self.assertEqual(out['realms'][0]['reason'], '样本不足（可用账号少于 2 个）')
+        self.assertEqual(out['realms'][0]['note'], '样本不足（可用账号少于 2 个）')
+
+
 if __name__ == '__main__':
     unittest.main()

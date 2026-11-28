@@ -10,7 +10,7 @@
   `deploy/check-upstream.sh` 只提示这一点并以 0 退出；需要验证的是补丁与
   Go 测试，不是 git 提交。
 - **源码从哪来**：维护者手上留存了一份**最后版本的源码归档**（HEAD 快照，
-  287 个文件，含 `LICENSE`）。它是完整的、可构建的；但原克隆是 blob-less
+  351 个文件，含 `LICENSE`）。它是完整的、可构建的；但原克隆是 blob-less
   部分克隆，**逐版本历史无法完整还原**，所以归档以「单次导入提交」的形式保存，
   不能 checkout 出中间某次提交的源码。
 - **源码怎么到达用户**（**不要**把上游代码提交进本仓库，也不要另开公开镜像）：
@@ -21,8 +21,8 @@
   3. `gh release upload upstream-src /tmp/upstream-pack/workbuddy2api-src.tar.gz --clobber`
      —— 覆盖到**固定的载体 Release**（tag `upstream-src`，**必须是 pre-release**：
      否则它会成为 `releases/latest`，把面板的更新检查带偏）；
-  4. 之后任何一次面板发版，CI 都会把它塞进发布包的 `upstream/`（取不到只告警、不
-     阻断发布），用户装/更新时就用它。
+  4. 之后任何一次面板发版，CI 都会把它塞进发布包的 `upstream/`（取不到会直接
+     让发布失败，不再产出不含上游的包），用户装/更新时就用它。
 - **改动上游代码**：改本地那份源码（`/opt/workbuddy2api`），
   然后 `docker compose up -d --build`。改的是别人的 MIT 代码，需保留其
   `LICENSE` 与版权声明。
@@ -56,7 +56,7 @@
 
 **CI 的发布门禁**（2.2.1 起）：发布作业会把随包上游当成一次真实构建来验 ——
 `apply_upstream_patches.py` 必须报「补丁数 = 文件数，且没有现场新应用的」，
-然后 `go build ./...`、`go test ./...`、对**补丁动过的文件**跑 `gofmt -l`，
+然后 `go build ./...`、`go test ./...`、对**补丁新增的 Go 文件**跑 `gofmt -l`，
 并校验 `server/main.py` 的 `version=` 与 tag 一致。以前只跑 Python 测试，
 上游补丁的缺陷可以一路进 Release。
 

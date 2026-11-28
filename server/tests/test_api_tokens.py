@@ -281,6 +281,9 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'POST /api/security/rules',
         'POST /api/sessions/revoke',
         'POST /api/settings/upstream',
+        # 数据库压缩会重建整库并短暂占锁（可用性动作），与 pgsync 恢复同级；
+        # 2026-11-28 审查：只接受会话管理员。
+        'POST /api/maintenance/database/compact',
         # 离线升级包（issue #153）：上传的是**可执行的代码包**，且下一步就是落盘重启
         'POST /api/system/update-package',
         'DELETE /api/system/update-package',

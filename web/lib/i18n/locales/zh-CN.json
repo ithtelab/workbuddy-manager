@@ -455,7 +455,7 @@
     "weightSaved": "权重已保存：×{weight}",
     "weightCleared": "已恢复默认权重（1）",
     "skipTasksBadge": "不参与任务",
-    "skipTasksBadgeTitle": "该账号不参与签到、保活、旅行、活跃、开学季、夜猫等定时任务；转发不受影响（账号仍在号池里）。",
+    "skipTasksBadgeTitle": "该账号不参与签到、旅行、活跃、开学季、夜猫等定时任务；token 保活/续期照常，转发不受影响（账号仍在号池里）。",
     "skipTasksEnable": "设置为不参与定时任务（保留转发）",
     "skipTasksDisable": "恢复参与定时任务",
     "skipTasksSavedOn": "已设置该账号不参与定时任务（转发照常）",
@@ -1282,7 +1282,8 @@
     "viewRaw": "原文",
     "addHour": "添加时刻",
     "removeHour": "移除时刻",
-    "reportCountOutOfRange": "后端允许 {min}-{max} 条，当前值超出范围，请重新选择"
+    "reportCountOutOfRange": "后端允许 {min}-{max} 条，当前值超出范围，请重新选择",
+    "schedulerKeepNote": "「只保留上游」会重新开启上游的签到与活跃上报；「只保留面板」会关闭它们。"
   },
   "addAccount": {
     "title": "添加腾讯账号 · {realm}",

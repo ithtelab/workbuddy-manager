@@ -180,6 +180,18 @@ def _ua(realm: Realm) -> str:
     return f'{platform}/{ver}'
 
 
+def cli_ua(realm: Realm) -> str:
+    """强制三段式 CLI UA。只给 `/v3/config` 这类**有 UA 门禁**的端点用。
+
+    2026-11-28 审计：该端点历史上只放行三段式 CLI UA（web/单段被 400 code
+    12403 拒），而 issue #497 把默认 UA 改成桌面单段后，模型目录会静默丢模型。
+    这里固定返回 CLI 形态，与 `upstream.ua_style` 无关。
+    """
+    ver = client_version()
+    platform = 'WorkBuddy AI' if realm == GLOBAL else 'WorkBuddy'
+    return f'WorkBuddy/{ver} {platform}/{ver} CLI/{cli_version()}'
+
+
 def billing_ua() -> str:
     """billing 域出站 UA：**单段** `WorkBuddy/<ver>`（不带 CLI 段）。
 

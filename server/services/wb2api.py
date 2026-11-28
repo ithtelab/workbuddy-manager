@@ -177,17 +177,31 @@ def set_account_skip_tasks(filename: str = '', enabled: bool = True,
     if path.is_symlink():
         raise ValueError('账号文件不能是符号链接')
     with file_lock(path):
-        raw = json.loads(path.read_text(encoding='utf-8'))
-        if not isinstance(raw, dict):
-            raise ValueError('账号文件格式异常')
-        current = raw.get('skip_tasks') is True
-        changed = current != enabled
-        if changed:
+        # 乐观并发：上游进程刷新令牌时会用它的 SaveAtomic 重写同一个文件。
+        # file_lock 只覆盖本进程，读—改—写之间仍可能被上游插进一次完整写入；
+        # 若我们拿旧快照直接覆盖，会把刚续期的新 accessToken 盖回旧值。
+        # 写前比较 mtime/size，变了就重读重试（窗口从「读整份文件」缩到
+        # 「stat → rename」的极短一段）。
+        for _ in range(3):
+            stat = path.stat()
+            raw = json.loads(path.read_text(encoding='utf-8'))
+            if not isinstance(raw, dict):
+                raise ValueError('账号文件格式异常')
+            current = raw.get('skip_tasks') is True
+            changed = current != enabled
+            if not changed:
+                break
             if enabled:
                 raw['skip_tasks'] = True
             else:
                 raw.pop('skip_tasks', None)
+            now_stat = path.stat()
+            if (now_stat.st_mtime_ns, now_stat.st_size) != (stat.st_mtime_ns, stat.st_size):
+                continue        # 别的进程刚写过：重读，别用旧快照覆盖
             _atomic_write_json(path, raw)
+            break
+        else:
+            raise ValueError('账号文件正在被频繁更新（可能正在续期），请稍后重试')
     account = raw.get('account') if isinstance(raw.get('account'), dict) else {}
     return {
         'file': path.name,
@@ -2041,6 +2055,13 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
                     '开启账号管理接口需要上游已设置 api_key（上游要求管理端点必须鉴权，'
                     '否则拒绝启动）。请先在上游 config.json 里设置 api_key')
             out[key] = bool(raw)
+        elif section == 'upstream' and key == 'ua_style':
+            # 上游对非法值是**启动报错**（normalize 里 switch 只有一个 default
+            # 返回 error），所以这里必须白名单；否则「保存成功、重启后上游起不来」。
+            val = str(raw or '').strip().lower()
+            if val not in ('', 'desktop', 'cli'):
+                raise ValueError('upstream.ua_style 只能是 desktop 或 cli（留空 = desktop）')
+            out[key] = val
         elif section == 'upstream' and key in _UPSTREAM_TEXT_KEYS:
             # 单行文本：UA、客户端版本、用量归知名度、设备 token 文件路径
             val = str(raw or '').strip()

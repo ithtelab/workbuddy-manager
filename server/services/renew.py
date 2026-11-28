@@ -140,11 +140,9 @@ async def refresh_all(force: bool = False, now: int | None = None) -> dict:
         if acct.get('disabled_by_panel'):
             stats['skipped'] += 1
             continue
-        # 账号级「不参与定时任务」（issue #437）：token 保活也属于定时任务，
-        # 用户显式关掉后不再自动续期（需要时可在账号页手动「刷新 Token」）。
-        if acct.get('skip_tasks'):
-            stats['skipped'] += 1
-            continue
+        # 注意：`skip_tasks` 只跳过**成长任务**（签到/旅行/活跃等），不跳过
+        # token 续期。只转发的账号也必须续期，否则 AT 到期后转发会 401
+        # （2026-11-28 审查：0060 曾把保活一起停掉，等于两个月后自动废号）。
         if not force and not _needs_renew(int(acct.get('expires_at') or 0), now):
             continue
         await pacer.wait()

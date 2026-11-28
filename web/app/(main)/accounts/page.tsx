@@ -1071,6 +1071,18 @@ export default function AccountsPage() {
    *  「确实没积分」，不该报警。
    */
   function renderCredits(a: Account) {
+    // 「需重登」优先于任何余额：实时值可能是失效前查到的旧数，单账号刷新失败
+    // 时也不会被删掉；继续展示数字会让人以为账号还能用（2026-11-28 审查）。
+    if (a.needs_relogin) {
+      return (
+        <span
+          className="text-xs text-rose-600 dark:text-rose-400"
+          title={t('accounts.badgeNeedsReloginTitle')}
+        >
+          {t('accounts.badgeNeedsRelogin')}
+        </span>
+      );
+    }
     // 优先用刚查到的实时值，其次上游 /status 的快照值
     const live = liveCredits[a.uid];
     const value = live ?? a.credits;

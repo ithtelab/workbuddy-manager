@@ -31,6 +31,7 @@ from .realm import (
     billing_paths,
     chat_base,
     chat_paths,
+    cli_ua,
     device_token_for,
     headers as realm_headers,
     realm_of,
@@ -1044,15 +1045,20 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
         else ['/console/enterprises/personal/models']
     )
 
-    async def _probe(paths: list[str]) -> tuple[object | None, str]:
+    async def _probe(paths: list[str], *,
+                     force_cli_ua: bool = False) -> tuple[object | None, str]:
         """按候选路径顺序取第一个成功响应，返回 (data, 错误说明)。"""
         last_code = -1
+        headers = _hdr(realm, access_token, uid)
+        if force_cli_ua:
+            # /v3/config 的 UA 门禁只放行三段式 CLI UA；默认桌面单段会被 400。
+            headers['User-Agent'] = cli_ua(realm)
         try:
             async with _account_http_client(auth) as client:
                 for path in paths:
                     resp = await client.get(
                         f'{chat_base(realm)}{path}',
-                        headers=_hdr(realm, access_token, uid),
+                        headers=headers,
                     )
                     code, body = _envelope(resp)
                     last_code = code
@@ -1065,7 +1071,7 @@ async def fetch_models(auth: dict) -> tuple[bool, list | str]:
     # 两路并发：串行会把模型中心的等待时间翻倍，而两路互不依赖。
     ent_res, v3_res = await asyncio.gather(
         _probe(enterprise_paths),
-        _probe([V3_CONFIG_PATH]),
+        _probe([V3_CONFIG_PATH], force_cli_ua=True),
     )
     ent_data, ent_err = ent_res
     v3_data, v3_err = v3_res

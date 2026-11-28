@@ -571,6 +571,16 @@ def verify_download(archive: Path, info: dict, rep: Reporter) -> None:
 
     rep.log(f'发布包 sha256：{digest}')
     rep.log('本次未比对发布页摘要（当前走的是回退路径），只校验了下载是否完整', 'warn')
+    # 回退路径拿不到可信摘要 = 没有防篡改能力。更新器通常以 root 运行、能替换
+    # server/deploy 并重启服务，不能把「HTTPS 可用」当成唯一门槛：
+    # 默认 fail-closed，只有用户显式接受风险才继续（2026-11-28 安全审查）。
+    if os.environ.get('WB_ALLOW_UNVERIFIED_UPDATE', '').strip() != '1':
+        raise RuntimeError(
+            '❌ 本次无法从 GitHub API 取得发布包摘要，已拒绝自动安装。\n'
+            '  这通常是因为 API 被限流或网络代理拦截；稍后重试，或到 Releases 页面\n'
+            '  手动下载并核对发布说明里的 sha256 后安装。\n'
+            '  确认要跳过摘要校验（不推荐）可设置 WB_ALLOW_UNVERIFIED_UPDATE=1。'
+        )
     rep.set_integrity('none', digest)
 
 
