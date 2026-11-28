@@ -8,6 +8,7 @@
  * 读不到时一律返回默认值：隐私模式下 localStorage 会抛错，那不该让页面白屏。
  */
 import type {CreditExpiry} from './types';
+import type {SortDirection, SortKey} from './account-list';
 
 /** 仪表盘「最近到期积分」是否按天归并。 */
 const EXPIRY_DAILY_KEY = 'wb.expiry-daily-group';
@@ -106,6 +107,87 @@ export function getRefreshInterval(): RefreshInterval {
 export function setRefreshInterval(v: RefreshInterval): void {
   try {
     window.localStorage.setItem(REFRESH_INTERVAL_KEY, String(v));
+  } catch {
+    /* 写不进去只影响下次打开；本次会话仍按调用方的 state 渲染 */
+  }
+}
+
+/**
+ * 账号页的排序档位与升降序：换档后记在浏览器本地，刷新 / 重开浏览器保持。
+ *
+ * 存本地不落后端：选哪一档是「我这块屏幕怎么看」的偏好，与语言、图表类型同类
+ * （见本文件头注）。首帧在服务端预渲染读不到 localStorage，所以页面要**挂载后**
+ * 再回填——别把读挪进 useState 的初始值。
+ *
+ * 只认**用户主动**的选择：排序下拉选档、点升降序按钮、「清除筛选」复位。
+ * 长按拖拽账号时页面会自动切到「自定义顺序」档，那是系统替用户做的临时切换，
+ * 不写偏好——拖一下就改掉用户自己选的默认视图，刷新回来视角变了反而奇怪
+ * （page.tsx 的拖拽路径不得调用下面的 set，server/tests/test_accounts_sort.py 有断言钉住）。
+ */
+const ACCOUNTS_SORT_KEY = 'wb.accounts.sort';
+const ACCOUNTS_SORT_DIR_KEY = 'wb.accounts.sort-direction';
+
+/**
+ * 排序档位的穷举哨兵：键集 = SortKey 的全部成员，合法档位集合由它派生。
+ *
+ * 不手抄一份字面量清单：SortKey 将来新增档位而这里漏写，会从「读偏好时静默
+ * 降级成默认档」变成**编译错误**（TS2741 缺成员），拼错键名同样编译不过。
+ * 本模块被 web/lib/*.test.mjs 用 Node 直接 import（type stripping），只能
+ * import type、不能运行时 import 值（规矩见 account-list.ts 开头的说明），
+ * 所以哨兵只能在文件里现写一份——test_accounts_sort.py 的源码级断言两头盯住它。
+ */
+const ACCOUNTS_SORT_SENTINEL: Record<SortKey, true> = {
+  default: true,
+  manual: true,
+  remain: true,
+  credits: true,
+  added: true,
+};
+
+/** 排序档位清单（由哨兵派生，恒等于 SortKey 全体）：测试直接用它做逐一回环。 */
+export const ACCOUNTS_SORT_KEYS = Object.keys(ACCOUNTS_SORT_SENTINEL) as SortKey[];
+
+/** 合法的排序档位集合（与 {@link ACCOUNTS_SORT_KEYS} 同源）。 */
+const ACCOUNTS_SORTS: ReadonlySet<string> = new Set(ACCOUNTS_SORT_KEYS);
+
+/**
+ * 读排序档位。没有存值 / 存的值不在集合里（旧版留下的、手工改的）→ 「默认」；
+ * 隐私模式下 localStorage 抛错同样回默认，不该让页面白屏。
+ */
+export function getAccountsSort(): SortKey {
+  try {
+    const raw = window.localStorage.getItem(ACCOUNTS_SORT_KEY);
+    // 集合的成员就是哨兵的键（= SortKey 全体），命中才把字符串当档位用。
+    return raw !== null && ACCOUNTS_SORTS.has(raw) ? (raw as SortKey) : 'default';
+  } catch {
+    return 'default';
+  }
+}
+
+export function setAccountsSort(v: SortKey): void {
+  try {
+    window.localStorage.setItem(ACCOUNTS_SORT_KEY, v);
+  } catch {
+    /* 写不进去只影响下次打开；本次会话仍按调用方的 state 渲染 */
+  }
+}
+
+/**
+ * 读升降序。没有存值 / 存的不是 'desc' → 升序：SortDirection 只有两档，
+ * 读规则刻意写成「非 desc 一律 asc」——将来若加第三档，这条读法会把新档位
+ * 永远读成 asc，test_accounts_sort.py 的方向断言会在那时拦一下。
+ */
+export function getAccountsSortDirection(): SortDirection {
+  try {
+    return window.localStorage.getItem(ACCOUNTS_SORT_DIR_KEY) === 'desc' ? 'desc' : 'asc';
+  } catch {
+    return 'asc';
+  }
+}
+
+export function setAccountsSortDirection(v: SortDirection): void {
+  try {
+    window.localStorage.setItem(ACCOUNTS_SORT_DIR_KEY, v);
   } catch {
     /* 写不进去只影响下次打开；本次会话仍按调用方的 state 渲染 */
   }
