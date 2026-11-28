@@ -412,6 +412,10 @@ jobs:
         run: |
           IMAGE="ghcr.io/${{ github.repository_owner }}/workbuddy-manager"
           echo "name=${IMAGE,,}" >> $GITHUB_OUTPUT
+          # 上游镜像名也给一份（全小写）：has_upstream=0 时后面的“解析上游镜像名”
+          # 步骤会被跳过，但管理端构建仍需要这个名字拼 fallback。
+          UPSTREAM="ghcr.io/${{ github.repository_owner }}/workbuddy2api"
+          echo "upstream_name=${UPSTREAM,,}" >> $GITHUB_OUTPUT
 
       # 下面这几步与镜像构建同属「附属产物」链路，一并加 continue-on-error：
       # 它们任一失败都会让 build-push-action 无法运行，若不加，job 会标红——
@@ -454,9 +458,12 @@ jobs:
           context: ${{ steps.pack.outputs.stage }}/upstream
           platforms: linux/amd64,linux/arm64
           push: true
+          # 只推 staging/sha：版本号与 latest 由 publish-images.yml 在 Release
+          # **正式发布后**提升，避免草稿核对前用户就拉到未验收的镜像
+          # （2026-11-28 审查 H3）。
           tags: |
-            ${{ steps.upstream_image.outputs.name }}:${{ steps.vars.outputs.version }}
-            ${{ steps.upstream_image.outputs.name }}:latest
+            ${{ steps.upstream_image.outputs.name }}:staging-${{ steps.vars.outputs.version }}
+            ${{ steps.upstream_image.outputs.name }}:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.version=${{ steps.vars.outputs.version }}
             dev.workbuddy.upstream-id=${{ steps.pack.outputs.upstream_id }}
@@ -483,19 +490,20 @@ jobs:
           push: true
           # 管理端镜像在构建期会从**上游镜像**里取一份任务脚本与配置模板
           # （见 Dockerfile 的 `FROM ${UPSTREAM_IMAGE} AS upstream`）。
-          # 必须显式钉到**本次发布的版本**：不传的话 Dockerfile 的默认值是
-          # `:latest`，而 latest 此刻还指着上一版 —— 内置脚本就会滞后一个版本，
-          # 与「随包上游同版本」的承诺不符。
+          # 必须显式钉到**本次构建的上游 staging 镜像**（`staging-<版本>`）：
+          # 不传的话 Dockerfile 的默认值是 `:latest`，而 latest 此刻还指着上一版
+          # —— 内置脚本就会滞后一个版本，与「随包上游同版本」的承诺不符。
           #
           # 因此上游镜像的构建被挪到了本步骤**之前**；若上游构建失败/被跳过
           # （has_upstream=0），这里回落到 latest —— 那种情况下发布包本身也不含
           # upstream/，管理端镜像里的内置脚本只是尽力而为。
           build-args: |
-            UPSTREAM_IMAGE=ghcr.io/${{ github.repository_owner }}/workbuddy2api:${{ steps.build_upstream.outcome == 'success' && steps.vars.outputs.version || 'latest' }}
-          # 镜像标签用小写（GHCR 要求），去掉 v 前缀
+            UPSTREAM_IMAGE=${{ steps.build_upstream.outcome == 'success' && format('{0}:staging-{1}', steps.image.outputs.upstream_name, steps.vars.outputs.version) || format('{0}:latest', steps.image.outputs.upstream_name) }}
+          # 只推 staging/sha；版本号与 latest 由 publish-images.yml 在 Release
+          # 正式发布后提升（2026-11-28 审查 H3）。
           tags: |
-            ${{ steps.image.outputs.name }}:${{ steps.vars.outputs.version }}
-            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:staging-${{ steps.vars.outputs.version }}
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
           # 关掉 provenance 证明：它会在 manifest list 里塞入 attestation 条目，
           # 某些旧版 Docker（< 25）拉取时会报 unknown/unknown platform。
           # 本项目不依赖该证明，关掉换来更干净的索引。

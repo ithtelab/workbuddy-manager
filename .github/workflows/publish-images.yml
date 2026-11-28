@@ -1,0 +1,104 @@
+# 把 Release 构建阶段推的 `staging-<版本>` 镜像提升为 `:<版本>` 与 `:latest`。
+#
+# 为什么不在 release.yml 里直接推版本号/latest：Release 先建为**草稿**，维护者
+# 核对发布说明与摘要后才手动发布。镜像如果在草稿阶段就占用了版本号与 latest，
+# 用户会在验收前拉到未发布的构建（2026-11-28 审查 H3）。这里只在 Release
+# **正式发布**（或手动指定一个已发布 tag）后提升，保证镜像与已核对版本同步。
+name: Publish Images
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已发布的 Release tag（如 v2.12.0）'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-images-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 解析版本与镜像名
+        id: vars
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          IMAGE="ghcr.io/${{ github.repository_owner }}/workbuddy-manager"
+          UPSTREAM="ghcr.io/${{ github.repository_owner }}/workbuddy2api"
+          echo "image=${IMAGE,,}" >> "$GITHUB_OUTPUT"
+          echo "upstream=${UPSTREAM,,}" >> "$GITHUB_OUTPUT"
+
+      - name: 确认 Release 已正式发布（非草稿/非预发布）
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          IS_DRAFT=$(gh release view "$TAG" --json isDraft -q .isDraft)
+          PRE=$(gh release view "$TAG" --json isPrerelease -q .isPrerelease)
+          if [ "$IS_DRAFT" != "false" ] || [ "$PRE" != "false" ]; then
+            echo "::error::$TAG 不是正式发布（draft=$IS_DRAFT prerelease=$PRE），拒绝提升镜像"
+            exit 1
+          fi
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 提升管理端镜像
+        run: |
+          IMAGE="${{ steps.vars.outputs.image }}"
+          VERSION="${{ steps.vars.outputs.version }}"
+          SRC="$IMAGE:staging-$VERSION"
+          docker buildx imagetools inspect "$SRC" >/dev/null || {
+            echo "::error::找不到 $SRC（本次发版的管理端镜像没有推成功？）"
+            exit 1
+          }
+          want=$(docker buildx imagetools inspect "$SRC" | sed -n 's/^Digest: *//p' | head -1)
+          have=$(docker buildx imagetools inspect "$IMAGE:$VERSION" 2>/dev/null | sed -n 's/^Digest: *//p' | head -1 || true)
+          if [ -n "$have" ] && [ "$have" != "$want" ]; then
+            echo "::error::$IMAGE:$VERSION 已存在且 digest 不同（$have vs $want），拒绝覆盖版本 tag"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            "$SRC"
+          echo "已提升 $IMAGE:$VERSION 与 :latest（源 $SRC）" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 提升上游镜像（若本次构建了）
+        run: |
+          UP="${{ steps.vars.outputs.upstream }}"
+          VERSION="${{ steps.vars.outputs.version }}"
+          SRC="$UP:staging-$VERSION"
+          if ! docker buildx imagetools inspect "$SRC" >/dev/null 2>&1; then
+            echo "上游镜像 $SRC 不存在（本次可能未内嵌上游或构建失败），跳过"
+            exit 0
+          fi
+          want=$(docker buildx imagetools inspect "$SRC" | sed -n 's/^Digest: *//p' | head -1)
+          have=$(docker buildx imagetools inspect "$UP:$VERSION" 2>/dev/null | sed -n 's/^Digest: *//p' | head -1 || true)
+          if [ -n "$have" ] && [ "$have" != "$want" ]; then
+            echo "::error::$UP:$VERSION 已存在且 digest 不同（$have vs $want），拒绝覆盖版本 tag"
+            exit 1
+          fi
+          docker buildx imagetools create \
+            -t "$UP:$VERSION" \
+            -t "$UP:latest" \
+            "$SRC"
+          echo "已提升 $UP:$VERSION 与 :latest（源 $SRC）" >> "$GITHUB_STEP_SUMMARY"
