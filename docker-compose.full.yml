@@ -43,8 +43,17 @@ services:
       WB2API_BASE: http://workbuddy2api:7863
       # 流式响应的「内容空闲」上限（秒，0 = 关闭，留空 = 默认 120）。
       # 上游开着保活时，逐字节读超时会被保活帧不断重置，正文不产出的请求能挂到
-      # 十几分钟；这里按「距上一个正文帧」计时，超时主动断开（issue #485）。
+      # 十几分钟；这里按「距上一个数据帧」计时（工具调用增量也算活跃，纯保活不算），
+      # 超时主动断开（issue #485）。
       WB_STREAM_IDLE_TIMEOUT: ${WB_STREAM_IDLE_TIMEOUT:-}
+      # 数据库维护与保留期（issue #492，可选；留空 = 默认 90 天 / 6 小时 / 256 MiB，
+      # 0 = 永久保留）。只列这几项：不写进 environment 的变量在 .env 里设了也不会生效。
+      WB_RETENTION_DAYS: ${WB_RETENTION_DAYS:-}
+      WB_REQUEST_LOG_RETENTION_DAYS: ${WB_REQUEST_LOG_RETENTION_DAYS:-}
+      WB_CHECKIN_LOG_RETENTION_DAYS: ${WB_CHECKIN_LOG_RETENTION_DAYS:-}
+      WB_RISK_EVENT_RETENTION_DAYS: ${WB_RISK_EVENT_RETENTION_DAYS:-}
+      WB_DB_MAINTENANCE_INTERVAL_HOURS: ${WB_DB_MAINTENANCE_INTERVAL_HOURS:-}
+      WB_JOURNAL_SIZE_LIMIT: ${WB_JOURNAL_SIZE_LIMIT:-}
       # 容器名，供依赖 docker 的功能定位上游（本文件默认不挂 docker.sock，
       # 这些功能会如实降级为「请到宿主机操作」）。
       WB2API_CONTAINER: workbuddy2api
