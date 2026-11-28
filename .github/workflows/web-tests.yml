@@ -27,6 +27,14 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 部分 .mjs 测试会真实执行 React hook / jsdom（account-backfill-refresh），
+      # 需要 web/node_modules；其余纯逻辑测试复用同一份安装。
+      - name: 安装前端依赖
+        working-directory: web
+        run: npm ci
 
       - name: 排序偏好行为测试（Node type stripping）
         run: node --experimental-strip-types web/lib/accounts-sort.test.mjs
