@@ -1,0 +1,38 @@
+# 前端纯逻辑测试（不装 npm 依赖，直接跑 .mjs / type-stripping）。
+#
+# 为什么不并进 release.yml：release 作业用的 Node 20 没有 type stripping，
+# `test_accounts_sort.py` 会按设计 skip——排序偏好这类行为测试就永远不在 CI 跑。
+# 这里单独用 Node 24 跑 web/lib 下的 .mjs 测试；它们只 import 纯逻辑 .ts，不需要
+# node_modules（先例：accounts-sort.test.mjs / display-prefs.test.mjs）。
+name: Web Tests
+
+on:
+  push:
+    paths:
+      - 'web/**'
+      - '.github/workflows/web-tests.yml'
+  pull_request:
+    paths:
+      - 'web/**'
+      - '.github/workflows/web-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: 排序偏好行为测试（Node type stripping）
+        run: node --experimental-strip-types web/lib/accounts-sort.test.mjs
+
+      - name: 其余 web/lib 逻辑测试
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(ls web/lib/*.test.mjs | grep -v '/accounts-sort.test.mjs$')
+          node --test "${tests[@]}"
