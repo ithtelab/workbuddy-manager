@@ -204,18 +204,11 @@ bash deploy/verify-release.sh /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz
 tar tzf /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz | head -5      # 抽查包结构
 #    再解开看 .version 与 server/main.py 的版本号
 
-# 5) 给旧版更新器补过渡签名（v1.0.85 及更早仍强制验签；私钥只在维护者本机）
-cd /tmp/vX.Y.Z
-ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-vX.Y.Z.tar.gz
-gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
-  --repo ithtelab/workbuddy-manager
-#    验一下再继续（用仓库里记录的公钥，或 update.py 里内嵌的那把）：
-#    printf 'release %s\n' "$(cat ~/.ssh/workbuddy-release.pub)" > allowed_signers
-#    ssh-keygen -Y verify -f allowed_signers -I release -n file \
-#      -s workbuddy-manager-vX.Y.Z.tar.gz.sig < workbuddy-manager-vX.Y.Z.tar.gz
-
-# 6) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
+# 5) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
 gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
+#    发布后 Publish Images 工作流会自动把 staging-<版本> 镜像提升为
+#    :<版本> 与 :latest；在这之前用户拉不到本次镜像。
+#    只适用于 v1.0.86+：更早的更新器仍强制要求 .sig，需手动下载安装一次。
 ```
 
 关键的一条：**草稿不发布，用户永远看不到这个版本** —— 面板与更新器的版本检查都读
@@ -224,9 +217,9 @@ gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 用户侧看到的一直是上一个**已发布且产物齐全**的版本。
 
 2026-10-14 起**新版本更新器不再要求签名**：只核对发布页给的 sha256 与文件大小
-（发布说明里就印着那个哈希，工作流自动附上）。但 `.sig` 仍要按第 5 步手工补 ——
-停在 v1.0.85 及更早的更新器强制验签，漏掉就会让这批老部署无法升级。为什么这样
-过渡、私钥如何保管，见 [release-signing.md](release-signing.md)。
+（发布说明里就印着那个哈希，工作流自动附上）。发版流程也**不再生成或上传 `.sig`**。
+停在 v1.0.85 及更早的更新器仍强制验签，这批老部署需要手动下载安装一次才能接上
+新链路；取舍与信任边界见 [release-signing.md](release-signing.md)。
 
 ## 发布包字节的可复现性
 
