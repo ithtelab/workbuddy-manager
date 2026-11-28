@@ -66,6 +66,12 @@ import {
   type SortKey,
   type SortDirection,
 } from '@/lib/account-list';
+import {
+  getAccountsSort,
+  getAccountsSortDirection,
+  setAccountsSort,
+  setAccountsSortDirection,
+} from '@/lib/display-prefs';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
@@ -189,6 +195,17 @@ export default function AccountsPage() {
   const [statusGroup, setStatusGroup] = useState<GroupFilter>('all');
   const [sort, setSort] = useState<SortKey>('default');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
+  /**
+   * 排序档位与升降序记在浏览器本地：刷新 / 重开浏览器保持最后的选择。
+   *
+   * 首帧固定按默认值渲染，挂载后再读偏好回填——服务端预渲染读不到
+   * localStorage，首帧就读会产生 hydration 不一致（仪表盘图表类型同款处理，
+   * 偏好本体见 lib/display-prefs.ts）。
+   */
+  useEffect(() => {
+    setSort(getAccountsSort());
+    setSortDirection(getAccountsSortDirection());
+  }, []);
   /**
    * 自定义顺序（拖拽排序）：uid 数组，存在**服务端**（server/services/accountorder.py）。
    *
@@ -668,7 +685,9 @@ export default function AccountsPage() {
       timer: window.setTimeout(() => {
         dragPressRef.current = null;
         dragStartOrderRef.current = manualOrderRef.current;
-        // 别的排序档位下松手会被立刻覆盖回去，所以拖动前先切到自定义顺序
+        // 别的排序档位下松手会被立刻覆盖回去，所以拖动前先切到自定义顺序。
+        // 这是系统替用户做的临时切换，不写本地偏好——拖一下不该改掉用户
+        // 自己选的默认视图（见 display-prefs.ts 的说明，测试有断言钉住）。
         setSort('manual');
         setDraggingUid(a.uid);
       }, 320),
@@ -680,12 +699,35 @@ export default function AccountsPage() {
   const noAccountsInRealm = !noAccountsAtAll && visible.length === 0;
   const noMatch = visible.length > 0 && filtered.length === 0;
 
-  /** 清掉列表自己的筛选（不动分组，也不动版本） */
+  /**
+   * 换排序档位：状态与本地偏好一起写，刷新后保持。
+   * `added` 档默认降序（新加的在前），换档时一并复位方向。
+   */
+  function chooseSort(v: SortKey) {
+    const dir: SortDirection = v === 'added' ? 'desc' : 'asc';
+    setSort(v);
+    setSortDirection(dir);
+    setPage(1);
+    setAccountsSort(v);
+    setAccountsSortDirection(dir);
+  }
+
+  /** 翻转升降序：同样写回本地偏好。 */
+  function toggleSortDirection() {
+    const next: SortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+    setSortDirection(next);
+    setAccountsSortDirection(next);
+    setPage(1);
+  }
+
+  /** 清掉列表自己的筛选（不动分组，也不动版本）；排序档位一并复位回默认（偏好同步落盘） */
   function clearListFilters() {
     setQ('');
     setStatusGroup('all');
     setSort('default');
     setSortDirection('asc');
+    setAccountsSort('default');
+    setAccountsSortDirection('asc');
     setPage(1);
   }
 
@@ -1792,9 +1834,7 @@ export default function AccountsPage() {
             </div>
             <div className="flex shrink-0 flex-wrap items-center gap-1.5">
               <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground" />
-              <Select value={sort} onValueChange={(v) => {
-                setSort(v as SortKey); setSortDirection(v === 'added' ? 'desc' : 'asc'); setPage(1);
-              }}>
+              <Select value={sort} onValueChange={(v) => chooseSort(v as SortKey)}>
                 <SelectTrigger className="h-9 w-[150px] bg-background" aria-label={t('accounts.sortLabel')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="default">{t('accounts.sortDefault')}</SelectItem>
@@ -1807,7 +1847,7 @@ export default function AccountsPage() {
               {sort !== 'default' && sort !== 'manual' && (
                 <Button variant="outline" size="sm" className="h-9 gap-1.5"
                   aria-label={t('accounts.sortDirectionToggle', {direction: t(sortDirection === 'asc' ? 'accounts.sortAscending' : 'accounts.sortDescending')})}
-                  onClick={() => { setSortDirection(d => d === 'asc' ? 'desc' : 'asc'); setPage(1); }}>
+                  onClick={toggleSortDirection}>
                   {sortDirection === 'asc' ? <ArrowUp className="h-3.5 w-3.5" /> : <ArrowDown className="h-3.5 w-3.5" />}
                   {t(sortDirection === 'asc' ? 'accounts.sortAscending' : 'accounts.sortDescending')}
                 </Button>
