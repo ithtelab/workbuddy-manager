@@ -44,8 +44,8 @@ jobs:
       - name: 确认 Release 已正式发布（非草稿/非预发布）
         run: |
           TAG="${{ steps.vars.outputs.tag }}"
-          IS_DRAFT=$(gh release view "$TAG" --json isDraft -q .isDraft)
-          PRE=$(gh release view "$TAG" --json isPrerelease -q .isPrerelease)
+          IS_DRAFT=$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft -q .isDraft)
+          PRE=$(gh release view "$TAG" --repo "${{ github.repository }}" --json isPrerelease -q .isPrerelease)
           if [ "$IS_DRAFT" != "false" ] || [ "$PRE" != "false" ]; then
             echo "::error::$TAG 不是正式发布（draft=$IS_DRAFT prerelease=$PRE），拒绝提升镜像"
             exit 1
